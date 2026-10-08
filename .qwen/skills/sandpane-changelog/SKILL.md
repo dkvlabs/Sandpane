@@ -19,8 +19,8 @@ Log every **big implementation step**: a roadmap phase or slice of one, a new mo
 1. **Implement** the change completely.
 2. **Auto-review BEFORE committing** — run the bundled `/review` skill on the working tree (`--effort low` for docs-only, `--effort medium` or higher for code). Fix every Critical finding or record a disposition. Keep the findings list; it feeds step 4.
 3. **Commit** the implementation (Conventional Commits). Note the short hash: `git log --oneline -1`.
-4. **Write the audit record** `docs/audit/NNNN-<slug>-review.md` using [audit-template.md](audit-template.md). `NNNN` = next zero-padded number after the highest existing entry in `docs/CHANGELOG.md` (check with `ls docs/audit/` and the changelog head — they share numbering; `0000` is the execution plan, entries start at `0001`).
-5. **Add the changelog entry** to `docs/CHANGELOG.md`, newest first, immediately above the `<!-- Entries are appended above this line -->` marker, using the entry format documented at the top of that file.
+4. **Write the audit record** `docs/audit/NNNN-<slug>-review.md` using [audit-template.md](audit-template.md). `NNNN` = next zero-padded number after the highest existing entry in `docs/CHANGELOG.md` (check with `ls docs/audit/` and the last changelog entry — they share numbering; `0000` is the execution plan, entries start at `0001`).
+5. **Add the changelog entry** to `docs/CHANGELOG.md` immediately above the append marker at the bottom (chronological order — numbers ascend, newest entry last), using the entry format documented at the top of that file.
 6. **Commit the log**: `docs(audit): log implementation NNNN — <title>`.
 
 ## Filling model and tokens (dash rule)
