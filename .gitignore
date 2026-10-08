@@ -1,2 +1,42 @@
+# IDE / OS
 .idea
 .DS_Store
+*.iml
+.vscode/*
+!.vscode/extensions.json
+
+# Qwen Code session artifacts (agents/skills/commands ARE committed)
+.qwen/tmp/
+.qwen/worktrees/
+.qwen/reviews/
+.qwen/review-cache/
+.qwen/archived-skills/
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node / TypeScript (anchored to known output locations)
+node_modules/
+clients/vscode/dist/
+clients/vscode/out/
+clients/vscode/coverage/
+apps/desktop/dist/
+apps/desktop/coverage/
+apps/desktop/.vite/
+*.tsbuildinfo
+
+# Java / Gradle / Kotlin
+.gradle/
+clients/jetbrains/build/
+clients/jetbrains/.intellijPlatform/
+
+# Tauri
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/schemas/
+
+# Environment / secrets — never commit
+.env
+.env.*
+*.pem
+*.key
