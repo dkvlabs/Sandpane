@@ -51,4 +51,16 @@ Rules:
 - **model:** qwen3.8-max (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; goal meter reads 0 mid-turn — updates only at turn boundaries, breakdown unavailable)
 
+## 0003 — Superpowers v6.4.2 installed from canonical GitHub source (project-level)
+
+- **date:** 2026-10-09
+- **phase:** infra / AI operations (user request; supersedes the cache-vendored v5.1.0 from entry 0002)
+- **commit:** `8f9506e` (feat(skills): install superpowers v6.4.2 from canonical GitHub source (project-level))
+- **details:** Per user request, installed superpowers directly from https://github.com/obra/superpowers into the **project** skills directory `.qwen/skills/` (explicitly not user-global `~/.qwen/skills/`). Fresh shallow clone at HEAD `8ca22dba9a94f28898bbce59f2537ff4d87c747d` = release **v6.4.2** (2026-09-25). Replaced all 14 cache-vendored v5.1.0 skills with their canonical v6.4.2 versions and added the new 15th skill `diagnosing-superpowers` (with its prompts/references/templates). Refreshed `SUPERPOWERS_LICENSE` and rewrote `SUPERPOWERS_NOTICE.md` with exact provenance (repo URL, version, commit hash, install date, history, adaptation notes; upstream Claude Code plugin plumbing — hooks/index.js/manifests — intentionally not installed). Security scan of all scripts: no network surface; two upstream `child_process` uses documented (env-gated browser open; graphviz via execFileSync). Project-authored skills/agents/commands untouched. Note: entry numbering shifts — the paused execution plan (audit/0000) had assigned 0003 to the Rust core; that work will take the next free number when resumed.
+- **files:** .qwen/skills/{15 superpowers dirs, SUPERPOWERS_LICENSE, SUPERPOWERS_NOTICE.md} — 69 files, +4084/−1472
+- **verification:** `diff -rq` installed vs fresh clone → 15/15 IDENTICAL + LICENSE identical; frontmatter scan → 20/20 OK; script grep → no curl/wget/fetch/http.request; `git diff --cached --stat` → all changes under .qwen/skills/; post-commit `git status` → clean except `?? core/` (paused-goal work, deliberately excluded via pathspec add)
+- **review:** [audit/0003-superpowers-v642-install-review.md](audit/0003-superpowers-v642-install-review.md) — `/review` quick pass (effort: low, unverified) + mechanical provenance/integrity checks: 0 critical, 2 suggestions + 1 nice-to-have; 1 mitigated at commit (scoped add), 2 accepted (upstream behavior documented)
+- **model:** qwen3.8-max (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; goal meter paused/unavailable for this user-requested change, no per-breakdown source)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
