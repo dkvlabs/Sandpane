@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sandpane for JetBrains — plugin descriptor.
+
+  Registration notes (deliberate, verify at JB0):
+  * The Tool Window is registered through the public `toolWindow` extension point with
+    `factoryClass`. The brief's `factoryId SandpaneToolWindow` is carried as
+    SandpaneToolWindowFactory.FACTORY_ID (the string used by the IDE to look the window
+    up is the `id` attribute). `<toolWindow>` has no documented `factoryId` attribute in
+    the current descriptor bean — adding an undocumented attribute risks a load error, so
+    it is NOT invented here. JB0: confirm the bean attributes against the pinned baseline.
+  * `<idea-version>` is intentionally absent: patchPluginXml (build.gradle.kts
+    intellijPlatform.pluginConfiguration.ideaVersion) supplies sinceBuild=242 /
+    untilBuild=252.*. Until a build is actually run, no unverified range is hardcoded.
+  * No icon is declared: an icon must be a real bundled asset, and no placeholder image is
+    fabricated in this scaffold. JB0 adds tools/sandpane.svg (+@2x) and the `icon` attributes.
+  * No keyboard shortcuts are declared yet: specs/04 §6 requires that Sandpane keybindings
+    do not conflict with common IDE actions. Shortcut ids are assigned only after the JB4
+    conflict audit, per action, from the Action Manager ("Find Action") surface.
+  * No `sbx` binary, no JetBrains AI Assistant internals, no TCP transport. The plugin only
+    talks to the user's own local Sandpane Core over the local socket.
+-->
+<idea-plugin>
+    <id>labs.dkv.sandpane</id>
+    <name>Sandpane</name>
+    <vendor email="sandpane@dkvlabs.invalid" url="https://dkvlabs.invalid/sandpane">DKV Labs</vendor>
+
+    <description><![CDATA[
+        <p><b>Sandpane</b> is an AI development workspace and Docker Sandboxes
+        (<code>sbx</code>) manager: isolated environments, multiple projects, parallel
+        coding-agent chats, real execution visibility, verification, and Git-safe review —
+        from inside the IDE, attached to one persistent per-user Sandpane Core over local
+        IPC. There is no terminal panel and no process scraping: everything shown here is
+        state reported by Core.</p>
+
+        <p><b>Independence notice.</b> Sandpane is an independent open-source developer tool
+        published by DKV Labs. It is <b>not affiliated with, endorsed by, or sponsored by
+        Docker, Inc. or JetBrains s.r.o.</b> Docker Sandboxes is installed, licensed and
+        authenticated separately by the user; this plugin bundles <b>no</b> <code>sbx</code>
+        binary and <b>no</b> provider credentials, and it does not use Docker- or
+        JetBrains-internal interfaces. Integration happens exclusively through documented
+        public IntelliJ Platform extension points and the Sandpane-owned Core protocol.</p>
+
+        <p><b>Current stage: JB0/JB1 scaffold.</b> Project and sandbox listing, tool-window
+        navigation, and Core connection are implemented as read-only paths. Chat/agent
+        streaming (JB2) stays visibly <i>unsupported</i> until the P0 feasibility gate for a
+        verified in-sandbox agent adapter passes; native diff review arrives at JB3.
+        Unsupported is reported as unsupported — nothing here is mocked.</p>
+
+        <p>Prerequisites: a running Sandpane Core service for your OS user, and (for sandbox
+        features) a separately installed Docker SBX CLI.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Tool Window: native Swing by default; JCEF is never a hard requirement. -->
+        <toolWindow id="Sandpane"
+                    anchor="right"
+                    secondary="false"
+                    factoryClass="labs.dkv.sandpane.SandpaneToolWindowFactory"/>
+
+        <notificationGroup id="Sandpane" displayType="BALLOON"/>
+
+        <!-- Application level: one Core connection per IDE process, shared by all windows.
+             Closing a project or a tool window detaches UI subscriptions only; it never
+             terminates the shared Core service or a task another client started. -->
+        <applicationService serviceImplementation="labs.dkv.sandpane.settings.SandpaneSettings"/>
+        <applicationService serviceImplementation="labs.dkv.sandpane.core.ConnectionManager"/>
+
+        <!-- Project level: repository bindings, selected conversation, task view model.
+             No authoritative client-side database (specs/02 §1). -->
+        <projectService serviceImplementation="labs.dkv.sandpane.services.SbxService"/>
+        <projectService serviceImplementation="labs.dkv.sandpane.services.SandpaneContextProvider"/>
+        <projectService serviceImplementation="labs.dkv.sandpane.services.TaskMonitorService"/>
+        <projectService serviceImplementation="labs.dkv.sandpane.services.EditorDiffProvider"/>
+
+        <!-- Client UI settings only; shared state lives in Core. -->
+        <applicationConfigurable parentId="tools"
+                                 id="labs.dkv.sandpane.settings"
+                                 displayName="Sandpane"
+                                 instance="labs.dkv.sandpane.settings.SandpaneConfigurable"/>
+    </extensions>
+
+    <!-- Actions mirror specs/04 §3 (IDE integration with explicit authorization).
+         Every action performs read-only Core calls plus bounded editor-context collection;
+         the one mutating action (Apply Task) requires explicit confirmation and is executed
+         by Core as a Git operation, never by writing host files here. -->
+    <actions>
+        <group id="labs.dkv.sandpane.Toolwindow"
+               text="Sandpane"
+               description="Sandpane Core actions"
+               popup="true">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+
+            <action id="labs.dkv.sandpane.StartTask"
+                    class="labs.dkv.sandpane.actions.StartTaskAction"
+                    text="Sandpane: Start Task with Editor Context"
+                    description="Send the current selection and/or active file as context to a Sandpane conversation"/>
+
+            <action id="labs.dkv.sandpane.ReviewChanges"
+                    class="labs.dkv.sandpane.actions.ReviewChangesAction"
+                    text="Sandpane: Review Changes"
+                    description="Ask Core for the real change set of a task against its recorded base revision"/>
+
+            <action id="labs.dkv.sandpane.ApplyTask"
+                    class="labs.dkv.sandpane.actions.ApplyTaskAction"
+                    text="Sandpane: Apply Task Changes…"
+                    description="Apply a reviewed change set through an explicit, base-checked Git operation in Core"/>
+
+            <action id="labs.dkv.sandpane.RefreshSandboxes"
+                    class="labs.dkv.sandpane.actions.RefreshSandboxesAction"
+                    text="Sandpane: Refresh Projects and Sandboxes"
+                    description="Re-probe project and sandbox state from Core (read-only; state is never assumed)"/>
+        </group>
+    </actions>
+</idea-plugin>

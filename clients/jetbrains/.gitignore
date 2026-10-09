@@ -1,0 +1,14 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ / Kotlin
+out/
+*.iml
+.idea/modules.xml
+.idea/workspace.xml
+.idea/libraries/
+
+# Node-free module: nothing else lives here.
+.DS_Store

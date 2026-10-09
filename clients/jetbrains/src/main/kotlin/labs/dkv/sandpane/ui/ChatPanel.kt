@@ -1,0 +1,596 @@
+package labs.dkv.sandpane.ui
+
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.project.Project
+import labs.dkv.sandpane.actions.ActionIds
+import labs.dkv.sandpane.core.AgentGate
+import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.RenderedEvent
+import labs.dkv.sandpane.model.AgentEvent
+import labs.dkv.sandpane.model.ConversationSendParams
+import labs.dkv.sandpane.model.CoreEventKinds
+import labs.dkv.sandpane.model.PROTOCOL_VERSION
+import labs.dkv.sandpane.model.Project as SandpaneProject
+import labs.dkv.sandpane.model.SandboxSummary
+import labs.dkv.sandpane.services.SandpaneContextProvider
+import labs.dkv.sandpane.services.SbxService
+import labs.dkv.sandpane.services.TaskMonitorService
+import labs.dkv.sandpane.settings.SandpaneSettings
+import java.awt.BorderLayout
+import java.awt.Component
+import java.awt.Dimension
+import java.awt.FlowLayout
+import java.awt.Font
+import javax.swing.BorderFactory
+import javax.swing.Box
+import javax.swing.BoxLayout
+import javax.swing.DefaultComboBoxModel
+import javax.swing.DefaultListCellRenderer
+import javax.swing.DefaultListModel
+import javax.swing.JButton
+import javax.swing.JComboBox
+import javax.swing.JComponent
+import javax.swing.JLabel
+import javax.swing.JList
+import javax.swing.JPanel
+import javax.swing.JScrollPane
+import javax.swing.JSplitPane
+import javax.swing.JTextArea
+import javax.swing.ListSelectionModel
+import javax.swing.SwingConstants
+import javax.swing.Timer
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
+
+/**
+ * The Sandpane tool window body: native Swing only (docs/specs/04 §2). No JCEF, no embedded
+ * browser, and no Markdown/HTML surface — untrusted agent text is never rendered as markup
+ * here. Markdown safety and accessibility are JB4 items after theme testing.
+ *
+ * ## Where streaming batch dispatch lands (the "never block the EDT" answer)
+ *
+ * ```text
+ * Core socket reader thread (CoreClient.readLoop)
+ *   -> EventStream.merge -> TaskMonitorService.onBatch              [background]
+ *     -> ChatPanel view listener:
+ *          message.delta      -> pendingDeltas.offer(...)           [lock-free queue, no Swing]
+ *          everything else     -> onEdt { ... }                    [invokeLater]
+ *   -> javax.swing.Timer(streamFlushIntervalMs, default 50ms)       [fires ON the EDT]
+ *     -> drainDeltas() -> DefaultListModel writes -> repaint        [the ONLY paint path]
+ * ```
+ *
+ * No background thread ever touches a component. The queue is the hand-off, so a fast adapter
+ * cannot flood the repaint loop (specs/04 §5 risk 2), the retained row count is capped by
+ * [MAX_ROWS], and the timer stops itself when the queue drains. Construction happens on the
+ * EDT (tool-window content creation), which is also where the timer is started.
+ *
+ * Known gaps this panel exposes rather than hides:
+ *  - `SandboxSummary` carries no `workspaceMode`, so a sandbox picker cannot label a
+ *    `direct_mount` binding as live-writable. The protocol needs it (see
+ *    [labs.dkv.sandpane.services.EditorDiffProvider.liveWritableNotice]).
+ *  - JB2 conversation tabs are not implemented, so there is no conversation to send to;
+ *    [selectedConversationId] returns null and the panel says so (AGENTS.md rule 5).
+ */
+class ChatPanel(
+    private val project: Project,
+    private val parentDisposable: Disposable,
+) : JPanel(BorderLayout()), Disposable {
+
+    /** One message. The list shows [summaryLine]; the details pane shows the full text. */
+    data class ChatRow(
+        val id: String,
+        val role: String,
+        val text: String,
+        val meta: String?,
+    ) {
+        fun summaryLine(): String {
+            val first = text.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: "(empty)"
+            val extraLines = (text.lines().size - 1).coerceAtLeast(0)
+            val head = "$role: $first"
+            return if (extraLines > 0) "$head …(+$extraLines lines)" else head
+        }
+    }
+
+    /** An editor context item the user agreed to send. */
+    data class AttachmentChip(val label: String, val target: String, val removable: Boolean)
+
+    private val settings = SandpaneSettings.instance()
+    private val connection = ConnectionManager.instance()
+    private val sbx = SbxService.instance(project)
+    private val tasks = TaskMonitorService.instance(project)
+    private val contextProvider = SandpaneContextProvider.instance(project)
+
+    private val rowsModel = DefaultListModel<ChatRow>()
+    private val rowsById = HashMap<String, ChatRow>()
+    private val messages = JList(rowsModel)
+    private val details = JTextArea().apply {
+        isEditable = false
+        lineWrap = true
+        wrapStyleWord = true
+        font = Font(Font.MONOSPACED, Font.PLAIN, 12)
+    }
+
+    private val attachmentsModel = DefaultListModel<AttachmentChip>()
+    private val attachments = JList(attachmentsModel)
+
+    private val projectModel = DefaultComboBoxModel<SandpaneProject>()
+    private val sandboxModel = DefaultComboBoxModel<SandboxSummary>()
+    private val agentModel = DefaultComboBoxModel<String>()
+    private val projectPicker = JComboBox(projectModel)
+    private val sandboxPicker = JComboBox(sandboxModel)
+    private val agentPicker = JComboBox(agentModel)
+
+    private val composer = JTextArea(4, 60).apply {
+        lineWrap = true
+        wrapStyleWord = true
+        document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) { onComposerChanged() }
+            override fun removeUpdate(e: DocumentEvent) { onComposerChanged() }
+            override fun changedUpdate(e: DocumentEvent) { onComposerChanged() }
+        })
+    }
+
+    private val sendButton = JButton("Send")
+    private val removeAttachmentButton = JButton("Remove ×")
+
+    private val connectionLabel = JLabel("  not connected")
+    private val contextLabel = JLabel("  no editor context")
+    private val gateLabel = JLabel("  ")
+    private val banner = JLabel("", SwingConstants.LEFT)
+
+    /** taskId → row id for the growing agent message. EDT-owned only. */
+    private val streamingRows = HashMap<String, String>()
+    private val pendingDeltas = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
+    private val flushTimer: Timer
+
+    private var removeStateListener: (() -> Unit)? = null
+    private var removeSnapshotListener: (() -> Unit)? = null
+    private var removeViewListener: (() -> Unit)? = null
+
+    private var hostMapping: SandpaneContextProvider.HostMapping =
+        SandpaneContextProvider.HostMapping.Unsupported("host/path mapping not resolved yet")
+
+    init {
+        name = "SandpanePanel"
+        border = BorderFactory.createEmptyBorder(4, 6, 4, 6)
+
+        add(buildHeader(), BorderLayout.NORTH)
+        add(buildTranscript(), BorderLayout.CENTER)
+        add(buildComposer(), BorderLayout.SOUTH)
+
+        messages.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        messages.cellRenderer = RowRenderer()
+        messages.addListSelectionListener { if (!messages.valueIsAdjusting) showSelectedRowDetails() }
+        attachments.cellRenderer = DefaultListCellRenderer()
+
+        flushTimer = Timer(settings.streamFlushIntervalMs) { drainDeltas() }
+        flushTimer.isCoalescesEvents = true
+        flushTimer.start()
+
+        wireCore()
+        addSystemRow(
+            "Sandpane scaffold (JB0/JB1). Projects and sandboxes are read from Core. Chat needs a " +
+                "conversation, and JB2 conversation tabs are not implemented here — so sending " +
+                "from this panel reports that instead of creating one implicitly.",
+        )
+        sbx.refresh()
+    }
+
+    // -----------------------------------------------------------------------
+    // layout
+    // -----------------------------------------------------------------------
+
+    private fun buildHeader(): JComponent {
+        val group = DefaultActionGroup()
+        val actionManager = ActionManager.getInstance()
+        ActionIds.ALL.forEach { id -> actionManager.getAction(id)?.let { group.add(it) } }
+        val toolbar = actionManager
+            .createActionToolbar("SandpaneToolWindow", group, true)
+            .apply { targetComponent = this@ChatPanel }
+
+        val pickers = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
+            add(JLabel("Project"))
+            add(projectPicker.apply { preferredSize = Dimension(170, 26) })
+            add(JLabel("Sandbox"))
+            add(sandboxPicker.apply { preferredSize = Dimension(180, 26) })
+            add(JLabel("Agent"))
+            add(agentPicker.apply { preferredSize = Dimension(150, 26) })
+        }
+
+        sandboxPicker.renderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                list: JList<*>?,
+                value: Any?,
+                index: Int,
+                isSelected: Boolean,
+                cellHasFocus: Boolean,
+            ): Component {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
+                val sandbox = value as? SandboxSummary ?: return this
+                text = sandbox.name + " ● " + (sandbox.probedState ?: "state not probed")
+                toolTipText = "last probed by Core; SBX owns sandbox state"
+                return this
+            }
+        }
+
+        return JPanel(BorderLayout()).apply {
+            add(toolbar.component, BorderLayout.WEST)
+            add(pickers, BorderLayout.CENTER)
+            add(banner.apply { border = BorderFactory.createEmptyBorder(2, 6, 2, 6) }, BorderLayout.SOUTH)
+        }
+    }
+
+    private fun buildTranscript(): JComponent {
+        val list = JScrollPane(messages).apply {
+            preferredSize = Dimension(320, 240)
+            border = BorderFactory.createTitledBorder("Conversation")
+        }
+        val detail = JScrollPane(details).apply {
+            border = BorderFactory.createTitledBorder("Message detail (plain text; never rendered as markup)")
+        }
+        return JSplitPane(JSplitPane.VERTICAL_SPLIT, list, detail).apply {
+            resizeWeight = 0.55
+            dividerLocation = 260
+        }
+    }
+
+    private fun buildComposer(): JComponent {
+        val chips = JPanel(BorderLayout()).apply {
+            add(JLabel("Attachments"), BorderLayout.WEST)
+            add(
+                JScrollPane(attachments.apply {
+                    selectionMode = ListSelectionModel.SINGLE_SELECTION
+                    preferredSize = Dimension(220, 56)
+                }).apply { horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER },
+                BorderLayout.CENTER,
+            )
+            add(
+                removeAttachmentButton.apply {
+                    addActionListener { removeSelectedAttachment() }
+                    toolTipText = "Drop the quoted selection from this message"
+                },
+                BorderLayout.SOUTH,
+            )
+        }
+
+        val input = JScrollPane(composer).apply {
+            preferredSize = Dimension(320, 84)
+            border = BorderFactory.createTitledBorder("Message")
+        }
+        sendButton.addActionListener { sendFromComposer() }
+
+        val sendColumn = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            add(Box.createVerticalGlue())
+            add(sendButton)
+        }
+
+        val bottom = JPanel(BorderLayout()).apply {
+            add(chips, BorderLayout.WEST)
+            add(input, BorderLayout.CENTER)
+            add(sendColumn, BorderLayout.EAST)
+        }
+
+        val status = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.X_AXIS)
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(1, 0, 0, 0, java.awt.Color(128, 128, 128)),
+                BorderFactory.createEmptyBorder(3, 4, 3, 4),
+            )
+            add(connectionLabel)
+            add(Box.createHorizontalStrut(12))
+            add(contextLabel)
+            add(Box.createHorizontalGlue())
+            add(gateLabel)
+        }
+
+        return JPanel(BorderLayout()).apply {
+            add(bottom, BorderLayout.CENTER)
+            add(status, BorderLayout.SOUTH)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Core wiring — callbacks arrive on background threads
+    // -----------------------------------------------------------------------
+
+    private fun wireCore() {
+        removeStateListener = connection.addStateListener { state -> applyState(state) }
+
+        removeSnapshotListener = sbx.addSnapshotListener { snapshot ->
+            onEdt {
+                projectModel.removeAllElements()
+                snapshot.projects.orEmpty().forEach { projectModel.addElement(it) }
+                sandboxModel.removeAllElements()
+                sbx.sandboxesFor((projectModel.selectedItem as? SandpaneProject)?.id)
+                    .forEach { sandboxModel.addElement(it) }
+                banner.text = snapshot.failure
+                    ?.let { "Core problem: $it (${snapshot.describeAge()})" }
+                    ?: "projects and sandboxes ${snapshot.describeAge()}"
+                refreshGateUI()
+            }
+        }
+
+        removeViewListener = tasks.addViewListener { taskId, view, rendered ->
+            val delta = (rendered?.agentEvent as? AgentEvent.MessageDelta)?.text
+            if (delta != null) {
+                // Hand-off only: no Swing access on this thread.
+                pendingDeltas.offer(taskId to delta)
+                // start() resets the countdown, so it is only called when the timer stopped.
+                if (!flushTimer.isRunning) flushTimer.start()
+            } else {
+                onEdt { applyTaskEvent(taskId, view, rendered) }
+            }
+        }
+    }
+
+    private fun applyState(state: ConnectionManager.State) {
+        onEdt {
+            connectionLabel.text = "  " + when (state) {
+                is ConnectionManager.State.Ready ->
+                    "Core ${state.capabilities.coreVersion} · ${shorten(state.socketPath)}"
+
+                is ConnectionManager.State.Connecting -> "connecting (retry #${state.attempt})…"
+                is ConnectionManager.State.Handshaking -> "negotiating protocol…"
+                is ConnectionManager.State.Unavailable -> "Core down: ${state.reason}"
+                is ConnectionManager.State.VersionMismatch ->
+                    "protocol mismatch: Core v${state.coreProtocolVersion}, client v$PROTOCOL_VERSION"
+
+                is ConnectionManager.State.TransportUnsupported -> "transport unsupported: ${state.reason}"
+                is ConnectionManager.State.Idle -> "idle"
+            }
+
+            val caps = (state as? ConnectionManager.State.Ready)?.capabilities
+            if (caps != null) {
+                agentModel.removeAllElements()
+                caps.agents.forEach { agentModel.addElement(if (it.verified) it.id else "${it.id} (unverified)") }
+            }
+            hostMapping = contextProvider.hostMapping()
+            refreshGateUI()
+        }
+    }
+
+    /** The single place that decides whether an action is allowed, from Core state. */
+    private fun refreshGateUI() {
+        val problem = connection.connectionProblem()
+        val gate = connection.agentGate()
+        val mapping = hostMapping
+        gateLabel.text = "  " + if (gate is AgentGate.Open) "streaming: ${gate.streamingAdapterIds}" else "chat unsupported"
+
+        val blocker: String? = problem
+            ?: (mapping as? SandpaneContextProvider.HostMapping.Unsupported)?.reason
+            ?: gate.reasonForUser().takeUnless { gate.chatEnabled }
+
+        val blocked = blocker != null
+        composer.isEnabled = !blocked
+        sendButton.isEnabled = !blocked && composer.text.isNotBlank()
+        sendButton.toolTipText = blocker ?: "Send this text plus the editor context to Core"
+        composer.toolTipText = blocker ?: "Type a message for the selected conversation"
+        banner.text = blocker
+            ?: "projects and sandboxes ${sbx.currentSnapshot().describeAge()}"
+    }
+
+    /** Runs on the EDT only (Swing Timer fires on the EDT). */
+    private fun drainDeltas() {
+        if (pendingDeltas.isEmpty()) {
+            flushTimer.stop()
+            return
+        }
+        val grouped = LinkedHashMap<String, StringBuilder>()
+        while (true) {
+            val next = pendingDeltas.poll() ?: break
+            grouped.getOrPut(next.first) { StringBuilder() }.append(next.second)
+        }
+        grouped.forEach { (taskId, text) -> appendDelta(taskId, text.toString()) }
+        trimRows()
+    }
+
+    private fun appendDelta(taskId: String, text: String) {
+        if (text.isEmpty()) return
+        val rowId = streamingRows.getOrPut(taskId) { "agent-$taskId" }
+        val existing = rowsById[rowId]
+        val row = ChatRow(
+            id = rowId,
+            role = "agent",
+            text = (existing?.text ?: "") + text,
+            meta = "task ${taskId.take(8)} · streaming (${settings.streamFlushIntervalMs}ms flush)",
+        )
+        if (existing == null) rowsModel.addElement(row) else rowsModel.setElementAt(row, rowsModel.indexOf(existing))
+        rowsById[rowId] = row
+        if (messages.selectedIndex < 0 || messages.selectedValue?.id == rowId) details.text = row.text
+    }
+
+    private fun applyTaskEvent(taskId: String, view: TaskMonitorService.TaskView, rendered: RenderedEvent?) {
+        val event = rendered?.agentEvent
+        val line: String? = when (event) {
+            is AgentEvent.ToolStarted -> "tool ${event.name} started (${event.id})"
+            is AgentEvent.ToolFinished ->
+                "tool finished ${if (event.ok) "ok" else "FAILED"} (${event.id})" +
+                    (event.summary?.let { " — $it" } ?: "")
+
+            is AgentEvent.FileChanged -> "file changed: ${event.path}"
+            is AgentEvent.ApprovalRequired -> "approval required (${event.requestId}): ${event.description}"
+            is AgentEvent.TaskCompleted -> "task ${taskId.take(8)} completed ok=${event.ok}"
+            is AgentEvent.Failed -> "error ${event.code}: ${event.message}"
+            is AgentEvent.UnsupportedEvent -> "unverified provider event: ${event.providerType}"
+            is AgentEvent.Malformed -> "unrecognized ${event.wireType}: ${event.reason}"
+            null -> rendered?.note
+            else -> null
+        }
+        val kind = rendered?.taskEvent?.kind
+        if (line != null) {
+            val prefix = if (kind != null && CoreEventKinds.ALL.contains(kind)) "[$kind] " else ""
+            addSystemRow(prefix + line)
+        }
+        updateRowStatus(taskId, view)
+    }
+
+    private fun updateRowStatus(taskId: String, view: TaskMonitorService.TaskView) {
+        val rowId = "agent-$taskId"
+        val row = rowsById[rowId] ?: return
+        val updated = row.copy(meta = "task ${taskId.take(8)} · ${view.statusLabel} (reported by Core)")
+        val index = rowsModel.indexOf(row)
+        if (index >= 0) rowsModel.setElementAt(updated, index)
+        rowsById[rowId] = updated
+    }
+
+    // -----------------------------------------------------------------------
+    // user actions
+    // -----------------------------------------------------------------------
+
+    private fun sendFromComposer() {
+        val content = composer.text.trim()
+        if (content.isEmpty()) return
+        val conversationId = selectedConversationId()
+        if (conversationId == null) {
+            addSystemRow(
+                "Nothing was sent: no conversation is selected, and JB2 conversation tabs are not " +
+                    "implemented in this scaffold. Creating one implicitly would be a fake integration.",
+            )
+            return
+        }
+        val snapshot = contextProvider.collect()
+        contextLabel.text = "  " + snapshot.describeForStatusBar()
+        val params = ConversationSendParams(
+            conversationId = conversationId,
+            content = contextProvider.buildContent(content, snapshot),
+            attachments = snapshot.attachments,
+        )
+        composer.text = ""
+        addAttachmentChips(snapshot)
+        addUserRow(content)
+        sendButton.isEnabled = false
+
+        tasks.send(params).whenComplete { result, error ->
+            onEdt {
+                if (error != null) {
+                    addSystemRow("conversation.send failed: ${error.message}")
+                } else if (result != null) {
+                    addSystemRow(
+                        when (result) {
+                            is TaskMonitorService.SendResult.FromSummary ->
+                                "Core accepted task ${result.taskId.take(8)} · status reported by Core: " +
+                                    result.summary.status.name.lowercase()
+
+                            is TaskMonitorService.SendResult.TaskIdOnly ->
+                                "Core accepted task ${result.taskId.take(8)} (id-only response; see protocol gap 2)"
+                        },
+                    )
+                }
+                refreshGateUI()
+            }
+        }
+    }
+
+    private fun addUserRow(content: String) {
+        addRow(ChatRow("user-${System.nanoTime()}", "you", content, contextLabel.text.trim()))
+    }
+
+    private fun addSystemRow(text: String) {
+        addRow(ChatRow("system-${System.nanoTime()}", "sandpane", text, null))
+    }
+
+    private fun addRow(row: ChatRow) {
+        rowsModel.addElement(row)
+        rowsById[row.id] = row
+        trimRows()
+    }
+
+    private fun addAttachmentChips(snapshot: SandpaneContextProvider.Snapshot) {
+        attachmentsModel.removeAllElements()
+        snapshot.activeFile?.let {
+            attachmentsModel.addElement(AttachmentChip("file ${it.substringAfterLast('/')}", it, removable = false))
+        }
+        if (snapshot.hasSelection) {
+            attachmentsModel.addElement(
+                AttachmentChip(
+                    "selection ${snapshot.selectionStartLine}–${snapshot.selectionEndLine}",
+                    "quoted into the message body",
+                    removable = true,
+                ),
+            )
+        }
+    }
+
+    private fun removeSelectedAttachment() {
+        val selected = attachments.selectedValue ?: return
+        if (!selected.removable) {
+            banner.text = "The active file stays attached: it is the task's repository context."
+            return
+        }
+        attachmentsModel.removeElement(selected)
+    }
+
+    private fun onComposerChanged() {
+        val gateAllows = connection.connectionProblem() == null && connection.agentGate().chatEnabled &&
+            hostMapping is SandpaneContextProvider.HostMapping.Supported
+        sendButton.isEnabled = gateAllows && composer.text.isNotBlank()
+    }
+
+    private fun trimRows() {
+        while (rowsModel.size() > MAX_ROWS) {
+            val dropped = rowsModel.removeAt(0)
+            rowsById.remove(dropped.id)
+            streamingRows.entries.removeAll { it.value == dropped.id }
+        }
+    }
+
+    private fun showSelectedRowDetails() {
+        messages.selectedValue?.let { details.text = it.text }
+    }
+
+    /**
+     * Conversation selection is Core state (`client_state.selected_conversation`), not an IDE
+     * workspace file, and JB2 owns the tab UI — so in this scaffold there is nothing to select
+     * and this returns null. Kept as the explicit seam rather than inventing a conversation.
+     */
+    private fun selectedConversationId(): String? = null
+
+    private fun shorten(path: String): String =
+        if (path.length <= 28) path else "…" + path.takeLast(26)
+
+    private fun onEdt(action: () -> Unit) {
+        val app = ApplicationManager.getApplication()
+        if (app == null) action() else app.invokeLater(action, parentDisposable)
+    }
+
+    /** Detaches every subscription. Core tasks are untouched by design. */
+    override fun dispose() {
+        flushTimer.stop()
+        removeStateListener?.invoke()
+        removeSnapshotListener?.invoke()
+        removeViewListener?.invoke()
+        removeStateListener = null
+        removeSnapshotListener = null
+        removeViewListener = null
+        pendingDeltas.clear()
+        rowsById.clear()
+        streamingRows.clear()
+    }
+
+    /** Renders the one-line summary; the details pane holds the full text. */
+    private class RowRenderer : DefaultListCellRenderer() {
+        override fun getListCellRendererComponent(
+            list: JList<*>?,
+            value: Any?,
+            index: Int,
+            isSelected: Boolean,
+            cellHasFocus: Boolean,
+        ): Component {
+            super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
+            val row = value as? ChatRow ?: return this
+            text = row.summaryLine()
+            toolTipText = row.meta ?: "select to read the full message"
+            border = BorderFactory.createEmptyBorder(2, 4, 2, 4)
+            return this
+        }
+    }
+
+    companion object {
+        /** Cap on the retained view model (docs/specs/04 §5 risk 2). */
+        const val MAX_ROWS = 400
+    }
+}
