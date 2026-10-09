@@ -26,6 +26,11 @@ Each line is one implementation commit plus its `docs(audit)` log entry. Small s
 
 | # | Area | Target |
 |---|---|---|
+
+Status (09.10.2026): U1 `013ecfd` (0022), U2 `7a0a5b8` (0023), U3 `8b45a9c` (0021), U4 `da20777` (0025) — all done. U4 targets Java 25, not 21: the IDE requires it.
+
+| # | Area | Target |
+|---|---|---|
 | U1 | Rust (core + Tauri) | rusqlite 0.32 → 0.40.2; serde 1.0.229; serde_json 1.0.151; thiserror 2.0.21; uuid 1.27; tauri 2.12.2; tauri-build 2.7.1 |
 | U2 | VS Code | TypeScript 7.0.2, Vitest 5.0.3, `@vscode/vsce` 4.0.0. `@types/vscode` and `@types/node` track `engines.vscode` and the Node bundled with VS Code's Electron (latest *compatible*, reason recorded) |
 | U3 | Desktop | React 19.3, Vite 8.3, `@vitejs/plugin-react` 6.1, Vitest 5.0, TypeScript 7.0, `@tauri-apps/api` + `@tauri-apps/cli` matched to the `tauri` crate minor, React Query 5 latest |

@@ -474,4 +474,29 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0025 — JetBrains toolchain upgrade (U4)
+
+- **date:** 2026-10-09
+- **phase:** P6 (JetBrains) maintenance
+- **commit:** `da20777` (build(jetbrains): upgrade to Gradle 9.8.1, Kotlin 2.4.21, IntelliJ Platform 2026.2.3, Java 25 (U4))
+- **details:**
+  - **Gradle 9.8.1.** Wrapper and distribution checksums verified against services.gradle.org.
+  - **Build plugins and libraries.**
+    - IntelliJ Platform Gradle Plugin 2.19.0.
+    - Kotlin 2.4.21.
+    - kotlinx-serialization 1.11.0.
+    - The foojay toolchain resolver.
+  - **Target IDE.** IntelliJ IDEA 2026.2.3 (build 262, unified dependency). Since/until is 262/262.*: only the verified build is claimed.
+  - **Java 25 toolchain.** The IDE requires it. CI `setup-java` moved to 25 as well.
+  - **Code.** Public API replacements, plus `jvmDefault` to remove verifier-flagged stubs.
+  - **Docs.** Versions recorded in `docs/compatibility.md`.
+- **files:** `clients/jetbrains/**` (11 files), `.github/workflows/ci.yml`, `docs/compatibility.md`
+- **verification:**
+  - `test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache` → 161 tests, 0 failures.
+  - Plugin Verifier → `Compatible` with IU-262.10968.63.
+  - `runIde` and loading the plugin in a real IDE: UNVERIFIED.
+- **review:** [audit/0025-jetbrains-toolchain-upgrade-review.md](audit/0025-jetbrains-toolchain-upgrade-review.md) — checklist; PASS (CI Java fixed in-commit)
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
