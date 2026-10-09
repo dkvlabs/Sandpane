@@ -159,4 +159,16 @@ Rules:
 - **model:** GLM-5.3 (session configuration, account:zai-individual-coding-plan/GLM-5.3)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0012 — Agent tooling migrated to Claude Code; Superpowers as project-scoped plugin
+
+- **date:** 2026-10-09
+- **phase:** infra (agent tooling)
+- **commit:** `edd6eac` (chore(tooling): migrate agent config from Qwen Code to Claude Code; superpowers as project plugin)
+- **details:** Claude Code is now the project's only agent harness. The 9 agents, 3 commands and 5 Sandpane skills moved from `.qwen/` to `.claude/` (git renames keep their history), and `.qwen/` was deleted. Superpowers (obra/superpowers v6.4.2, upstream HEAD `8ca22db`) is no longer vendored. It is enabled for the project through `.claude/settings.json` `enabledPlugins` (`superpowers@claude-plugins-official`), which removes the duplicate skill triggers caused by the plugin also being enabled globally; each clone needs one setup step, documented in AGENTS.md and README. Agent frontmatter was converted to Claude Code fields (`permissionMode`; reviewer tools `Read, Grep, Glob, Bash`), which fixes reviewer agents that had no resolvable tools. Commands now use `$ARGUMENTS`. The `sandpane-changelog` model/token sources and the `/review` references (now `/code-review`) were updated. Staged `.claude/tmp` Qwen review leftovers were dropped, and `.gitignore` now covers Claude Code local artifacts. Historical entries 0001–0011 were left unchanged.
+- **files:** `.claude/{settings.json,agents/*,commands/*,skills/*}`, `.qwen/**` (removed), `AGENTS.md`, `README.md`, `LICENSE`, `clients/vscode/LICENSE`, `.gitignore`, `docs/audit/README.md`
+- **verification:** fresh upstream clone diffed against the vendored copies: 15/15 skills and LICENSE identical. `git grep -i qwen` outside historical records: 0 matches. Relative-link walk: 0 broken. Frontmatter check: OK. `.claude/settings.json`: valid JSON. No tmp or `.DS_Store` files staged. Not verified: reload in a fresh Claude Code session, and plugin install on other hosts.
+- **review:** [audit/0012-claude-code-migration-review.md](audit/0012-claude-code-migration-review.md) — docs/tooling checklist tier, orchestrator inline, with Claude Code syntax checked by a `claude-code-guide` subagent against official docs; 1 Critical (reviewer agents had no usable tools) and 4 Suggestions fixed pre-commit, 1 Nice-to-have documented; PASS
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
