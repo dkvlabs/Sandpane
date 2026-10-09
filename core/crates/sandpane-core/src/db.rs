@@ -28,7 +28,7 @@ pub struct Database {
 }
 
 /// Newest schema version this build understands.
-pub const LATEST_SCHEMA_VERSION: i64 = 2;
+pub const LATEST_SCHEMA_VERSION: i64 = 3;
 
 /// Schema v1: the entity set from specs/02 §3.
 const MIGRATION_V1: &str = r#"
@@ -173,6 +173,20 @@ UPDATE tasks SET last_event_seq =
     COALESCE((SELECT MAX(sequence) FROM task_events WHERE task_events.task_id = tasks.id), 0);
 "#;
 
+/// Schema v3 (C3, task Git context): v1 already carries `repo_id`,
+/// `base_commit`, `task_branch` and `workspace_mode` on `tasks`; v3 adds the
+/// Core-owned worktree directory a `host_worktree` task was given and when
+/// Core removed it. The path is KEPT after removal (audit trail; the
+/// `worktree_removed_at` marker says it is gone). One directory per task is
+/// enforced by a partial unique index — every existing row is NULL, so the
+/// index cannot fail on upgrade.
+const MIGRATION_V3: &str = r#"
+ALTER TABLE tasks ADD COLUMN worktree_path TEXT;
+ALTER TABLE tasks ADD COLUMN worktree_removed_at TEXT;
+CREATE UNIQUE INDEX idx_tasks_worktree_path ON tasks(worktree_path)
+    WHERE worktree_path IS NOT NULL;
+"#;
+
 impl Database {
     /// Open (or create) the database at `path` and migrate to the latest
     /// schema. Refuses databases from a newer schema version.
@@ -234,6 +248,9 @@ impl Database {
         }
         if current < 2 {
             self.apply_migration(2, MIGRATION_V2)?;
+        }
+        if current < 3 {
+            self.apply_migration(3, MIGRATION_V3)?;
         }
         Ok(())
     }
@@ -325,6 +342,7 @@ mod tests {
             "idx_conversations_project_updated",
             "idx_task_events_task_seq",
             "idx_messages_conversation_seq",
+            "idx_tasks_worktree_path",
         ] {
             assert!(names.iter().any(|n| n == expected), "missing {expected}");
         }
@@ -392,7 +410,7 @@ mod tests {
             .unwrap();
         }
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let hw = |id: &str| -> i64 {
             db.conn()
                 .query_row("SELECT last_event_seq FROM tasks WHERE id=?1", [id], |r| {
@@ -418,8 +436,95 @@ mod tests {
         drop(db);
         // Re-open: idempotent, no second backup for an up-to-date schema.
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         assert!(!dir.path().join("core.sqlite3.pre-v2.bak.1").exists());
+    }
+
+    /// C3 migration: a REAL v2 file (built with the v1 + v2 SQL, a task row
+    /// carrying Git context written the v1 way) upgrades forward to v3: rows
+    /// intact, the new task-worktree columns present and NULL, a consistent
+    /// backup of the v2 file taken, and one worktree path per task enforced.
+    #[test]
+    fn v2_database_migrates_forward_to_v3_preserving_rows_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        let base = "a".repeat(40);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO repositories (id,project_id,canonical_path) VALUES ('r1','p1','/repo/atlas');
+                 INSERT INTO conversations (id,project_id,agent_id,created_at) VALUES ('c1','p1','codex','t');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id,conversation_id,repo_id,base_commit,task_branch,workspace_mode,status,created_at,updated_at,last_event_seq)
+                 VALUES ('t1','c1','r1',?1,'sandpane/t1','direct_mount','queued','t','t',1)",
+                [&base],
+            )
+            .unwrap();
+            conn.execute_batch("INSERT INTO task_events VALUES ('t1',1,'k','{}','ts');")
+                .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 3);
+        let row: (String, String, String, Option<String>, Option<String>, i64) = db
+            .conn()
+            .query_row(
+                "SELECT repo_id, base_commit, task_branch, worktree_path, worktree_removed_at,
+                        last_event_seq FROM tasks WHERE id='t1'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "r1".into(),
+                base.clone(),
+                "sandpane/t1".into(),
+                None,
+                None,
+                1
+            )
+        );
+        // The v2 file was backed up before the upgrade and is still v2.
+        let backup = dir.path().join("core.sqlite3.pre-v3.bak");
+        assert!(backup.exists());
+        let b = Connection::open(&backup).unwrap();
+        let v: i64 = b
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
+        // One worktree directory per task (partial unique index; NULLs free).
+        db.conn()
+            .execute_batch(
+                "INSERT INTO tasks (id,conversation_id,status,created_at,updated_at) VALUES ('t2','c1','queued','t','t');
+                 INSERT INTO tasks (id,conversation_id,status,created_at,updated_at) VALUES ('t3','c1','queued','t','t');
+                 UPDATE tasks SET worktree_path='/wt/x' WHERE id='t2';",
+            )
+            .unwrap();
+        assert!(db
+            .conn()
+            .execute("UPDATE tasks SET worktree_path='/wt/x' WHERE id='t3'", [])
+            .is_err());
+        drop(db);
+        // Re-open: idempotent, no second backup.
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 3);
+        assert!(!dir.path().join("core.sqlite3.pre-v3.bak.1").exists());
     }
 
     #[test]

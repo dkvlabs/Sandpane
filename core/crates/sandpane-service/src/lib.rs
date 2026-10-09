@@ -25,6 +25,7 @@ use sandpane_core::sbx::{
 use sandpane_core::scheduler::{Admission, Scheduler};
 use sandpane_core::task::{TaskStateMachine, ALL_STATUSES};
 use sandpane_core::validation::Validator;
+use sandpane_core::workspace::{self, WorkspaceError};
 use sandpane_core::{git as scoregit, Database, EventLog};
 use sandpane_protocol::{
     AgentCapability, AgentEvent, ApplyResult, ChangeSet, Conversation, ConversationCreateParams,
@@ -97,6 +98,23 @@ impl Default for SbxLimits {
     }
 }
 
+/// Construction-time configuration for [`ServerInner`].
+#[derive(Debug, Clone, Default)]
+pub struct CoreConfig {
+    pub sbx_limits: SbxLimits,
+    /// Core-owned directory that holds per-task Git worktrees
+    /// (`<data_dir>/worktrees`, created 0700 on first use). `None` = worktree
+    /// allocation is unavailable and refused with a structured error (tests
+    /// and embedders that never asked for it).
+    pub worktrees_root: Option<PathBuf>,
+    /// CANDIDATE for the user's own global excludes file (resolved by
+    /// `main.rs` with `sandpane_core::git::user_excludes_candidate`, i.e.
+    /// from global git config only). Vetted at startup by
+    /// `accept_excludes_file` against every registered repository and the
+    /// worktree root; rejected or `None` → `/dev/null` (fail safe).
+    pub user_excludes_file: Option<PathBuf>,
+}
+
 pub struct ServerInner {
     pub db: Mutex<Database>,
     pub scheduler: Mutex<Scheduler>,
@@ -104,6 +122,7 @@ pub struct ServerInner {
     pub sbx_limits: SbxLimits,
     pub instance_id: String,
     pub git: scoregit::GitRunner,
+    pub worktrees_root: Option<PathBuf>,
 }
 
 impl ServerInner {
@@ -117,20 +136,58 @@ impl ServerInner {
         sbx_locator: SbxLocator,
         sbx_limits: SbxLimits,
     ) -> Arc<Self> {
+        Self::with_config(
+            db,
+            sbx_locator,
+            CoreConfig {
+                sbx_limits,
+                ..CoreConfig::default()
+            },
+        )
+    }
+
+    /// Full constructor (`main.rs` passes `<data_dir>/worktrees`).
+    pub fn with_config(db: Database, sbx_locator: SbxLocator, config: CoreConfig) -> Arc<Self> {
         // RESTART RECONCILIATION (specs/02 §1/§4, T09): any task row left in
         // an in-flight state belongs to a dead daemon instance. Every such
         // task becomes `interrupted` — durable event + row update — BEFORE
         // any client can observe it. Nothing is ever auto-resumed, and the
         // scheduler starts empty alongside it.
         reconcile_after_restart(&db);
-        Arc::new(Self {
+        let excludes_file = vetted_excludes_file(
+            &db,
+            config.user_excludes_file.as_deref(),
+            config.worktrees_root.as_deref(),
+        );
+        let inner = Arc::new(Self {
             db: Mutex::new(db),
             scheduler: Mutex::new(Scheduler::reconciliation_baseline()),
             sbx_locator,
-            sbx_limits,
+            sbx_limits: config.sbx_limits,
             instance_id: uuid::Uuid::new_v4().to_string(),
-            git: scoregit::GitRunner::default(),
-        })
+            git: scoregit::GitRunner {
+                excludes_file,
+                ..scoregit::GitRunner::default()
+            },
+            worktrees_root: config.worktrees_root,
+        });
+        // Read-only: report what a crash may have left behind; never delete.
+        if inner.worktrees_root.is_some() {
+            let orphans = report_orphaned_task_workspaces(&inner);
+            for dir in &orphans.worktree_dirs {
+                eprintln!(
+                    "sandpane-service: worktree directory {} has no live task; left in place \
+                     (inspect and remove it manually if it holds nothing you need)",
+                    dir.display()
+                );
+            }
+            for (repo, branch) in &orphans.branches {
+                eprintln!(
+                    "sandpane-service: branch {branch} in {repo} has no live task; left in place"
+                );
+            }
+        }
+        inner
     }
 
     /// Poison-tolerant locking: one panicked handler must not brick the
@@ -141,6 +198,52 @@ impl ServerInner {
 
     pub fn lock_scheduler(&self) -> MutexGuard<'_, Scheduler> {
         self.scheduler.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Vet the user-excludes candidate once, at startup. Forbidden locations are
+/// every registered repository and Core's worktree root (agent-writable).
+/// A rejection is reported ONCE on stderr and falls back to `/dev/null`.
+fn vetted_excludes_file(
+    db: &Database,
+    candidate: Option<&Path>,
+    worktrees_root: Option<&Path>,
+) -> PathBuf {
+    let fallback = PathBuf::from("/dev/null");
+    let Some(candidate) = candidate else {
+        return fallback;
+    };
+    let mut forbidden: Vec<PathBuf> =
+        match db.conn().prepare("SELECT canonical_path FROM repositories") {
+            Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
+                Ok(rows) => rows.filter_map(Result::ok).map(PathBuf::from).collect(),
+                Err(e) => {
+                    eprintln!("sandpane-service: user excludes not used (repository query: {e})");
+                    return fallback;
+                }
+            },
+            Err(e) => {
+                eprintln!("sandpane-service: user excludes not used (repository query: {e})");
+                return fallback;
+            }
+        };
+    if let Some(root) = worktrees_root {
+        forbidden.push(root.to_path_buf());
+    }
+    #[cfg(unix)]
+    let uid = runtime::euid();
+    #[cfg(not(unix))]
+    let uid = 0;
+    match scoregit::accept_excludes_file(candidate, &forbidden, uid) {
+        Ok(accepted) => accepted,
+        Err(reason) => {
+            eprintln!(
+                "sandpane-service: not using global excludes file {}: {reason}; reviews and the \
+                 dirty gate ignore NO extra files (fail safe)",
+                candidate.display()
+            );
+            fallback
+        }
     }
 }
 
@@ -333,8 +436,8 @@ fn dispatch(
             .and_then(|p| conversation_create(inner, p))
             .map_err(Into::into),
         Method::ConversationSend => parse_params::<ConversationSendParams>(params)
-            .and_then(|p| conversation_send(inner, p))
-            .map_err(Into::into),
+            .map_err(SvcFailure::from)
+            .and_then(|p| conversation_send(inner, p)),
         Method::ConversationList => parse_params::<ConversationListParams>(params)
             .and_then(|p| conversation_list(inner, p))
             .map_err(Into::into),
@@ -864,8 +967,9 @@ fn sandbox_create(
     if matches!(spec.workspace_mode, WorkspaceMode::HostWorktree) {
         return Err(SvcFailure::from((
             ErrorCode::ValidationFailed,
-            "workspace mode host_worktree is not implemented in this build (Core does not yet \
-             allocate task worktrees); use sbx_clone, direct_mount (live-writable) or mountless"
+            "workspace mode host_worktree is not implemented for sandbox.create in this build: \
+             Core allocates per-task worktrees, but protocol v1 cannot bind a sandbox to a \
+             task's worktree; use sbx_clone, direct_mount (live-writable) or mountless"
                 .to_string(),
         )));
     }
@@ -1111,92 +1215,118 @@ fn conversation_create(
     serde_json::to_value(conv).map_err(internal)
 }
 
-fn conversation_send(
+/// How a new task maps onto a registered repository. INTERNAL API: protocol
+/// v1's `conversation.send` cannot express it yet, so the wire path always
+/// passes `None` (no Git context).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskWorkspaceRequest {
+    pub mode: WorkspaceMode,
+    /// A repository root registered with the conversation's project
+    /// (`None` only for `mountless`).
+    pub repo_path: Option<String>,
+}
+
+/// Outcome of [`discard_task_worktree`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeDiscard {
+    pub task_id: String,
+    pub worktree_path: String,
+    pub task_branch: Option<String>,
+    pub directory_was_present: bool,
+    pub branch_deleted: bool,
+    /// The worktree had already been removed by an earlier discard.
+    pub already_removed: bool,
+}
+
+/// Create a task for one user message, optionally bound to a repository
+/// workspace (specs/02 §3/§4/§7). Everything Git-side happens BEFORE the
+/// durable write and outside the DB lock: the base commit is read (exact full
+/// OID) and, for `host_worktree`, the Core-owned worktree is allocated. Then
+/// message + task row (with its Git context) + events commit as one
+/// transaction. If that write fails, the just-created (pristine) worktree and
+/// branch are removed again.
+///
+/// - `None` — no Git context (the `conversation.send` wire default; protocol
+///   v1 has no field to request one, so no workspace is ever implied).
+/// - `mountless` — no repository.
+/// - `direct_mount` — base recorded; NO branch, NO worktree: the agent works
+///   in the live host tree (`liveWritable: true` in the event).
+/// - `sbx_clone` — NO base recorded (the host HEAD is not verified against
+///   the sandbox's private clone) and nothing created on the host.
+/// - `host_worktree` — base, `sandpane/<task-id>` branch and
+///   `<worktrees_root>/<task-id>` worktree. This isolates working-tree FILES
+///   only: the worktree shares the user's common `.git` (refs, config, hooks,
+///   objects) and is NOT repository-metadata isolation. Preconditions before
+///   any sandbox is bound to it are listed in `sandpane_core::workspace`.
+pub fn create_task(
     inner: &ServerInner,
-    p: ConversationSendParams,
-) -> Result<serde_json::Value, SvcError> {
-    Validator::display_text(&p.content, 64 * 1024)
-        .map_err(|e| (ErrorCode::ValidationFailed, format!("content: {e}")))?;
+    conversation_id: &str,
+    content: &str,
+    workspace: Option<TaskWorkspaceRequest>,
+) -> Result<TaskSummary, SvcFailure> {
+    Validator::display_text(content, 64 * 1024)
+        .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, format!("content: {e}"))))?;
     let (project_id, agent_id) = {
         let db = inner.lock_db();
         db.conn()
             .query_row(
                 "SELECT project_id, agent_id FROM conversations
                  WHERE id = ?1 AND archived_at IS NULL",
-                params![p.conversation_id],
+                params![conversation_id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
-            .map_err(|_| (ErrorCode::NotFound, "conversation not found".to_string()))?
+            .map_err(|_| {
+                SvcFailure::from((ErrorCode::NotFound, "conversation not found".to_string()))
+            })?
     };
 
     let task_id = uuid::Uuid::new_v4().to_string();
-    let now = now_rfc3339();
-    let mut machine = TaskStateMachine::new();
+    let prepared = match workspace {
+        None => None,
+        Some(req) => Some(prepare_task_workspace(inner, &project_id, &task_id, req)?),
+    };
 
-    // Durable events BEFORE any subscriber could be notified (specs/02 §4),
-    // and atomically: message + task row + events commit or roll back as one
-    // unit so the append-only log can never disagree with tasks.status.
-    {
-        let db = inner.lock_db();
-        // created -> queued is decided up front (pure logic) so the whole
-        // write unit is one transaction.
-        let to = machine
-            .transition(TaskStatus::Queued)
-            .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
-        let tx = db.conn().unchecked_transaction().map_err(internal)?;
-        {
-            let log = EventLog::from_conn(&tx);
-            tx.execute(
-                "INSERT INTO messages (id, conversation_id, role, content, sequence)
-                 VALUES (?1,?2,'user',?3,
-                         COALESCE((SELECT MAX(sequence) FROM messages WHERE conversation_id = ?2),0)+1)",
-                params![uuid::Uuid::new_v4().to_string(), p.conversation_id, p.content],
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "INSERT INTO tasks (id, conversation_id, status, created_at, updated_at)
-                 VALUES (?1,?2,'created',?3,?3)",
-                params![task_id, p.conversation_id, now],
-            )
-            .map_err(internal)?;
-            log.append(
-                &task_id,
-                "task.created",
-                &serde_json::json!({ "conversationId": p.conversation_id }),
-                &now,
-            )
-            .map_err(internal)?;
-            let msg = AgentEvent::MessageDelta {
-                text: p.content.clone(),
-            };
-            log.append(
-                &task_id,
-                "message.user",
-                &serde_json::to_value(msg).map_err(internal)?,
-                &now,
-            )
-            .map_err(internal)?;
-            log.append(
-                &task_id,
-                "status.changed",
-                &serde_json::json!({ "to": to }),
-                &now,
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "UPDATE tasks SET status='queued', updated_at=?2 WHERE id=?1",
-                params![task_id, now],
-            )
-            .map_err(internal)?;
+    let written = write_new_task(inner, &task_id, conversation_id, content, prepared.as_ref());
+    if let Err(e) = written {
+        if let (Some(p), Some(root)) = (&prepared, &inner.worktrees_root) {
+            if let (Some(repo), Some(wt), Some(branch), Some(base)) = (
+                &p.repo_path,
+                &p.worktree_path,
+                &p.task_branch,
+                &p.base_commit,
+            ) {
+                if let Err(re) =
+                    workspace::remove_worktree(&inner.git, Path::new(repo), root, wt, branch, base)
+                {
+                    eprintln!(
+                        "sandpane-service: task {task_id}: rollback of worktree {} failed: {re}",
+                        wt.display()
+                    );
+                }
+            }
         }
-        tx.commit().map_err(internal)?;
+        return Err(e.into());
     }
 
     // Admission is policy-only in the scaffold: no verified agent adapter
-    // exists yet (P0 Codex gate), so the task stays queued and says so.
+    // exists yet (P0 Codex gate), so the task stays queued and says so. The
+    // writer-lock key is the directory the task would write: its own
+    // worktree, or the live host tree for direct_mount. sbx_clone writes a
+    // private in-sandbox clone (the sandbox is its key, unknown here).
+    let (mode, workspace_key) = match &prepared {
+        Some(p) => match p.mode {
+            WorkspaceMode::HostWorktree => (
+                p.mode,
+                p.worktree_path.as_ref().map(|w| w.display().to_string()),
+            ),
+            WorkspaceMode::DirectMount => (p.mode, p.repo_path.clone()),
+            other => (other, None),
+        },
+        None => (WorkspaceMode::Mountless, None),
+    };
     let admission = {
         let sched = inner.lock_scheduler();
-        sched.admit(&task_id, &project_id, None, WorkspaceMode::Mountless)
+        sched.admit(&task_id, &project_id, workspace_key.as_deref(), mode)
     };
     {
         let db = inner.lock_db();
@@ -1239,15 +1369,544 @@ fn conversation_send(
         }
     }
 
-    let summary = TaskSummary {
+    Ok(TaskSummary {
         id: task_id,
-        conversation_id: p.conversation_id,
+        conversation_id: conversation_id.to_string(),
         status: TaskStatus::Queued,
         sandbox_name: None,
-        task_branch: None,
-        base_commit: None,
+        task_branch: prepared.as_ref().and_then(|p| p.task_branch.clone()),
+        base_commit: prepared.as_ref().and_then(|p| p.base_commit.clone()),
+    })
+}
+
+/// A task's resolved Git context, ready to be stored.
+struct PreparedWorkspace {
+    mode: WorkspaceMode,
+    repo_id: Option<String>,
+    repo_path: Option<String>,
+    base_commit: Option<String>,
+    task_branch: Option<String>,
+    worktree_path: Option<PathBuf>,
+}
+
+fn prepare_task_workspace(
+    inner: &ServerInner,
+    project_id: &str,
+    task_id: &str,
+    req: TaskWorkspaceRequest,
+) -> Result<PreparedWorkspace, SvcFailure> {
+    let vf = |m: String| SvcFailure::from((ErrorCode::ValidationFailed, m));
+    if matches!(req.mode, WorkspaceMode::Mountless) {
+        if req.repo_path.is_some() {
+            return Err(vf("mountless task takes no repository path".into()));
+        }
+        return Ok(PreparedWorkspace {
+            mode: req.mode,
+            repo_id: None,
+            repo_path: None,
+            base_commit: None,
+            task_branch: None,
+            worktree_path: None,
+        });
+    }
+    let Some(raw) = req.repo_path else {
+        return Err(vf(format!(
+            "{} task requires a registered repository path",
+            workspace_mode_wire(&req.mode)
+        )));
     };
-    serde_json::to_value(summary).map_err(internal)
+    let (repo_id, repo) = registered_repository(inner, project_id, &raw)?;
+    let repo_str = repo.to_str().map(str::to_string);
+    // sbx_clone (review W4): the isolated tree is the sandbox's private
+    // clone; the host HEAD now is NOT verified to be what that clone starts
+    // from, so Core records no base at all rather than one that looks
+    // verified. direct_mount / host_worktree record the host HEAD exactly.
+    // A repository with no commit is VALIDATION_FAILED; any other git failure
+    // is INTERNAL (review S4).
+    let base = match req.mode {
+        WorkspaceMode::SbxClone => None,
+        _ => Some(workspace::record_base(&inner.git, &repo).map_err(workspace_failure)?),
+    };
+    let (task_branch, worktree_path) = match (req.mode, &base) {
+        (WorkspaceMode::HostWorktree, Some(base)) => {
+            let Some(root) = &inner.worktrees_root else {
+                return Err(vf(
+                    "host_worktree tasks need Core's worktree directory, which this Core \
+                     instance was started without"
+                        .into(),
+                ));
+            };
+            ensure_worktree_root(root).map_err(|m| {
+                SvcFailure::from((ErrorCode::Internal, format!("worktree root: {m}")))
+            })?;
+            let wt = workspace::allocate_worktree(&inner.git, &repo, root, task_id, base)
+                .map_err(workspace_failure)?;
+            (Some(wt.task_branch), Some(wt.path))
+        }
+        _ => (None, None),
+    };
+    Ok(PreparedWorkspace {
+        mode: req.mode,
+        repo_id: Some(repo_id),
+        repo_path: repo_str,
+        base_commit: base,
+        task_branch,
+        worktree_path,
+    })
+}
+
+#[cfg(unix)]
+fn ensure_worktree_root(root: &Path) -> Result<(), String> {
+    runtime::ensure_private_data_dir(root).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn ensure_worktree_root(_root: &Path) -> Result<(), String> {
+    Err("task worktrees are only supported on Unix hosts in this build".into())
+}
+
+/// Resolve a requested repository to a root REGISTERED with the project:
+/// the canonical request must EQUAL a registered root (re-canonicalized and
+/// re-checked against the W1 denylist, as `sandbox.create` does).
+fn registered_repository(
+    inner: &ServerInner,
+    project_id: &str,
+    raw: &str,
+) -> Result<(String, PathBuf), SvcFailure> {
+    let requested = Path::new(raw);
+    if !requested.is_absolute() {
+        return Err(SvcFailure::from((
+            ErrorCode::ValidationFailed,
+            format!("repository path must be absolute: {raw}"),
+        )));
+    }
+    let candidate = std::fs::canonicalize(requested).map_err(|e| {
+        SvcFailure::from((
+            ErrorCode::ValidationFailed,
+            format!("repository path not usable: {e}"),
+        ))
+    })?;
+    let rows: Vec<(String, String)> = {
+        let db = inner.lock_db();
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT id, canonical_path FROM repositories WHERE project_id = ?1")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(params![project_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(internal)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(internal)?
+    };
+    let home = runtime::home_dir();
+    let home_c = std::fs::canonicalize(&home).unwrap_or(home);
+    for (id, stored) in rows {
+        let Ok(root) = std::fs::canonicalize(&stored) else {
+            continue;
+        };
+        if root == candidate && Validator::registrable_repository(&root, &home_c).is_ok() {
+            return Ok((id, root));
+        }
+    }
+    Err(SvcFailure::from((
+        ErrorCode::PermissionDenied,
+        "repository path must be exactly a repository root registered with this task's \
+         project; subdirectories and unregistered repositories are refused"
+            .to_string(),
+    )))
+}
+
+/// Structured mapping for task-workspace failures.
+fn workspace_failure(e: WorkspaceError) -> SvcFailure {
+    let code = match &e {
+        WorkspaceError::Git(scoregit::GitError::Exec(_)) => ErrorCode::Internal,
+        WorkspaceError::Git(scoregit::GitError::DirtyHostState(_))
+        | WorkspaceError::Git(scoregit::GitError::BaseDiverged { .. })
+        | WorkspaceError::PathExists(_)
+        | WorkspaceError::UncommittedChanges(_)
+        | WorkspaceError::HeadMoved { .. }
+        | WorkspaceError::BranchAdvanced { .. }
+        | WorkspaceError::BranchCheckedOutElsewhere { .. }
+        | WorkspaceError::SymbolicTaskRef { .. }
+        | WorkspaceError::IndexFlagsHideChanges { .. }
+        | WorkspaceError::IgnoredFiles { .. } => ErrorCode::Conflict,
+        WorkspaceError::Git(scoregit::GitError::SubmodulesPresent(_))
+        | WorkspaceError::Git(scoregit::GitError::Validation(_))
+        | WorkspaceError::Validation(_)
+        | WorkspaceError::RootOverlapsRepository { .. }
+        | WorkspaceError::NotTaskWorktree { .. }
+        | WorkspaceError::NoCommit(_) => ErrorCode::ValidationFailed,
+    };
+    SvcFailure::from((code, e.to_string()))
+}
+
+/// The durable unit for a new task: message, task row (with its Git context)
+/// and the created/message/queued events, in ONE transaction, so the
+/// append-only log never disagrees with `tasks` (specs/02 §4).
+fn write_new_task(
+    inner: &ServerInner,
+    task_id: &str,
+    conversation_id: &str,
+    content: &str,
+    prepared: Option<&PreparedWorkspace>,
+) -> Result<(), SvcError> {
+    let now = now_rfc3339();
+    let mut machine = TaskStateMachine::new();
+    // created -> queued is decided up front (pure logic) so the whole write
+    // unit is one transaction.
+    let to = machine
+        .transition(TaskStatus::Queued)
+        .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+    let mut created = serde_json::json!({ "conversationId": conversation_id });
+    let mut mode_str: Option<&'static str> = None;
+    let mut worktree_str: Option<String> = None;
+    if let Some(p) = prepared {
+        mode_str = Some(workspace_mode_wire(&p.mode));
+        worktree_str = match &p.worktree_path {
+            Some(w) => Some(w.to_str().map(str::to_string).ok_or_else(|| {
+                (
+                    ErrorCode::ValidationFailed,
+                    "worktree path must be valid UTF-8".to_string(),
+                )
+            })?),
+            None => None,
+        };
+        let map = created.as_object_mut().expect("json object");
+        map.insert("workspaceMode".into(), serde_json::json!(mode_str));
+        // specs/02 §7: direct_mount edits reach the host immediately.
+        map.insert(
+            "liveWritable".into(),
+            serde_json::json!(matches!(p.mode, WorkspaceMode::DirectMount)),
+        );
+        for (key, value) in [
+            ("repoId", &p.repo_id),
+            ("repoPath", &p.repo_path),
+            ("baseCommit", &p.base_commit),
+            ("taskBranch", &p.task_branch),
+            ("worktreePath", &worktree_str),
+        ] {
+            if let Some(v) = value {
+                map.insert(key.into(), serde_json::json!(v));
+            }
+        }
+    }
+    let db = inner.lock_db();
+    let tx = db.conn().unchecked_transaction().map_err(internal)?;
+    {
+        let log = EventLog::from_conn(&tx);
+        tx.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, sequence)
+             VALUES (?1,?2,'user',?3,
+                     COALESCE((SELECT MAX(sequence) FROM messages WHERE conversation_id = ?2),0)+1)",
+            params![uuid::Uuid::new_v4().to_string(), conversation_id, content],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "INSERT INTO tasks (id, conversation_id, repo_id, base_commit, task_branch,
+                                workspace_mode, worktree_path, status, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'created',?8,?8)",
+            params![
+                task_id,
+                conversation_id,
+                prepared.and_then(|p| p.repo_id.clone()),
+                prepared.and_then(|p| p.base_commit.clone()),
+                prepared.and_then(|p| p.task_branch.clone()),
+                mode_str,
+                worktree_str,
+                now
+            ],
+        )
+        .map_err(internal)?;
+        log.append(task_id, "task.created", &created, &now)
+            .map_err(internal)?;
+        let msg = AgentEvent::MessageDelta {
+            text: content.to_string(),
+        };
+        log.append(
+            task_id,
+            "message.user",
+            &serde_json::to_value(msg).map_err(internal)?,
+            &now,
+        )
+        .map_err(internal)?;
+        log.append(
+            task_id,
+            "status.changed",
+            &serde_json::json!({ "to": to }),
+            &now,
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "UPDATE tasks SET status='queued', updated_at=?2 WHERE id=?1",
+            params![task_id, now],
+        )
+        .map_err(internal)?;
+    }
+    tx.commit().map_err(internal)?;
+    Ok(())
+}
+
+/// Remove a FINISHED task's Core-allocated worktree and `sandpane/<id>`
+/// branch — never the user's tree, never work. Distinct from `task.cancel`
+/// (cancel keeps the worktree; specs/02 §4 separates the operations).
+/// INTERNAL API: the wire method needs the server-side confirmation token of
+/// the protocol-additions design (§2), which protocol v1 does not have yet.
+///
+/// Refuses (CONFLICT) while the task is not terminal, when the worktree has
+/// uncommitted/untracked changes, when its HEAD or the branch moved past the
+/// recorded base (commits are work), or when the branch is checked out
+/// elsewhere; VALIDATION_FAILED when the task has no Core worktree (e.g.
+/// `direct_mount`). Idempotent once removed.
+pub fn discard_task_worktree(
+    inner: &ServerInner,
+    task_id: &str,
+) -> Result<WorktreeDiscard, SvcFailure> {
+    type Row = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Row = {
+        let db = inner.lock_db();
+        db.conn()
+            .query_row(
+                "SELECT t.status, t.workspace_mode, t.worktree_path, t.worktree_removed_at,
+                        t.task_branch, t.base_commit, r.canonical_path
+                 FROM tasks t LEFT JOIN repositories r ON r.id = t.repo_id WHERE t.id = ?1",
+                params![task_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .map_err(|_| SvcFailure::from((ErrorCode::NotFound, "task not found".to_string())))?
+    };
+    let (status, mode, worktree, removed_at, branch, base, repo) = row;
+    let Some(worktree) = worktree else {
+        let why = if mode.as_deref() == Some("direct_mount") {
+            "it is a direct_mount task: it works in the live host tree, and Core never removes \
+             host files"
+        } else {
+            "it was never given a Core-allocated worktree"
+        };
+        return Err(SvcFailure::from((
+            ErrorCode::ValidationFailed,
+            format!("task {task_id} has no worktree to discard: {why}"),
+        )));
+    };
+    if removed_at.is_some() {
+        return Ok(WorktreeDiscard {
+            task_id: task_id.to_string(),
+            worktree_path: worktree,
+            task_branch: branch,
+            directory_was_present: false,
+            branch_deleted: false,
+            already_removed: true,
+        });
+    }
+    let status = task_status_from_stored(&status, task_id)?;
+    if !TaskStateMachine::from_status(status).is_terminal() {
+        return Err(SvcFailure::from((
+            ErrorCode::Conflict,
+            format!(
+                "task {task_id} is {}; only a finished task's worktree can be discarded \
+                 (cancel it first)",
+                task_status_stored(status)?
+            ),
+        )));
+    }
+    let (Some(branch), Some(base), Some(repo)) = (branch, base, repo) else {
+        return Err(SvcFailure::from((
+            ErrorCode::Internal,
+            format!("task {task_id} has a worktree but an incomplete Git context"),
+        )));
+    };
+    let Some(root) = &inner.worktrees_root else {
+        return Err(SvcFailure::from((
+            ErrorCode::ValidationFailed,
+            "this Core instance was started without its worktree directory".to_string(),
+        )));
+    };
+    // The scheduler's writer lock is keyed by the worktree path; a holder
+    // means something may still be writing there (precondition 2 in
+    // `sandpane_core::workspace`). Core does not yet stop/unmount a bound
+    // sandbox — none can be bound to a worktree in protocol v1.
+    if let Some(holder) = inner.lock_scheduler().writer_lock_holder(&worktree) {
+        return Err(SvcFailure::from((
+            ErrorCode::Conflict,
+            format!("task {holder} holds the writer lock on {worktree}; refusing to discard it"),
+        )));
+    }
+    let plan = workspace::plan_worktree_removal(
+        &inner.git,
+        Path::new(&repo),
+        root,
+        Path::new(&worktree),
+        &branch,
+        &base,
+    )
+    .map_err(workspace_failure)?;
+    // Durable INTENT before the first side effect (review S1): after a crash
+    // or a failed step the log says what Core was doing.
+    {
+        let db = inner.lock_db();
+        EventLog::new(&db)
+            .append(
+                task_id,
+                "workspace.removing",
+                &serde_json::json!({
+                    "worktreePath": worktree,
+                    "taskBranch": branch,
+                    "directoryPresent": plan.directory_present,
+                    "branchExists": plan.branch_exists,
+                }),
+                &now_rfc3339(),
+            )
+            .map_err(internal)?;
+    }
+    let removed = match workspace::execute_worktree_removal(&inner.git, &plan) {
+        Ok(r) => r,
+        Err(e) => {
+            let failure = workspace_failure(e);
+            let db = inner.lock_db();
+            if let Err(le) = EventLog::new(&db).append(
+                task_id,
+                "workspace.removal_failed",
+                &serde_json::json!({ "worktreePath": worktree, "error": failure.message }),
+                &now_rfc3339(),
+            ) {
+                eprintln!("sandpane-service: task {task_id}: recording removal failure: {le}");
+            }
+            return Err(failure);
+        }
+    };
+    let now = now_rfc3339();
+    let db = inner.lock_db();
+    let tx = db.conn().unchecked_transaction().map_err(internal)?;
+    let changed = tx
+        .execute(
+            "UPDATE tasks SET worktree_removed_at=?2, updated_at=?2
+             WHERE id=?1 AND worktree_removed_at IS NULL",
+            params![task_id, now],
+        )
+        .map_err(internal)?;
+    if changed == 1 {
+        EventLog::from_conn(&tx)
+            .append(
+                task_id,
+                "workspace.removed",
+                &serde_json::json!({
+                    "worktreePath": worktree,
+                    "taskBranch": branch,
+                    "directoryWasPresent": removed.directory_was_present,
+                    "branchDeleted": removed.branch_deleted,
+                }),
+                &now,
+            )
+            .map_err(internal)?;
+    }
+    tx.commit().map_err(internal)?;
+    Ok(WorktreeDiscard {
+        task_id: task_id.to_string(),
+        worktree_path: worktree,
+        task_branch: Some(branch),
+        directory_was_present: removed.directory_was_present,
+        branch_deleted: removed.branch_deleted,
+        already_removed: changed == 0,
+    })
+}
+
+/// Task workspaces Core finds with no task row behind them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrphanReport {
+    pub worktree_dirs: Vec<PathBuf>,
+    /// (repository path, branch name)
+    pub branches: Vec<(String, String)>,
+}
+
+/// READ-ONLY reconciliation (review W3): list directories under the worktree
+/// root and `sandpane/*` branches in registered repositories that no live
+/// task row accounts for (a crash between `worktree add` and the durable
+/// write, a removal that failed half-way, or manual edits). Reports only —
+/// NEVER deletes: whatever is there may hold work. Git failures on one
+/// repository are logged and skipped.
+pub fn report_orphaned_task_workspaces(inner: &ServerInner) -> OrphanReport {
+    let mut report = OrphanReport::default();
+    let (live_paths, live_branches, repos) = {
+        let db = inner.lock_db();
+        let collect = |sql: &str| -> Vec<String> {
+            match db.conn().prepare(sql) {
+                Ok(mut stmt) => stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(Result::ok).collect())
+                    .unwrap_or_default(),
+                Err(e) => {
+                    eprintln!("sandpane-service: orphan scan query failed: {e}");
+                    Vec::new()
+                }
+            }
+        };
+        (
+            collect(
+                "SELECT worktree_path FROM tasks
+                 WHERE worktree_path IS NOT NULL AND worktree_removed_at IS NULL",
+            ),
+            collect(
+                "SELECT task_branch FROM tasks
+                 WHERE task_branch IS NOT NULL AND worktree_removed_at IS NULL",
+            ),
+            collect("SELECT DISTINCT canonical_path FROM repositories ORDER BY canonical_path"),
+        )
+    };
+    if let Some(root) = &inner.worktrees_root {
+        if let (Ok(root_c), Ok(entries)) = (std::fs::canonicalize(root), std::fs::read_dir(root)) {
+            let mut dirs: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|e| root_c.join(e.file_name()))
+                .filter(|p| !live_paths.iter().any(|l| Path::new(l) == p))
+                .collect();
+            dirs.sort();
+            report.worktree_dirs = dirs;
+        }
+    }
+    for repo in repos {
+        match inner
+            .git
+            .run(Path::new(&repo), &scoregit::GitArgs::list_task_branches())
+        {
+            Ok(out) => {
+                for branch in out.lines().map(str::trim).filter(|b| !b.is_empty()) {
+                    if !live_branches.iter().any(|l| l == branch) {
+                        report.branches.push((repo.clone(), branch.to_string()));
+                    }
+                }
+            }
+            Err(e) => eprintln!("sandpane-service: orphan scan of {repo} skipped: {e}"),
+        }
+    }
+    report
+}
+
+fn conversation_send(
+    inner: &ServerInner,
+    p: ConversationSendParams,
+) -> Result<serde_json::Value, SvcFailure> {
+    // Protocol v1 carries no workspace selection, so the wire path creates a
+    // task WITHOUT Git context — never an implied worktree or live mount.
+    let summary = create_task(inner, &p.conversation_id, &p.content, None)?;
+    serde_json::to_value(summary).map_err(|e| internal(e).into())
 }
 
 fn task_cancel(inner: &ServerInner, task_id: String) -> Result<serde_json::Value, SvcError> {
@@ -1594,26 +2253,52 @@ fn query_task_ids(db: &Database, project_id: Option<&str>) -> Result<Vec<String>
     Ok(ids)
 }
 
-/// Load a task's real Git context (repo path + recorded base commit).
-fn git_context(inner: &ServerInner, task_id: &str) -> Result<(String, String), SvcError> {
+/// A task's stored Git context.
+struct TaskGitContext {
+    /// The registered HOST repository (the integration target).
+    repo_path: String,
+    /// Absent for `sbx_clone` tasks (no verified base; review W4).
+    base_commit: Option<String>,
+    workspace_mode: Option<String>,
+    worktree_path: Option<String>,
+    worktree_removed: bool,
+}
+
+/// Load a task's real Git context (repo path + recorded base commit, plus
+/// its workspace mode and Core worktree when it has one).
+fn git_context(inner: &ServerInner, task_id: &str) -> Result<TaskGitContext, SvcError> {
     let db = inner.lock_db();
-    let row = db
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Row = db
         .conn()
         .query_row(
-            "SELECT r.canonical_path, t.base_commit FROM tasks t
+            "SELECT r.canonical_path, t.base_commit, t.workspace_mode, t.worktree_path,
+                    t.worktree_removed_at
+             FROM tasks t
              LEFT JOIN repositories r ON r.id = t.repo_id
              WHERE t.id = ?1",
             params![task_id],
-            |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .map_err(|_| (ErrorCode::NotFound, "task not found".to_string()))?;
     match row {
-        (Some(path), Some(base)) => Ok((path, base)),
+        (Some(repo_path), base_commit, workspace_mode, worktree_path, removed)
+            if base_commit.is_some() || workspace_mode.is_some() =>
+        {
+            Ok(TaskGitContext {
+                repo_path,
+                base_commit,
+                workspace_mode,
+                worktree_path,
+                worktree_removed: removed.is_some(),
+            })
+        }
         _ => Err((
             ErrorCode::ValidationFailed,
             "task has no Git context (repo binding + base_commit)".to_string(),
@@ -1621,17 +2306,89 @@ fn git_context(inner: &ServerInner, task_id: &str) -> Result<(String, String), S
     }
 }
 
+/// The directory whose changes ARE the task's work, by workspace mode:
+/// - `host_worktree` → its Core worktree, after proving it is still this
+///   repository's task worktree; a removed/missing one is refused — never a
+///   fall-back to the host tree, which would attribute the user's own edits
+///   to the task;
+/// - `direct_mount` (and legacy rows with no mode) → the live host tree;
+/// - `sbx_clone` → refused: the work lives in the sandbox's private clone.
+fn review_target(inner: &ServerInner, ctx: &TaskGitContext) -> Result<PathBuf, SvcError> {
+    let repo = Path::new(&ctx.repo_path);
+    let mode = match &ctx.workspace_mode {
+        None => None,
+        Some(stored) => Some(workspace_mode_from_stored(stored).ok_or_else(|| {
+            (
+                ErrorCode::Internal,
+                format!("task stores workspace mode {stored:?}, which is not a Core mode"),
+            )
+        })?),
+    };
+    match mode {
+        None | Some(WorkspaceMode::DirectMount) => Ok(repo.to_path_buf()),
+        Some(WorkspaceMode::HostWorktree) => {
+            if ctx.worktree_removed {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "the task's worktree was removed (discarded); there is nothing left to \
+                     review"
+                        .to_string(),
+                ));
+            }
+            let Some(wt) = &ctx.worktree_path else {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "host_worktree task has no allocated worktree".to_string(),
+                ));
+            };
+            let Some(root) = &inner.worktrees_root else {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "this Core instance was started without its worktree directory".to_string(),
+                ));
+            };
+            workspace::verify_task_worktree(&inner.git, repo, root, Path::new(wt)).map_err(
+                |e| {
+                    let f = workspace_failure(e);
+                    (f.code, f.message)
+                },
+            )?;
+            Ok(PathBuf::from(wt))
+        }
+        Some(WorkspaceMode::SbxClone) => Err((
+            ErrorCode::ValidationFailed,
+            "review of sbx_clone tasks is not implemented: the agent's commits live in the \
+             sandbox's private clone (reachable through the sandbox-<name> Git remote), so the \
+             host tree would show none of them"
+                .to_string(),
+        )),
+        Some(WorkspaceMode::Mountless) => Err((
+            ErrorCode::ValidationFailed,
+            "mountless task has no repository to review".to_string(),
+        )),
+    }
+}
+
 fn git_review(inner: &ServerInner, task_id: String) -> Result<serde_json::Value, SvcError> {
-    let (repo_path, base_commit) = git_context(inner, &task_id)?;
-    let repo = Path::new(&repo_path);
+    let ctx = git_context(inner, &task_id)?;
+    let target = review_target(inner, &ctx)?;
+    let Some(base_commit) = ctx.base_commit else {
+        return Err((
+            ErrorCode::ValidationFailed,
+            "task has no Git context (repo binding + base_commit)".to_string(),
+        ));
+    };
+    let repo = Path::new(&ctx.repo_path);
     // A repository with submodules is REFUSED (VALIDATION_FAILED, naming the
     // submodule paths): Core never enters submodule work trees, and the
     // ChangeSet has no "incomplete" field, so returning a list would silently
     // under-report the agent's changes and the host's dirty state.
+    // `hostDirty` describes the HOST repository (the integration target);
+    // the change list comes from the task's own workspace.
     let dirty = inner.git.is_dirty(repo).map_err(review_git_error)?;
     let changes = inner
         .git
-        .change_list(repo, &base_commit)
+        .change_list(&target, &base_commit)
         .map_err(review_git_error)?;
     let change_set = ChangeSet {
         task_id,
@@ -1677,7 +2434,11 @@ fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value
     // FAIL-CLOSED: no usable Git context aborts the apply — it never falls
     // through to the "preconditions passed" branch (review finding #9).
     match git_context(inner, &p.task_id) {
-        Ok((repo_path, base_commit)) => {
+        Ok(TaskGitContext {
+            repo_path,
+            base_commit: Some(base_commit),
+            ..
+        }) => {
             if !base_commit.eq_ignore_ascii_case(&p.expected_base) {
                 let result = ApplyResult {
                     applied: false,
@@ -1701,6 +2462,18 @@ fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value
                 };
                 return serde_json::to_value(result).map_err(internal);
             }
+        }
+        Ok(TaskGitContext {
+            base_commit: None, ..
+        }) => {
+            let result = ApplyResult {
+                applied: false,
+                abort_reason: Some(
+                    "apply refused: no Git context for task (no verified base commit)".to_string(),
+                ),
+                conflicted_files: vec![],
+            };
+            return serde_json::to_value(result).map_err(internal);
         }
         Err((code, msg)) => {
             let result = ApplyResult {

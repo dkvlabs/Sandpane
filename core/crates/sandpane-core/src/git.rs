@@ -130,7 +130,20 @@ pub const HARDENING_CONFIG: &[&str] = &[
     "submodule.recurse=false",
     "status.submoduleSummary=false",
     "diff.submodule=short",
+    // Review C2: repo config `status.showUntrackedFiles=no` hid untracked
+    // work from the dirty gate AND from git's own cleanliness check inside
+    // `worktree remove` (`-c` propagates to git's internal status via
+    // GIT_CONFIG_PARAMETERS).
+    "status.showUntrackedFiles=normal",
+    // Review S2: never trust stat-only "unchanged" shortcuts.
+    "core.ignoreStat=false",
 ];
+// `core.excludesFile` is NOT a fixed entry: every command gets
+// `-c core.excludesFile=<GitRunner::excludes_file>` (see
+// [`GitRunner::hardened_command`]) so a repo-chosen excludes file can never
+// reclassify work as ignored (review W2), while the USER's own global
+// excludes — resolved outside repo config by [`user_excludes_candidate`] and
+// vetted by [`accept_excludes_file`] — still apply.
 
 /// Environment set on every git invocation after all `GIT_*` are removed.
 pub const HARDENING_ENV: &[(&str, &str)] = &[
@@ -150,6 +163,10 @@ pub const EMPTY_TREE_SHA256: &str =
 pub struct GitRunner {
     pub program: PathBuf,
     pub limits: RunLimits,
+    /// The excludes file passed as `-c core.excludesFile=…` on EVERY call:
+    /// `/dev/null` by default, or the user's own global excludes file once
+    /// the service resolved and accepted it at startup.
+    pub excludes_file: PathBuf,
 }
 
 impl Default for GitRunner {
@@ -157,8 +174,123 @@ impl Default for GitRunner {
         Self {
             program: PathBuf::from("git"),
             limits: RunLimits::QUERY,
+            excludes_file: PathBuf::from("/dev/null"),
         }
     }
+}
+
+/// Environment for resolving the user's global excludes file.
+#[derive(Debug, Clone, Default)]
+pub struct ExcludesEnv {
+    pub home: Option<PathBuf>,
+    pub xdg_config_home: Option<PathBuf>,
+}
+
+/// The user's global excludes file as GIT resolves it, without consulting any
+/// repository: `git config --global --get --path core.excludesFile` (global
+/// scope = `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` only, system
+/// config off) run from the neutral cwd `/` under the usual hardening, with
+/// `HOME`/`XDG_CONFIG_HOME` taken from `env`. Unset → git's documented
+/// default, `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`. `None`
+/// when there is no home directory. The result is only a CANDIDATE: it must
+/// pass [`accept_excludes_file`]. Run once (at startup), never per call.
+pub fn user_excludes_candidate(
+    runner: &GitRunner,
+    env: &ExcludesEnv,
+) -> Result<Option<PathBuf>, GitError> {
+    let non_empty = |p: &Option<PathBuf>| p.clone().filter(|p| !p.as_os_str().is_empty());
+    let Some(home) = non_empty(&env.home) else {
+        return Ok(None);
+    };
+    let xdg = non_empty(&env.xdg_config_home);
+    let args: Vec<String> = ["config", "--global", "--get", "--path", "core.excludesFile"]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    let mut cmd = runner.hardened_command(
+        Path::new("/"),
+        &[],
+        None,
+        &args,
+        std::env::vars_os().map(|(k, _)| k),
+    );
+    cmd.env("HOME", &home);
+    match &xdg {
+        Some(x) => cmd.env("XDG_CONFIG_HOME", x),
+        None => cmd.env_remove("XDG_CONFIG_HOME"),
+    };
+    let out = run_bounded(cmd, &runner.limits).map_err(|e| GitError::Exec(e.to_string()))?;
+    match out.status.code() {
+        Some(0) if !out.stdout_truncated => {
+            let value = out.stdout_lossy();
+            let value = value.trim_end_matches(['\n', '\r']);
+            if !value.is_empty() {
+                return Ok(Some(PathBuf::from(value)));
+            }
+        }
+        Some(1) => {}
+        _ => {
+            return Err(GitError::Exec(format!(
+                "git config --global (excludes) exited {}: {}",
+                out.status,
+                out.stderr_lossy().trim()
+            )))
+        }
+    }
+    Ok(Some(match xdg {
+        Some(x) => x.join("git").join("ignore"),
+        None => home.join(".config").join("git").join("ignore"),
+    }))
+}
+
+/// Vet an excludes-file candidate. Accepted only as the CANONICAL path of an
+/// existing regular file (a dotfiles symlink is followed, then judged by its
+/// target), absolute, UTF-8 without control characters, owned by `uid`, and
+/// not inside any of `forbidden_roots` (registered repositories, Core's
+/// worktree root) — an agent-writable file must never decide what is
+/// ignored. Callers fall back to `/dev/null` on `Err` (fail safe: more files
+/// show as untracked, never fewer).
+pub fn accept_excludes_file(
+    candidate: &Path,
+    forbidden_roots: &[PathBuf],
+    uid: u32,
+) -> Result<PathBuf, String> {
+    if !candidate.is_absolute() {
+        return Err(format!("{} is not an absolute path", candidate.display()));
+    }
+    let canonical = std::fs::canonicalize(candidate)
+        .map_err(|e| format!("{} is not usable: {e}", candidate.display()))?;
+    let Some(text) = canonical.to_str() else {
+        return Err(format!("{} is not valid UTF-8", canonical.display()));
+    };
+    if text.chars().any(|c| c.is_control()) {
+        return Err(format!("{text:?} contains control characters"));
+    }
+    let meta =
+        std::fs::symlink_metadata(&canonical).map_err(|e| format!("{text} is not usable: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{text} is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != uid {
+            return Err(format!("{text} is owned by uid {}, not {uid}", meta.uid()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = uid;
+    for root in forbidden_roots {
+        let root_c = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if canonical.starts_with(&root_c) {
+            return Err(format!(
+                "{text} lies inside {} (a repository or Sandpane's worktree root), which an \
+                 agent may write",
+                root_c.display()
+            ));
+        }
+    }
+    Ok(canonical)
 }
 
 impl GitRunner {
@@ -192,12 +324,35 @@ impl GitRunner {
         for c in HARDENING_CONFIG
             .iter()
             .map(|c| c.to_string())
+            .chain(std::iter::once(format!(
+                "core.excludesFile={}",
+                self.effective_excludes(cwd)
+            )))
             .chain(extra_config.iter().cloned())
         {
             cmd.arg("-c").arg(c);
         }
         cmd.args(args).current_dir(cwd);
         cmd
+    }
+
+    /// The excludes file for a call in `cwd`: the configured one unless it is
+    /// not an absolute control-free UTF-8 path or lies INSIDE `cwd` (a
+    /// repository registered after startup) — then `/dev/null`. Lexical and
+    /// pure: Core passes canonical repository/worktree roots as `cwd`, and the
+    /// accepted excludes path is canonical.
+    pub fn effective_excludes(&self, cwd: &Path) -> String {
+        let path = &self.excludes_file;
+        match path.to_str() {
+            Some(p)
+                if path.is_absolute()
+                    && !p.chars().any(|c| c.is_control())
+                    && !path.starts_with(cwd) =>
+            {
+                p.to_string()
+            }
+            _ => "/dev/null".to_string(),
+        }
     }
 
     /// Run a builder-produced vector in `cwd` under the full hardening. No
@@ -210,7 +365,9 @@ impl GitRunner {
     }
 
     /// [`Self::run`] under explicit output/time limits (same hardening).
-    fn run_with_limits(
+    /// Mutations such as `worktree add` use [`RunLimits::MUTATION`]: a
+    /// QUERY-class timeout mid-checkout would leave a half-made worktree.
+    pub fn run_with_limits(
         &self,
         cwd: &Path,
         args: &[String],
@@ -295,6 +452,107 @@ impl GitRunner {
     pub fn rev_parse_head(&self, repo: &Path) -> Result<String, GitError> {
         let out = self.run(repo, &GitArgs::rev_parse_head())?;
         Ok(out.trim().to_string())
+    }
+
+    /// `refs/heads/<branch>` → its object id, or `None` when the branch does
+    /// not exist. Any other failure is an error (never read as "absent").
+    pub fn branch_oid(&self, repo: &Path, branch: &str) -> Result<Option<String>, GitError> {
+        self.quiet_oid(repo, &GitArgs::rev_parse_branch(branch)?)
+    }
+
+    /// `HEAD` as a full object id, or `None` when HEAD is unborn (no commit).
+    pub fn head_oid(&self, repo: &Path) -> Result<Option<String>, GitError> {
+        self.quiet_oid(repo, &GitArgs::rev_parse_head_quiet())
+    }
+
+    fn quiet_oid(&self, repo: &Path, args: &[String]) -> Result<Option<String>, GitError> {
+        match self.run_quiet(repo, args)? {
+            Some(out) => {
+                let oid = out.trim().to_string();
+                Validator::full_object_id(&oid)?;
+                Ok(Some(oid))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The target of `refs/heads/<branch>` when it is a SYMBOLIC ref, else
+    /// `None` (regular or absent). Review C1 tamper signal.
+    pub fn symbolic_ref_target(
+        &self,
+        repo: &Path,
+        branch: &str,
+    ) -> Result<Option<String>, GitError> {
+        Ok(self
+            .run_quiet(repo, &GitArgs::symbolic_ref_target(branch)?)?
+            .map(|t| t.trim().to_string()))
+    }
+
+    /// Index paths whose tags hide modifications (assume-unchanged or
+    /// skip-worktree), repo-wide. Raised stdout cap like the gitlink scan.
+    pub fn index_hidden_entries(&self, repo: &Path) -> Result<Vec<String>, GitError> {
+        let limits = RunLimits {
+            max_stdout: SUBMODULE_SCAN_MAX_STDOUT.max(self.limits.max_stdout),
+            ..self.limits
+        };
+        let out = self.run_with_limits(repo, &GitArgs::ls_files_flags(), &limits)?;
+        hidden_entries_from_ls_files_v(&out)
+    }
+
+    /// Ignored untracked entries of the work tree containing `dir`.
+    pub fn ignored_entries(&self, dir: &Path) -> Result<Vec<String>, GitError> {
+        let out = self.run(dir, &GitArgs::ls_files_ignored())?;
+        Ok(out
+            .split('\0')
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Run a query whose "absent" answer is a QUIET exit 1 (no output, no
+    /// stderr): `Ok(Some(stdout))` on exit 0, `Ok(None)` on quiet exit 1,
+    /// an error otherwise (a failure is never read as "absent").
+    fn run_quiet(&self, repo: &Path, args: &[String]) -> Result<Option<String>, GitError> {
+        Validator::assert_no_shell_metachars(args).map_err(GitError::Validation)?;
+        let repo_o = self.repo_overrides(repo)?;
+        let cmd = self.hardened_command(
+            repo,
+            &repo_o.config,
+            Some(repo_o.empty_tree),
+            args,
+            std::env::vars_os().map(|(k, _)| k),
+        );
+        let out = run_bounded(cmd, &self.limits).map_err(|e| GitError::Exec(e.to_string()))?;
+        let sub = args.first().map(String::as_str).unwrap_or("?");
+        match out.status.code() {
+            Some(0) if !out.stdout_truncated => Ok(Some(out.stdout_lossy())),
+            Some(1) if out.stdout.is_empty() && out.stderr.is_empty() => Ok(None),
+            _ => Err(GitError::Exec(format!(
+                "git {sub} exited {}: {}",
+                out.status,
+                out.stderr_lossy().trim()
+            ))),
+        }
+    }
+
+    /// Every registered worktree of `repo` (see [`parse_worktree_list`]).
+    pub fn worktree_list(&self, repo: &Path) -> Result<Vec<WorktreeEntry>, GitError> {
+        let out = self.run(repo, &GitArgs::worktree_list())?;
+        parse_worktree_list(&out)
+    }
+
+    /// Canonical absolute common git dir of the repository containing `dir`.
+    pub fn common_dir(&self, dir: &Path) -> Result<PathBuf, GitError> {
+        let out = self.run(dir, &GitArgs::git_common_dir())?;
+        let line = out.trim_end_matches(['\n', '\r']);
+        if line.is_empty() || line.contains('\n') {
+            return Err(GitError::Exec(format!(
+                "unexpected rev-parse output {out:?}"
+            )));
+        }
+        // Relative output is relative to the cwd git ran in (`dir`).
+        std::fs::canonicalize(dir.join(line))
+            .map_err(|e| GitError::Exec(format!("common dir {line:?} not usable: {e}")))
     }
 
     /// Absolute path of the working tree's top level containing `dir`.
@@ -521,6 +779,8 @@ impl GitArgs {
             "status".into(),
             "--porcelain".into(),
             "--ignore-submodules=dirty".into(),
+            // Belt and braces with `status.showUntrackedFiles=normal`.
+            "--untracked-files=normal".into(),
         ]
     }
 
@@ -565,6 +825,130 @@ impl GitArgs {
         ]
     }
 
+    /// Every worktree of the repository (NUL-separated porcelain). Reads
+    /// git's administrative files only; never a work tree's contents.
+    pub fn worktree_list() -> Vec<String> {
+        vec![
+            "worktree".into(),
+            "list".into(),
+            "--porcelain".into(),
+            "-z".into(),
+        ]
+    }
+
+    /// `git worktree remove -- <path>` — deliberately WITHOUT `--force`: git
+    /// itself refuses a worktree holding modified or untracked files, a
+    /// second guard behind Core's own dirty check.
+    pub fn worktree_remove(path: &Path) -> Result<Vec<String>, GitError> {
+        let path_str = absolute_path_arg(path)?;
+        Ok(vec![
+            "worktree".into(),
+            "remove".into(),
+            "--".into(),
+            path_str,
+        ])
+    }
+
+    /// Atomic compare-and-delete of `refs/heads/<branch>`: git deletes the
+    /// ref only while it still equals `old` (a FULL object id), so a branch
+    /// that gained commits after Core looked is never deleted.
+    pub fn update_ref_delete(branch: &str, old: &str) -> Result<Vec<String>, GitError> {
+        Validator::branch_name(branch)?;
+        Validator::full_object_id(old)?;
+        Ok(vec![
+            "update-ref".into(),
+            // Review C1: operate on the ref ITSELF, never on what a
+            // (tampered) symbolic ref points at.
+            "--no-deref".into(),
+            "-d".into(),
+            "--end-of-options".into(),
+            format!("refs/heads/{branch}"),
+            old.into(),
+        ])
+    }
+
+    /// Index listing with tags (`-v`): a lowercase tag marks an
+    /// assume-unchanged entry, `S` a skip-worktree entry — both hide
+    /// modifications from `status` (review S2). Reads the index only.
+    pub fn ls_files_flags() -> Vec<String> {
+        vec![
+            "ls-files".into(),
+            "-v".into(),
+            "-z".into(),
+            "--full-name".into(),
+            "--".into(),
+            ":(top)".into(),
+        ]
+    }
+
+    /// Untracked files that the exclude rules IGNORE (whole ignored
+    /// directories collapsed to `dir/`): exactly what `worktree remove`
+    /// would delete without asking (review W2).
+    pub fn ls_files_ignored() -> Vec<String> {
+        vec![
+            "ls-files".into(),
+            "-z".into(),
+            "--others".into(),
+            "--ignored".into(),
+            "--exclude-standard".into(),
+            "--directory".into(),
+            "--".into(),
+        ]
+    }
+
+    /// `symbolic-ref -q refs/heads/<branch>`: exit 0 + target when the ref is
+    /// SYMBOLIC; quiet exit 1 when it is a regular ref or absent.
+    pub fn symbolic_ref_target(branch: &str) -> Result<Vec<String>, GitError> {
+        Validator::branch_name(branch)?;
+        Ok(vec![
+            "symbolic-ref".into(),
+            "-q".into(),
+            "--end-of-options".into(),
+            format!("refs/heads/{branch}"),
+        ])
+    }
+
+    /// Every `refs/heads/sandpane/*` branch, short names, one per line.
+    pub fn list_task_branches() -> Vec<String> {
+        vec![
+            "for-each-ref".into(),
+            "--format=%(refname:short)".into(),
+            "--end-of-options".into(),
+            "refs/heads/sandpane/".into(),
+        ]
+    }
+
+    /// `rev-parse --verify --quiet HEAD`: quiet exit 1 when HEAD is unborn.
+    pub fn rev_parse_head_quiet() -> Vec<String> {
+        vec![
+            "rev-parse".into(),
+            "--verify".into(),
+            "--quiet".into(),
+            "--end-of-options".into(),
+            "HEAD".into(),
+        ]
+    }
+
+    /// Resolve `refs/heads/<branch>`; `--quiet` makes a missing ref exit 1
+    /// with no output (see [`GitRunner::branch_oid`]).
+    pub fn rev_parse_branch(branch: &str) -> Result<Vec<String>, GitError> {
+        Validator::branch_name(branch)?;
+        Ok(vec![
+            "rev-parse".into(),
+            "--verify".into(),
+            "--quiet".into(),
+            "--end-of-options".into(),
+            format!("refs/heads/{branch}"),
+        ])
+    }
+
+    /// The repository's COMMON git dir (shared by all of its worktrees);
+    /// git may print it relative to the cwd (see [`GitRunner::common_dir`]).
+    /// Not `--path-format=absolute`: `=` trips the argument tripwire.
+    pub fn git_common_dir() -> Vec<String> {
+        vec!["rev-parse".into(), "--git-common-dir".into()]
+    }
+
     /// Create an isolated task worktree: `git worktree add <path> -b <branch> <base>`.
     pub fn worktree_add(
         path: &Path,
@@ -573,31 +957,112 @@ impl GitArgs {
     ) -> Result<Vec<String>, GitError> {
         Validator::branch_name(branch)?;
         Validator::git_ref(base_commit)?;
-        if !path.is_absolute() {
-            return Err(GitError::Validation(ValidationError::NotAbsolute {
-                path: path.display().to_string(),
-            }));
-        }
-        let Some(path_str) = path.to_str() else {
-            return Err(GitError::Validation(ValidationError::InvalidShape {
-                reason: "worktree path must be valid UTF-8".into(),
-            }));
-        };
-        if let Some(c) = path_str.chars().find(|c| c.is_control()) {
-            return Err(GitError::Validation(ValidationError::DisallowedChar {
-                found: c,
-            }));
-        }
+        let path_str = absolute_path_arg(path)?;
         Ok(vec![
             "worktree".into(),
             "add".into(),
             "-b".into(),
             branch.into(),
             "--".into(),
-            path_str.into(),
+            path_str,
             base_commit.into(),
         ])
     }
+}
+
+/// One entry of `git worktree list --porcelain -z`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: String,
+    pub head: Option<String>,
+    /// Full ref (`refs/heads/...`) when a branch is checked out.
+    pub branch: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain -z`: NUL-terminated attribute lines,
+/// an empty line between entries. Unknown attributes (`locked`, `prunable`,
+/// `bare`, `detached`) are ignored; an attribute before any `worktree` line
+/// fails CLOSED.
+pub fn parse_worktree_list(out: &str) -> Result<Vec<WorktreeEntry>, GitError> {
+    let mut entries: Vec<WorktreeEntry> = Vec::new();
+    let mut current: Option<WorktreeEntry> = None;
+    for field in out.split('\0') {
+        if field.is_empty() {
+            if let Some(e) = current.take() {
+                entries.push(e);
+            }
+            continue;
+        }
+        if let Some(path) = field.strip_prefix("worktree ") {
+            if let Some(e) = current.take() {
+                entries.push(e);
+            }
+            current = Some(WorktreeEntry {
+                path: path.to_string(),
+                head: None,
+                branch: None,
+            });
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
+            return Err(GitError::Exec(format!(
+                "unexpected worktree list field {field:?}"
+            )));
+        };
+        if let Some(head) = field.strip_prefix("HEAD ") {
+            entry.head = Some(head.to_string());
+        } else if let Some(branch) = field.strip_prefix("branch ") {
+            entry.branch = Some(branch.to_string());
+        }
+    }
+    if let Some(e) = current.take() {
+        entries.push(e);
+    }
+    Ok(entries)
+}
+
+/// Parse `git ls-files -v -z` (`<tag> SP <path>` NUL-terminated) into the
+/// paths whose tag hides modifications: a lowercase tag (assume-unchanged)
+/// or `S` (skip-worktree). A malformed entry fails CLOSED.
+pub fn hidden_entries_from_ls_files_v(out: &str) -> Result<Vec<String>, GitError> {
+    let mut paths = Vec::new();
+    for entry in out.split('\0').filter(|e| !e.is_empty()) {
+        let mut chars = entry.chars();
+        let (Some(tag), Some(' ')) = (chars.next(), chars.next()) else {
+            return Err(GitError::Exec(format!(
+                "unexpected ls-files -v entry {entry:?}"
+            )));
+        };
+        if tag.is_ascii_lowercase() || tag == 'S' {
+            let path = chars.as_str().to_string();
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+/// A Core-chosen absolute path as an argument: absolute, UTF-8, no control
+/// characters (it is exempt from the metacharacter tripwire in
+/// [`GitRunner::run`], so it is validated here).
+fn absolute_path_arg(path: &Path) -> Result<String, GitError> {
+    if !path.is_absolute() {
+        return Err(GitError::Validation(ValidationError::NotAbsolute {
+            path: path.display().to_string(),
+        }));
+    }
+    let Some(path_str) = path.to_str() else {
+        return Err(GitError::Validation(ValidationError::InvalidShape {
+            reason: "worktree path must be valid UTF-8".into(),
+        }));
+    };
+    if let Some(c) = path_str.chars().find(|c| c.is_control()) {
+        return Err(GitError::Validation(ValidationError::DisallowedChar {
+            found: c,
+        }));
+    }
+    Ok(path_str.to_string())
 }
 
 /// Pre-integration safety gate (specs/06 §6 "Before integrating changes"):
@@ -643,7 +1108,12 @@ mod tests {
         );
         assert_eq!(
             GitArgs::status_porcelain(),
-            vec!["status", "--porcelain", "--ignore-submodules=dirty"]
+            vec![
+                "status",
+                "--porcelain",
+                "--ignore-submodules=dirty",
+                "--untracked-files=normal"
+            ]
         );
         assert_eq!(
             GitArgs::diff_name_status("abc1234"),
@@ -705,6 +1175,164 @@ mod tests {
         assert!(msg.contains("\"m19\""), "{msg}");
         assert!(!msg.contains("\"m20\""), "list capped: {msg}");
         assert!(msg.contains("80 more"), "{msg}");
+    }
+
+    #[test]
+    fn task_worktree_arg_builders_are_exact_and_validated() {
+        let oid = "a".repeat(40);
+        assert_eq!(
+            GitArgs::worktree_list(),
+            vec!["worktree", "list", "--porcelain", "-z"]
+        );
+        assert_eq!(
+            GitArgs::worktree_remove(Path::new("/data/worktrees/t 1")).unwrap(),
+            vec!["worktree", "remove", "--", "/data/worktrees/t 1"]
+        );
+        assert!(GitArgs::worktree_remove(Path::new("rel/wt")).is_err());
+        // Control characters in a path are refused (same rule as `worktree add`).
+        assert!(GitArgs::worktree_remove(Path::new("/a\nb")).is_err());
+        assert!(GitArgs::worktree_remove(Path::new("/a\u{7}b")).is_err());
+        // No `--force`, ever: git's own clean check stays a second guard.
+        assert!(!GitArgs::worktree_remove(Path::new("/w"))
+            .unwrap()
+            .iter()
+            .any(|a| a.starts_with("-f") || a == "--force"));
+        // Compare-and-delete: the old value is a FULL oid.
+        assert_eq!(
+            GitArgs::update_ref_delete("sandpane/t-1", &oid).unwrap(),
+            vec![
+                "update-ref",
+                "--no-deref",
+                "-d",
+                "--end-of-options",
+                "refs/heads/sandpane/t-1",
+                oid.as_str()
+            ]
+        );
+        assert!(GitArgs::update_ref_delete("sandpane/t-1", &oid[..12]).is_err());
+        assert!(GitArgs::update_ref_delete("a..b", &oid).is_err());
+        assert_eq!(
+            GitArgs::rev_parse_branch("sandpane/t-1").unwrap(),
+            vec![
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                "refs/heads/sandpane/t-1"
+            ]
+        );
+        assert!(GitArgs::rev_parse_branch("-x").is_err());
+        assert_eq!(
+            GitArgs::git_common_dir(),
+            vec!["rev-parse", "--git-common-dir"]
+        );
+    }
+
+    /// Review C2 / S2 / W2: repo config must not hide work from any check.
+    #[test]
+    fn hardening_pins_untracked_visibility_stat_and_excludes() {
+        for must in ["status.showUntrackedFiles=normal", "core.ignoreStat=false"] {
+            assert!(HARDENING_CONFIG.contains(&must), "{must}");
+        }
+        // Every command pins core.excludesFile (default /dev/null).
+        let cmd = GitRunner::default().hardened_command(
+            Path::new("/repo"),
+            &[],
+            None,
+            &GitArgs::status_porcelain(),
+            Vec::<OsString>::new(),
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "core.excludesFile=/dev/null"),
+            "{args:?}"
+        );
+        assert!(GitArgs::status_porcelain().contains(&"--untracked-files=normal".to_string()));
+        // C1: the compare-and-delete never dereferences a symbolic ref.
+        let oid = "a".repeat(40);
+        assert!(GitArgs::update_ref_delete("sandpane/t-1", &oid)
+            .unwrap()
+            .contains(&"--no-deref".to_string()));
+        assert_eq!(
+            GitArgs::ls_files_flags(),
+            vec!["ls-files", "-v", "-z", "--full-name", "--", ":(top)"]
+        );
+        assert_eq!(
+            GitArgs::ls_files_ignored(),
+            vec![
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--",
+            ]
+        );
+        assert_eq!(
+            GitArgs::symbolic_ref_target("sandpane/t-1").unwrap(),
+            vec![
+                "symbolic-ref",
+                "-q",
+                "--end-of-options",
+                "refs/heads/sandpane/t-1"
+            ]
+        );
+    }
+
+    /// Review C2 (pre-existing): the HOST dirty gate (hostDirty, apply
+    /// preconditions) honoured `status.showUntrackedFiles=no`.
+    #[test]
+    fn host_dirty_gate_sees_untracked_files_despite_repo_config() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        git_plain(dir.path(), &["config", "status.showUntrackedFiles", "no"]);
+        let runner = GitRunner::default();
+        let base = runner.rev_parse_head(dir.path()).unwrap();
+        std::fs::write(dir.path().join("user-work.txt"), "x\n").unwrap();
+        assert!(runner.is_dirty(dir.path()).unwrap());
+        assert!(matches!(
+            preconditions_for_apply(&runner, dir.path(), &base),
+            Err(GitError::DirtyHostState(_))
+        ));
+    }
+
+    #[test]
+    fn worktree_list_porcelain_z_is_parsed() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let out = format!(
+            "worktree /repo/main\0HEAD {a}\0branch refs/heads/main\0\0\
+             worktree /data/wt/t 1\0HEAD {b}\0branch refs/heads/sandpane/t1\0\0\
+             worktree /data/wt/det\0HEAD {b}\0detached\0prunable gitdir file points to non-existent location\0\0"
+        );
+        assert_eq!(
+            parse_worktree_list(&out).unwrap(),
+            vec![
+                WorktreeEntry {
+                    path: "/repo/main".into(),
+                    head: Some(a.clone()),
+                    branch: Some("refs/heads/main".into())
+                },
+                WorktreeEntry {
+                    path: "/data/wt/t 1".into(),
+                    head: Some(b.clone()),
+                    branch: Some("refs/heads/sandpane/t1".into())
+                },
+                WorktreeEntry {
+                    path: "/data/wt/det".into(),
+                    head: Some(b.clone()),
+                    branch: None
+                },
+            ]
+        );
+        assert!(parse_worktree_list("").unwrap().is_empty());
+        // An attribute before any `worktree` line fails closed.
+        assert!(parse_worktree_list("HEAD x\0\0").is_err());
     }
 
     #[test]
@@ -779,6 +1407,8 @@ mod tests {
             expected.push("-c".into());
             expected.push(c.to_string());
         }
+        expected.push("-c".into());
+        expected.push("core.excludesFile=/dev/null".into());
         expected.extend(
             [
                 "-c",
@@ -786,6 +1416,7 @@ mod tests {
                 "status",
                 "--porcelain",
                 "--ignore-submodules=dirty",
+                "--untracked-files=normal",
             ]
             .iter()
             .map(|s| s.to_string()),
@@ -1469,5 +2100,163 @@ mod tests {
             );
         }
         preconditions_for_apply(&runner, dir.path(), &base).unwrap();
+    }
+
+    // --- User global excludes (orchestrator follow-up to review W2) --------
+
+    fn euid_now() -> u32 {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    /// A user's OWN global ignore (e.g. `.DS_Store`) is honoured by the host
+    /// dirty gate and the review change list once Core resolved it.
+    #[test]
+    fn user_global_excludes_are_honoured_by_dirty_gate_and_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let global = base.join("global-ignore");
+        std::fs::write(&global, ".DS_Store\n").unwrap();
+        let runner = GitRunner {
+            excludes_file: global,
+            ..GitRunner::default()
+        };
+        let head = runner.rev_parse_head(&repo).unwrap();
+        std::fs::write(repo.join(".DS_Store"), "finder\n").unwrap();
+        assert!(!runner.is_dirty(&repo).unwrap());
+        assert!(runner.change_list(&repo, &head).unwrap().is_empty());
+        std::fs::write(repo.join("work.txt"), "work\n").unwrap();
+        assert!(runner.is_dirty(&repo).unwrap());
+        let changes = runner.change_list(&repo, &head).unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].path, "work.txt");
+    }
+
+    /// Repo-local `core.excludesFile` (agent-writable) still cannot hide work
+    /// when a user global excludes file is in force: Core's `-c` wins.
+    #[test]
+    fn repo_local_excludes_cannot_hide_work_with_user_excludes_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let global = base.join("global-ignore");
+        std::fs::write(&global, ".DS_Store\n").unwrap();
+        let agent = base.join("agent-ignore");
+        std::fs::write(&agent, "*.txt\n").unwrap();
+        git_plain(
+            &repo,
+            &["config", "core.excludesFile", &agent.display().to_string()],
+        );
+        let runner = GitRunner {
+            excludes_file: global,
+            ..GitRunner::default()
+        };
+        std::fs::write(repo.join("work.txt"), "work\n").unwrap();
+        assert!(runner.is_dirty(&repo).unwrap());
+    }
+
+    /// Per-call guard: an excludes file that lies inside the directory git
+    /// runs in (a repository registered after startup) is never used.
+    #[test]
+    fn excludes_file_inside_the_working_directory_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let inside = repo.join("ignore-everything");
+        std::fs::write(&inside, "*\n").unwrap();
+        let runner = GitRunner {
+            excludes_file: inside,
+            ..GitRunner::default()
+        };
+        std::fs::write(repo.join("work.txt"), "work\n").unwrap();
+        assert!(runner.is_dirty(&repo).unwrap());
+    }
+
+    #[test]
+    fn excludes_candidates_are_accepted_only_when_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base.join("repo");
+        let root = base.join("data").join("worktrees");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let forbidden = vec![repo.clone(), root.clone()];
+        let uid = euid_now();
+        let ok = base.join("global-ignore");
+        std::fs::write(&ok, ".DS_Store\n").unwrap();
+        assert_eq!(accept_excludes_file(&ok, &forbidden, uid).unwrap(), ok);
+        // A dotfiles-style symlink to a safe file resolves to that file.
+        let link_ok = base.join("link-ok");
+        std::os::unix::fs::symlink(&ok, &link_ok).unwrap();
+        assert_eq!(accept_excludes_file(&link_ok, &forbidden, uid).unwrap(), ok);
+        // Inside a registered repository or the worktrees root.
+        let in_repo = repo.join("ignore");
+        std::fs::write(&in_repo, "*\n").unwrap();
+        assert!(accept_excludes_file(&in_repo, &forbidden, uid).is_err());
+        let in_root = root.join("ignore");
+        std::fs::write(&in_root, "*\n").unwrap();
+        assert!(accept_excludes_file(&in_root, &forbidden, uid).is_err());
+        // A symlink pointing INTO the repository.
+        let link_in = base.join("link-in");
+        std::os::unix::fs::symlink(&in_repo, &link_in).unwrap();
+        assert!(accept_excludes_file(&link_in, &forbidden, uid).is_err());
+        // Relative, missing, a directory, control characters, foreign owner.
+        assert!(accept_excludes_file(Path::new("rel/ignore"), &forbidden, uid).is_err());
+        assert!(accept_excludes_file(&base.join("missing"), &forbidden, uid).is_err());
+        assert!(accept_excludes_file(&base, &forbidden, uid).is_err());
+        assert!(accept_excludes_file(&base.join("a\nb"), &forbidden, uid).is_err());
+        assert!(accept_excludes_file(&ok, &forbidden, uid.wrapping_add(1)).is_err());
+    }
+
+    /// Resolution reads GLOBAL config only (`~/.gitconfig`,
+    /// `$XDG_CONFIG_HOME/git/config`), from a neutral cwd, and falls back to
+    /// git's documented default `$XDG_CONFIG_HOME/git/ignore` or
+    /// `~/.config/git/ignore`.
+    #[test]
+    fn user_excludes_candidate_follows_global_config_and_git_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let runner = GitRunner::default();
+        // Unset → defaults.
+        let env = ExcludesEnv {
+            home: Some(home.clone()),
+            xdg_config_home: None,
+        };
+        assert_eq!(
+            user_excludes_candidate(&runner, &env).unwrap(),
+            Some(home.join(".config/git/ignore"))
+        );
+        let xdg = home.join("xdg");
+        std::fs::create_dir_all(xdg.join("git")).unwrap();
+        let env_xdg = ExcludesEnv {
+            home: Some(home.clone()),
+            xdg_config_home: Some(xdg.clone()),
+        };
+        assert_eq!(
+            user_excludes_candidate(&runner, &env_xdg).unwrap(),
+            Some(xdg.join("git/ignore"))
+        );
+        // Configured in ~/.gitconfig, with `~` expanded by `--path`.
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[core]\n\texcludesFile = ~/my-ignore\n",
+        )
+        .unwrap();
+        assert_eq!(
+            user_excludes_candidate(&runner, &env).unwrap(),
+            Some(home.join("my-ignore"))
+        );
+        // No home at all → no candidate.
+        assert_eq!(
+            user_excludes_candidate(&runner, &ExcludesEnv::default()).unwrap(),
+            None
+        );
     }
 }

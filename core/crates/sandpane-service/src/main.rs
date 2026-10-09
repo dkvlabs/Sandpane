@@ -17,7 +17,7 @@ fn main() {
     use sandpane_core::sbx::SbxLocator;
     use sandpane_core::Database;
     use sandpane_service::runtime::{self, ConnectionLimits, PathEnv, StartupError};
-    use sandpane_service::{serve_listener, ServerInner};
+    use sandpane_service::{serve_listener, CoreConfig, ServerInner};
 
     let env = PathEnv::from_process();
     let data_dir = runtime::data_dir_for(&env);
@@ -74,7 +74,34 @@ fn main() {
         ),
         Err(e) => eprintln!("sandpane-service: {e}"),
     }
-    let inner = ServerInner::new(db, locator);
+    // Task worktrees live in Core's OWN private data directory (created 0700
+    // on first allocation), never inside a user's repository.
+    // The USER's own global excludes file, resolved from global git config
+    // only (never a repository's config). A missing file ignores nothing, so
+    // it is simply not passed; a git failure is reported and falls back.
+    let user_excludes_file = match sandpane_core::git::user_excludes_candidate(
+        &sandpane_core::git::GitRunner::default(),
+        &sandpane_core::git::ExcludesEnv {
+            home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from),
+        },
+    ) {
+        Ok(Some(p)) if std::fs::symlink_metadata(&p).is_ok() => Some(p),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("sandpane-service: cannot resolve global excludes file ({e}); using none");
+            None
+        }
+    };
+    let inner = ServerInner::with_config(
+        db,
+        locator,
+        CoreConfig {
+            worktrees_root: Some(data_dir.join("worktrees")),
+            user_excludes_file,
+            ..CoreConfig::default()
+        },
+    );
     eprintln!(
         "sandpane-service: listening on {} (protocol v{}, core v{}, db {})",
         socket_path.display(),

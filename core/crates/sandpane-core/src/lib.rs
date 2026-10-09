@@ -12,6 +12,7 @@ pub mod sbx;
 pub mod scheduler;
 pub mod task;
 pub mod validation;
+pub mod workspace;
 
 pub use db::{Database, DbError};
 pub use events::EventLog;
