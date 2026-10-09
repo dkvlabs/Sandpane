@@ -14,7 +14,7 @@ This folder is the documentation home for Sandpane — an independent, local-fir
 | [design/](design/README.md) | Desktop visual design reference, design spec, final design agent prompt, HTML mockup and preview screenshots (mockup data only). |
 | [CHANGELOG.md](CHANGELOG.md) | Implementation changelog. Every big implementation step is logged here with details, review link, model, and token usage. |
 | [audit/](audit/README.md) | Auto-review records and the execution plan. One review file per logged implementation. |
-| [plans/](plans/2026-10-09-spec-completion-plan.md) | Plans of record: scope, phase order, blocked items with owners, definition of done. |
+| [plans/](plans/2026-10-09-spec-completion-plan.md) | Plans of record: scope, phase order, blocked items with owners, definition of done. The protocol design of record is [plans/2026-10-09-protocol-v1-additions.md](plans/2026-10-09-protocol-v1-additions.md). |
 | [compatibility.md](compatibility.md) | Verified platform / SBX / agent / IDE compatibility matrix (P0 record). |
 | [licensing-decision.md](licensing-decision.md) | Docker licensing gate decision record (P0 blocker). |
 

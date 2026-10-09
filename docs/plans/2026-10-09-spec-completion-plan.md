@@ -35,6 +35,8 @@ All verified versions are recorded in `docs/compatibility.md`.
 
 ### C — Core features (protocol changes serialized: Core + schemas + drift gate first, then clients)
 
+Protocol additions follow the design of record: [2026-10-09-protocol-v1-additions.md](2026-10-09-protocol-v1-additions.md). It covers additive-only rules, the two-step confirmation token, and landing order A1–A9.
+
 1. Sandbox lifecycle: `sandbox.stop` and `sandbox.remove` (confirmed, `rm --force` behind server confirmation). `start` maps to the documented path or is reported unsupported.
 2. Project/conversation lifecycle: update/archive/delete, repo add/remove, conversation rename/archive/delete/export (redacted), persisted `sandboxId`.
 3. Task Git context: `repo_id`, `base_commit`, `task_branch`, worktree allocation and cleanup.
