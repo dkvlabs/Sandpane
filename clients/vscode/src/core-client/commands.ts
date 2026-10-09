@@ -260,6 +260,13 @@ function guarded<R>(work: () => Promise<R>): Promise<R> {
   }
 }
 
+/**
+ * `sandbox.create` runs `sbx create`, which Core allows up to 300 s; the client
+ * waits a little longer so Core's own timeout verdict arrives first. Every
+ * other method keeps the connection's default deadline.
+ */
+export const SANDBOX_CREATE_TIMEOUT_MS = 330_000;
+
 export class CoreCommands {
   constructor(private readonly connection: CoreConnection) {}
 
@@ -298,7 +305,9 @@ export class CoreCommands {
       if (typeof spec.repoPath === 'string' && spec.repoPath.length > 0) {
         payload['repoPath'] = validateAbsoluteRepoPath(spec.repoPath);
       }
-      return this.connection.request<SandboxSummary>('sandbox.create', payload);
+      return this.connection.request<SandboxSummary>('sandbox.create', payload, {
+        timeoutMs: SANDBOX_CREATE_TIMEOUT_MS,
+      });
     });
   }
 

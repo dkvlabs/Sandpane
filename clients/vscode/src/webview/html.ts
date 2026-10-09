@@ -9,6 +9,8 @@
  * Pure string builder → the invariants are unit-tested in `test/webview.test.ts`.
  */
 
+import { randomBytes } from 'node:crypto';
+
 export interface SidebarHtmlInput {
   /** `webview.cspSource` — the local resource origin. */
   cspSource: string;
@@ -23,12 +25,27 @@ export interface SidebarHtmlInput {
 }
 
 const NONCE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+const NONCE_LENGTH = 32;
+/** Largest multiple of 62 below 256: bytes at/above it are rejected (no modulo bias). */
+const UNBIASED_LIMIT = 248;
 
-/** 32-char nonce from an injectable RNG (tests pass a deterministic one). */
-export function createNonce(rng: () => number = Math.random): string {
+/**
+ * 32-char CSP nonce from a CSPRNG (security review S6: never Math.random).
+ * `bytes` is injectable so tests are deterministic; production uses
+ * `crypto.randomBytes`.
+ */
+export function createNonce(bytes: (size: number) => Uint8Array = randomBytes): string {
   let out = '';
-  for (let i = 0; i < 32; i += 1) {
-    out += NONCE_ALPHABET.charAt(Math.floor(Math.max(0, Math.min(0.9999999, rng())) * 62));
+  // Rejection sampling keeps every character uniformly distributed.
+  for (let guard = 0; out.length < NONCE_LENGTH && guard < 64; guard += 1) {
+    for (const byte of bytes(NONCE_LENGTH * 2)) {
+      if (byte >= UNBIASED_LIMIT) continue;
+      out += NONCE_ALPHABET.charAt(byte % NONCE_ALPHABET.length);
+      if (out.length === NONCE_LENGTH) break;
+    }
+  }
+  if (out.length !== NONCE_LENGTH) {
+    throw new Error('random source produced no usable bytes for the CSP nonce');
   }
   return out;
 }

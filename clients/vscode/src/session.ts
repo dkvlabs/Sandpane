@@ -13,9 +13,15 @@
  */
 
 import * as vscode from 'vscode';
+import { realpath } from 'node:fs/promises';
 import { CoreCommands, verifiedAgents, CoreValidationError } from './core-client/commands';
-import { CoreConnection, CoreRpcError, CoreTransportError } from './core-client/connection';
-import { TaskSubscription } from './core-client/catchup';
+import {
+  CoreConnection,
+  CoreRpcError,
+  CoreTransportError,
+  type CoreTransport,
+} from './core-client/connection';
+import { ProjectEventFeed } from './core-client/catchup';
 import { coreSocketPath } from './core-client/paths';
 import { createSocketTransport } from './core-client/transport';
 import type {
@@ -28,21 +34,25 @@ import type {
 } from './core-client/protocol';
 import { coreAdvertisesMethod } from './core-client/protocol';
 import { EMPTY_STATE, reduceTaskView, selectTasks, type TaskViewState } from './state/reducer';
-import { evaluateHostContext, type HostVerdict } from './vscode/host';
-import { explainFailure, toFailure, type GuidanceAction } from './vscode/diagnostics';
 import {
-  isKnownWorkspaceMode,
-  sandboxWorkspaceModeView,
-  unknownWorkspaceModeView,
-  workspaceModeView,
-} from './vscode/workspaces';
+  authorizeSend,
+  conversationInScope,
+  matchWorkspaceFolder,
+  selectedWorkspaceMode,
+  sendGate,
+  shouldPollEvents,
+  transcriptView,
+} from './state/sessionPolicy';
+import { evaluateHostContext, type HostVerdict } from './vscode/host';
+import { explainFailure, remediationFrom, toFailure, type GuidanceAction } from './vscode/diagnostics';
+import { workspaceModeView } from './vscode/workspaces';
 import {
   DEFAULT_CONTEXT_POLICY,
   planContextAttachments,
   type ContextPlan,
 } from './vscode/context';
 import { collectEditorSnapshot } from './vscode/editor';
-import { buildChangeSetPlans } from './vscode/diff';
+import { buildChangeSetPlans, capReviewPlans, materializeUri, type UriFactory } from './vscode/diff';
 import {
   emptySidebarState,
   type ConnectionTone,
@@ -57,18 +67,47 @@ const UI_KEYS = {
   conversation: 'sandpane.ui.conversation',
 } as const;
 
+/** `task.subscribe` re-pull interval while a task is non-terminal (Core never pushes). */
+export const EVENT_POLL_INTERVAL_MS = 2_000;
+
+/** Fallback (task-by-task) mode follows at most this many tasks. */
+const MAX_FOLLOWED_TASKS = 64;
+
+/** UI preference for the selected conversation, incl. the sandbox it was made in. */
+interface ConversationPreference {
+  id: string;
+  projectId: string;
+  title: string;
+  agentId: string;
+  /** Absent in preferences written before review bug 8 — read as null. */
+  sandboxName?: string | null;
+}
+
 export type SessionListener = (state: SidebarState) => void;
+
+/** Injection seams for tests; production uses the real socket and timers. */
+export interface SessionDeps {
+  transportFactory?: (socketPath: string) => CoreTransport;
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
+  requestTimeoutMs?: number;
+}
+
+const VSCODE_URI: UriFactory<vscode.Uri> = { file: (fsPath: string) => vscode.Uri.file(fsPath) };
 
 export class SandpaneSession {
   readonly connection: CoreConnection;
   readonly commands: CoreCommands;
 
   private view: TaskViewState = EMPTY_STATE;
-  private subscription: TaskSubscription | null = null;
+  private feed: ProjectEventFeed | null = null;
+  private feedStarted = false;
   private capabilities: CoreCapabilities | null = null;
   private projects: Project[] = [];
   private sandboxes: SandboxSummary[] = [];
   private conversation: Conversation | null = null;
+  /** Sandbox selected when `conversation` was created (Core's record has no sandbox field). */
+  private conversationSandbox: string | null = null;
   /**
    * `conversation.list` hydration — Core's own enumeration, cached only for this
    * session's display. Not a database: it is re-read on every refresh, and an
@@ -77,44 +116,69 @@ export class SandpaneSession {
   private conversations: Conversation[] = [];
   private selectedProjectId: string | null = null;
   private selectedSandbox: string | null = null;
-  private workspaceMode: string | null = null;
   private contextPlan: ContextPlan | null = null;
+  /** Id of `contextPlan`; a send must quote it back (review bug 6). */
+  private contextPlanId = 0;
+  private acceptedSends = 0;
+  /** True while a send is in flight; a second send is refused (review W3). */
+  private sending = false;
   private status: { tone: 'ok' | 'error' | 'info'; text: string } | null = null;
   private readonly listeners = new Set<SessionListener>();
-  private attached = false;
+  private loading: Promise<void> | null = null;
+  private lastSocketPath: string;
 
-  constructor(private readonly context: vscode.ExtensionContext) {
-    const config = vscode.workspace.getConfiguration('sandpane');
-    const socketPath = coreSocketPath(
-      { env: process.env, platform: process.platform, homedir: process.env['HOME'] ?? '' },
-      config.get<string>('coreSocketPath', ''),
-    );
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly deps: SessionDeps = {},
+  ) {
+    this.lastSocketPath = this.resolveSocketPath();
     this.selectedProjectId = context.workspaceState.get<string>(UI_KEYS.selectedProject) ?? null;
     this.selectedSandbox = context.workspaceState.get<string>(UI_KEYS.selectedSandbox) ?? null;
-    const storedConversation = context.workspaceState.get<{
-      id: string;
-      projectId: string;
-      title: string;
-      agentId: string;
-    }>(UI_KEYS.conversation);
+    const storedConversation = context.workspaceState.get<ConversationPreference>(UI_KEYS.conversation);
     if (storedConversation) {
-      // A restored selection is a UI preference; the conversation itself is
-      // re-read from Core on the next send (createdAt is not carried locally).
-      this.conversation = { ...storedConversation, createdAt: '' };
+      // A restored selection is a UI preference; it is re-pointed at Core's
+      // record (or dropped) by the next conversation.list hydration.
+      const { sandboxName, ...conversation } = storedConversation;
+      this.conversation = { ...conversation, createdAt: '' };
+      this.conversationSandbox = sandboxName ?? null;
     }
 
     this.connection = new CoreConnection({
-      transportFactory: () => createSocketTransport({ path: socketPath, connectTimeoutMs: 3_000 }),
+      // The socket path is resolved per attempt, so the path shown to the user
+      // (`socketPath`) is always the one actually dialled (review 12g).
+      transportFactory: () => {
+        this.lastSocketPath = this.resolveSocketPath();
+        return this.deps.transportFactory
+          ? this.deps.transportFactory(this.lastSocketPath)
+          : createSocketTransport({ path: this.lastSocketPath, connectTimeoutMs: 3_000 });
+      },
+      ...(deps.setTimer ? { setTimer: deps.setTimer } : {}),
+      ...(deps.clearTimer ? { clearTimer: deps.clearTimer } : {}),
+      ...(deps.requestTimeoutMs ? { requestTimeoutMs: deps.requestTimeoutMs } : {}),
       onStateChange: () => this.emit(),
       onDecodeError: (error) => this.log(`frame decode ${error.reason}: ${error.message}`),
       onNotification: (frame) =>
         // Forward-compat only: this Core build never pushes frames.
         this.log(`unexpected pushed frame "${frame.method}" — ignored (no such Core capability)`),
-      onReconnect: async () => {
-        await this.catchUpNow();
-      },
+      // EVERY successful (re)connect — including a background reconnect after a
+      // failed first attach — loads Core state. Previously a late reconnect left
+      // the sidebar "online" with no data (review bug 9).
+      onReconnect: () => this.load(),
     });
     this.commands = new CoreCommands(this.connection);
+  }
+
+  /** The Core socket path of the latest connection attempt (what is actually dialled). */
+  get socketPath(): string {
+    return this.lastSocketPath;
+  }
+
+  private resolveSocketPath(): string {
+    const config = vscode.workspace.getConfiguration('sandpane');
+    return coreSocketPath(
+      { env: process.env, platform: process.platform, homedir: process.env['HOME'] ?? '' },
+      config.get<string>('coreSocketPath', ''),
+    );
   }
 
   get host(): HostVerdict {
@@ -135,7 +199,11 @@ export class SandpaneSession {
   // Lifecycle
   // -----------------------------------------------------------------------
 
-  /** Probe + first replay. Never auto-starts a service (ADR 1 undecided). */
+  /**
+   * Connect to Core. Loading happens in the connection's `onReconnect` hook, so
+   * the first attach, a manual refresh and a background reconnect all take the
+   * same single path. Never auto-starts a service (ADR 1 undecided).
+   */
   async attach(): Promise<void> {
     if (!this.host.supported) {
       this.setStatus('error', this.host.label);
@@ -147,11 +215,7 @@ export class SandpaneSession {
       await this.connection.connect();
     } catch (error) {
       this.reportError(error, 'attach');
-      await this.catchUpNow().catch(() => undefined);
-      return;
     }
-    this.attached = true;
-    await this.refresh();
   }
 
   /**
@@ -159,9 +223,7 @@ export class SandpaneSession {
    * pulling events and close our socket, nothing more.
    */
   detach(): void {
-    this.subscription?.stop();
-    this.subscription = null;
-    this.attached = false;
+    this.stopFeed();
     this.connection.dispose();
   }
 
@@ -195,13 +257,30 @@ export class SandpaneSession {
   // Core operations (each is a typed RPC)
   // -----------------------------------------------------------------------
 
+  /** Reload from Core; (re)connects first when not online (the hook then loads). */
   async refresh(): Promise<void> {
     if (!this.host.supported) {
       void vscode.window.showWarningMessage(this.host.explanation);
       return;
     }
-    if (!this.attached) await this.attach();
-    if (!this.attached) return;
+    if (this.connection.connectionState !== 'online') {
+      await this.attach();
+      return;
+    }
+    await this.load();
+  }
+
+  /** Single-flight load: concurrent triggers (ready + attach + timer) share one. */
+  private load(): Promise<void> {
+    if (this.loading) return this.loading;
+    const run = this.loadOnce().finally(() => {
+      if (this.loading === run) this.loading = null;
+    });
+    this.loading = run;
+    return run;
+  }
+
+  private async loadOnce(): Promise<void> {
     try {
       this.capabilities = await this.commands.systemProbe();
     } catch (error) {
@@ -213,7 +292,7 @@ export class SandpaneSession {
     if (projects.status === 'fulfilled') {
       this.projects = projects.value;
       if (!this.selectedProjectId && this.projects.length === 1) {
-        this.selectedProjectId = this.projects[0]?.id ?? null;
+        this.setProject(this.projects[0]?.id ?? null);
       }
     } else {
       this.log(`project.list failed: ${describe(projects.reason)}`);
@@ -222,7 +301,7 @@ export class SandpaneSession {
     if (sandboxes.status === 'fulfilled') {
       this.sandboxes = sandboxes.value;
       if (!this.selectedSandbox && this.sandboxes.length === 1) {
-        this.selectedSandbox = this.sandboxes[0]?.name ?? null;
+        this.selectSandbox(this.sandboxes[0]?.name ?? '', { reload: false });
       }
       this.setStatus('ok', `${this.sandboxes.length} sandbox(es) from Core`);
     } else {
@@ -230,29 +309,49 @@ export class SandpaneSession {
       this.sandboxes = [];
       this.reportError(sandboxes.reason, 'sandbox.list');
     }
+    await this.reloadScope();
+  }
+
+  /** Re-read the selected project's tasks/conversations and catch up its events. */
+  private async reloadScope(): Promise<void> {
     await this.hydrateFromCore();
     await this.catchUpNow();
     this.emit();
   }
 
   /**
-   * Pull the read-only enumerations Core advertises: `task.list` and
-   * `conversation.list`.
-   *
-   * Both are ADDITIVE protocol-v1 methods, so they are FEATURE-DETECTED from
-   * `system.probe`'s `methods` array rather than assumed — a pre-revision Core
-   * answers `VALIDATION_FAILED` for an unknown method, and a client that
-   * assumed it would report a false failure on every refresh.
-   *
-   * Hydration is display-only: `task.list` rows carry Core's stored status and go
-   * straight into the reducer. Nothing here derives, advances or repairs a
-   * lifecycle state (AGENTS.md rule 3).
-   *
-   * Scoping is deliberate: with no project selected nothing is pulled at all. An
-   * unscoped read would be Core-legal, but it would paint other projects' tasks
-   * and chats into a per-project sidebar, which is a display bug the client is
-   * responsible for, not a Core verdict.
+   * The ONE place the selected project changes (review bug 3): the old event
+   * feed is stopped, the task display is reset (no other project's tasks stay
+   * painted), a conversation from another scope is dropped (bug 8), and the
+   * preference is persisted. Callers then `reloadScope()`.
    */
+  private setProject(projectId: string | null): boolean {
+    if (projectId === this.selectedProjectId) return false;
+    this.selectedProjectId = projectId;
+    void this.context.workspaceState.update(UI_KEYS.selectedProject, projectId ?? undefined);
+    this.stopFeed();
+    this.view = EMPTY_STATE;
+    this.conversations = [];
+    this.dropConversationOutOfScope();
+    return true;
+  }
+
+  private dropConversationOutOfScope(): void {
+    if (!this.conversation) return;
+    const inScope = conversationInScope(
+      { projectId: this.conversation.projectId, sandboxName: this.conversationSandbox },
+      { projectId: this.selectedProjectId, sandbox: this.selectedSandbox },
+    );
+    if (inScope) return;
+    this.log(
+      `conversation ${this.conversation.id.slice(0, 8)} belongs to another project/sandbox — ` +
+        'the next send starts a new conversation in the current scope',
+    );
+    this.conversation = null;
+    this.conversationSandbox = null;
+    void this.context.workspaceState.update(UI_KEYS.conversation, undefined);
+  }
+
   private async hydrateFromCore(): Promise<void> {
     const caps = this.capabilities;
     const projectId = this.selectedProjectId;
@@ -261,8 +360,12 @@ export class SandpaneSession {
     if (coreAdvertisesMethod(caps, 'task.list')) {
       try {
         const tasks = await this.commands.taskList({ projectId });
+        // The user may have switched project while this was in flight: a
+        // late answer for the old project must never paint the new one (W1).
+        if (this.selectedProjectId !== projectId) return;
         this.view = reduceTaskView(this.view, { kind: 'taskList', tasks });
       } catch (error) {
+        if (this.selectedProjectId !== projectId) return;
         this.log(`task.list failed: ${describe(error)}`);
       }
     } else {
@@ -270,18 +373,27 @@ export class SandpaneSession {
     }
 
     if (coreAdvertisesMethod(caps, 'conversation.list')) {
+      let listed = false;
+      let conversations: Conversation[] = [];
       try {
-        this.conversations = await this.commands.conversationList({ projectId });
+        conversations = await this.commands.conversationList({ projectId });
+        listed = true;
       } catch (error) {
-        this.conversations = [];
         this.log(`conversation.list failed: ${describe(error)}`);
       }
+      if (this.selectedProjectId !== projectId) return; // stale answer (W1)
+      this.conversations = conversations;
       // Re-point a restored UI preference at Core's live record when the id still
       // exists; otherwise drop it rather than rendering a conversation Core does
-      // not have.
+      // not have. The stored preference is cleared only on Core's verdict (a
+      // successful list without it), not on a transient failure.
       if (this.conversation) {
         const live = this.conversations.find((c) => c.id === this.conversation?.id);
         this.conversation = live ?? null;
+        if (!live && listed) {
+          this.conversationSandbox = null;
+          void this.context.workspaceState.update(UI_KEYS.conversation, undefined);
+        }
       }
     } else {
       this.conversations = [];
@@ -295,10 +407,9 @@ export class SandpaneSession {
     try {
       const project = await this.commands.projectCreate({ name, repositories });
       this.projects = [...this.projects, project];
-      this.selectedProjectId = project.id;
-      await this.context.workspaceState.update(UI_KEYS.selectedProject, project.id);
+      this.setProject(project.id);
       this.setStatus('ok', `Project "${project.name}" created in Core`);
-      this.emit();
+      await this.reloadScope();
       return project;
     } catch (error) {
       this.reportError(error, 'project.create');
@@ -320,11 +431,14 @@ export class SandpaneSession {
         ...(input.repoPath ? { repoPath: input.repoPath } : {}),
       });
       this.sandboxes = [...this.sandboxes.filter((s) => s.name !== summary.name), summary];
-      this.selectedSandbox = summary.name;
-      this.workspaceMode = input.workspaceMode;
-      await this.context.workspaceState.update(UI_KEYS.selectedSandbox, summary.name);
+      // The header/gate read the mode from Core's returned summary; if Core
+      // returned none, it shows UNVERIFIED rather than the requested mode.
+      this.selectSandbox(summary.name);
       const view = workspaceModeView(input.workspaceMode);
-      this.setStatus('ok', `Sandbox "${summary.name}" created — ${view.label}${view.hostWritable ? ` (${view.badge})` : ''}`);
+      this.setStatus(
+        'ok',
+        `Sandbox "${summary.name}" created — requested ${view.label}${view.hostWritable ? ` (${view.badge})` : ''}`,
+      );
       this.emit();
       return summary;
     } catch (error) {
@@ -334,10 +448,18 @@ export class SandpaneSession {
   }
 
   /**
-   * Composer send. Attachment authorization is mandatory: a send without the
-   * explicit list the user saw is refused (specs/03 §4).
+   * Composer send. The request must quote the CURRENT attachment plan id for
+   * this exact intent (specs/03 §4, review bug 6) — this rejects stale and
+   * wrong-intent plans; it is not proof against script inside the webview
+   * (see `authorizeSend`). `origin` only controls whether the sidebar draft is
+   * cleared after Core accepts.
    */
-  async send(text: string, writable: boolean, authorizedContext: boolean): Promise<void> {
+  async send(
+    text: string,
+    writable: boolean,
+    planId: number | null,
+    origin: 'sidebar' | 'command' = 'sidebar',
+  ): Promise<void> {
     if (!this.host.supported) {
       void vscode.window.showWarningMessage(this.host.explanation);
       return;
@@ -347,29 +469,61 @@ export class SandpaneSession {
       this.emit();
       return;
     }
-    if (!authorizedContext) {
-      this.setStatus(
-        'error',
-        'Refused: review the attachment list ("Show attachments") and confirm before sending.',
-      );
+    // One send at a time: a double click, Ctrl+Enter repeat or a palette send
+    // during a sidebar send must not create a second conversation or task.
+    if (this.sending) {
+      this.setStatus('info', 'A send is already in progress; wait for Core to answer.');
       this.emit();
       return;
     }
-    const gate = this.adapterGate(writable);
+    this.sending = true;
+    this.emit();
+    try {
+      await this.sendGuarded(text, writable, planId, origin);
+    } finally {
+      this.sending = false;
+      this.emit();
+    }
+  }
+
+  private async sendGuarded(
+    text: string,
+    writable: boolean,
+    planId: number | null,
+    origin: 'sidebar' | 'command',
+  ): Promise<void> {
+    const authorization = authorizeSend(
+      this.contextPlan ? { id: this.contextPlanId, mode: this.contextPlan.mode } : null,
+      { writable, planId },
+    );
+    if (!authorization.ok) {
+      this.setStatus('error', `Not sent: ${authorization.reason}`);
+      this.emit();
+      return;
+    }
+    const plan = this.contextPlan;
+    const sentPlanId = this.contextPlanId;
+    const scopeProjectId = this.selectedProjectId;
+    const gate = sendGate(
+      this.capabilities?.agents ?? [],
+      writable,
+      selectedWorkspaceMode(this.sandboxes, this.selectedSandbox),
+    );
     if (!gate.allowed) {
       const confirmed = await vscode.window.showWarningMessage(
-        `${gate.reason}\n\nCore will accept this and the task stays queued — nothing runs. Send anyway?`,
+        `${gate.reason}\n\nCore will accept this and the task stays queued unless a verified adapter runs it. Send anyway?`,
         { modal: true, detail: 'Sending creates a real task record in Core. It is not a simulation.' },
         'Send anyway',
       );
       if (confirmed !== 'Send anyway') {
-        this.setStatus('info', 'Not sent: no verified agent adapter in this Core build.');
+        this.setStatus('info', 'Not sent.');
         this.emit();
         return;
       }
     }
     try {
-      if (!this.attached) await this.attach();
+      if (this.connection.connectionState !== 'online') await this.attach();
+      this.dropConversationOutOfScope();
       if (!this.conversation) {
         const projectId = this.selectedProjectId;
         const agentId = this.pickAgentId();
@@ -388,23 +542,32 @@ export class SandpaneSession {
           ...(this.selectedSandbox ? { sandboxId: this.selectedSandbox } : {}),
           title: text.slice(0, 80),
         });
-        await this.context.workspaceState.update(UI_KEYS.conversation, {
+        this.conversationSandbox = this.selectedSandbox;
+        const preference: ConversationPreference = {
           id: this.conversation.id,
           projectId: this.conversation.projectId,
           title: this.conversation.title,
           agentId: this.conversation.agentId,
-        });
+          sandboxName: this.conversationSandbox,
+        };
+        await this.context.workspaceState.update(UI_KEYS.conversation, preference);
       }
       const summary = await this.commands.conversationSend({
         conversationId: this.conversation.id,
         content: text,
-        attachments: this.contextPlan?.refs ?? [],
+        attachments: plan?.refs ?? [],
       });
-      this.view = reduceTaskView(this.view, { kind: 'taskSummary', summary });
+      // Only paint the accepted task if the user is still on that project.
+      if (this.selectedProjectId === scopeProjectId) {
+        this.view = reduceTaskView(this.view, { kind: 'taskSummary', summary });
+      }
       // No local echo: Core appends `message.user` durably itself, and the
       // catch-up below brings it back. Inventing the line here would paint a
       // transcript the durable log does not contain (AGENTS.md rule 3).
-      this.contextPlan = null;
+      // Discard the plan only if it is still the one that was sent: a list the
+      // user reviewed while this send was in flight stays (review S4).
+      if (this.contextPlanId === sentPlanId) this.contextPlan = null;
+      if (origin === 'sidebar') this.acceptedSends += 1;
       this.setStatus('ok', `Core accepted task ${summary.id.slice(0, 8)} (status: ${summary.status})`);
       await this.catchUpNow();
       this.emit();
@@ -442,22 +605,29 @@ export class SandpaneSession {
         return undefined;
       }
       const { reviewed, refused } = buildChangeSetPlans(repoRoot, changeSet);
+      // Bounded: one Review never opens hundreds of editors (security S5).
+      const { open, notOpened } = capReviewPlans(reviewed);
       let opened = 0;
-      for (const item of reviewed) {
+      for (const item of open) {
         if (!item.plan.ok) continue;
+        // Real Uri objects (Uri.file + .with for the git revision) — never
+        // pre-encoded strings, which mangle '#'/'?' in paths (review bug 1).
         if (item.plan.kind === 'diff') {
-          await vscode.commands.executeCommand(item.plan.plan.command, ...item.plan.plan.args);
-          opened += 1;
-        } else {
+          const [left, right, title] = item.plan.plan.args;
           await vscode.commands.executeCommand(
             item.plan.plan.command,
-            vscode.Uri.parse(item.plan.plan.args[0]),
+            materializeUri(left, VSCODE_URI),
+            materializeUri(right, VSCODE_URI),
+            title,
           );
-          opened += 1;
+        } else {
+          await vscode.commands.executeCommand(item.plan.plan.command, materializeUri(item.plan.plan.args[0], VSCODE_URI));
         }
+        opened += 1;
       }
       const notes = [
         `${changeSet.changes.length} change(s) from Core, ${opened} opened`,
+        notOpened > 0 ? `${notOpened} more not opened (limit per review) — run Review again after closing editors` : null,
         changeSet.hostDirty ? 'HOST DIRTY — apply is blocked until your own edits are resolved' : null,
         refused.length > 0 ? `${refused.length} not shown: ${refused.map((r) => `${r.path} (${r.reason})`).join('; ')}` : null,
       ].filter((s): s is string => s !== null);
@@ -534,8 +704,20 @@ export class SandpaneSession {
       ? planContextAttachments([snapshot], policy, writable ? 'writable' : 'read_only')
       : planContextAttachments([], policy, writable ? 'writable' : 'read_only');
     this.contextPlan = plan;
-    const view: ContextPlanView = {
+    this.contextPlanId += 1;
+    const view = this.planView();
+    this.emit();
+    if (!view) throw new Error('internal: context plan missing right after it was built');
+    return view;
+  }
+
+  private planView(): ContextPlanView | null {
+    const plan = this.contextPlan;
+    if (!plan) return null;
+    return {
+      planId: this.contextPlanId,
       summary: plan.summary,
+      disclosure: plan.disclosure,
       mode: plan.mode,
       attachments: plan.attachments.map((a) => ({
         kind: a.kind,
@@ -546,16 +728,27 @@ export class SandpaneSession {
       })),
       excluded: plan.excluded.map((e) => ({ label: e.label, reason: e.reason })),
     };
-    this.emit();
-    return view;
   }
 
-  selectSandbox(name: string): void {
+  /**
+   * Select a sandbox. Its workspace mode is read from Core's summary wherever it
+   * is needed (bug 4); a bound project re-scopes the sidebar (bug 3); a
+   * conversation from another project/sandbox is dropped (bug 8).
+   */
+  selectSandbox(name: string, options: { reload?: boolean } = {}): void {
+    // Only a sandbox Core listed can be selected (review S3); '' clears.
+    if (name.length > 0 && !this.sandboxes.some((s) => s.name === name)) {
+      this.setStatus('error', `Sandbox "${name}" is not listed by Core; selection unchanged.`);
+      this.emit();
+      return;
+    }
     this.selectedSandbox = name.length > 0 ? name : null;
+    void this.context.workspaceState.update(UI_KEYS.selectedSandbox, this.selectedSandbox ?? undefined);
     const bound = this.sandboxes.find((s) => s.name === name);
-    if (bound?.boundProjectId) this.selectedProjectId = bound.boundProjectId;
-    void this.context.workspaceState.update(UI_KEYS.selectedSandbox, this.selectedSandbox);
+    const projectChanged = bound?.boundProjectId ? this.setProject(bound.boundProjectId) : false;
+    this.dropConversationOutOfScope();
     this.emit();
+    if (projectChanged && options.reload !== false) void this.reloadScope();
   }
 
   handleWebviewMessage(message: WebviewToExtension): void {
@@ -570,10 +763,10 @@ export class SandpaneSession {
         this.selectSandbox(message.name);
         break;
       case 'previewContext':
-        this.previewContext(false);
+        this.previewContext(message.writable);
         break;
       case 'send':
-        void this.send(message.text, message.writable, message.authorizedContext);
+        void this.send(message.text, message.writable, message.planId, 'sidebar');
         break;
       case 'cancelTask':
         void this.cancelTask(message.taskId);
@@ -597,39 +790,48 @@ export class SandpaneSession {
     const project = this.projects.find((p) => p.id === this.selectedProjectId) ?? null;
     const agent = this.pickAgentId();
     const sandbox = this.sandboxes.find((s) => s.name === this.selectedSandbox) ?? null;
+    const mode = selectedWorkspaceMode(this.sandboxes, this.selectedSandbox);
     const tasks = selectTasks(this.view);
-    const lines = tasks
-      .flatMap((task) => task.lines.map((line) => ({ task, line })))
-      .map(({ line }) => ({
-        role: line.role,
-        text: line.text,
-        ...(line.unsupported ? { unsupported: true } : {}),
-        ...(line.errorCode ? { errorCode: line.errorCode } : {}),
-      }));
+    const transcript = transcriptView(
+      tasks,
+      this.conversation ? { id: this.conversation.id, title: this.conversation.title } : null,
+    );
+    const scopedTasks =
+      transcript.scope === 'conversation'
+        ? tasks.filter((t) => t.conversationId === this.conversation?.id)
+        : tasks;
     return {
       connection: this.tone(),
       header: {
         project: project?.name ?? (this.projects.length > 0 ? `${this.projects.length} project(s), none selected` : null),
         agent,
-        sandbox: sandbox?.name ?? null,
-        workspaceMode: this.workspaceMode,
-        branch: tasks[tasks.length - 1]?.taskBranch ?? null,
+        sandbox: sandbox?.name ?? this.selectedSandbox,
+        workspaceMode: mode.raw,
+        workspaceModeBadge: this.selectedSandbox === null ? null : mode.badge,
+        workspaceHostWritable: this.selectedSandbox === null ? false : mode.hostWritable,
+        branch: scopedTasks[scopedTasks.length - 1]?.taskBranch ?? null,
       },
       sandboxes: this.sandboxes.map((s) => {
-        const mode = sandboxWorkspaceModeView(s);
+        const view = selectedWorkspaceMode([s], s.name);
         return {
           name: s.name,
           probedState: s.probedState ?? null,
           workspaceMode: s.workspaceMode ?? null,
-          modeBadge: mode.badge,
-          modeHostWritable: mode.hostWritable,
+          modeBadge: view.badge,
+          modeHostWritable: view.hostWritable,
         };
       }),
       selectedSandbox: this.selectedSandbox,
       conversation: this.conversation
         ? { id: this.conversation.id, title: this.conversation.title, agentId: this.conversation.agentId }
         : null,
-      lines,
+      lines: transcript.lines.map((line) => ({
+        role: line.role,
+        text: line.text,
+        ...(line.unsupported ? { unsupported: true } : {}),
+        ...(line.errorCode ? { errorCode: line.errorCode } : {}),
+      })),
+      transcript: { scope: transcript.scope, label: transcript.label },
       tasks: tasks.map((task) => ({
         taskId: task.taskId,
         status: task.status,
@@ -638,6 +840,8 @@ export class SandpaneSession {
         baseCommit: task.baseCommit ?? null,
         unknownKinds: task.unknownKinds,
       })),
+      acceptedSends: this.acceptedSends,
+      sending: this.sending,
       status: this.status,
       capabilities: this.capabilities
         ? {
@@ -654,20 +858,7 @@ export class SandpaneSession {
             })),
           }
         : null,
-      contextPlan: this.contextPlan
-        ? {
-            summary: this.contextPlan.summary,
-            mode: this.contextPlan.mode,
-            attachments: this.contextPlan.attachments.map((a) => ({
-              kind: a.kind,
-              label: a.label,
-              target: a.target,
-              excerpt: a.excerpt,
-              truncated: a.excerptTruncated,
-            })),
-            excluded: this.contextPlan.excluded.map((e) => ({ label: e.label, reason: e.reason })),
-          }
-        : null,
+      contextPlan: this.planView(),
       notices: this.notices(base),
     };
   }
@@ -687,6 +878,12 @@ export class SandpaneSession {
         );
       }
     }
+    if (this.projects.length > 1 && this.selectedProjectId === null) {
+      notices.push(
+        'No project selected: tasks are shown per project. Select a sandbox bound to a project, or ' +
+          'create a project, to load its tasks.',
+      );
+    }
     if (process.platform === 'win32') {
       notices.push('Windows transport (named pipe) is a P1 deliverable; Core binds a Unix socket here.');
     }
@@ -701,35 +898,104 @@ export class SandpaneSession {
     return 'offline';
   }
 
+  /**
+   * Catch up the selected project's durable events. The feed is scoped to the
+   * CURRENT project and rebuilt when it changes (review bug 3); with no project
+   * selected nothing is pulled, matching `hydrateFromCore`. After the first
+   * replay the feed keeps re-pulling while a task is non-terminal and the
+   * connection is online (review bug 10 / backlog 6).
+   */
   private async catchUpNow(): Promise<void> {
     if (!this.host.supported) return;
-    if (!this.subscription) {
-      this.subscription = new TaskSubscription(this.commands, {
-        projectId: this.selectedProjectId ?? undefined,
+    const projectId = this.selectedProjectId;
+    if (!projectId) {
+      this.stopFeed();
+      return;
+    }
+    if (this.feed && this.feed.projectId !== projectId) this.stopFeed();
+    if (!this.feed) {
+      // Every callback checks it still belongs to the CURRENT feed: a stopped
+      // feed's late page must never reach another project's view (W1).
+      let created: ProjectEventFeed | null = null;
+      const isCurrent = (): boolean => created !== null && this.feed === created;
+      created = new ProjectEventFeed(this.commands, {
+        projectId,
+        knownTaskIds: () => this.view.order,
+        isTaskActive: (taskId) =>
+          shouldPollEvents(this.connection.connectionState, [this.view.tasks[taskId]?.status ?? null]),
+        pollIntervalMs: EVENT_POLL_INTERVAL_MS,
+        ...(this.deps.setTimer ? { schedule: this.deps.setTimer } : {}),
+        ...(this.deps.clearTimer ? { cancel: this.deps.clearTimer } : {}),
+        shouldPoll: () =>
+          shouldPollEvents(
+            this.connection.connectionState,
+            selectTasks(this.view).map((t) => t.status),
+          ),
+        rankTask: (taskId) => {
+          const task = this.view.tasks[taskId];
+          const stamp = task?.lastTimestamp ? Date.parse(task.lastTimestamp) : Number.NaN;
+          return {
+            active: shouldPollEvents('online', [task?.status ?? null]),
+            lastActivity: Number.isFinite(stamp) ? stamp : Number.NEGATIVE_INFINITY,
+          };
+        },
         onApplied: (events) => {
+          if (!isCurrent()) return;
           this.view = reduceTaskView(this.view, { kind: 'taskEvents', events });
           this.emit();
         },
-        onError: (error) => this.log(`task.subscribe replay failed: ${describe(error)}`),
-        // Core refuses a replay that cannot fit one IPC frame instead of
-        // sending a frame both ends reject. It is recoverable — narrow the
-        // request — and the subscription stops polling so nothing retries in a
-        // loop; surface the guidance rather than hiding it.
-        onReplayRefused: (message) => {
-          this.log(`task.subscribe refused: ${message}`);
+        onError: (error) => {
+          if (isCurrent()) this.log(`task.subscribe replay failed: ${describe(error)}`);
+        },
+        // Core refuses a replay that cannot fit one IPC frame. Re-sending it can
+        // never succeed, so the feed switches to task-scoped pulls instead of
+        // disabling catch-up; say so rather than hiding it.
+        onFallback: (message, omitted) => {
+          if (!isCurrent()) return;
+          this.log(`task.subscribe refused project-wide: ${message}`);
           this.setStatus(
             'info',
-            'Event replay is larger than one Core frame — narrow to one task or a higher cursor.',
+            'Event replay for the whole project is larger than one Core frame — catching up task by task' +
+              (omitted > 0
+                ? ` (${omitted} task(s) not followed: only the ${MAX_FOLLOWED_TASKS} most relevant are pulled — ` +
+                  'unfinished tasks first, then the most recently active).'
+                : '.'),
           );
+          this.emit();
         },
+        onTaskReplayRefused: (taskId, message) => {
+          if (!isCurrent()) return;
+          this.log(`task.subscribe refused for task ${taskId.slice(0, 8)}: ${message}`);
+          this.setStatus(
+            'info',
+            `Task ${taskId.slice(0, 8)}'s event history is larger than one Core frame; its events are not shown.`,
+          );
+          this.emit();
+        },
+        maxFallbackTasks: MAX_FOLLOWED_TASKS,
       });
+      this.feed = created;
+      this.feedStarted = false;
     }
+    const feed = this.feed;
     try {
-      await this.subscription.catchUp();
+      if (!this.feedStarted) {
+        this.feedStarted = true;
+        await feed.start();
+      } else {
+        await feed.catchUp();
+      }
     } catch (error) {
       // Core answered VALIDATION_FAILED / NOT_FOUND etc.: report, never hide.
       this.log(`task.subscribe replay failed: ${describe(error)}`);
     }
+    feed.poke();
+  }
+
+  private stopFeed(): void {
+    this.feed?.stop();
+    this.feed = null;
+    this.feedStarted = false;
   }
 
   private pickAgentId(): string | null {
@@ -738,53 +1004,36 @@ export class SandpaneSession {
     return (verified[0] ?? this.capabilities.agents[0])?.id ?? null;
   }
 
-  private adapterGate(writable: boolean): { allowed: boolean; reason: string } {
-    const agents = this.capabilities?.agents ?? [];
-    if (agents.length === 0) {
-      return {
-        allowed: false,
-        reason: 'Core advertised no agent adapters at all.',
-      };
-    }
-    if (verifiedAgents(agents).length === 0) {
-      return {
-        allowed: false,
-        reason:
-          `No verified adapter: ${agents.map((a) => `${a.id}(verified=${a.verified})`).join(', ')}. ` +
-          'The P0 Codex-in-SBX feasibility gate has not passed, so streaming/cancel/resume are all off.',
-      };
-    }
-    if (writable) {
-      const raw = this.workspaceMode;
-      const mode =
-        raw === null
-          ? null
-          : isKnownWorkspaceMode(raw)
-            ? workspaceModeView(raw)
-            : unknownWorkspaceModeView(String(raw));
-      if (mode?.hostWritable) {
-        return {
-          allowed: false,
-          reason: `Writable task in "${mode.label}" mode — ${mode.badge}. ${mode.explanation}`,
-        };
-      }
-    }
-    return { allowed: true, reason: '' };
-  }
-
   /**
    * Protocol v1 `git.review` returns no repository root (only baseCommit +
    * paths), so the client must propose one. It is confirmed explicitly instead
    * of being assumed — a wrong root would diff unrelated files.
    */
   private async confirmRepoRoot(changeSet: ChangeSet): Promise<string | null> {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder || folder.uri.scheme !== 'file') return null;
-    const candidate = folder.uri.fsPath;
+    const folders = (vscode.workspace.workspaceFolders ?? []).filter((f) => f.uri.scheme === 'file');
+    if (folders.length === 0) return null;
+    // Core stores CANONICAL repository paths (symlinks resolved, git toplevel
+    // only), so folders are realpath'd before the exact comparison.
+    const canonical = await Promise.all(
+      folders.map(async (f) => ({
+        fsPath: f.uri.fsPath,
+        canonical: await realpath(f.uri.fsPath).catch(() => f.uri.fsPath),
+      })),
+    );
+    const project = this.projects.find((p) => p.id === this.selectedProjectId);
+    const matched = matchWorkspaceFolder(canonical, project?.repositories ?? []);
+    const candidate = matched?.fsPath ?? canonical[0]?.fsPath;
+    if (!candidate) return null;
+    const provenance = matched
+      ? `This folder is one of the project's repositories registered in Core (${matched.canonical}).`
+      : project?.repositories && project.repositories.length > 0
+        ? `WARNING: no open folder matches the project's repositories in Core (${project.repositories.join(', ')}).`
+        : 'Core reports no repository for the selected project.';
     const answer = await vscode.window.showInformationMessage(
       `Diff the ${changeSet.changes.length} reported change(s) against the task base ` +
         `${changeSet.baseCommit.slice(0, 8)} using this workspace folder as the repository root?\n\n${candidate}\n\n` +
-        'Gap: protocol v1 does not return the task repository path (P4). Confirm it is the right repo.',
+        `${provenance}\n\n` +
+        'Gap: protocol v1 git.review does not return the task repository path (P4). Confirm it is the right repo.',
       { modal: true },
       'Yes, use this folder',
     );
@@ -815,7 +1064,14 @@ export class SandpaneSession {
       error instanceof CoreRpcError || error instanceof CoreTransportError || error instanceof CoreValidationError
         ? error.message
         : undefined;
-    const text = `${operation} — ${[guidance.headline, guidance.explanation, coreMessage ? `Core said: ${coreMessage}` : null, guidance.honestUncertainty ?? null]
+    // Core's own remediation (`details.hint`, e.g. `sbx login` or
+    // `sbx policy init …`) is shown verbatim as text for the user to run
+    // themselves; Sandpane never executes it.
+    const remedy = remediationFrom(error);
+    const remedyText = remedy
+      ? `Core suggests${remedy.provider ? ` (provider: ${remedy.provider})` : ''}: ${remedy.hint} — run it yourself; Sandpane never runs it.`
+      : null;
+    const text = `${operation} — ${[guidance.headline, guidance.explanation, coreMessage ? `Core said: ${coreMessage}` : null, remedyText, guidance.honestUncertainty ?? null]
       .filter((p): p is string => p !== null)
       .join('\n\n')}`;
     this.log(`${operation} failed (${failure.source}): ${coreMessage ?? describe(error)}`);
@@ -826,11 +1082,13 @@ export class SandpaneSession {
         const action = actions.find((a) => a.label === choice);
         if (action?.command) void vscode.commands.executeCommand(action.command);
       });
-    this.setStatus('error', `${operation}: ${guidance.headline}`);
+    this.setStatus('error', `${operation}: ${guidance.headline}${remedy ? ` — Core suggests: ${remedy.hint}` : ''}`);
     this.emit();
   }
 
   private emit(): void {
+    // Re-arm the event poll if activity resumed (new task, reconnect).
+    this.feed?.poke();
     const state = this.snapshot();
     for (const listener of this.listeners) listener(state);
   }

@@ -93,7 +93,18 @@ export interface ContextPlan {
   mode: 'read_only' | 'writable';
   /** One-line human summary for the confirmation message. */
   summary: string;
+  /** What happens to the attachments on the Core side — always shown with the list. */
+  disclosure: string;
 }
+
+/**
+ * Verified against `sandpane-service` (`conversation_send` never reads
+ * `attachments`): the references go on the wire but Core v1 neither stores nor
+ * resolves them. The UI must not imply the agent sees them (review bug 7).
+ */
+export const ATTACHMENT_DISCLOSURE =
+  'Attachments are listed for your review: Core v1 accepts the references but does not yet store ' +
+  'or forward them to the agent.';
 
 export function isSensitivePath(fsPath: string, extraPatterns: readonly string[] = []): boolean {
   const patterns = [...DEFAULT_SENSITIVE_PATTERNS, ...extraPatterns];
@@ -107,10 +118,19 @@ export function isSensitivePath(fsPath: string, extraPatterns: readonly string[]
   });
 }
 
+/**
+ * A literal `#` in a document URI (possible with `Uri.toString(true)`, which
+ * skips encoding) would be indistinguishable from the `#L…` range separator.
+ * Escape it so every target has at most one `#`, owned by this module (12h).
+ */
+export function escapeTargetUri(uri: string): string {
+  return uri.replace(/#/g, '%23');
+}
+
 export function selectionTarget(uri: string, startLine: number, endLine: number): string {
   const from = Math.max(1, Math.trunc(startLine));
   const to = Math.max(from, Math.trunc(endLine));
-  return `${uri}#L${from}-L${to}`;
+  return `${escapeTargetUri(uri)}#L${from}-L${to}`;
 }
 
 function clip(text: string, max: number): { excerpt: string; truncated: boolean } {
@@ -180,7 +200,7 @@ export function planContextAttachments(
       pushCandidate(
         {
           kind: 'file',
-          target: snapshot.uri,
+          target: escapeTargetUri(snapshot.uri),
           label: baseName(snapshot.fsPath),
           excerpt: clipped.excerpt,
           excerptTruncated: clipped.truncated,
@@ -193,7 +213,7 @@ export function planContextAttachments(
     if (diagnostics.length > 0) {
       if (!policy.includeDiagnostics) {
         excluded.push({
-          target: snapshot.uri,
+          target: escapeTargetUri(snapshot.uri),
           label: `${baseName(snapshot.fsPath)} diagnostics (${diagnostics.length})`,
           reason: 'diagnostics are opt-in and were not authorized for this send',
         });
@@ -202,7 +222,7 @@ export function planContextAttachments(
         pushCandidate(
           {
             kind: 'diagnostics',
-            target: `${snapshot.uri}#diagnostics`,
+            target: `${escapeTargetUri(snapshot.uri)}#diagnostics`,
             label: `${baseName(snapshot.fsPath)} problems (${diagnostics.length})`,
             excerpt: clipped.excerpt,
             excerptTruncated: clipped.truncated,
@@ -215,7 +235,7 @@ export function planContextAttachments(
 
   const refs: ContextRef[] = attachments.map((a) => ({ kind: a.kind, target: a.target }));
   const summary = describePlan(attachments, excluded, mode);
-  return { attachments, excluded, refs, mode, summary };
+  return { attachments, excluded, refs, mode, summary, disclosure: ATTACHMENT_DISCLOSURE };
 }
 
 export function summarizeDiagnostics(diagnostics: readonly DiagnosticSnapshot[]): string {
@@ -235,10 +255,13 @@ function describePlan(
   const kindCount = new Map<ContextRefKind, number>();
   for (const a of attachments) kindCount.set(a.kind, (kindCount.get(a.kind) ?? 0) + 1);
   const listed = [...kindCount.entries()].map(([kind, n]) => `${kind}×${n}`).join(', ') || 'nothing';
+  // Neither phrase may promise more than the wire carries: conversation.send has
+  // no mode field, and isolation depends on the sandbox's workspace mode
+  // (direct_mount is live-writable), so neither is claimed here (bug 7).
   const intent =
     mode === 'writable'
-      ? 'writable task in an isolated workspace (agent may edit files)'
-      : 'read-only discussion (no writable task)';
+      ? "intended as a writable task — the agent may edit files in the selected sandbox's workspace"
+      : 'intended as read-only discussion — Core v1 has no read-only mode and records a task either way';
   const drop = excluded.length > 0 ? `; ${excluded.length} excluded` : '';
   return `Attaching ${listed}${drop} — ${intent}`;
 }

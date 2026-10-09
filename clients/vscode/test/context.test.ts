@@ -4,6 +4,7 @@ import {
   isSensitivePath,
   planContextAttachments,
   selectionTarget,
+  ATTACHMENT_DISCLOSURE,
   summarizeDiagnostics,
   type EditorSnapshot,
 } from '../src/vscode/context';
@@ -162,10 +163,38 @@ describe('explicit attachment list before send', () => {
     ).toBe('error [eslint] line 4: bad\nhint line 7: hmm');
   });
 
-  it('describes what will happen, distinguishing discussion from execution', () => {
+  it('describes the intent honestly, without claiming isolation or a read-only Core mode (bug 7)', () => {
     const readOnly = planContextAttachments([snapshot()], policy, 'read_only');
     expect(readOnly.summary).toContain('read-only discussion');
+    // conversation.send has no mode field: Core v1 records a task either way.
+    expect(readOnly.summary).toMatch(/Core v1 has no read-only mode/);
+    expect(readOnly.summary).not.toMatch(/no writable task/);
     const writable = planContextAttachments([snapshot()], policy, 'writable');
-    expect(writable.summary).toContain('writable task in an isolated workspace');
+    expect(writable.summary).toContain('writable task');
+    // Isolation depends on the sandbox workspace mode (direct_mount is live-writable).
+    expect(writable.summary).not.toMatch(/isolated/);
+  });
+
+  it('discloses that Core v1 does not store or forward attachments (bug 7)', () => {
+    const plan = planContextAttachments([snapshot()], policy, 'read_only');
+    expect(plan.disclosure).toBe(ATTACHMENT_DISCLOSURE);
+    expect(ATTACHMENT_DISCLOSURE).toMatch(/does not yet store/);
+  });
+
+  it('escapes a literal "#" in the document URI so it cannot collide with #L ranges (12h)', () => {
+    expect(selectionTarget('file:///repo/a#b.ts', 2, 4)).toBe('file:///repo/a%23b.ts#L2-L4');
+    const plan = planContextAttachments(
+      [
+        snapshot({
+          uri: 'file:///repo/a#b.ts',
+          fsPath: '/repo/a#b.ts',
+          selection: { text: 'x', startLine: 1, endLine: 1 },
+        }),
+      ],
+      { ...policy, includeDiagnostics: true },
+    );
+    expect(plan.refs.map((r) => r.target)).toEqual(['file:///repo/a%23b.ts#L1-L1', 'file:///repo/a%23b.ts']);
+    // Exactly one '#' per selection target: the range separator.
+    expect(plan.refs[0]?.target.split('#')).toHaveLength(2);
   });
 });

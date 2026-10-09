@@ -337,6 +337,21 @@ function applySummary(state: TaskViewState, summary: TaskSummary): TaskViewState
   return withTask(state, task);
 }
 
+/**
+ * Group a replayed page by task in FIRST-APPEARANCE order (Core's delivery
+ * order) and sort each task's events by sequence. Sorting tasks by UUID made a
+ * newer task render before an older one purely by id (review 12c).
+ */
+function orderBatch(events: readonly TaskEvent[]): TaskEvent[] {
+  const groups = new Map<string, TaskEvent[]>();
+  for (const event of events) {
+    const group = groups.get(event.taskId);
+    if (group) group.push(event);
+    else groups.set(event.taskId, [event]);
+  }
+  return [...groups.values()].flatMap((group) => [...group].sort((a, b) => a.sequence - b.sequence));
+}
+
 export function reduceTaskView(state: TaskViewState, action: TaskViewAction): TaskViewState {
   switch (action.kind) {
     case 'reset':
@@ -345,9 +360,7 @@ export function reduceTaskView(state: TaskViewState, action: TaskViewAction): Ta
       return applyTaskEvent(state, action.event);
     case 'taskEvents': {
       let next = state;
-      for (const event of [...action.events].sort((a, b) =>
-        a.taskId === b.taskId ? a.sequence - b.sequence : a.taskId.localeCompare(b.taskId)
-      )) {
+      for (const event of orderBatch(action.events)) {
         next = applyTaskEvent(next, event);
       }
       return next;

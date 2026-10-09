@@ -130,8 +130,17 @@ describe('NDJSON framing codec', () => {
     expect(decodeLine('{"v":0,"id":"1","ok":1}').ok).toBe(false);
     expect(decodeLine('{"v":1,"ok":1}').ok).toBe(false); // no id
     expect(decodeLine('{"v":1,"id":"1","ok":1,"err":{"code":"INTERNAL","message":"m"}}').ok).toBe(false);
-    expect(decodeLine('{"v":1,"id":"1","err":{"code":"NOPE","message":"m"}}').ok).toBe(false);
-    expect(decodeLine('{"v":1,"id":"1","err":{"code":"INTERNAL"}}').ok).toBe(false);
+    // An err with a correlatable id is always delivered to its request (review
+    // bug 11) — an unknown code becomes INTERNAL with the raw code preserved,
+    // never a silently dropped line that leaves the caller to time out.
+    const unknown = decodeLine('{"v":1,"id":"1","err":{"code":"NOPE","message":"m"}}');
+    expect(unknown.ok && unknown.frame.kind === 'response' && unknown.frame.response.err?.code).toBe('INTERNAL');
+    const noMessage = decodeLine('{"v":1,"id":"1","err":{"code":"INTERNAL"}}');
+    expect(noMessage.ok && noMessage.frame.kind === 'response' && noMessage.frame.response.err?.message).toContain(
+      'no error message',
+    );
+    // Without a string id there is nothing to correlate: still a decode error.
+    expect(decodeLine('{"v":1,"id":7,"err":{"code":"NOPE","message":"m"}}').ok).toBe(false);
   });
 
   it('accepts a valid ok/err response pair exactly as Core writes them', () => {

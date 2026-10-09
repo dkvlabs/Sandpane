@@ -323,3 +323,33 @@ describe('AgentEvent normalization', () => {
     });
   });
 });
+
+describe('batch ordering across tasks (review 12c)', () => {
+  it("keeps Core's delivery order between tasks instead of sorting by UUID", () => {
+    const state = reduceTaskView(EMPTY_STATE, {
+      kind: 'taskEvents',
+      events: [
+        ev('ffff-newer-uuid-but-first', 1, 'task.created', { conversationId: 'c1' }),
+        ev('0000-sorts-first-by-uuid', 1, 'task.created', { conversationId: 'c1' }),
+        ev('ffff-newer-uuid-but-first', 2, 'status.changed', { to: 'queued' }),
+      ],
+    });
+    expect(state.order).toEqual(['ffff-newer-uuid-but-first', '0000-sorts-first-by-uuid']);
+  });
+
+  it('still applies each task in sequence order even when the page is shuffled', () => {
+    const state = reduceTaskView(EMPTY_STATE, {
+      kind: 'taskEvents',
+      events: [
+        ev('b', 3, 'status.changed', { to: 'preparing' }),
+        ev('a', 2, 'status.changed', { to: 'queued' }),
+        ev('b', 2, 'status.changed', { to: 'queued' }),
+        ev('a', 1, 'task.created', { conversationId: 'c1' }),
+      ],
+    });
+    expect(state.order).toEqual(['b', 'a']);
+    expect(selectTask(state, 'b')?.status).toBe('preparing');
+    expect(selectTask(state, 'b')?.statusSequence).toBe(3);
+    expect(selectTask(state, 'a')?.status).toBe('queued');
+  });
+});

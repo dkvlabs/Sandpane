@@ -51,11 +51,18 @@ describe('webview CSP (specs/03 §2, §3)', () => {
     const nonce = createNonce();
     expect(nonce).toHaveLength(32);
     expect(/^[A-Za-z0-9]{32}$/.test(nonce)).toBe(true);
-    expect(createNonce(() => 0)).toBe('A'.repeat(32));
-    // 0.5 lands on alphabet index 31 — lowercase 'f' (A–Z, a–z, 0–9).
-    expect(createNonce(() => 0.5)).toBe('f'.repeat(32));
-    // A hostile rng cannot break out of the alphabet.
-    expect(/^[A-Za-z0-9]{32}$/.test(createNonce(() => 1_000_000))).toBe(true);
+    // Deterministic byte sources: 0 → 'A', 31 → 'f', 61 → '9'.
+    expect(createNonce((n) => new Uint8Array(n).fill(0))).toBe('A'.repeat(32));
+    expect(createNonce((n) => new Uint8Array(n).fill(31))).toBe('f'.repeat(32));
+    expect(createNonce((n) => new Uint8Array(n).fill(61))).toBe('9'.repeat(32));
+    // Bytes >= 248 are rejected (no modulo bias), never mapped.
+    expect(createNonce((n) => Uint8Array.from({ length: n }, (_, i) => (i % 2 === 0 ? 255 : 1)))).toBe(
+      'B'.repeat(32),
+    );
+    // A source that only yields biased bytes fails loudly instead of a weak nonce.
+    expect(() => createNonce((n) => new Uint8Array(n).fill(250))).toThrow(/no usable bytes/);
+    // Two default nonces differ (CSPRNG, not a constant).
+    expect(createNonce()).not.toBe(createNonce());
   });
 
   it('links the stylesheet as a resource, never inline', () => {
@@ -73,9 +80,32 @@ describe('webview message whitelist', () => {
       type: 'selectSandbox',
       name: 'auth-codex',
     });
-    expect(
-      parseWebviewMessage({ type: 'send', text: 'hi', writable: 'yes', authorizedContext: undefined }),
-    ).toEqual({ type: 'send', text: 'hi', writable: false, authorizedContext: false });
+    expect(parseWebviewMessage({ type: 'send', text: 'hi', writable: 'yes', planId: undefined })).toEqual({
+      type: 'send',
+      text: 'hi',
+      writable: false,
+      planId: null,
+    });
+    expect(parseWebviewMessage({ type: 'send', text: 'hi', writable: true, planId: 4 })).toEqual({
+      type: 'send',
+      text: 'hi',
+      writable: true,
+      planId: 4,
+    });
+    // A plan id must be a non-negative integer, or it is no authorization at all.
+    expect(parseWebviewMessage({ type: 'send', text: 'hi', writable: true, planId: 1.5 })).toMatchObject({
+      planId: null,
+    });
+    // The preview carries the intent the user chose (review bug 6).
+    expect(parseWebviewMessage({ type: 'previewContext', writable: true })).toEqual({
+      type: 'previewContext',
+      writable: true,
+    });
+    expect(parseWebviewMessage({ type: 'previewContext' })).toEqual({ type: 'previewContext', writable: false });
+    // The old webview-asserted authorization flag is not part of the contract.
+    expect(parseWebviewMessage({ type: 'send', text: 'hi', authorizedContext: true })).not.toHaveProperty(
+      'authorizedContext',
+    );
     expect(parseWebviewMessage({ type: 'cancelTask', taskId: 't1' })).toEqual({
       type: 'cancelTask',
       taskId: 't1',
@@ -110,6 +140,8 @@ describe('webview message whitelist', () => {
       agent: null,
       sandbox: null,
       workspaceMode: null,
+      workspaceModeBadge: null,
+      workspaceHostWritable: false,
       branch: null,
     });
     expect(state.notices.join(' ')).toMatch(/VS2|P3/);

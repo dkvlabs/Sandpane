@@ -16,7 +16,12 @@ export interface HeaderContext {
   project: string | null;
   agent: string | null;
   sandbox: string | null;
+  /** Core's recorded mode for the SELECTED sandbox; null = none recorded/selected. */
   workspaceMode: WorkspaceMode | string | null;
+  /** Precomputed badge (LIVE-WRITABLE / ISOLATED / UNVERIFIED — …); null = no sandbox. */
+  workspaceModeBadge: string | null;
+  /** True for direct_mount, unknown and unverified modes — rendered loud. */
+  workspaceHostWritable: boolean;
   branch: string | null;
 }
 
@@ -62,7 +67,11 @@ export interface CapabilitySummary {
 
 /** The attachment list the user must see and authorize before a send. */
 export interface ContextPlanView {
+  /** Identifies exactly this list; a send must quote it back (review bug 6). */
+  planId: number;
   summary: string;
+  /** What Core does with attachments (v1: accepts, does not store) — always shown. */
+  disclosure: string;
   mode: 'read_only' | 'writable';
   attachments: { kind: string; label: string; target: string; excerpt: string; truncated: boolean }[];
   excluded: { label: string; reason: string }[];
@@ -75,7 +84,16 @@ export interface SidebarState {
   selectedSandbox: string | null;
   conversation: { id: string; title: string; agentId: string } | null;
   lines: ChatLine[];
+  /** What the stream shows: one conversation, or every task of the project. */
+  transcript: { scope: 'conversation' | 'project'; label: string };
   tasks: TaskRow[];
+  /**
+   * Increments each time Core accepted a send from the sidebar composer, so the
+   * webview clears its draft only after a real acceptance (never optimistically).
+   */
+  acceptedSends: number;
+  /** A send is in flight in the extension host; the composer's Send is disabled. */
+  sending: boolean;
   status: { tone: 'ok' | 'error' | 'info'; text: string } | null;
   capabilities: CapabilitySummary | null;
   contextPlan: ContextPlanView | null;
@@ -87,8 +105,14 @@ export type WebviewToExtension =
   | { type: 'ready' }
   | { type: 'refresh' }
   | { type: 'selectSandbox'; name: string }
-  | { type: 'previewContext' }
-  | { type: 'send'; text: string; writable: boolean; authorizedContext: boolean }
+  /** Build the attachment list for this intent and show it (no send). */
+  | { type: 'previewContext'; writable: boolean }
+  /**
+   * `planId` is the id of the attachment list the user was shown; the
+   * extension checks it (and its mode) to reject a stale or wrong-intent
+   * plan. Not a forgery defence: the id is visible to the webview.
+   */
+  | { type: 'send'; text: string; writable: boolean; planId: number | null }
   | { type: 'cancelTask'; taskId: string }
   | { type: 'reviewTask'; taskId: string };
 
@@ -112,20 +136,21 @@ export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefine
   switch (type) {
     case 'ready':
     case 'refresh':
-    case 'previewContext':
       return { type };
+    case 'previewContext':
+      return { type: 'previewContext', writable: (raw as { writable?: unknown }).writable === true };
     case 'selectSandbox': {
       const name = (raw as { name?: unknown }).name;
       return typeof name === 'string' ? { type: 'selectSandbox', name } : undefined;
     }
     case 'send': {
-      const r = raw as { text?: unknown; writable?: unknown; authorizedContext?: unknown };
+      const r = raw as { text?: unknown; writable?: unknown; planId?: unknown };
       if (typeof r.text !== 'string') return undefined;
       return {
         type: 'send',
         text: r.text,
         writable: r.writable === true,
-        authorizedContext: r.authorizedContext === true,
+        planId: typeof r.planId === 'number' && Number.isSafeInteger(r.planId) && r.planId >= 0 ? r.planId : null,
       };
     }
     case 'cancelTask':
@@ -144,12 +169,23 @@ export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefine
 export function emptySidebarState(connection: ConnectionTone): SidebarState {
   return {
     connection,
-    header: { project: null, agent: null, sandbox: null, workspaceMode: null, branch: null },
+    header: {
+      project: null,
+      agent: null,
+      sandbox: null,
+      workspaceMode: null,
+      workspaceModeBadge: null,
+      workspaceHostWritable: false,
+      branch: null,
+    },
     sandboxes: [],
     selectedSandbox: null,
     conversation: null,
     lines: [],
+    transcript: { scope: 'project', label: 'Transcript of all tasks in this project (no conversation selected)' },
     tasks: [],
+    acceptedSends: 0,
+    sending: false,
     status: null,
     capabilities: null,
     contextPlan: null,

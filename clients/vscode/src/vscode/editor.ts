@@ -49,7 +49,9 @@ export function collectEditorSnapshot(options: CollectOptions = {}): EditorSnaps
   const selectionText = selection.isEmpty ? '' : document.getText(selection);
 
   const snapshot: EditorSnapshot = {
-    uri: document.uri.toString(true),
+    // Fully encoded: a skip-encoding string could carry a literal '#' that
+    // collides with the '#L…' selection range separator (review 12h).
+    uri: document.uri.toString(),
     fsPath: document.uri.fsPath,
     languageId: document.languageId,
     text: includeDocumentText ? fullText.slice(0, MAX_DOCUMENT_CHARS) : '',
@@ -73,26 +75,11 @@ export function collectEditorSnapshot(options: CollectOptions = {}): EditorSnaps
  */
 export function collectDiagnostics(uri: vscode.Uri): DiagnosticSnapshot[] {
   return vscode.languages.getDiagnostics(uri).map((diagnostic) => ({
-    uri: uri.toString(true),
+    uri: uri.toString(),
     message: diagnostic.message,
     severity: severityName(diagnostic.severity),
     ...(diagnostic.source ? { source: diagnostic.source } : {}),
     startLine: diagnostic.range.start.line + 1,
     character: diagnostic.range.start.character,
   }));
-}
-
-/** All diagnostics in the workspace, grouped per file — for "Fix Current Problems". */
-export function workspaceDiagnosticSummary(limit = 40): { file: string; count: number; lines: string[] } | null {
-  const entries = vscode.languages.getDiagnostics();
-  const errors = entries
-    .flatMap(([uri, diagnostics]) =>
-      diagnostics
-        .filter((d) => d.severity === vscode.DiagnosticSeverity.Error)
-        .map((d) => `${uri.fsPath}:${d.range.start.line + 1} ${d.message}`),
-    )
-    .slice(0, limit);
-  if (errors.length === 0) return null;
-  const files = new Set(errors.map((line) => line.split(':')[0] ?? ''));
-  return { file: [...files][0] ?? '', count: errors.length, lines: errors };
 }

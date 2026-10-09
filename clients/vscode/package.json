@@ -147,7 +147,8 @@
         "sandpane.attachDiagnostics": {
           "type": "boolean",
           "default": false,
-          "description": "Explicit consent to attach the active file's diagnostics to a task (specs/03 §4). Off means diagnostics are never sent."
+          "scope": "machine",
+          "description": "Explicit consent to list the active file's diagnostics as an attachment for writable tasks (specs/03 §4). User/machine setting only — a workspace cannot opt you in. Off means diagnostics are never attached. Note: Core v1 accepts attachment references but does not yet store or forward them."
         },
         "sandpane.serviceMode": {
           "type": "string",
@@ -161,7 +162,8 @@
         "sandpane.coreSocketPath": {
           "type": "string",
           "default": "",
-          "description": "Override the Core Unix socket path. Empty uses SANDPANE_SOCKET, then the per-user default data directory (mirrors sandpane_service::default_socket_path)."
+          "scope": "machine",
+          "description": "Override the Core Unix socket path (user/machine setting only — a workspace's .vscode/settings.json cannot set it). Empty uses SANDPANE_SOCKET, then the per-user default data directory (mirrors sandpane_service::default_socket_path). Before attaching, the extension refuses any path that is not a Unix socket owned by you with mode 0600."
         }
       }
     }

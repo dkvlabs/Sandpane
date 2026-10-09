@@ -80,7 +80,9 @@ export type TransportFailureReason =
   | 'closed'
   | 'timeout'
   | 'send_failed'
-  | 'unsupported_platform';
+  | 'unsupported_platform'
+  /** The socket path failed the owner/type/mode check (security review W4). */
+  | 'untrusted_socket';
 
 export class CoreTransportError extends Error {
   readonly reason: TransportFailureReason;
@@ -189,18 +191,36 @@ export function decodeLine(line: string): { ok: true; frame: InboundFrame } | { 
     if (!isPlainObject(err)) {
       return { ok: false, error: parseError('err must be an object') };
     }
+    // The frame carries a correlatable id, so it is ALWAYS delivered to its
+    // pending request — dropping it would leave the caller waiting for the full
+    // request timeout (review bug 11). A code or message this client cannot
+    // validate is surfaced as INTERNAL with the raw values preserved verbatim,
+    // never relabelled as a known Core verdict.
     const code = err['code'];
     const message = err['message'];
-    if (typeof code !== 'string' || !(ERROR_CODES as readonly string[]).includes(code)) {
-      return { ok: false, error: parseError(`unknown error code: ${String(code)}`) };
+    const knownCode = typeof code === 'string' && (ERROR_CODES as readonly string[]).includes(code);
+    const hasMessage = typeof message === 'string';
+    const details = err['details'];
+    if (knownCode && hasMessage) {
+      const envelope: RpcErrorEnvelope = {
+        code: code as ErrorCode,
+        message: message as string,
+        ...(typeof details === 'undefined' ? {} : { details }),
+      };
+      return { ok: true, frame: { kind: 'response', response: { v, id, err: envelope } } };
     }
-    if (typeof message !== 'string') {
-      return { ok: false, error: parseError('err.message must be a string') };
-    }
+    const rawCode = typeof code === 'string' ? code : JSON.stringify(code) ?? String(code);
+    const rawMessage = hasMessage ? (message as string) : '(no message)';
     const envelope: RpcErrorEnvelope = {
-      code: code as ErrorCode,
-      message,
-      ...(typeof err['details'] === 'undefined' ? {} : { details: err['details'] }),
+      code: knownCode ? (code as ErrorCode) : 'INTERNAL',
+      message: knownCode
+        ? `${rawMessage} (Core sent no error message string)`
+        : `Core returned an error code this client does not recognize ("${rawCode}"): ${rawMessage}`,
+      details: {
+        ...(knownCode ? {} : { unrecognizedCode: rawCode }),
+        ...(hasMessage ? {} : { malformedMessage: true }),
+        ...(typeof details === 'undefined' ? {} : { coreDetails: details }),
+      },
     };
     return { ok: true, frame: { kind: 'response', response: { v, id, err: envelope } } };
   }
@@ -400,6 +420,12 @@ export interface CoreConnectionOptions {
   onReconnect?: () => void | Promise<void>;
 }
 
+/** Per-call options; most calls use the connection's default deadline. */
+export interface RequestOptions {
+  /** Override the request deadline for a method Core documents as slow. */
+  timeoutMs?: number;
+}
+
 interface PendingRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
@@ -428,6 +454,8 @@ export class CoreConnection {
   private attempt = 0;
   private idCounter = 0;
   private reconnectTimer: unknown = undefined;
+  /** The single in-flight transport open, shared by concurrent connect() calls. */
+  private opening: Promise<void> | null = null;
   private disposed = false;
   /** Set when Core answered with a different protocol version. */
   private peerVersion: number | null = null;
@@ -455,8 +483,13 @@ export class CoreConnection {
     if (this.disposed) {
       throw new CoreTransportError('closed', 'connection has been disposed');
     }
-    if (this.state === 'online' || this.state === 'connecting') return;
-    await this.openTransport('connecting');
+    if (this.opening) return this.opening;
+    if (this.state === 'online') return;
+    // From idle/offline, or while a backoff timer is pending ('reconnecting'):
+    // open now. openTransport cancels the pending timer and closes any previous
+    // transport, so this can never leave two sockets sharing one framer.
+    const transition = this.state === 'reconnecting' ? 'reconnecting' : 'connecting';
+    await this.openTransportOnce(transition);
   }
 
   /**
@@ -464,7 +497,7 @@ export class CoreConnection {
    * `CoreTransportError` (not connected / timeout / closed) or throws
    * `UnknownMethodError` / `FrameTooLargeError` before anything is written.
    */
-  request<T>(method: CoreMethodName, params: unknown = {}): Promise<T> {
+  request<T>(method: CoreMethodName, params: unknown = {}, options: RequestOptions = {}): Promise<T> {
     if (!isCoreMethodName(method)) {
       // Runtime guard: the type is a union, but callers may pass user input.
       throw new UnknownMethodError(String(method));
@@ -485,17 +518,19 @@ export class CoreConnection {
     } catch (e) {
       return Promise.reject(e instanceof Error ? e : new Error(String(e)));
     }
+    const timeoutMs =
+      typeof options.timeoutMs === 'number' && options.timeoutMs > 0 ? options.timeoutMs : this.opts.requestTimeoutMs;
     return new Promise<T>((resolve, reject) => {
       const timer = this.setTimer(() => {
         if (this.pending.delete(id)) {
           reject(
             new CoreTransportError(
               'timeout',
-              `Core did not answer "${method}" within ${this.opts.requestTimeoutMs}ms. The request id is dropped; nothing is retried blindly.`,
+              `Core did not answer "${method}" within ${timeoutMs}ms. The request id is dropped; nothing is retried blindly.`,
             ),
           );
         }
-      }, this.opts.requestTimeoutMs);
+      }, timeoutMs);
       this.pending.set(id, {
         resolve: (value) => resolve(value as T),
         reject,
@@ -563,23 +598,75 @@ export class CoreConnection {
     this.opts.onStateChange?.(state, detail);
   }
 
+  /** Serialize opens: one transport attempt at a time, shared by all callers. */
+  private openTransportOnce(transition: 'connecting' | 'reconnecting'): Promise<void> {
+    if (this.opening) return this.opening;
+    const run = this.openTransport(transition);
+    this.opening = run;
+    const clear = (): void => {
+      if (this.opening === run) this.opening = null;
+    };
+    run.then(clear, clear);
+    return run;
+  }
+
   private async openTransport(transition: 'connecting' | 'reconnecting'): Promise<void> {
+    // A pending backoff timer would open another socket later: cancel it.
+    this.clearTimer(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    // Never keep a superseded transport alive next to the new one.
+    const previous = this.transport;
+    this.transport = null;
+    if (previous) {
+      try {
+        previous.close();
+      } catch {
+        /* already gone */
+      }
+    }
     this.setState(transition, this.attempt > 0 ? `attempt ${this.attempt + 1}` : undefined);
     const transport = this.opts.transportFactory();
     this.transport = transport;
     this.framer.reset();
     try {
+      // Callbacks are bound to THIS transport: once it is superseded, its late
+      // data/close events are ignored instead of resetting the live framer or
+      // nulling the live transport.
       await transport.start({
-        onData: (chunk) => this.handleChunk(chunk),
-        onClose: (error) => this.handleClose(error),
+        onData: (chunk) => {
+          if (this.transport === transport) this.handleChunk(chunk);
+        },
+        onClose: (error) => {
+          if (this.transport === transport) this.handleClose(error);
+        },
       });
     } catch (e) {
-      this.transport = null;
+      if (this.transport === transport) this.transport = null;
       const message = e instanceof Error ? e.message : String(e);
+      if (this.disposed) {
+        throw new CoreTransportError('closed', 'connection has been disposed');
+      }
       this.scheduleReconnect(`connect failed: ${message}`);
+      if (e instanceof CoreTransportError && e.reason !== 'not_connected') {
+        // Keep a specific reason (untrusted socket, unsupported platform,
+        // connect timeout) so the guidance shown to the user stays accurate.
+        throw e;
+      }
       throw new CoreTransportError('not_connected', `cannot reach Sandpane Core: ${message}`);
     }
+    if (this.disposed || this.transport !== transport) {
+      try {
+        transport.close();
+      } catch {
+        /* already gone */
+      }
+      throw new CoreTransportError('closed', 'connection was disposed or superseded while opening');
+    }
     this.attempt = 0;
+    // The transport is open: release the shared open BEFORE the (possibly slow)
+    // reconnect hook, so a drop during that hook lets the backoff timer open a
+    // new socket instead of being handed this finished attempt.
+    if (this.opening !== null) this.opening = null;
     this.setState('online');
     try {
       await this.opts.onReconnect?.();
@@ -630,7 +717,13 @@ export class CoreConnection {
   private handleClose(error?: Error): void {
     if (this.disposed) return;
     this.framer.reset();
+    const closed = this.transport;
     this.transport = null;
+    try {
+      closed?.close(); // release it explicitly; a no-op for an already-closed socket
+    } catch {
+      /* already gone */
+    }
     const detail = error?.message ?? 'socket closed by Core';
     for (const [, entry] of this.pending) {
       this.clearTimer(entry.timer);
@@ -651,7 +744,7 @@ export class CoreConnection {
     this.reconnectTimer = this.setTimer(() => {
       this.reconnectTimer = undefined;
       if (this.disposed) return;
-      void this.openTransport('reconnecting').catch(() => {
+      void this.openTransportOnce('reconnecting').catch(() => {
         // openTransport already scheduled the next attempt.
       });
     }, delay);

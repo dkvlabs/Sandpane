@@ -14,8 +14,8 @@
  * Usage: npm run compile && node scripts/live-core-check.mjs
  */
 
-import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -44,6 +44,12 @@ const work = mkdtempSync(join(tmpdir(), 'sandpane-vscode-live-'));
 const socket = join(work, 'sandpane.sock');
 const db = join(work, 'sandpane.sqlite3');
 const repoPath = join(work, 'repo');
+// Core's project.create accepts only a git repository's TOP-LEVEL folder and
+// stores its canonical path (symlinks resolved: /var → /private/var on macOS).
+// Argument vector, no shell.
+execFileSync('git', ['init', '-q', repoPath]);
+mkdirSync(join(repoPath, 'packages', 'sub'), { recursive: true });
+const canonicalRepoPath = realpathSync(repoPath);
 
 const child = spawn(CORE_BINARY, [], {
   env: { ...process.env, SANDPANE_SOCKET: socket, SANDPANE_DB: db },
@@ -117,7 +123,13 @@ async function main() {
   const caps = await commands.systemProbe();
   check('system.probe protocol version is 1', caps.protocolVersion === 1, JSON.stringify(caps.protocolVersion));
   check('system.probe returns instanceId + coreVersion', Boolean(caps.instanceId && caps.coreVersion), `${caps.instanceId} / ${caps.coreVersion}`);
-  check('system.probe reports sbx as NOT installed on this host', caps.sbx?.installed === false, JSON.stringify(caps.sbx));
+  // Host-dependent: report what Core probed, and require it to be coherent.
+  const sbxInstalled = caps.sbx?.installed === true;
+  check(
+    `system.probe reports sbx presence coherently (this host: ${sbxInstalled ? 'installed' : 'not installed'})`,
+    typeof caps.sbx?.installed === 'boolean' && (!sbxInstalled || typeof caps.sbx?.binaryPath === 'string'),
+    JSON.stringify(caps.sbx),
+  );
   const codex = caps.agents.find((a) => a.id === 'codex');
   check(
     'codex adapter is honestly unverified (P0 gate not passed)',
@@ -167,23 +179,51 @@ async function main() {
   const projects = await commands.projectList();
   check('project.list shows the created project', projects.length === 1 && projects[0].name === 'Atlas Demo', JSON.stringify(projects));
   check(
-    'project.list returns the repository paths it was created with',
+    'project.list returns the CANONICAL repository path (clients must realpath before comparing)',
     Array.isArray(projects[0]?.repositories) &&
       projects[0].repositories.length === 1 &&
-      projects[0].repositories[0] === repoPath,
-    JSON.stringify(projects[0]?.repositories),
+      projects[0].repositories[0] === canonicalRepoPath,
+    `${JSON.stringify(projects[0]?.repositories)} (created with ${repoPath})`,
+  );
+  let subfolderError = null;
+  await commands
+    .projectCreate({ name: 'Nova Demo', repositories: [join(repoPath, 'packages', 'sub')] })
+    .catch((e) => {
+      subfolderError = e;
+    });
+  check(
+    'project.create refuses a monorepo subfolder (git toplevel only)',
+    subfolderError?.code === 'VALIDATION_FAILED',
+    `${subfolderError?.code}: ${subfolderError?.message ?? 'accepted'}`,
   );
 
-  // ---- sandbox.list must surface NOT_INSTALLED, not an empty list ------
+  // ---- sandbox.list: a real list or a structured error, never a guess ----
+  // (read-only `sbx ls` when sbx is installed; this harness never creates one)
   let sandboxError = null;
-  await commands.sandboxList().catch((e) => {
-    sandboxError = e;
-  });
-  check(
-    'sandbox.list fails with NOT_INSTALLED (no sbx on this host)',
-    sandboxError?.code === 'NOT_INSTALLED',
-    sandboxError?.message ?? 'no error',
-  );
+  let sandboxListing = null;
+  await commands
+    .sandboxList()
+    .then((list) => {
+      sandboxListing = list;
+    })
+    .catch((e) => {
+      sandboxError = e;
+    });
+  if (sbxInstalled) {
+    check(
+      'sandbox.list returns Core\'s listing or a structured error (sbx installed)',
+      Array.isArray(sandboxListing) || typeof sandboxError?.code === 'string',
+      sandboxError
+        ? `${sandboxError.code}: ${sandboxError.message} ${JSON.stringify(sandboxError.details ?? null)}`
+        : `${sandboxListing.length} sandbox(es)`,
+    );
+  } else {
+    check(
+      'sandbox.list fails with NOT_INSTALLED (no sbx on this host)',
+      sandboxError?.code === 'NOT_INSTALLED',
+      sandboxError?.message ?? 'no error',
+    );
+  }
 
   // ---- conversation + hostile content round-trip (specs/03 §6.4) -------
   const conversation = await commands.conversationCreate({
@@ -217,8 +257,8 @@ async function main() {
   );
   const adapterEvent = events.find((e) => e.kind === 'adapter.unavailable');
   check(
-    'adapter.unavailable carries PROVIDER_AUTH_REQUIRED (no fake execution)',
-    adapterEvent?.payload?.code === 'PROVIDER_AUTH_REQUIRED',
+    'adapter.unavailable carries PERMISSION_DENIED (policy: no verified adapter — not a sign-in problem)',
+    adapterEvent?.payload?.code === 'PERMISSION_DENIED',
     JSON.stringify(adapterEvent?.payload),
   );
   const lastSeq = events.at(-1)?.sequence ?? 0;

@@ -18,25 +18,30 @@ not implemented. Nothing here pretends to be a capability it does not have.
 | NDJSON framing (encode/parse, `MAX_FRAME_BYTES` guard, chunk reassembly, resync) | **functional** | `test/framing.test.ts` (10 tests) + live: oversized line answered by Core with `VALIDATION_FAILED "frame too large"` |
 | Request/response correlation by `id`, timeout, structured `err` envelope | **functional** | `test/connection.test.ts` (12) + live: 25 concurrent requests each returned to their own promise |
 | Reconnect with exponential backoff + jitter, resubscribe hook | **functional** | `test/connection.test.ts` (delays 188/375/750 while failing; reset after a healthy drop) |
-| Durable-event catch-up from a checkpoint (`task.subscribe`, per-task `afterSequences`) | **functional** | `test/catchup.test.ts` (17) + live: a shared scalar is shown to skip the behind task's unseen events, and `afterSequences` recovers them |
+| Durable-event catch-up from a checkpoint (`task.subscribe`, per-task `afterSequences`) | **functional** | `test/catchup.test.ts` + live: a shared scalar is shown to skip the behind task's unseen events, and `afterSequences` recovers them |
+| Live updates: `task.subscribe` re-pulled every 2 s while the connection is online and some task of the selected project is non-terminal (Core never pushes); scoped to the selected project and rebuilt when it changes, and a late answer for a previous project is discarded; a refused project-wide replay falls back to task-scoped pulls (at most 64 tasks — unfinished first, then most recently active — omission reported) | **functional (headless)** | `test/eventFeed.test.ts`, `test/session.test.ts` |
+| Core socket trust check: before every connect the socket path is `lstat`ed and must be a Unix socket (not a symlink) owned by the current uid with no group/other bits; otherwise the client refuses with guidance | **functional** | `test/transport.test.ts` (real sockets: 0666, foreign uid, symlink, regular file, stale socket). Live: the 2026-10-09 `scripts/live-core-check.mjs` run (56/56) attached through this check to the 0600 socket `sandpane-service` created — that shows real Core's socket is ACCEPTED; refusals are proven only by the unit tests |
 | Typed wrappers for exactly the 14 Core methods | **functional** | `test/commands.test.ts` (22) + live: all 14 exercised against the real service |
 | Read-only enumeration + bounded transcript (`task.list`, `conversation.list`, `conversation.history`) | **functional** | live: project scoping, status filter, `truncated`/`nextSequence` paging against real rows |
 | Feature discovery from `system.probe` → `methods` (additive methods are detected, never assumed) | **functional** | `test/protocolWire.test.ts` (13) + live: Core advertises 14 and it equals `schemas/rpc-request.schema.json` |
 | TS protocol types mirrored from Rust (`camelCase` payloads, `snake_case` statuses/modes, `SCREAMING_SNAKE` codes) | **functional + drift-guarded** | `test/protocolWire.test.ts` reads `core/crates/sandpane-protocol/src/lib.rs`, `sandpane-service/src/lib.rs` and `schemas/*.json` and fails on a rename |
 | Display-only task reducer (no invented transitions), incl. `task.list` hydration | **functional** | `test/reducer.test.ts` (20) + live: `cancelled` appears only because Core appended it; double cancel → `CONFLICT` |
-| Context attachments: selection/active file/diagnostics, explicit list before send, secret exclusion | **functional (planner)** | `test/context.test.ts` (20) |
-| Diff argument builder (`vscode.diff`) from a real ChangeSet | **functional (builder)** | `test/diff.test.ts` (10) — URI resolution inside VS Code is **not yet verified**, see Pending |
+| Context attachments: selection/active file/diagnostics, explicit list before send, secret exclusion | **functional (planner)** — Core v1 accepts the references but does **not** store or forward them (verified in `sandpane-service` `conversation_send`); the UI says so next to every list | `test/context.test.ts` |
+| Send check: a send must quote the id of the CURRENT attachment list, built for the same intent (read-only vs writable); checked in the extension host, so stale or wrong-intent lists are rejected. One send at a time (Send disabled while one is in flight) | **functional** | `test/sessionPolicy.test.ts`, `test/session.test.ts`, `test/sidebarApp.test.ts` |
+| Diff review: `vscode.diff` with real `Uri` objects (`Uri.file`, and `.with({scheme:'git', query:{path,ref}})` for the base revision) from a real ChangeSet; the base must be a plain 7–64 hex commit id or the diff is refused; at most 10 editors per Review, the rest reported | **functional (builder + wiring)** | `test/diff.test.ts`, `test/session.test.ts` (paths with `#`/`?`) — resolution by the installed `vscode.git` inside a real window is **not yet verified**, see Pending |
 | Workspace-mode labels incl. prominent `direct_mount` LIVE-WRITABLE, and UNVERIFIED when Core reports no binding row | **functional** | `test/vscodeGuards.test.ts` (14) — `SandboxSummary.workspaceMode` absent ⇒ never rendered as safe |
-| Error-code → install/help guidance (`NOT_INSTALLED`, `DAEMON_DOWN`, …) incl. the oversized-replay refusal as recoverable | **functional** | `test/diagnostics.test.ts` (23) + live: `task.subscribe` over the frame ceiling ⇒ structured `VALIDATION_FAILED` |
+| Error-code → install/help guidance (`NOT_INSTALLED`, `DAEMON_DOWN`, …) incl. the oversized-replay refusal as recoverable, plus Core's `details.hint` remediation shown verbatim (never executed) | **functional** | `test/diagnostics.test.ts`, `test/coreRemediation.test.ts`, `test/session.test.ts` + live: `task.subscribe` over the frame ceiling ⇒ structured `VALIDATION_FAILED` |
 | Remote-host gate (`env.remoteName`) → explicit unsupported state | **functional** | `test/vscodeGuards.test.ts` |
 | Webview CSP (nonce, `default-src 'none'`, no inline script/style, escaping) | **functional** | `test/webview.test.ts` (8) |
-| Sidebar webview (plain TypeScript), task tree, status bar, 9 commands | **wired, needs a human-in-the-loop run** | compiles; never launched inside a real VS Code window yet |
+| Sidebar webview (plain TypeScript): composer built once and never replaced (draft, writable checkbox and focus survive every state push), regions patched in place, pushes coalesced per animation frame, stable ids on task buttons | **functional (headless)** | `test/sidebarApp.test.ts` runs the real `app.ts` (transpiled, `node:vm`) against a minimal fake DOM — no jsdom dependency |
+| Task tree, status bar, 9 commands, the sidebar inside VS Code | **wired, needs a human-in-the-loop run** | compiles; never launched inside a real VS Code window yet |
 
 ### Live integration against a real Core
 
 `scripts/live-core-check.mjs` runs the compiled client against the actual
 `sandpane-service` binary over its Unix socket (temp socket + temp DB, nothing
-mocked). Latest run on this host — **55/55 checks passed**, including:
+mocked). Latest run on this host (2026-10-09, after the review-fix revision and
+the Core error-code update) — **56/56 checks passed**, including:
 
 ```
 PASS  system.probe advertises exactly the 14 methods the client allowlists
@@ -60,9 +65,12 @@ PASS  an over-ceiling replay is refused with structured VALIDATION_FAILED
 PASS  the client classifies it as a refusal and maps it to recoverable guidance
 PASS  narrowing to one taskId still succeeds — the refusal is recoverable, not fatal
 PASS  a bounded read discloses truncation instead of overflowing the frame
-PASS  sandbox.list fails with NOT_INSTALLED (no sbx on this host)
+PASS  system.probe reports sbx presence coherently (this host: installed)
+PASS  project.list returns the CANONICAL repository path (clients must realpath before comparing)
+PASS  project.create refuses a monorepo subfolder (git toplevel only)
+PASS  sandbox.list returns Core's listing or a structured error (sbx installed)
 PASS  hostile multi-line content is stored verbatim as inert data
-PASS  adapter.unavailable carries PROVIDER_AUTH_REQUIRED (no fake execution)
+PASS  adapter.unavailable carries PERMISSION_DENIED (policy: no verified adapter — not a sign-in problem)
 PASS  cancellation is durable: status.changed(cancelled) is appended
 PASS  git.apply does not write host files (honest abort: P4 deliverable)
 PASS  Core rejects an off-allowlist method with VALIDATION_FAILED (no free-form exec)
@@ -92,7 +100,8 @@ launches, upgrades or stops Core — see *Deferred* (ADR 1).
 cd clients/vscode
 npm install --no-audit --no-fund   # dev dependencies only — the shipped extension has zero runtime deps
 npm run typecheck                  # tsc --noEmit (extension + tests, then the webview script)
-npm test                           # vitest run — 171 tests, pure modules + one real-socket transport suite
+npm test                           # vitest run — pure modules, real-socket transport suites, the sidebar
+                                   # script in node:vm, and session.ts against a recording vscode stub
 npm run compile                    # tsc → out/ (extension) + out/webview/app.js (sidebar script)
 npm run check                      # typecheck + test
 npm run check:live                 # optional: real Core service integration (see above)
@@ -105,12 +114,14 @@ publication is deliberately not done yet (licensing gate,
 [`docs/licensing-decision.md`](../../docs/licensing-decision.md)).
 
 No runtime dependencies: Node stdlib + the VS Code API only. `devDependencies`
-are typescript, @types/vscode, @types/node, vitest.
+are typescript, @types/vscode, @types/node, vitest and @vscode/vsce.
 
-**Unit tests need no extension host.** Everything under `src/core-client/`
-(except `transport.ts`), `src/state/reducer.ts` and the pure halves of
-`src/vscode/*` and `src/webview/html.ts`/`bridge.ts` import no `vscode`, so they
-run under plain Node with an injected fake duplex.
+**Unit tests need no extension host.** Everything under `src/core-client/`,
+`src/state/*` and the pure halves of `src/vscode/*` and `src/webview/html.ts`/
+`bridge.ts` import no `vscode`, so they run under plain Node with an injected
+fake duplex. `src/session.ts` is exercised through `test/helpers/vscodeStub.ts`
+(aliased as `vscode` in `vitest.config.ts`) against a scripted fake Core, and
+`src/webview/app.ts` through `test/helpers/fakeDom.ts`.
 
 ## Module layout
 
@@ -126,9 +137,13 @@ src/
 │   ├── connection.ts         NDJSON codec, id correlation, timeouts, backoff
 │   ├── transport.ts          the real node:net socket transport (injected seam)
 │   ├── commands.ts           typed wrappers for exactly 14 methods + guards
-│   ├── catchup.ts            EventCheckpoint + pull-based resume (per-task cursors)
+│   ├── catchup.ts            EventCheckpoint + pull-based resume (per-task cursors),
+│   │                         ProjectEventFeed (polling + task-scoped fallback)
+│   ├── socketTrust.ts        socket owner/type/mode verdict before connecting
 │   └── paths.ts              socket/data-dir resolution (mirrors sandpane_service)
 ├── state/reducer.ts          display-only task state over Core statuses
+├── state/sessionPolicy.ts    pure session decisions: selected workspace mode,
+│                             send gate, send authorization, scope, polling
 ├── vscode/
 │   ├── context.ts            attachment planner (explicit list, secret deny)
 │   ├── editor.ts             the thin vscode glue that feeds context.ts
@@ -167,12 +182,28 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
 - **Bounded frames** in both directions: oversized client frames are refused
   before writing; oversized inbound lines are dropped and the stream resyncs.
   A replay that cannot fit one frame comes back from Core as a structured
-  `VALIDATION_FAILED`, is surfaced as recoverable guidance, and the pull loop
-  **stops retrying** it instead of hammering the socket.
+  `VALIDATION_FAILED`; the project-wide request is never re-sent, and the feed
+  switches to task-scoped pulls (one task per request, from each task's own
+  cursor) instead of disabling catch-up. A single task that is itself too large
+  is reported and skipped.
+- **The Core socket is verified before connecting.** Symlinks, non-sockets, a
+  foreign owner or any group/other permission bit are refused with guidance.
+  `sandpane.coreSocketPath` and `sandpane.attachDiagnostics` are
+  `"scope": "machine"`, so a repository's `.vscode/settings.json` cannot point
+  the client at another socket or opt you into diagnostics.
+- **Sends match the list that was shown.** The extension host only sends when
+  the request quotes the id of the CURRENT attachment plan, built for the same
+  intent; a stale list or a read-only list sent as writable is refused. This
+  prevents UI mistakes, not forgery: the plan id is visible to the webview, so
+  script running inside it could post a matching id. The webview's protection
+  is the strict CSP and the message whitelist.
+- **CSP nonce from a CSPRNG** (`crypto.randomBytes`, rejection-sampled).
 - **Context is explicit and deny-by-default**: selection → active file →
-  diagnostics (opt-in), every attachment listed before send, sensitive paths
-  (`.env`, `id_rsa`, `credentials.json`, `*.key`, `.npmrc`, `secrets*`, …)
-  excluded outright rather than redacted, per-attachment size cap.
+  diagnostics (opt-in, writable intent only), every attachment listed before
+  send, sensitive paths (`.env`, `id_rsa`, `credentials.json`, `*.key`,
+  `.npmrc`, `secrets*`, …) excluded outright rather than redacted,
+  per-attachment size cap. Honest limit: Core v1 ignores `attachments`, and
+  `conversation.send` has no read-only mode — both intents create a task.
 - **Logs are not a secret sink.** The client log channel records transport and
   RPC outcomes; prompt bodies and credentials are never written.
 - **Deactivate closes UI hooks only.** `deactivate()` is empty;
@@ -187,7 +218,7 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
 ## Deferred / not implemented (stated, not hidden)
 
 ### Context actions (specs/03 §4 + §2 manifest)
-- **DEFERRED: Explain Selection / Refactor Selection / Fix Current Problems / Add File to Chat / Review Active Task, and `sandpane.sendSelection`** (specs/03:131–135, :82). None are contributed or registered; there is no `editor/context` menu. The data path exists (selection is quoted into task context via `startTask`'s preview), but the dedicated menu entries and their consent UX are P3 work. Named here after review 0006 #6 — previously this gap was invisible in this file.
+- **DEFERRED: Explain Selection / Refactor Selection / Fix Current Problems / Add File to Chat / Review Active Task, and `sandpane.sendSelection`** (specs/03:131–135, :82). None are contributed or registered; there is no `editor/context` menu. A selection *reference* is listed and sent via `startTask`'s preview (Core v1 does not store or resolve it), but the dedicated menu entries and their consent UX are P3 work. Named here after review 0006 #6 — previously this gap was invisible in this file.
 
 ### VS1 — sandbox management
 - **DEFERRED: quick-create wizard.** The manifest, `sandboxCreate` wrapper, name
@@ -199,16 +230,23 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
   none of them is sandbox lifecycle beyond create/list), and
   inventing one client-side is forbidden. Requires a Core protocol change plus a
   verified SBX adapter path (`docs/specs/07` P1/P8). Sandboxes can currently only
-  be listed and created — and listing needs `sbx`, which is **not installed on
-  this host** (`docs/compatibility.md`: P0 BLOCKER).
+  be listed and created. `sbx` 0.47.0 is now installed on this host and
+  `sandbox.list` answers live (see the run above); `sandbox.create` (real
+  `sbx create`, up to 300 s in Core — the client waits 330 s for that one
+  method) has not been exercised from this extension.
 
 ### VS2 — chat and multi-project
 - **DEFERRED (P0 gate): real streaming chat.** Core advertises
   `codex {verified:false, supportsStreaming:false, supportsCancel:false,
   supportsResume:false}` — confirmed live. Sending a prompt therefore creates a
-  real queued task and Core answers `adapter.unavailable` /
-  `PROVIDER_AUTH_REQUIRED`; the sidebar shows exactly that, and the composer asks
-  for explicit confirmation before sending. Chat tabs, streaming repaint
+  real queued task and Core appends `adapter.unavailable` with
+  `PERMISSION_DENIED` (Core's policy refuses to run an unverified adapter —
+  signing in would not help); the sidebar shows exactly that, and the composer
+  asks for explicit confirmation before sending. `PROVIDER_AUTH_REQUIRED` now
+  means "sign in" (e.g. sbx not signed in to Docker); when Core attaches a
+  `details.hint` (`sbx login`, `sbx policy init <allow-all|balanced|deny-all>`)
+  the error box and status line show it as text for the user to run — the
+  extension never runs it. Chat tabs, streaming repaint
   batching and event replay UI land after the Codex-in-SBX feasibility gate.
 - **DEFERRED: React + Tailwind + shadcn/ui webview.** `specs/03 §3` describes
   `App.tsx` + `views/`/`components/`/`dialogs/`. This scaffold ships a plain
@@ -246,9 +284,11 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
   RPC.
 
 ### VS3 / P4 — Git-safe coding integration
-- **DEFERRED: verified `vscode.diff` resolution.** `buildDiffPlan` produces the
-  `git:` + `file:` argument pair from Core's real `baseCommit`, and its shape is
-  unit-tested; that the installed `vscode.git` resolves the URI on this host is
+- **DEFERRED: verified `vscode.diff` resolution.** `buildDiffPlan` produces
+  `Uri.file` + git-revision `Uri` specs from Core's real `baseCommit` (the same
+  `{path, ref}` query shape `vscode.git`'s own `toGitUri` builds), and the
+  session passes real `Uri` objects — unit-tested, including paths with `#`/`?`;
+  that the installed `vscode.git` resolves the URI on this host is
   unverified. Claiming it would be an evidence-free verification (`AGENTS.md`
   rule 5).
 - **DEFERRED: repository root for diffs.** `git.review` returns
@@ -269,9 +309,11 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
   Core method exists yet (`verifications` table is server-side only).
 
 ### VS0 leftovers
-- **DEFERRED: `.vsix` packaging + marketplace metadata, VS Code integration-test
-  runner, accessibility audit** (VS4 items). `package.json` is `private: true`
-  and there is no `@vscode/vsce` dependency yet.
+- **Local `.vsix` packaging works; publication does not exist.** `@vscode/vsce`
+  is a devDependency and `npm run package` builds `sandpane-<version>.vsix`
+  locally (gitignored, never committed). **DEFERRED: marketplace metadata and
+  publication, VS Code integration-test runner, accessibility audit** (VS4
+  items); `package.json` stays `private: true` (licensing gate).
 - **DEFERRED: service start/stop.** `sandpane.startService` / `stopService`
   explain the ownership-policy gap (ADR 1, `specs/02 §10`) and print the command
   for the user to run. `sandpane.serviceMode` deliberately offers only
@@ -283,7 +325,14 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
   `package.json` say so.
 - **DEFERRED: Windows named pipe** (P1) and **push notifications**. This Core
   build is strictly request/response, so live updates come from re-pulling
-  `task.subscribe` from the checkpoint. The codec already understands
+  `task.subscribe` from the checkpoint every 2 s while a task of the selected
+  project is non-terminal (tasks stuck in `queued` because no adapter is
+  verified keep that poll alive). Normally that is one project-wide request
+  per interval; after Core refuses the project-wide replay as too large, it is
+  one request per FOLLOWED task per interval — up to 64 tasks, chosen
+  unfinished-first then most recently active, so up to ~32 requests/s in the
+  worst case. Tasks outside that set are not followed, and the status line
+  says how many. The codec already understands
   method-bearing frames and routes them to a notification seam, but no such frame
   exists yet — it is forward-compat, not a claimed capability.
 
@@ -294,10 +343,10 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
 | 1 | two projects, three chats, two tasks running while switching tabs | **PENDING** — needs chat (VS2) and a real writable task |
 | 2 | reopen VS Code, UI catches up from the Core checkpoint | **PARTIAL** — per-task checkpoint replay verified headless (17 unit cases + live: `afterSequences` recovers the behind task's unseen events, which a shared scalar skips); inside a real window: PENDING |
 | 3 | second window shows the same state, no duplicate process | **PARTIAL** — two socket clients on one `instanceId` verified live; two VS Code windows: PENDING |
-| 4 | selection with spaces/Unicode/newlines arrives exactly, no shell execution | **VERIFIED** live — hostile multi-line payload stored verbatim; Core has no exec method and rejects one |
+| 4 | selection with spaces/Unicode/newlines arrives exactly, no shell execution | **PARTIAL** — verified live: a hostile multi-line *message body* is stored verbatim and Core has no exec method (rejects one). NOT verified: the selection itself — the client sends only a `kind:"selection"` reference (no content, no Core-defined range grammar), and Core v1's `conversation_send` ignores `attachments`, so selection content never reaches Core today. Needs Core attachment storage + selection grammar |
 | 5 | apply with dirty host files aborts safely | **PARTIAL** — Core's precondition gates abort (verified live for the no-Git-context case); the dirty-host path with a real repo: PENDING |
 | 6 | stop sandbox with active tasks warns | **PENDING** — no `sandbox.stop` method in v1 |
-| 7 | omitted Codex adapter shows an unsupported explanation | **VERIFIED** live — `adapter.unavailable` + `PROVIDER_AUTH_REQUIRED`, no terminal scraping fallback exists in this client |
+| 7 | omitted Codex adapter shows an unsupported explanation | **VERIFIED** live (Core-level) — `adapter.unavailable` + `PERMISSION_DENIED`, no terminal scraping fallback exists in this client; the sidebar rendering of it inside a real window: PENDING |
 | 8 | unsupported remote host does not bind the wrong filesystem | **PARTIAL** — `host.ts` gate is unit-tested and every command checks it; inside a real remote window: PENDING (review 0006 #5: re-labelled from "VERIFIED (logic)" for consistency with rows 2/3/5) |
 
 ## Conventions

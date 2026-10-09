@@ -15,11 +15,10 @@ import * as fs from 'node:fs';
 import { SandpaneSession } from './session';
 import { SandpaneChatProvider } from './webview/sidebar';
 import { SandpaneTaskTreeProvider } from './vscode/taskTree';
-import { coreDataDir, coreSocketPath, unsupportedPlatformReason } from './core-client/paths';
+import { coreDataDir, unsupportedPlatformReason } from './core-client/paths';
 import { allWorkspaceModeViews } from './vscode/workspaces';
 import { isKnownWorkspaceMode } from './vscode/workspaces';
 import { validateSandboxName, CoreValidationError } from './core-client/commands';
-import { workspaceDiagnosticSummary } from './vscode/editor';
 
 const CORE_AVAILABLE_CONTEXT = 'sandpane.coreAvailable';
 
@@ -40,6 +39,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   status.command = 'sandpane.openCoreLogs';
 
+  // `sandpane.coreAvailable` means "Core is attached", not "this host is
+  // supported" (review 12f) — and it is only re-sent when it changes.
+  let coreAvailable: boolean | null = null;
   const stateSub = session.subscribe((state) => {
     const icon =
       state.connection === 'online'
@@ -48,23 +50,38 @@ export function activate(context: vscode.ExtensionContext): void {
           ? '$(error)'
           : '$(debug-disconnect)';
     status.text = `${icon} Sandpane: ${state.connection}`;
+    // The path shown is the one the session actually dialled (review 12g).
     status.tooltip =
       state.capabilities === null
-        ? `${host.explanation}\n\nCore socket: ${socketPathFor()}`
+        ? `${host.explanation}\n\nCore socket: ${session.socketPath}`
         : `Core ${state.capabilities.coreVersion} · protocol v${state.capabilities.protocolVersion}\n` +
           `instance ${state.capabilities.instanceId}\nplatform: ${state.capabilities.platform}\n` +
           `sbx installed: ${String(state.capabilities.sbxInstalled)}\n` +
           `agents: ${state.capabilities.agents
             .map((a) => `${a.id}${a.verified ? ' (verified)' : ' (unverified)'}`)
-            .join(', ') || 'none'}\nCore socket: ${socketPathFor()}`;
+            .join(', ') || 'none'}\nCore socket: ${session.socketPath}`;
     status.show();
-    void vscode.commands.executeCommand('setContext', CORE_AVAILABLE_CONTEXT, host.supported);
+    const available = host.supported && state.connection === 'online';
+    if (available !== coreAvailable) {
+      coreAvailable = available;
+      void vscode.commands.executeCommand('setContext', CORE_AVAILABLE_CONTEXT, available);
+    }
+  });
+
+  const configSub = vscode.workspace.onDidChangeConfiguration((event) => {
+    if (event.affectsConfiguration('sandpane.coreSocketPath')) {
+      void vscode.window.showInformationMessage(
+        'Sandpane: the Core socket path changed. It is used from the next connection attempt; ' +
+          `this window is still attached to ${session.socketPath}. Reload the window to switch now.`,
+      );
+    }
   });
 
   context.subscriptions.push(
     output,
     status,
     stateSub,
+    configSub,
     session,
     provider,
     tree,
@@ -93,7 +110,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   log(
-    `activated (host=${host.supported ? 'local' : 'remote'}, socket=${socketPathFor()}, protocol v1, transport=unix-socket)`,
+    `activated (host=${host.supported ? 'local' : 'remote'}, socket=${session.socketPath}, protocol v1, transport=unix-socket)`,
   );
 }
 
@@ -104,13 +121,8 @@ export function deactivate(): void {
   // Task cancellation is a separate, explicit user action through `task.cancel`.
 }
 
-function socketPathFor(): string {
-  const config = vscode.workspace.getConfiguration('sandpane');
-  return coreSocketPath(
-    { env: process.env, platform: process.platform, homedir: process.env['HOME'] ?? '' },
-    config.get<string>('coreSocketPath', ''),
-  );
-}
+/** Printed and copied for the user; the extension never runs it (ADR 1). */
+const START_SERVICE_COMMAND = 'cd core && cargo run -p sandpane-service';
 
 /** The nine contributed commands, each wrapped in a progress notification. */
 function registrations(
@@ -169,7 +181,12 @@ function registrations(
             : ((
                 await vscode.window.showQuickPick(
                   folders.map((folder) => ({ label: folder.uri.fsPath, description: folder.name })),
-                  { canPickMany: true, title: 'Repository paths to associate (optional)' },
+                  {
+                    canPickMany: true,
+                    // Core accepts only a git repository's top-level folder and
+                    // stores its canonical path; a monorepo subfolder is refused.
+                    title: 'Repositories to associate (optional) — each must be a git top-level folder',
+                  },
                 )
               ) ?? []).map((item) => item.label);
         return session.createProject(name.trim(), chosen);
@@ -177,7 +194,7 @@ function registrations(
     ),
 
     vscode.commands.registerCommand('sandpane.newSandbox', () =>
-      guard('Sandpane: new sandbox', async () => {
+      guard('Sandpane: new sandbox (sbx create can take up to 5 minutes)', async () => {
         const projectId = await pickProject(session);
         if (!projectId) return undefined;
         const name = await vscode.window.showInputBox({
@@ -233,12 +250,19 @@ function registrations(
           placeHolder: 'e.g. explain what this function does',
         });
         if (!text) return undefined;
+        // Honest copy (review bug 7): conversation.send has no mode field, so
+        // Core v1 records a task for BOTH choices. The choice changes this
+        // client's confirmation gate and attachment policy only.
         const intent = await vscode.window.showQuickPick(
           [
-            { label: 'Discuss (read-only)', description: 'no writable task is created', writable: false },
+            {
+              label: 'Discuss (read-only intent)',
+              description: 'Core v1 has no read-only mode: it still records a task',
+              writable: false,
+            },
             {
               label: 'Writable task',
-              description: 'agent may edit files in the bound workspace',
+              description: "agent may edit files in the selected sandbox's workspace",
               writable: true,
             },
           ],
@@ -250,21 +274,20 @@ function registrations(
         const listed = [
           plan.summary,
           ...plan.attachments.map((a) => `· ${a.kind}: ${a.label} → ${a.target}`),
-          ...plan.excluded.map((e) => `· excluded ${e.label}: ${e.reason}`),
+          ...plan.excluded.map((e) => `· not attached — ${e.label}: ${e.reason}`),
         ].join('\n');
-        const problems = intent.writable ? workspaceDiagnosticSummary(5) : null;
         const confirmed = await vscode.window.showInformationMessage(
-          [listed, problems ? `Workspace errors (${problems.count}), first: ${problems.lines[0]}` : null]
-            .filter((line): line is string => line !== null)
-            .join('\n\n'),
+          listed,
           {
             modal: true,
-            detail: 'Everything listed above is attached. Nothing is attached implicitly.',
+            detail:
+              'Only the references listed above are sent; nothing is attached implicitly. ' +
+              plan.disclosure,
           },
           'Send it',
         );
         if (confirmed !== 'Send it') return undefined;
-        await session.send(text, intent.writable, true);
+        await session.send(text, intent.writable, plan.planId, 'command');
         return undefined;
       }),
     ),
@@ -301,12 +324,17 @@ function registrations(
           'decided, and launching an unverified binary from an IDE would let a plugin silently ' +
           'downgrade a core another client is already using.\n\n' +
           'Start it yourself, then run "Sandpane: Refresh Sandboxes":\n' +
-          '  cd core && cargo run -p sandpane-service\n\n' +
-          `Socket it will listen on: ${socketPathFor()}\n` +
+          `  ${START_SERVICE_COMMAND}\n\n` +
+          `Socket this window dials: ${session.socketPath}\n` +
           `Sandbox directory (this client's setting, not sent to Core): ${configured || 'not set'}` +
           (blocked ? `\n\n${blocked}` : ''),
         'Copy the command',
-      );
+      ).then(async (choice) => {
+        // The button does what it says (review 12e): copy only, never run.
+        if (choice !== 'Copy the command') return;
+        await vscode.env.clipboard.writeText(START_SERVICE_COMMAND);
+        void vscode.window.showInformationMessage(`Copied: ${START_SERVICE_COMMAND}`);
+      });
       return Promise.resolve(undefined);
     }),
 
@@ -344,7 +372,12 @@ function registrations(
           'the client-side record: connect/close, frame-decode failures and every RPC outcome.\n\n' +
           `Core data directory: ${dir}\n${listing}`,
         'Open folder',
-      );
+      ).then((choice) => {
+        // Reveal in the OS file manager (review 12e) — opens nothing else.
+        if (choice === 'Open folder') {
+          void vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(dir));
+        }
+      });
       return Promise.resolve(undefined);
     }),
   ];

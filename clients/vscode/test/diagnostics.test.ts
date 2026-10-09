@@ -74,6 +74,7 @@ describe('error code → human guidance', () => {
     'unknown_method',
     'validation',
     'unsupported_platform',
+    'untrusted_socket',
     'remote_host',
     'adapter_unverified',
     'service_policy',
@@ -81,6 +82,12 @@ describe('error code → human guidance', () => {
     const g = explainClientFailure(reason);
     expect(g.headline.length).toBeGreaterThan(0);
     expect(g.explanation.length).toBeGreaterThan(20);
+  });
+
+  it('classifies an untrusted-socket refusal with guidance naming the setting (W4)', () => {
+    const failure = toFailure(new CoreTransportError('untrusted_socket', 'owned by uid 0'));
+    expect(failure).toMatchObject({ source: 'client', reason: 'untrusted_socket' });
+    expect(explainClientFailure('untrusted_socket').explanation).toMatch(/coreSocketPath/);
   });
 
   it('the unverified-adapter copy states the VS2/P0 gate instead of a fake chat', () => {

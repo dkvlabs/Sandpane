@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  MAX_REVIEW_EDITORS,
   buildChangeSetPlans,
   buildDiffPlan,
-  fileUri,
-  gitRevisionUri,
+  capReviewPlans,
+  fileSpec,
+  gitRevisionSpec,
+  materializeUri,
+  type UriFactory,
 } from '../src/vscode/diff';
 import type { ChangeSet, FileChange } from '../src/core-client/protocol';
 
@@ -40,9 +44,8 @@ describe('vscode.diff argument builder', () => {
       expect(result.plan.command).toBe('vscode.diff');
       expect(result.plan.args).toHaveLength(3);
       const [left, right, title] = result.plan.args;
-      expect(left.startsWith(`git:${REPO}/src/AuthService.ts?`)).toBe(true);
-      expect(left).toContain(encodeURIComponent(JSON.stringify({ path: `${REPO}/src/AuthService.ts`, ref: BASE })));
-      expect(right).toBe(`file:${REPO}/src/AuthService.ts`);
+      expect(left).toEqual({ scheme: 'git', fsPath: `${REPO}/src/AuthService.ts`, ref: BASE });
+      expect(right).toEqual({ scheme: 'file', fsPath: `${REPO}/src/AuthService.ts` });
       expect(title).toContain('b71995fc');
       expect(title).toContain('working tree');
     }
@@ -66,7 +69,7 @@ describe('vscode.diff argument builder', () => {
     const result = plan('deleted', 'src/Gone.ts');
     expect(result.ok && result.kind === 'diff').toBe(true);
     if (result.ok && result.kind === 'diff') {
-      expect(result.plan.args[1]).toBe(`file:${REPO}/src/Gone.ts`);
+      expect(result.plan.args[1]).toEqual({ scheme: 'file', fsPath: `${REPO}/src/Gone.ts` });
     }
   });
 
@@ -115,14 +118,91 @@ describe('vscode.diff argument builder', () => {
 
   it('keeps Unicode and spaces intact in the URIs it builds', () => {
     const path = 'src/路径/файл с space.ts';
-    const uri = fileUri(`${REPO}/${path}`);
-    expect(uri.startsWith('file:')).toBe(true);
-    expect(gitRevisionUri(`${REPO}/${path}`, BASE)).toContain(encodeURIComponent(JSON.stringify({ path: `${REPO}/${path}`, ref: BASE })));
+    expect(materializeUri(fileSpec(`${REPO}/${path}`), fakeUri)).toMatchObject({ path: `${REPO}/${path}` });
     const result = buildDiffPlan({
       repoRoot: REPO,
       changeSet: changeSet(),
       change: change('modified', path),
     });
     expect(result.ok && result.kind === 'diff').toBe(true);
+  });
+});
+
+/**
+ * Stand-in for `vscode.Uri` with its documented component semantics: `file()`
+ * keeps the filesystem path as the PATH component (nothing becomes a query or
+ * fragment) and `with()` replaces only the named components. It is a test
+ * double for VS Code, not the unit under test (materializeUri / the plans).
+ */
+interface FakeUri {
+  scheme: string;
+  path: string;
+  query: string;
+  fragment: string;
+}
+const fakeUri: UriFactory<FakeUri> = {
+  file(fsPath: string) {
+    const make = (u: FakeUri): FakeUri & { with(c: { scheme?: string; query?: string }): FakeUri } => ({
+      ...u,
+      with: (c) => make({ ...u, ...(c.scheme ? { scheme: c.scheme } : {}), ...(c.query !== undefined ? { query: c.query } : {}) }),
+    });
+    return make({ scheme: 'file', path: fsPath, query: '', fragment: '' });
+  },
+};
+
+describe('URI materialization (review bug 1 / security S5)', () => {
+  it.each([
+    'src/a#b.ts',
+    'src/what?.ts',
+    'src/100%.ts',
+    'src/路径/файл с space.ts',
+  ])('keeps "%s" entirely in the path component — no fragment, no stray query', (rel) => {
+    const fsPath = `${REPO}/${rel}`;
+    const file = materializeUri(fileSpec(fsPath), fakeUri);
+    expect(file).toMatchObject({ scheme: 'file', path: fsPath, query: '', fragment: '' });
+
+    const git = materializeUri(gitRevisionSpec(fsPath, BASE), fakeUri);
+    expect(git.scheme).toBe('git');
+    expect(git.path).toBe(fsPath);
+    expect(git.fragment).toBe('');
+    expect(JSON.parse(git.query)).toEqual({ path: fsPath, ref: BASE });
+  });
+
+  it('every plan argument is a spec, never a pre-encoded string', () => {
+    const result = plan('modified', 'src/a#b?.ts');
+    expect(result.ok && result.kind === 'diff').toBe(true);
+    if (result.ok && result.kind === 'diff') {
+      const [left, right] = result.plan.args;
+      expect(typeof left).toBe('object');
+      expect(typeof right).toBe('object');
+      expect(left.fsPath).toBe(`${REPO}/src/a#b?.ts`);
+    }
+  });
+});
+
+describe('review editor cap (security S5)', () => {
+  it('opens at most the cap and reports how many were left closed', () => {
+    const items = Array.from({ length: 25 }, (_, i) => i);
+    expect(capReviewPlans(items, 10)).toEqual({ open: items.slice(0, 10), notOpened: 15 });
+    expect(capReviewPlans(items.slice(0, 3), 10)).toEqual({ open: [0, 1, 2], notOpened: 0 });
+    expect(capReviewPlans(items).open).toHaveLength(MAX_REVIEW_EDITORS);
+    expect(capReviewPlans(items, -1)).toEqual({ open: [], notOpened: 25 });
+  });
+});
+
+describe('base commit validation before building a git: ref (review W5)', () => {
+  it.each(['HEAD', 'main', '--output=/tmp/x', 'b71995f..HEAD', 'b71995fc1e0f4a3c8f0d7b1a2e3c4d5e6f708192:secret', 'abc12', 'B71995FC', 'g'.repeat(40), 'a'.repeat(65)])(
+    'refuses %s with an honest reason and builds no URI',
+    (base) => {
+      const result = plan('modified', 'src/A.ts', { baseCommit: base });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toMatch(/not a commit id/i);
+    },
+  );
+
+  it('accepts abbreviated and full lowercase hex object ids (SHA-1 and SHA-256)', () => {
+    for (const base of ['b71995f', BASE, 'a'.repeat(64)]) {
+      expect(plan('modified', 'src/A.ts', { baseCommit: base }).ok).toBe(true);
+    }
   });
 });

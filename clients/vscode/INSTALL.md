@@ -65,7 +65,11 @@ On macOS the service listens on the per-user default socket:
 The extension connects there automatically. To use a different socket, either
 start the service with `SANDPANE_SOCKET=/path/to/sandpane.sock` or set the
 extension setting **Sandpane: Core Socket Path** (`sandpane.coreSocketPath`)
-to the same path.
+to the same path. That setting is machine-scoped: set it in your **User**
+settings — a workspace's `.vscode/settings.json` cannot set it. Before
+connecting, the extension checks that the path is a Unix socket (not a
+symlink) owned by you with mode `0600` (what `sandpane-service` creates) and
+refuses anything else.
 
 ## 5. Verify
 

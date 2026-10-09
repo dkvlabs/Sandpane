@@ -20,6 +20,7 @@ export type ClientFailureReason =
   | 'unknown_method'
   | 'validation'
   | 'unsupported_platform'
+  | 'untrusted_socket'
   | 'remote_host'
   | 'adapter_unverified'
   | 'service_policy';
@@ -88,12 +89,13 @@ const CORE_GUIDANCE: Record<ErrorCode, ErrorGuidance> = {
       'tested fixture for your SBX version is the supported path.',
   },
   PROVIDER_AUTH_REQUIRED: {
-    headline: 'The agent provider needs authentication',
+    headline: 'Sign-in required',
     explanation:
-      'The coding-agent provider inside the sandbox is not signed in. Sandpane does not scrape ' +
-      'credentials from Docker, Codex or Claude installations and cannot complete this login for ' +
-      'you (specs/06 §5).',
-    actions: [{ label: 'Sign in inside the sandbox (provider flow)', url: SBX_DOCS }],
+      'A provider Core depends on is not signed in — for example the Docker Sandboxes CLI ' +
+      '("not signed in to Docker"; Core suggests `sbx login`). Sign in yourself with that ' +
+      "provider's own flow. Sandpane does not scrape credentials from Docker, Codex or Claude " +
+      'installations and cannot complete a login for you (specs/06 §5).',
+    actions: [{ label: `Docker Sandboxes documentation (${SBX_DOCS})`, url: SBX_DOCS }],
   },
   CONFLICT: {
     headline: 'Core rejected the operation for the task’s current state',
@@ -110,9 +112,13 @@ const CORE_GUIDANCE: Record<ErrorCode, ErrorGuidance> = {
     actions: [{ label: 'Start a fresh task', command: 'sandpane.startTask' }],
   },
   PERMISSION_DENIED: {
-    headline: 'Operation not permitted',
+    headline: 'Core’s policy refused the operation',
     explanation:
-      'Core authorizes mutating operations server-side. The socket is per-user (0600); a client ' +
+      'The request was well-formed but a policy does not allow it. Two cases this build reports: ' +
+      'there is no verified agent adapter yet (the P0 in-SBX feasibility gate has not passed), so ' +
+      'Core will not run the agent and the task stays queued — signing in would not help; or the ' +
+      'Docker Sandboxes network policy is not initialized (Core suggests ' +
+      '`sbx policy init <allow-all|balanced|deny-all>` — choose the policy yourself). A client ' +
       'cannot widen what the service allows.',
     actions: [{ label: 'Open client logs', command: 'sandpane.openCoreLogs' }],
   },
@@ -209,6 +215,15 @@ const CLIENT_GUIDANCE: Record<ClientFailureReason, ErrorGuidance> = {
       'deliverable. TCP is never used as a fallback.',
     actions: [{ label: 'Open client logs', command: 'sandpane.openCoreLogs' }],
   },
+  untrusted_socket: {
+    headline: 'Refused to attach: the Core socket failed the ownership check',
+    explanation:
+      'Before connecting, Sandpane requires the socket path to be a Unix socket (not a symlink or ' +
+      'file) owned by your user with no group/other permissions — the shape sandpane-service ' +
+      'creates (0600). Something else answered at that path, so nothing was sent to it. Check ' +
+      'the "sandpane.coreSocketPath" user setting and SANDPANE_SOCKET.',
+    actions: [{ label: 'Open client logs', command: 'sandpane.openCoreLogs' }],
+  },
   remote_host: {
     headline: 'Remote extension hosts are not supported in v0.1',
     explanation:
@@ -301,4 +316,38 @@ export function formatGuidance(guidance: ErrorGuidance, coreMessage?: string): s
   }
   if (guidance.honestUncertainty) parts.push(guidance.honestUncertainty);
   return parts.join('\n\n');
+}
+
+/** A remediation Core attached to a failure (`details.hint`, `details.provider`). */
+export interface CoreRemediation {
+  hint: string;
+  provider?: string;
+}
+
+const MAX_HINT_CHARS = 200;
+
+function plainLine(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_HINT_CHARS) return undefined;
+  // One printable line only: shown as text, never run, never multi-line.
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+/**
+ * The remediation Core suggested for a failure, e.g. `sbx login` or
+ * `sbx policy init <allow-all|balanced|deny-all>`. Displayed to the user as
+ * text to run themselves — Sandpane never executes it.
+ */
+export function remediationFrom(error: unknown): CoreRemediation | undefined {
+  const failure = toFailure(error);
+  if (failure.source !== 'core') return undefined;
+  const details = failure.details;
+  if (typeof details !== 'object' || details === null || Array.isArray(details)) return undefined;
+  const record = details as Record<string, unknown>;
+  const hint = plainLine(record['hint']);
+  if (!hint) return undefined;
+  const provider = plainLine(record['provider']);
+  return provider ? { hint, provider } : { hint };
 }

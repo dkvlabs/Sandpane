@@ -10,16 +10,32 @@
 
 import type { ChangeSet, FileChange } from '../core-client/protocol';
 
+/**
+ * A URI described by its parts, never by a pre-encoded string (review bug 1 /
+ * security S5): `vscode.diff` needs real `Uri` objects, and building
+ * `file:${encodeURI(path)}` strings mangles any path containing `#` or `?`
+ * (encodeURI leaves both unescaped, so they become the fragment/query). The
+ * extension side turns a spec into a `vscode.Uri` with `materializeUri`.
+ */
+export type UriSpec =
+  | { scheme: 'file'; fsPath: string }
+  /**
+   * The built-in Git extension's revision URI: the file URI re-schemed to
+   * `git` with query `{"path": <fsPath>, "ref": <sha>}` — the same shape its
+   * own `toGitUri` produces.
+   */
+  | { scheme: 'git'; fsPath: string; ref: string };
+
 export interface DiffCommandPlan {
   command: 'vscode.diff';
   /** [left/base, right/working, title] — the documented vscode.diff signature. */
-  args: [string, string, string];
+  args: [UriSpec, UriSpec, string];
   warning?: string;
 }
 
 export interface OpenFilePlan {
   command: 'vscode.open';
-  args: [string];
+  args: [UriSpec];
   note: string;
 }
 
@@ -35,21 +51,53 @@ export interface ReviewedChange {
   plan: DiffPlan;
 }
 
-/**
- * `git:` raw-content URI understood by the built-in Git extension
- * (`git:/absolute/path?{"path":"...","ref":"<sha>"}`).
- *
- * STATUS: the URI *shape* is unit-tested here; that the installed `vscode.git`
- * resolves it on this host is an integration fact still to be verified — see
- * README "Verified vs. pending" (specs/03 §6 has no remote/local diff case yet).
- */
-export function gitRevisionUri(fsPath: string, ref: string): string {
-  const query = encodeURIComponent(JSON.stringify({ path: fsPath, ref }));
-  return `git:${encodeURI(fsPath)}?${query}`;
+export function fileSpec(fsPath: string): UriSpec {
+  return { scheme: 'file', fsPath };
 }
 
-export function fileUri(fsPath: string): string {
-  return `file:${encodeURI(fsPath)}`;
+export function gitRevisionSpec(fsPath: string, ref: string): UriSpec {
+  return { scheme: 'git', fsPath, ref };
+}
+
+/** The query the Git extension expects on a `git:` revision URI. */
+export function gitRevisionQuery(fsPath: string, ref: string): string {
+  return JSON.stringify({ path: fsPath, ref });
+}
+
+/** Minimal `vscode.Uri` surface, so materialization is testable without VS Code. */
+export interface UriLike<U> {
+  with(change: { scheme?: string; query?: string }): U;
+}
+
+export interface UriFactory<U> {
+  file(fsPath: string): U & UriLike<U>;
+}
+
+/**
+ * Build the real URI object: `Uri.file` (which escapes `#`, `?`, `%`, spaces
+ * and Unicode correctly) and, for a revision, `.with({scheme:'git', query})`.
+ * STATUS: that the installed `vscode.git` resolves the revision URI on this
+ * host is an integration fact still to be verified — see README.
+ */
+export function materializeUri<U>(spec: UriSpec, factory: UriFactory<U>): U {
+  const file = factory.file(spec.fsPath);
+  if (spec.scheme === 'file') return file;
+  return file.with({ scheme: 'git', query: gitRevisionQuery(spec.fsPath, spec.ref) });
+}
+
+/** Most diff editors one Review opens at once (security review S5). */
+export const MAX_REVIEW_EDITORS = 10;
+
+/**
+ * Split the openable plans into the ones to open now and a count left closed,
+ * so a 500-file change set cannot open 500 editors. The rest are reported.
+ */
+export function capReviewPlans<T>(items: readonly T[], max: number = MAX_REVIEW_EDITORS): {
+  open: T[];
+  notOpened: number;
+} {
+  const limit = Math.max(0, Math.floor(max));
+  return { open: items.slice(0, limit), notOpened: Math.max(0, items.length - limit) };
 }
 
 function joinPath(repoRoot: string, relPath: string): string | null {
@@ -60,6 +108,9 @@ function joinPath(repoRoot: string, relPath: string): string | null {
   if (rel.length === 0 || rel.split('/').some((seg) => seg === '..')) return null;
   return `${root}/${rel}`;
 }
+
+/** A git object id: abbreviated (7+) or full SHA-1 (40) / SHA-256 (64), lowercase hex. */
+const COMMIT_ID = /^[0-9a-f]{7,64}$/;
 
 export interface DiffPlanInput {
   repoRoot: string;
@@ -76,6 +127,17 @@ export function buildDiffPlan(input: DiffPlanInput): DiffPlan {
       reason:
         'Core recorded no base commit for this task, so there is nothing to compare against. ' +
         'Opening a fabricated diff would be a made-up result (AGENTS.md rule 5).',
+    };
+  }
+  if (!COMMIT_ID.test(baseCommit)) {
+    // The value becomes the `ref` of a git: URI that vscode.git hands to git.
+    // Only a plain object id is accepted — never a branch name, a range, an
+    // option-looking string or a `rev:path` expression (review W5).
+    return {
+      ok: false,
+      reason:
+        `Core's recorded base "${baseCommit.slice(0, 80)}" is not a commit id (expected 7–64 lowercase ` +
+        'hex characters), so no diff URI was built. Nothing was guessed in its place.',
     };
   }
   if (!repoRoot.startsWith('/')) {
@@ -106,7 +168,7 @@ export function buildDiffPlan(input: DiffPlanInput): DiffPlan {
         kind: 'open',
         plan: {
           command: 'vscode.open',
-          args: [fileUri(fsPath)],
+          args: [fileSpec(fsPath)],
           note: 'Untracked file — it has no base revision, so it is opened instead of diffed.',
         },
       };
@@ -118,7 +180,7 @@ export function buildDiffPlan(input: DiffPlanInput): DiffPlan {
           command: 'vscode.diff',
           // Right side is the working-tree path, which no longer exists; VS Code
           // renders it empty — that *is* the deletion.
-          args: [gitRevisionUri(fsPath, baseCommit), fileUri(fsPath), title],
+          args: [gitRevisionSpec(fsPath, baseCommit), fileSpec(fsPath), title],
           ...(dirtyWarning ? { warning: dirtyWarning } : {}),
         },
       };
@@ -137,7 +199,7 @@ export function buildDiffPlan(input: DiffPlanInput): DiffPlan {
         kind: 'diff',
         plan: {
           command: 'vscode.diff',
-          args: [gitRevisionUri(fsPath, baseCommit), fileUri(fsPath), title],
+          args: [gitRevisionSpec(fsPath, baseCommit), fileSpec(fsPath), title],
           ...(dirtyWarning ? { warning: dirtyWarning } : {}),
         },
       };
