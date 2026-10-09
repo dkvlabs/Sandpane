@@ -123,4 +123,16 @@ Rules:
 - **model:** qwen3.8-max (session configuration; scaffold subagent same family)
 - **tokens:** input: - · cached: - · output: - (session delta: -; agent totals only (25.9M at delivery, +6.9M post-fence recheck), no input/cached/output breakdown exposed — dash per rule)
 
+## 0009 — Integration & final docs-sync sweep
+
+- **date:** 2026-10-09
+- **phase:** plan-of-record entry 0007 close-out half ("CI + integration": final README/docs sync + full verification sweep)
+- **commit:** `9a8d5d2` (chore(integrate): make check aggregates landed clients; README status + command sweep)
+- **details:** Closed the execution plan. `make check` now aggregates everything verifiable on this host — core (fmt/clippy/72 tests) + schema-lint + drift gate + vscode-check (141) + desktop-check (144) — while **excluding** jetbrains-check with an explicit in-target reason (no Kotlin ever compiled; JB0 gate). Root README: status block rewritten to the evidence-backed state ("scaffold phase complete", P0 sbx/Codex + licensing gates stated as OPEN, "Unsupported = visibly unsupported"), command list extended with the schema gates and `npm install first` notes. Execution plan gained the authoritative plan↔actual numbering map (0004↔core, 0005↔CI, 0006/0007/0008↔clients, 0009↔this sweep) and records the two folded logging-rule alignment commits (`a2634bd`, `5052102`: review-method tiering per the user's lighter-path directive; AGENTS.md "newest first" contradiction fixed to chronological-newest-last; `/log-implementation` command aligned). Definition-of-done walked item by item in the audit record. Standing open gates deliberately NOT closed by anything in this session: P0 (real `sbx` CLI + Codex-in-SBX feasibility + real fixtures), licensing release gates, JB0 Kotlin build, P3 in-host VS Code verification, Core push transport + the six protocol-v1 gaps in the compatibility register.
+- **files:** Makefile, README.md, docs/audit/0000-execution-plan.md, docs/audit/0009-integration-docs-review.md, docs/CHANGELOG.md
+- **verification:** full `make check` fresh: **357 tests passed / 0 failed** (72 Rust + 141 VS Code + 144 desktop), clippy clean, schema gates 7×OK + JSON syntax OK, aggregate exit 0; docs-relative-link walk → **0 broken**; `ls docs/audit/` → records 0000–0009 + README, one per implementation entry; `grep -c '^## 0009' docs/CHANGELOG.md` = 1 post-commit; final `git status` → clean (verified in the closing commit below)
+- **review:** [audit/0009-integration-docs-review.md](audit/0009-integration-docs-review.md) — docs/tooling checklist tier (lighter path stands per user directive): 0 Critical, 2 Suggestion accepted-with-docs, 1 Nice-to-have deferred; PASS
+- **model:** qwen3.8-max (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; goal meter exposes session totals only (~45.8M of 62.0M budget at the turn's start), no per-breakdown source available — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->

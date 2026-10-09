@@ -30,11 +30,12 @@ Changelog numbers are assigned by **commit chronology**, not by this plan's tabl
 |---|---|---|
 | 0003 Protocol + Rust Core | CHANGELOG **0004** | User-requested superpowers v6.4.2 install took 0003 mid-session |
 | 0007 CI + integration | CHANGELOG **0005** | CI/drift-gate work is non-overlapping with the client scaffolds, so it landed first while three client agents ran in the background |
-| 0004 VS Code client | next free number when its agent returns (0006+) | parallel scaffold |
-| 0005 Desktop app | next free number when its agent returns (0006+) | parallel scaffold |
-| 0006 JetBrains plugin | next free number when its agent returns (0006+) | parallel scaffold |
+| 0004 VS Code client | CHANGELOG **0006** (`39bfaa2`) | parallel scaffold; reviewed via lighter path (user directive) |
+| 0005 Desktop app | CHANGELOG **0007** (`136231b`) | parallel scaffold; lighter path, disclosed |
+| 0006 JetBrains plugin | CHANGELOG **0008** (`137524a`) | parallel scaffold; file-level-only review, JB0 build gate open |
+| 0007 (final sync half) | CHANGELOG **0009** | `make check` aggregation + README/docs sync + plan close-out |
 
-The plan's "Definition of done" item 1 ("All 7 entries") therefore reads: every planned deliverable logged under its actual chronological number, one `docs/audit/NNNN` record per implementation commit.
+Two follow-up tooling commits (`a2634bd`, `5052102` — logging-rule alignment) are folded into entry 0009 per the skill's "trivial fixes fold into the next entry" rule.
 
 ## Scope boundaries (honest limits)
 
