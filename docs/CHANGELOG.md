@@ -147,4 +147,16 @@ Rules:
 - **model:** GLM-5.3 (session configuration, account:zai-individual-coding-plan/GLM-5.3)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0011 — VS Code .vsix packaging + local installation guide (P3 close-out item)
+
+- **date:** 2026-10-09
+- **phase:** P3 (roadmap item "Package/test `.vsix` and write local installation guide")
+- **commit:** `a725b52` (feat(clients/vscode): package .vsix via vsce + local installation guide (P3))
+- **details:** `npm run package` = compile + `vsce package` (`@vscode/vsce` 4.0.0 as a dev-only dependency — the shipped extension keeps zero runtime deps). Manifest gained `repository`/`bugs` (github.com/dkvlabs/Sandpane, directory `clients/vscode`); MIT `LICENSE` shipped inside the package; `.vscodeignore` keeps sources, tests, tooling, source maps, session-artifact dirs and the `.vsix` itself out of the artifact (first build leaked `.gitignore` + a `.mimosa/` hook-state dir — caught in review, fixed, rebuilt clean). New `clients/vscode/INSTALL.md`: build Core, package, install-from-VSIX, start the service the extension attaches to (the extension never launches Core — ADR 1), socket resolution (`SANDPANE_SOCKET` / `sandpane.coreSocketPath` / per-user default), and the honest scaffold-state limits (sbx absent ⇒ `NOT_INSTALLED`; chats seam-level; no Marketplace until the licensing gate). `docs/compatibility.md` gains the `@vscode/vsce` 4.0.0 verified row. Marketplace publication deliberately NOT done (licensing gate, `docs/licensing-decision.md`).
+- **files:** `clients/vscode/{package.json,package-lock.json,.vscodeignore,LICENSE,INSTALL.md,README.md}`, `docs/compatibility.md`, `.gitignore`
+- **verification:** `npm run package` → `sandpane-0.0.1.vsix` (28 files, 77.21 KB); `unzip -l` → contents audited, 0 leaks after fix; `npm test` → 171 passed / 0 failed after manifest changes; `npx vsce --version` → 4.0.0
+- **review:** [audit/0011-vsix-packaging-review.md](audit/0011-vsix-packaging-review.md) — docs/tooling checklist tier, orchestrator inline (subagents unavailable this session); 1 finding fixed pre-commit (package leak); no Critical findings; PASS
+- **model:** GLM-5.3 (session configuration, account:zai-individual-coding-plan/GLM-5.3)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
