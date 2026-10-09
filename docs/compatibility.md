@@ -14,10 +14,19 @@ Required by `specs/07_ROADMAP_AND_TASKS.md` (P0) and `specs/08_TESTING_AND_RELEA
 | Gradle / Kotlin | Gradle **8.10.2** + JDK 23 present via sdkman (re-measured 09.10.2026); `kotlinc` absent | JetBrains scaffold exists file-level only — **build UNVERIFIED**: `./gradlew` has never been executed, no Kotlin file compiled, IntelliJ Platform artifacts never resolved |
 | Git | driven by core integration tests on real temp repos | verified (host) |
 | Core protocol | version **1** (integer `PROTOCOL_VERSION`); crate semver 0.1.0 — separate axes, do not conflate | verified (core suite) |
-| Docker CLI | /usr/local/bin/docker present | verified (presence only) |
-| Docker SBX CLI (`sbx`) | **not installed** | **P0 BLOCKER — all SBX integration UNVERIFIED** |
-| Codex app-server | not validated inside SBX | **P0 BLOCKER — chat adapter UNVERIFIED** |
+| Docker CLI | `/usr/local/bin/docker`, `Docker version 29.8.2, build 7fc2dff` (re-probed 09.10.2026) | verified (CLI version) |
+| Docker daemon | `docker info` fails: `failed to connect to the docker API at unix:///Users/gabrielgeorgescu/.docker/run/docker.sock … daemon is not running` | **daemon DOWN on this host — no container can run here today** |
+| Docker SBX CLI (`sbx`) | `sbx` not on PATH (Python `shutil.which` probe + Core `system.probe` → `sbx.installed:false`) | **P0 BLOCKER — all SBX integration UNVERIFIED** |
+| Codex CLI | `/Users/gabrielgeorgescu/.local/bin/codex`, `codex-cli 0.155.1`; `~/.codex/auth.json` + `config.toml` exist (presence metadata only — contents never read, never logged) | **P0 BLOCKER — never validated inside SBX, so the adapter stays `verified:false`** |
 | Claude Agent SDK | not validated | UNVERIFIED |
+
+> **P0 blocker attribution, corrected 09.10.2026 by live host probes.** The gate is *not* missing
+> Docker or a missing Codex install — both are present (Docker CLI 29.8.2, `codex-cli 0.155.1`).
+> It is precisely: (1) the `sbx` CLI is not installed, (2) the Docker daemon is not running, and
+> (3) adapter verification requires executing Codex **inside a real SBX**, which neither (1) nor (2)
+> permits. Until all three hold, `system.probe` must keep reporting `sbx.installed:false` and
+> `codex {verified:false, supportsStreaming:false, supportsCancel:false, supportsResume:false}` —
+> which is what the live harness (`clients/vscode/scripts/live-core-check.mjs`, 30/30) asserts.
 
 ## Transport / platform prerequisites recorded against the code (entry 0004 review)
 
