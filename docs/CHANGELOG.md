@@ -309,4 +309,29 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0019 — Core review fixes (F1)
+
+- **date:** 2026-10-09
+- **phase:** P1/P2 (Core) hardening
+- **commit:** `bb5cc8f` (fix(core): security and correctness fixes from the review (F1))
+- **details:** Fixes Core bugs 1–10 and security findings W1–W3, W5, S2–S4, S7 and S8. A security re-review then found two git-hardening bypasses with working proofs of concept (W-1 promisor lazy fetch through `core.sshCommand`; W-2 a submodule's filter driver). Both are closed by regression tests that failed before the fix.
+  - **Reconciliation:** restart reconciliation now covers every non-terminal status.
+  - **Host git:** cannot run repo-configured programs and never fetches lazily.
+  - **sbx adapter:** matches the real v0.47.0 argv and `ls --json` rows; probes with `daemon status --json`; classifies captured stderr.
+  - **Subprocesses:** a bounded runner with a deadline, output cap and process-group kill. A `sandbox.create` timeout re-queries sbx instead of orphaning the sandbox.
+  - **Runtime:** `<state>/sandpane` 0700/0600, flock, peer-uid check, idle timeout and connection cap.
+  - **Projects and mounts:** projects store the canonical git root with a denylist, and mounts must equal a registered root.
+  - **Also:** exact base-OID checks; scheduler idempotency; event high-water mark (migration v2); an honest `conversation.send` error code.
+  - **Unchanged:** the protocol crate and schemas.
+- **files:** `core/**` (18 files; new `process.rs`, `runtime.rs`; `libc` 0.2)
+- **verification:**
+  - clippy `-D warnings` clean;
+  - `cargo test` 154 passed, 0 failed;
+  - `make schema-drift` in sync;
+  - VS Code live check 56/56 against the rebuilt service.
+  - Agent execution in a sandbox: UNVERIFIED (provider sign-in).
+- **review:** [audit/0019-core-review-fixes-review.md](audit/0019-core-review-fixes-review.md) — two rounds incl. PoC-backed security re-review; PASS (residual `info/attributes` race documented)
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->

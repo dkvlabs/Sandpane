@@ -17,9 +17,9 @@ Each line is one implementation commit plus its `docs(audit)` log entry. Small s
 | # | Area | Content | Status |
 |---|---|---|---|
 | F0 | CI | Actions pinned to SHAs, gradle wrapper validation, cargo-audit pinned, Node 24 (security W7) | done `edf9a74` |
-| F1 | Core | Reconcile `awaiting_input`/`verifying`; git hardening (fsmonitor/hooks/env); real sbx v0.47 argv + validator + `--clone`; version parse + probe via `daemon status --json`; bounded subprocess runner; stderr classification; socket/data-dir permissions + `sandpane/` subdir; flock single-instance; peer-cred check; idle timeout + connection cap; scheduler idempotency; event high-water mark (migration v2); honest `conversation.send` code; `project.create` canonical git-root + denylist; exact base-OID checks (security W1–W3, W5, S2–S4, S7, S8) | in progress |
-| F2 | Desktop | Tauri crate compiles; async proxy; CR/LF + response-id checks; timeouts; task-derived live-writable disclosure; state-leak keys; history race; project-scoped task index; ConfirmDialog; reactive store status; inert settings; router/theme/contrast; socket path + owner check; narrowed capability (A1–A12, W4–W6, S9) | in progress |
-| F3 | VS Code | `vscode.diff` Uri args; reconnect socket leak; replay scope; live-writable from the selected sandbox; composer persistence; attachment authorization; honest copy; conversation scope reset; refresh after reconnect; live polling; settings `scope: machine` + socket owner check; crypto nonce (bugs 1–12, W4, S5, S6) | in progress |
+| F1 | Core | Reconcile `awaiting_input`/`verifying`; git hardening (fsmonitor/hooks/env); real sbx v0.47 argv + validator + `--clone`; version parse + probe via `daemon status --json`; bounded subprocess runner; stderr classification; socket/data-dir permissions + `sandpane/` subdir; flock single-instance; peer-cred check; idle timeout + connection cap; scheduler idempotency; event high-water mark (migration v2); honest `conversation.send` code; `project.create` canonical git-root + denylist; exact base-OID checks (security W1–W3, W5, S2–S4, S7, S8) | done `bb5cc8f` (entry 0019) |
+| F2 | Desktop | Tauri crate compiles; async proxy; CR/LF + response-id checks; timeouts; task-derived live-writable disclosure; state-leak keys; history race; project-scoped task index; ConfirmDialog; reactive store status; inert settings; router/theme/contrast; socket path + owner check; narrowed capability (A1–A12, W4–W6, S9) | done `321f4fd` (entry 0017) |
+| F3 | VS Code | `vscode.diff` Uri args; reconnect socket leak; replay scope; live-writable from the selected sandbox; composer persistence; attachment authorization; honest copy; conversation scope reset; refresh after reconnect; live polling; settings `scope: machine` + socket owner check; crypto nonce (bugs 1–12, W4, S5, S6) | done `0344167` (entry 0018) |
 | F4 | JetBrains | Inverted dispose guard; intentional-close reconnect loop and client leak; conversation selection drift; ref-counted streams; per-stream replay refusal and real gap resync; apply sends the reviewed paths; honest send/chip; UTF-8 byte budget; settings wiring; Swing `html.disable` (S1); socket owner check (W4) | in progress |
 
 ### U — Latest dependencies (one area per commit, full suite each)
@@ -59,7 +59,8 @@ Every step to build, run and install the Core service, desktop app, VS Code exte
 
 | Item | Blocked on | Owner / action |
 |---|---|---|
-| Real sandbox create/stop/rm proof, non-empty `ls --json` rows, ports/policy/secrets effects | `sbx create` refuses until the global network policy exists | **User:** `sbx policy init <allow-all\|balanced\|deny-all>` (persistent machine-wide choice) |
+| ~~Real sandbox create/stop/rm proof, non-empty `ls --json` rows~~ | **Unblocked 2026-10-09:** the user ran `sbx policy init balanced`; CLI round trip captured (entry 0015) | — |
+| Ports/policy/secrets effects against a real sandbox | Not yet exercised | Orchestrator, provider-free `shell` sandbox only |
 | Real Codex conversation in SBX (streaming, cancel, session id, resume); verified adapters (Codex, Claude Code, OpenCode…) | Provider credentials inside a sandbox | **User:** provider sign-in; agents never enter credentials |
 | Docker SBX license and written position; trademark/marketplace suitability | Humans / Docker | **Maintainers** (`docs/licensing-decision.md`) |
 | Marketplace publication (VS Code, Open VSX, JetBrains), desktop signing and notarization | Licensing gate + certificates | **User permission + licensing gate** |
