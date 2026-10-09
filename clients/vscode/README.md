@@ -63,9 +63,9 @@ launches, upgrades or stops Core — see *Deferred* (ADR 1).
 
 ```bash
 cd clients/vscode
-npm install --no-audit --no-fund   # 47 packages, no runtime dependencies
+npm install --no-audit --no-fund   # dev dependencies only — the shipped extension has zero runtime deps
 npm run typecheck                  # tsc --noEmit (extension + tests, then the webview script)
-npm test                           # vitest run — 141 tests, pure modules only
+npm test                           # vitest run — 143 tests, pure modules + one real-socket transport suite
 npm run compile                    # tsc → out/ (extension) + out/webview/app.js (sidebar script)
 npm run check                      # typecheck + test
 npm run check:live                 # optional: real Core service integration (see above)
@@ -143,6 +143,9 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
   a P1 deliverable, so `unsupportedPlatformReason()` says so rather than trying.
 
 ## Deferred / not implemented (stated, not hidden)
+
+### Context actions (specs/03 §4 + §2 manifest)
+- **DEFERRED: Explain Selection / Refactor Selection / Fix Current Problems / Add File to Chat / Review Active Task, and `sandpane.sendSelection`** (specs/03:131–135, :82). None are contributed or registered; there is no `editor/context` menu. The data path exists (selection is quoted into task context via `startTask`'s preview), but the dedicated menu entries and their consent UX are P3 work. Named here after review 0006 #6 — previously this gap was invisible in this file.
 
 ### VS1 — sandbox management
 - **DEFERRED: quick-create wizard.** The manifest, `sandboxCreate` wrapper, name
@@ -231,7 +234,7 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
 | 5 | apply with dirty host files aborts safely | **PARTIAL** — Core's precondition gates abort (verified live for the no-Git-context case); the dirty-host path with a real repo: PENDING |
 | 6 | stop sandbox with active tasks warns | **PENDING** — no `sandbox.stop` method in v1 |
 | 7 | omitted Codex adapter shows an unsupported explanation | **VERIFIED** live — `adapter.unavailable` + `PROVIDER_AUTH_REQUIRED`, no terminal scraping fallback exists in this client |
-| 8 | unsupported remote host does not bind the wrong filesystem | **VERIFIED (logic)** — `host.ts` gate is unit-tested and every command checks it; inside a real remote window: PENDING |
+| 8 | unsupported remote host does not bind the wrong filesystem | **PARTIAL** — `host.ts` gate is unit-tested and every command checks it; inside a real remote window: PENDING (review 0006 #5: re-labelled from "VERIFIED (logic)" for consistency with rows 2/3/5) |
 
 ## Conventions
 

@@ -39,8 +39,11 @@ describe('sensitive path exclusion (specs/06 §5)', () => {
     for (const path of [
       '/repo/src/AuthService.ts',
       '/repo/env/envHelper.ts',
-      '/repo/docs/keys.md',
       '/repo/src/token/tokenStore.spec.ts',
+      // review 0006 #2: an unescaped dot in the .env pattern made it match
+      // any char before "env" — benign files must NOT be excluded.
+      '/repo/xenv.ts',
+      '/repo/docs/keys.md',
     ]) {
       expect(isSensitivePath(path)).toBe(false);
     }

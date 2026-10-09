@@ -6,7 +6,7 @@
  * (no `unsafe-inline`), no remote origins, no inline event handlers. Every
  * interpolated value is escaped; content from Core is never rendered as HTML.
  *
- * Pure string builder → the invariants are unit-tested in `test/webviewHtml.test.ts`.
+ * Pure string builder → the invariants are unit-tested in `test/webview.test.ts`.
  */
 
 export interface SidebarHtmlInput {

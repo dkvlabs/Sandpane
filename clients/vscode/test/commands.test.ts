@@ -192,7 +192,12 @@ describe('client-side guards mirror sandpane_core::validation', () => {
     expect(validateGitRef('b71995fc')).toBe('b71995fc');
     expect(validateGitRef('refs/heads/main')).toBe('refs/heads/main');
     expect(validateGitRef('sandpane/task-1')).toBe('sandpane/task-1');
-    for (const bad of ['', 'a..b', 'a//b', 'a.lock', '-x', 'br/', 'br.', 'a; rm -rf /', '$(id)']) {
+    for (const bad of [
+      '', 'a..b', 'a//b', 'a.lock', '-x', 'br/', 'br.', 'a; rm -rf /', '$(id)',
+      // review 0006 #3: these pass the old loose mirror but fail Rust
+      // Validator::branch_name — the client guard must reject them too.
+      '.foo', 'a./b', '/.x',
+    ]) {
       expect(() => validateGitRef(bad)).toThrowError(CoreValidationError);
     }
   });

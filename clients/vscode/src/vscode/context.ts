@@ -45,7 +45,7 @@ export interface ContextPolicy {
  * blanket-send a directory.
  */
 export const DEFAULT_SENSITIVE_PATTERNS: readonly string[] = [
-  '(^|/)\.env($|\\.)',
+  '(^|/)\\.env($|\\.)',
   '(^|/)\\.env\\.production($|\\.)',
   '(^|/)id_(rsa|ed25519|ecdsa|dsa)($|\\.)',
   '(^|/)\\.ssh/',

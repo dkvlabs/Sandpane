@@ -69,13 +69,21 @@ export function validateGitRef(value: string, field = 'expectedBase'): string {
   if (!/^[A-Za-z0-9._/-]+$/.test(value)) {
     throw new CoreValidationError(field, 'only [A-Za-z0-9._/-] are allowed in a ref');
   }
-  for (const seq of ['..', '//', '.lock']) {
+  for (const seq of ['..', '//', '.lock', './', '/.']) {
     if (value.includes(seq)) {
       throw new CoreValidationError(field, `contains the disallowed sequence "${seq}"`);
     }
   }
-  if (value.startsWith('-') || value.endsWith('/') || value.endsWith('.')) {
-    throw new CoreValidationError(field, 'ref may not start with "-" or end with "/" or "."');
+  if (
+    value.startsWith('-') ||
+    value.startsWith('.') ||
+    value.endsWith('/') ||
+    value.endsWith('.')
+  ) {
+    throw new CoreValidationError(
+      field,
+      'ref may not start with "-" or "." or end with "/" or "."',
+    );
   }
   return value;
 }
