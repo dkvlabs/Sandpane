@@ -10,7 +10,7 @@ This folder holds the **auto-review record** for every big implementation step, 
 ## What a review record contains
 
 1. **Scope** — what was reviewed (commit range / working tree diff, files).
-2. **Method** — how the auto-review was produced (e.g. `/review` skill, review agent, checklist pass).
+2. **Method** — how the auto-review was produced (e.g. `/code-review` skill, review agent, checklist pass).
 3. **Findings** — categorized (critical / warning / suggestion), each with file references.
 4. **Disposition** — what was fixed before commit, what was accepted, what was deferred (with issue/changelog pointer).
 5. **Verification evidence** — commands run and actual output summaries.

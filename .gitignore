@@ -5,12 +5,11 @@
 .vscode/*
 !.vscode/extensions.json
 
-# Qwen Code session artifacts (agents/skills/commands ARE committed)
-.qwen/tmp/
-.qwen/worktrees/
-.qwen/reviews/
-.qwen/review-cache/
-.qwen/archived-skills/
+# Claude Code local/session artifacts (settings.json, agents/, skills/, commands/ ARE committed)
+.claude/settings.local.json
+.claude/tmp/
+.claude/worktrees/
+CLAUDE.local.md
 
 # Rust
 target/

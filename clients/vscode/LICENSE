@@ -27,8 +27,5 @@ Scope notes (see docs/licensing-decision.md):
 - This license covers original Sandpane code only. It does not relicense
   Docker Sandboxes (sbx), any coding-agent software, or any third-party
   dependency; those remain under their own terms.
-- Vendored Superpowers skills under .qwen/skills/ are MIT, Copyright (c) 2025
-  Jesse Vincent — see .qwen/skills/SUPERPOWERS_LICENSE and
-  .qwen/skills/SUPERPOWERS_NOTICE.md.
 - Public distribution of SBX-integrated Sandpane artifacts is gated on the
   release checks recorded in docs/licensing-decision.md.

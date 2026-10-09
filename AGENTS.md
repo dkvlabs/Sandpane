@@ -12,12 +12,12 @@ The authoritative specification lives in [`docs/specs/`](docs/specs/README.md). 
 
 > **After each big implementation: commit, auto-review, log in `docs/audit/`, and create a changelog entry in `docs/CHANGELOG.md` with the implementation details, model used, and tokens used (input, cached, output). If you don't have specific information for the changelog, use a dash (e.g., `model: -`). Never guess or fabricate numbers.**
 
-A "big implementation" is any coherent deliverable that would be its own commit series: a phase, module, client skeleton, docs rebuild, or infrastructure addition. The operational procedure (numbering, formats, review method, where model/token figures come from) is defined by the **`sandpane-changelog` skill** (`.qwen/skills/sandpane-changelog/SKILL.md`) — invoke it; do not improvise the format.
+A "big implementation" is any coherent deliverable that would be its own commit series: a phase, module, client skeleton, docs rebuild, or infrastructure addition. The operational procedure (numbering, formats, review method, where model/token figures come from) is defined by the **`sandpane-changelog` skill** (`.claude/skills/sandpane-changelog/SKILL.md`) — invoke it; do not improvise the format.
 
 Flow per implementation (details in the skill):
 
 1. Implement the change.
-2. Run the auto-review **before committing** — method scaled to risk per the `sandpane-changelog` skill: read-only `phase-reviewer` agent (plus `security-reviewer` for execution/IPC/credential/git/webview surfaces) for code; a checklist pass for docs/tooling. Use the bundled `/review` fan-out only when the user explicitly asks for it.
+2. Run the auto-review **before committing** — method scaled to risk per the `sandpane-changelog` skill: read-only `phase-reviewer` agent (plus `security-reviewer` for execution/IPC/credential/git/webview surfaces) for code; a checklist pass for docs/tooling. Use the `/code-review ultra` multi-agent review only when the user explicitly asks for it.
 3. Fix or disposition every Critical finding; commit the implementation.
 4. Write `docs/audit/NNNN-<slug>-review.md` (scope, method, findings, disposition, verification evidence).
 5. Add entry `NNNN` to `docs/CHANGELOG.md` immediately above the bottom append marker (chronological — numbers ascend, newest last), with `-` for every unknown value.
@@ -35,9 +35,10 @@ core/                ← Rust workspace: sandpane-protocol, sandpane-core, sandp
 clients/vscode/      ← VS Code extension (TypeScript)
 clients/jetbrains/   ← IntelliJ Platform plugin (Kotlin, Gradle)
 apps/desktop/        ← Tauri 2 desktop app (React + Rust shell)
-.qwen/agents/        ← project subagent definitions (role-specialized)
-.qwen/skills/        ← project skills + vendored superpowers (MIT, see SUPERPOWERS_NOTICE.md)
-.qwen/commands/      ← project slash commands (/log-implementation, /audit-review, /phase-status)
+.claude/settings.json ← project Claude Code settings (enables the Superpowers plugin)
+.claude/agents/      ← project subagent definitions (role-specialized)
+.claude/skills/      ← Sandpane-authored project skills
+.claude/commands/    ← project slash commands (/log-implementation, /audit-review, /phase-status)
 ```
 
 ## Commands
@@ -57,18 +58,18 @@ apps/desktop/        ← Tauri 2 desktop app (React + Rust shell)
 2. **Single source of truth.** Docker SBX owns sandbox state; the Core owns project/task/conversation state in SQLite. Clients never keep authoritative databases and never parent agent processes.
 3. **Task state transitions are enforced in Core**, emitted as durable append-only events **before** subscribers are notified. Never fabricate `running`/`resumed` state after a restart — reconcile and mark `interrupted`.
 4. **Git safety.** Never overwrite uncommitted host changes; record `base_commit`; apply only via explicit Git operations with conflict detection and user confirmation. Direct-mount mode must always be labeled live-writable.
-5. **Honesty.** No fake success UI, no mocked integration presented as real, no capability claimed without a verified adapter path. Unsupported = visibly unsupported. Verification claims require fresh command output (superpowers `verification-before-completion`).
+5. **Honesty.** No fake success UI, no mocked integration presented as real, no capability claimed without a verified adapter path. Unsupported = visibly unsupported. Verification claims require fresh command output (`superpowers:verification-before-completion`).
 6. **Licensing gate.** Public release of SBX-integrated artifacts is blocked until `docs/licensing-decision.md` gates are checked. Never bundle `sbx` binaries. Never access proprietary ChatGPT/Claude Desktop/Copilot/JetBrains AI internals. MIT covers original Sandpane code only.
 7. **Secrets.** Never scrape, mirror, or log credentials. SBX secrets: presence metadata only. Redact tokens/keys from logs, events, and exports (best-effort, documented).
 8. **Demo data** uses fictional project names Atlas Demo / Nova Demo / Orbit Demo only.
 
 ## Agents and skills map
 
-Specialized subagents (`.qwen/agents/`): `core-engineer`, `sbx-integration-engineer`, `vscode-engineer`, `jetbrains-engineer`, `desktop-engineer`, `test-engineer`, `security-reviewer`, `docs-maintainer`, `phase-reviewer`. Delegate phase work to the matching agent; keep the logging discipline in the orchestrator.
+Specialized subagents (`.claude/agents/`): `core-engineer`, `sbx-integration-engineer`, `vscode-engineer`, `jetbrains-engineer`, `desktop-engineer`, `test-engineer`, `security-reviewer`, `docs-maintainer`, `phase-reviewer`. Delegate phase work to the matching agent; keep the logging discipline in the orchestrator.
 
-Project skills (`.qwen/skills/`): `sandpane-changelog` (logging system — mandatory), `sandpane-phase-gates` (acceptance checks per phase), `sbx-cli-integration`, `git-safe-tasks`, `core-protocol`.
+Project skills (`.claude/skills/`): `sandpane-changelog` (logging system — mandatory), `sandpane-phase-gates` (acceptance checks per phase), `sbx-cli-integration`, `git-safe-tasks`, `core-protocol`.
 
-**Superpowers** (vendored, MIT — see `.qwen/skills/SUPERPOWERS_NOTICE.md`): use `using-superpowers` to start, `writing-plans`/`executing-plans` for planned work, `test-driven-development` for code, `requesting-code-review` around reviews, `verification-before-completion` before ANY completion claim. When a superpowers skill and this file conflict, this file and `docs/specs/06_SECURITY_AND_LICENSING.md` win.
+**Superpowers** ([obra/superpowers](https://github.com/obra/superpowers), MIT © 2025 Jesse Vincent) is installed as a Claude Code plugin enabled at project scope in `.claude/settings.json` (`superpowers@claude-plugins-official`) — it is not vendored into this repo. One-time setup per clone: `claude plugin install superpowers@claude-plugins-official --scope project`. Use `superpowers:using-superpowers` to start, `superpowers:writing-plans`/`superpowers:executing-plans` for planned work, `superpowers:test-driven-development` for code, `superpowers:requesting-code-review` around reviews, `superpowers:verification-before-completion` before ANY completion claim. When a superpowers skill and this file conflict, this file and `docs/specs/06_SECURITY_AND_LICENSING.md` win.
 
 ## Conventions
 

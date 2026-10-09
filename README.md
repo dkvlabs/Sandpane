@@ -25,7 +25,7 @@ Open project → Detect stack → Pick agent → Create isolated SBX environment
 | [`clients/jetbrains/`](clients/jetbrains/) | IntelliJ Platform plugin (Kotlin) — native Tool Window |
 | [`apps/desktop/`](apps/desktop/) | Tauri 2 desktop app (React) — project cockpit and global activity |
 | [`AGENTS.md`](AGENTS.md) | Contract for AI agents working in this repo (includes the mandatory logging rule) |
-| [`.qwen/`](.qwen/skills/SUPERPOWERS_NOTICE.md) | Project subagents, skills (incl. vendored MIT Superpowers), and slash commands |
+| [`.claude/`](.claude/) | Claude Code project config — subagents, Sandpane skills, slash commands; `settings.json` enables the Superpowers plugin |
 
 ## Getting started (development)
 
@@ -47,9 +47,9 @@ JetBrains plugin: `cd clients/jetbrains && ./gradlew buildPlugin test --offline`
 
 1. Read [`AGENTS.md`](AGENTS.md) — engineering rules, safety gates, logging obligation.
 2. Follow [`docs/specs/07_ROADMAP_AND_TASKS.md`](docs/specs/07_ROADMAP_AND_TASKS.md) in phase order; do not assume later-phase modules exist.
-3. Use the project skills: `sandpane-changelog` (logging), `sandpane-phase-gates` (acceptance), `sbx-cli-integration`, `git-safe-tasks`, `core-protocol`; and the vendored Superpowers workflow skills (`using-superpowers` first).
+3. Use the project skills: `sandpane-changelog` (logging), `sandpane-phase-gates` (acceptance), `sbx-cli-integration`, `git-safe-tasks`, `core-protocol`; and the Superpowers plugin workflow skills (`superpowers:using-superpowers` first; enabled for this project in `.claude/settings.json`; install once per clone with `claude plugin install superpowers@claude-plugins-official --scope project`).
 4. Every big implementation ends with: commit → auto-review → `docs/audit/NNNN-*-review.md` → `docs/CHANGELOG.md` entry `NNNN` (unknown values recorded as `-`).
 
 ## License
 
-MIT for original Sandpane code — see [LICENSE](LICENSE) and the redistribution gates in [docs/licensing-decision.md](docs/licensing-decision.md). Vendored Superpowers skills are MIT © 2025 Jesse Vincent.
+MIT for original Sandpane code — see [LICENSE](LICENSE) and the redistribution gates in [docs/licensing-decision.md](docs/licensing-decision.md). The Superpowers plugin (MIT © 2025 Jesse Vincent) is enabled via project settings, not vendored.
