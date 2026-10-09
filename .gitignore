@@ -46,3 +46,4 @@ apps/desktop/src-tauri/gen/schemas/
 .v2c/
 .video_agent/
 .zcodeignore
+clients/vscode/*.vsix

@@ -1,0 +1,20 @@
+# Everything not needed inside the packaged .vsix. The extension runs compiled
+# JS from out/; sources, tests and tooling stay in the checkout.
+.gitignore
+.mimosa/**
+.vscode/**
+.vscode-test/**
+src/**
+test/**
+scripts/**
+node_modules/**
+coverage/**
+dist/**
+out/**/*.map
+tsconfig.json
+tsconfig.build.json
+tsconfig.webview.json
+vitest.config.ts
+package-lock.json
+INSTALL.md
+*.vsix

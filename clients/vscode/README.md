@@ -96,7 +96,13 @@ npm test                           # vitest run — 171 tests, pure modules + on
 npm run compile                    # tsc → out/ (extension) + out/webview/app.js (sidebar script)
 npm run check                      # typecheck + test
 npm run check:live                 # optional: real Core service integration (see above)
+npm run package                    # compile + vsce package → sandpane-<version>.vsix
 ```
+
+Local installation guide (packaging the `.vsix`, installing it, starting the
+Core service it attaches to): [`INSTALL.md`](INSTALL.md). Marketplace
+publication is deliberately not done yet (licensing gate,
+[`docs/licensing-decision.md`](../../docs/licensing-decision.md)).
 
 No runtime dependencies: Node stdlib + the VS Code API only. `devDependencies`
 are typescript, @types/vscode, @types/node, vitest.

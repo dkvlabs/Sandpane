@@ -6,6 +6,14 @@
   "publisher": "dkvlabs",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dkvlabs/Sandpane.git",
+    "directory": "clients/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/dkvlabs/Sandpane/issues"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -163,11 +171,13 @@
     "compile": "tsc -p tsconfig.build.json && tsc -p tsconfig.webview.json",
     "test": "vitest run",
     "check": "npm run typecheck && npm run test",
-    "check:live": "node scripts/live-core-check.mjs"
+    "check:live": "node scripts/live-core-check.mjs",
+    "package": "npm run compile && vsce package"
   },
   "devDependencies": {
     "@types/node": "^22.7.5",
     "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^4.0.0",
     "typescript": "~5.6.3",
     "vitest": "^2.1.9"
   }
