@@ -9,19 +9,21 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://example.invalid/sandpane"
 
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-# Already in Cargo.lock transitively (0.2.190); used directly for flock,
-# process-group kill, geteuid and peer credentials (no std equivalent at MSRV).
-libc = "0.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+uuid = { version = "1.27.0", features = ["v4", "serde"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }  # drop the wasm-only default (ffi-sqlite-wasm-rs)
+# Used directly for flock, process-group kill, geteuid and peer credentials.
+# Stays on the 0.2 line (1.0 is prerelease). Since MSRV 1.89 std has
+# File::lock/try_lock, so flock could migrate later; the rest has no std
+# equivalent.
+libc = "0.2.190"
 
 sandpane-protocol = { path = "crates/sandpane-protocol" }
 sandpane-core = { path = "crates/sandpane-core" }
