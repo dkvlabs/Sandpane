@@ -212,4 +212,16 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0015 — Real sbx sandbox lifecycle round trip (P0 progress)
+
+- **date:** 2026-10-09
+- **phase:** P0 (supported-interface feasibility)
+- **commit:** `5153311` (test(sbx): capture a real sbx v0.47.0 sandbox lifecycle round trip (P0))
+- **details:** The user initialized the global network policy (`sbx policy init balanced`). A disposable `shell` sandbox on an empty scratch workspace then went through the full real lifecycle, all captured as fixtures: create → `ls --json` → exec → stop → `rm --force` → not-found. This yields the real `ls --json` row shape (`name, id, agent, status, last_used_at, workspaces[], created_at`); the illustrative fixture had assumed `state`. Two findings were recorded: `start` does not exist in this CLI version (restart is the interactive `sbx run --name`), and the Core adapter must parse the real rows. `docs/compatibility.md` now records sandbox CRUD as verified at the CLI level. Codex/Claude sandboxes (which need provider sign-in) remain UNVERIFIED.
+- **files:** `core/crates/sandpane-core/tests/fixtures/sbx/captured/v0.47.0/{crud/*,_meta.json}`, `docs/compatibility.md`
+- **verification:** create exit 0; one `running` row; exec printed `sandpane-p0-ok`; stop → `stopped`; rm → empty list; second rm → not-found, exit 1; leak grep 0 hits
+- **review:** [audit/0015-sbx-crud-roundtrip-review.md](audit/0015-sbx-crud-roundtrip-review.md) — fixtures checklist: 2 findings routed to Core work; PASS
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
