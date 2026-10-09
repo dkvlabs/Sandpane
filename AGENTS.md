@@ -17,10 +17,10 @@ A "big implementation" is any coherent deliverable that would be its own commit 
 Flow per implementation (details in the skill):
 
 1. Implement the change.
-2. Run the auto-review **before committing** (`/review` skill; effort scaled to risk — `low` for docs, `medium`+ for code).
+2. Run the auto-review **before committing** — method scaled to risk per the `sandpane-changelog` skill: read-only `phase-reviewer` agent (plus `security-reviewer` for execution/IPC/credential/git/webview surfaces) for code; a checklist pass for docs/tooling. Use the bundled `/review` fan-out only when the user explicitly asks for it.
 3. Fix or disposition every Critical finding; commit the implementation.
 4. Write `docs/audit/NNNN-<slug>-review.md` (scope, method, findings, disposition, verification evidence).
-5. Add entry `NNNN` to `docs/CHANGELOG.md` (newest first) using the documented format, with `-` for every unknown value.
+5. Add entry `NNNN` to `docs/CHANGELOG.md` immediately above the bottom append marker (chronological — numbers ascend, newest last), with `-` for every unknown value.
 6. Commit the log as `docs(audit): log implementation NNNN — <title>`.
 
 ## Repository layout

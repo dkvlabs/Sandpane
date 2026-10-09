@@ -17,7 +17,11 @@ Log every **big implementation step**: a roadmap phase or slice of one, a new mo
 ## Procedure (in order)
 
 1. **Implement** the change completely.
-2. **Auto-review BEFORE committing** — run the bundled `/review` skill on the working tree (`--effort low` for docs-only, `--effort medium` or higher for code). Fix every Critical finding or record a disposition. Keep the findings list; it feeds step 4.
+2. **Auto-review BEFORE committing.** Choose the method scaled to risk:
+   - Docs/tooling-only: a read-only checklist pass (the `phase-reviewer` agent, or the `/review` skill at `--effort low`) against the working-tree diff.
+   - Code changes: dispatch the read-only `phase-reviewer` project agent on the diff; add `security-reviewer` when the change touches command execution, IPC, credentials, Git apply, or webview surfaces.
+   - The bundled `/review` multi-agent fan-out is available but must NOT be launched unless the user explicitly requests it in the current session (a large fan-out was user-cancelled in this project's history — "do not retry" without a fresh request).
+   Fix every Critical finding or record a disposition. Keep the findings list; it feeds step 4. Whichever method ran, name it in the audit record's Method section and the changelog's review line.
 3. **Commit** the implementation (Conventional Commits). Note the short hash: `git log --oneline -1`.
 4. **Write the audit record** `docs/audit/NNNN-<slug>-review.md` using [audit-template.md](audit-template.md). `NNNN` = next zero-padded number after the highest existing entry in `docs/CHANGELOG.md` (check with `ls docs/audit/` and the last changelog entry — they share numbering; `0000` is the execution plan, entries start at `0001`).
 5. **Add the changelog entry** to `docs/CHANGELOG.md` immediately above the append marker at the bottom (chronological order — numbers ascend, newest entry last), using the entry format documented at the top of that file.
