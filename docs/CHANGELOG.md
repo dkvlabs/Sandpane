@@ -224,4 +224,89 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0016 — CI supply-chain hardening (F0)
+
+- **date:** 2026-10-09
+- **phase:** cross-cutting (security review W7)
+- **commit:** `edf9a74` (ci: pin all actions to commit SHAs, validate gradle wrapper, pin cargo-audit (security W7))
+- **details:**
+  - Every GitHub Action is pinned to a full commit SHA of its latest release: checkout v7.0.1, setup-node v7.1.0, setup-python v7.0.0, setup-java v6.0.1, rust-cache v2.9.2. `dtolnay/rust-toolchain` is pinned to the head of its `stable` branch on 2026-10-09.
+  - `gradle/actions/wrapper-validation` v6.4.0 runs before `./gradlew`.
+  - cargo-audit is pinned to 0.22.2 with `--locked`.
+  - CI moves from Node 20 to Node 24, ahead of the Vitest 5 / Vite 8 upgrades.
+- **files:** `.github/workflows/ci.yml`
+- **verification:** all 13 `uses:` lines carry 40-hex SHAs. The workflow has not been run on GitHub from this session: UNVERIFIED.
+- **review:** [audit/0016-ci-action-pinning-review.md](audit/0016-ci-action-pinning-review.md) — inline checklist; PASS (CI execution UNVERIFIED)
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
+## 0017 — Desktop review fixes (F2)
+
+- **date:** 2026-10-09
+- **phase:** P5 (desktop) hardening
+- **commit:** `321f4fd` (fix(desktop): security and correctness fixes from the review (F2))
+- **details:**
+  - **Discovery review findings fixed:** A1–A12 from the desktop review, and W5, W6 and S9 from the security review.
+  - **The `src-tauri` crate compiles again,** and `make desktop-check` now gates on cargo fmt/check/clippy/test.
+  - **Proxy:**
+    - async request path;
+    - CR/LF smuggling rejected;
+    - response-id check;
+    - newline-aware frame cap;
+    - per-method deadlines with a Rust↔TS drift test;
+    - a single bounded retry for read-only methods only;
+    - a mutation whose write broke part-way is flagged "may have been applied";
+    - Core's connection refusal surfaced as its own code.
+  - **Socket path and trust:** the path matches the other clients, with an owner/mode trust check before connect. The capability is narrowed to the single request command.
+  - **UI fixes:**
+    - the task-derived live-writable disclosure;
+    - state-leak keys;
+    - a history race and a project-scoped task index;
+    - ConfirmDialog;
+    - an ErrorBoundary;
+    - sanitized Core hints, which are never executed;
+    - an icon-only rail by default;
+    - contrast and router fixes.
+  - **Two review rounds:** the independent re-review's W1–W3 and suggestions were all fixed.
+- **files:** `apps/desktop/**` (33 files), `Makefile`
+- **verification:** `make desktop-check` exit 0 — 273 TS passed / 8 skipped; 31 Rust passed; clippy `-D warnings` clean. No native Tauri window run: UNVERIFIED.
+- **review:** [audit/0017-desktop-review-fixes-review.md](audit/0017-desktop-review-fixes-review.md) — two rounds; PASS
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
+## 0018 — VS Code review fixes (F3)
+
+- **date:** 2026-10-09
+- **phase:** P3/P4 (VS Code) hardening
+- **commit:** `0344167` (fix(vscode): security and correctness fixes from the review (F3))
+- **details:**
+  - **Discovery review findings fixed:** bugs 1–12 from the VS Code review, and W4 and S6 from the security review.
+  - **Diff:** `vscode.diff` is given `Uri` objects, and `baseCommit` is validated as a hex commit id.
+  - **Connection:** reconnect no longer leaks sockets.
+  - **Catch-up:**
+    - rescoped when the project or sandbox changes;
+    - stale responses are dropped after a switch;
+    - an oversize replay falls back to following the 64 most relevant tasks.
+  - **Live-writable state** now comes from the selected sandbox.
+  - **Composer:**
+    - the draft is preserved across state pushes;
+    - sends are single-flight;
+    - attachment previews are always shown;
+    - the copy was made honest.
+  - **Settings and trust:**
+    - `scope: machine` settings;
+    - a socket owner/mode check;
+    - a crypto nonce for the webview CSP.
+  - **Two review rounds:** W1–W5 and S2/S3/S4/S6 were fixed; S1 and S5 are deferred.
+- **files:** `clients/vscode/**` (37 files)
+- **verification:**
+  - `npm run typecheck` clean;
+  - `npm test` 280/280;
+  - `npm run package` OK;
+  - the live check passed 56/56 against a local Core build.
+  - No Extension Development Host run: UNVERIFIED.
+- **review:** [audit/0018-vscode-review-fixes-review.md](audit/0018-vscode-review-fixes-review.md) — two rounds; PASS (2 suggestions deferred)
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
