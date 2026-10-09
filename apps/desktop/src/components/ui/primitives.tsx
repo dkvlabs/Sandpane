@@ -6,13 +6,12 @@
  */
 
 import {
-  forwardRef,
   useEffect,
   useId,
   useRef,
   useState,
   type ButtonHTMLAttributes,
-  type InputHTMLAttributes,
+  type ComponentPropsWithRef,
   type ReactNode,
 } from "react";
 import type { StatusTone } from "../../lib/reducers";
@@ -122,18 +121,26 @@ export function Field({
   );
 }
 
-export const TextInput = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement> & { invalid?: boolean }>(
-  function TextInput({ invalid, className, ...rest }, ref) {
-    return (
-      <input
-        ref={ref}
-        className={`input${className ? ` ${className}` : ""}`}
-        aria-invalid={invalid ? true : undefined}
-        {...rest}
-      />
-    );
-  },
-);
+/**
+ * React 19: `ref` is an ordinary prop on function components, so this no longer
+ * needs `forwardRef` (which React has announced it will deprecate). Callers that
+ * pass `ref` keep working unchanged.
+ */
+export function TextInput({
+  invalid,
+  className,
+  ref,
+  ...rest
+}: ComponentPropsWithRef<"input"> & { invalid?: boolean }) {
+  return (
+    <input
+      ref={ref}
+      className={`input${className ? ` ${className}` : ""}`}
+      aria-invalid={invalid ? true : undefined}
+      {...rest}
+    />
+  );
+}
 
 /**
  * Honest empty state. `variant` distinguishes the three things that look alike

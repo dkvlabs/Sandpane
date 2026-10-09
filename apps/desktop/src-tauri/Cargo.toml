@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "Sandpane Desktop — Tauri 2 shell with a narrow Core IPC proxy"
 authors = ["DKV Labs"]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT"
 
 # Deliberately NOT a member of the `core/` Cargo workspace: this crate keeps its
@@ -14,9 +14,9 @@ license = "MIT"
 # what makes `version.workspace = true` there still work.)
 
 [dependencies]
-tauri = { version = "2", features = [] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+tauri = { version = "~2.12.2", features = [] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 # Three levels up, not two: src-tauri → desktop → apps → repo root. The
 # previous `../../core/...` resolved to `apps/core/crates/sandpane-protocol`,
 # which does not exist, so `cargo check` failed at dependency resolution
@@ -27,10 +27,10 @@ sandpane-protocol = { path = "../../../core/crates/sandpane-protocol" }
 # `getuid()` for the socket-ownership check before every connect (W4). Already in
 # the lockfile at the version Tauri resolves; added as a direct dependency only.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.190"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "~2.7.1", features = [] }
 
 [profile.release]
 codegen-units = 1

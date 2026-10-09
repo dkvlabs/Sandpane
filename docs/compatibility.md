@@ -31,6 +31,14 @@ Required by `specs/07_ROADMAP_AND_TASKS.md` (P0) and `specs/08_TESTING_AND_RELEA
 > `codex {verified:false, supportsStreaming:false, supportsCancel:false, supportsResume:false}` —
 > which is what the live harness (`clients/vscode/scripts/live-core-check.mjs`, 30/30) asserts.
 
+## Dependency versions (upgrade pass U1–U4, 09.10.2026)
+
+Every version below was confirmed against its registry (`npm view`, crates.io / `cargo search`, Gradle Plugin Portal, JetBrains releases), and the area's full gate ran fresh on it.
+
+| Area | Versions | Status |
+|---|---|---|
+| Desktop (`apps/desktop`), entry 0021 | react / react-dom 19.3.0, @types/react(-dom) 19.3.0, vite 8.3.4, @vitejs/plugin-react 6.1.2, vitest 5.0.3, typescript 7.0.2, @tanstack/react-query 5.104.1, @tauri-apps/api 2.12.2, @tauri-apps/cli 2.12.1, @types/node 24.19.1 (matches the host's Node 24, not 26); crates tauri 2.12.2, tauri-build 2.7.1, serde 1.0.229, serde_json 1.0.151, libc 0.2.190; `rust-version` 1.90 (tauri 2.12's own MSRV) | verified: `make desktop-check` 273 TS passed / 8 skipped + 31 Rust; `vite build` OK; `npm audit` 0. Native `tauri dev`/`tauri build`: UNVERIFIED. Transitive holds from the Linux GTK stack: thiserror 1.0.69, toml 0.8.2 |
+
 ## Transport / platform prerequisites recorded against the code (entry 0004 review)
 
 - **Windows:** the named-pipe transport is NOT implemented in the scaffold (`sandpane-service` refuses to start on non-Unix with a stated reason). Before any Windows support claim, additionally resolve `git` to an absolute path at startup — a bare program name + untrusted cwd can execute a repository-local `git.exe` on Windows (review 0004 #13).
