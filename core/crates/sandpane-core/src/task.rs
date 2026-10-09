@@ -79,6 +79,8 @@ impl TaskStateMachine {
             (TaskStatus::Verifying, TaskStatus::Interrupted) => true,
             (TaskStatus::AwaitingInput, TaskStatus::Cancelled) => true,
             (TaskStatus::AwaitingInput, TaskStatus::Failed) => true,
+            // The adapter waiting for input died with the service.
+            (TaskStatus::AwaitingInput, TaskStatus::Interrupted) => true,
             // A queued/preparing task interrupted by a service crash.
             (TaskStatus::Queued, TaskStatus::Interrupted) => true,
             (TaskStatus::Preparing, TaskStatus::Interrupted) => true,
@@ -89,6 +91,53 @@ impl TaskStateMachine {
         }
         self.status = to;
         Ok(to)
+    }
+}
+
+/// Every [`TaskStatus`], in declaration order. Kept honest by
+/// [`exhaustive_index`] (a wildcard-free match) and its test.
+pub const ALL_STATUSES: &[TaskStatus] = &[
+    TaskStatus::Created,
+    TaskStatus::Queued,
+    TaskStatus::Preparing,
+    TaskStatus::Running,
+    TaskStatus::Verifying,
+    TaskStatus::AwaitingInput,
+    TaskStatus::AwaitingReview,
+    TaskStatus::Completed,
+    TaskStatus::Rejected,
+    TaskStatus::Failed,
+    TaskStatus::Cancelled,
+    TaskStatus::Interrupted,
+];
+
+/// Position of `s` in [`ALL_STATUSES`]. No `_` arm: a new protocol variant is
+/// a compile error here, forcing the list (and every test iterating it) to be
+/// revisited.
+pub const fn exhaustive_index(s: TaskStatus) -> usize {
+    match s {
+        TaskStatus::Created => 0,
+        TaskStatus::Queued => 1,
+        TaskStatus::Preparing => 2,
+        TaskStatus::Running => 3,
+        TaskStatus::Verifying => 4,
+        TaskStatus::AwaitingInput => 5,
+        TaskStatus::AwaitingReview => 6,
+        TaskStatus::Completed => 7,
+        TaskStatus::Rejected => 8,
+        TaskStatus::Failed => 9,
+        TaskStatus::Cancelled => 10,
+        TaskStatus::Interrupted => 11,
+    }
+}
+
+impl TaskStateMachine {
+    /// Statuses that cannot survive the process that was driving them and
+    /// become `interrupted` after a Core restart (specs/02 §1/§4, T09): every
+    /// non-terminal state EXCEPT `awaiting_review`, which is a durable resting
+    /// state (no agent process; the reviewable diff lives in Git).
+    pub fn reconciled_on_restart(status: TaskStatus) -> bool {
+        !TaskStateMachine::from_status(status).is_terminal() && status != TaskStatus::AwaitingReview
     }
 }
 
@@ -215,6 +264,58 @@ mod tests {
 
         let mut m = run_to(TaskStatus::Queued);
         m.transition(TaskStatus::Interrupted).unwrap();
+    }
+
+    #[test]
+    fn every_status_is_listed_exactly_once() {
+        for s in ALL_STATUSES {
+            assert_eq!(ALL_STATUSES.iter().filter(|x| *x == s).count(), 1, "{s:?}");
+            // `exhaustive_index` is a wildcard-free match: adding a TaskStatus
+            // variant fails compilation until ALL_STATUSES is updated.
+            assert_eq!(ALL_STATUSES[exhaustive_index(*s)], *s);
+        }
+    }
+
+    /// Bug 1 (review 0015): restart reconciliation silently skipped tasks
+    /// whose status had no legal edge to `interrupted`. Every status Core
+    /// reconciles on restart MUST have that edge.
+    #[test]
+    fn every_reconciled_status_can_become_interrupted() {
+        for s in ALL_STATUSES {
+            if TaskStateMachine::reconciled_on_restart(*s) {
+                let mut m = TaskStateMachine::from_status(*s);
+                assert_eq!(
+                    m.transition(TaskStatus::Interrupted),
+                    Ok(TaskStatus::Interrupted),
+                    "{s:?} is reconciled on restart but cannot become interrupted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconciliation_set_is_every_live_state() {
+        for s in ALL_STATUSES {
+            let m = TaskStateMachine::from_status(*s);
+            let expected = !m.is_terminal() && *s != TaskStatus::AwaitingReview;
+            assert_eq!(
+                TaskStateMachine::reconciled_on_restart(*s),
+                expected,
+                "{s:?}"
+            );
+        }
+        // Named explicitly: the two states the old list got wrong.
+        assert!(TaskStateMachine::reconciled_on_restart(
+            TaskStatus::AwaitingInput
+        ));
+        assert!(TaskStateMachine::reconciled_on_restart(
+            TaskStatus::Verifying
+        ));
+        // awaiting_review has no live process behind it (the diff lives in
+        // Git), so a restart leaves it awaiting the user.
+        assert!(!TaskStateMachine::reconciled_on_restart(
+            TaskStatus::AwaitingReview
+        ));
     }
 
     #[test]

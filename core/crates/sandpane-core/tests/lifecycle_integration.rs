@@ -199,7 +199,7 @@ fn writer_lock_serializes_two_writable_tasks_across_modules() {
     advance(&db, &mut m1, "t1", TaskStatus::Verifying, "ts1");
     advance(&db, &mut m1, "t1", TaskStatus::AwaitingReview, "ts2");
     advance(&db, &mut m1, "t1", TaskStatus::Rejected, "ts3");
-    sched.mark_finished("t1", "p1", Some("/repo/atlas"));
+    sched.mark_finished("t1");
     assert_eq!(
         sched.admit("t2", "p1", Some("/repo/atlas"), WorkspaceMode::DirectMount),
         Admission::Admitted

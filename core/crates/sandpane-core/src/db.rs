@@ -4,7 +4,7 @@
 //! Sandpane stores its OWN project/task/conversation state here — never a
 //! duplicate authoritative SBX sandbox inventory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use thiserror::Error;
@@ -22,7 +22,13 @@ pub enum DbError {
 #[derive(Debug)]
 pub struct Database {
     conn: Connection,
+    /// File path for on-disk databases (None for in-memory); used to take a
+    /// backup before upgrading an existing schema.
+    path: Option<PathBuf>,
 }
+
+/// Newest schema version this build understands.
+pub const LATEST_SCHEMA_VERSION: i64 = 2;
 
 /// Schema v1: the entity set from specs/02 §3.
 const MIGRATION_V1: &str = r#"
@@ -158,12 +164,24 @@ CREATE INDEX idx_task_events_task_seq ON task_events(task_id, sequence);
 CREATE INDEX idx_messages_conversation_seq ON messages(conversation_id, sequence);
 "#;
 
+/// Schema v2 (review 0015 bug 8): per-task event-sequence HIGH-WATER MARK so
+/// pruning the newest events can never cause a sequence to be re-issued.
+/// Backfilled from the events that exist at upgrade time.
+const MIGRATION_V2: &str = r#"
+ALTER TABLE tasks ADD COLUMN last_event_seq INTEGER NOT NULL DEFAULT 0;
+UPDATE tasks SET last_event_seq =
+    COALESCE((SELECT MAX(sequence) FROM task_events WHERE task_events.task_id = tasks.id), 0);
+"#;
+
 impl Database {
     /// Open (or create) the database at `path` and migrate to the latest
     /// schema. Refuses databases from a newer schema version.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            path: Some(path.to_path_buf()),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -171,7 +189,7 @@ impl Database {
     /// In-memory database for tests.
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self { conn };
+        let db = Self { conn, path: None };
         db.migrate()?;
         Ok(db)
     }
@@ -194,11 +212,10 @@ impl Database {
         // Version gate FIRST: refusing a too-new database must not have
         // already mutated its pragmas.
         let current = self.schema_version()?;
-        const LATEST: i64 = 1;
-        if current > LATEST {
+        if current > LATEST_SCHEMA_VERSION {
             return Err(DbError::TooNew {
                 found: current,
-                supported: LATEST,
+                supported: LATEST_SCHEMA_VERSION,
             });
         }
         // journal_mode/busy_timeout pragmas RETURN rows; execute_batch handles
@@ -206,9 +223,44 @@ impl Database {
         self.conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
         )?;
+        // Upgrading an EXISTING on-disk schema: take a consistent backup
+        // first (core-protocol skill: migrations are backed up atomically).
+        // A fresh database (version 0) has nothing to protect.
+        if (1..LATEST_SCHEMA_VERSION).contains(&current) {
+            self.backup_before_upgrade(current)?;
+        }
         if current < 1 {
             self.apply_migration(1, MIGRATION_V1)?;
         }
+        if current < 2 {
+            self.apply_migration(2, MIGRATION_V2)?;
+        }
+        Ok(())
+    }
+
+    /// `VACUUM INTO` a sibling file `<db>.pre-v<N>.bak[.k]` — a transactionally
+    /// consistent copy; an existing backup is never overwritten.
+    fn backup_before_upgrade(&self, from_version: i64) -> Result<(), DbError> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let base = format!("{}.pre-v{}.bak", path.display(), from_version + 1);
+        let mut target = PathBuf::from(&base);
+        let mut k = 1;
+        while target.exists() {
+            target = PathBuf::from(format!("{base}.{k}"));
+            k += 1;
+        }
+        let target_str = target.to_str().ok_or_else(|| DbError::Migration {
+            version: from_version + 1,
+            reason: "backup path is not valid UTF-8".into(),
+        })?;
+        self.conn
+            .execute("VACUUM INTO ?1", rusqlite::params![target_str])
+            .map_err(|e| DbError::Migration {
+                version: from_version + 1,
+                reason: format!("pre-migration backup failed: {e}"),
+            })?;
         Ok(())
     }
 
@@ -244,7 +296,7 @@ mod tests {
     #[test]
     fn migrate_creates_all_tables_and_indexes() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let names: Vec<String> = db
             .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'")
@@ -304,7 +356,7 @@ mod tests {
         }
         // Reopening migrates nothing new and preserves data.
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let mode: String = db
             .conn()
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
@@ -315,6 +367,59 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// Bug 8 migration: a REAL v1 file (built with the v1 SQL, events
+    /// present, newest pruned) upgrades forward to v2 with the high-water mark
+    /// backfilled, a backup taken, and no sequence reuse afterwards.
+    #[test]
+    fn v1_database_migrates_forward_to_v2_with_backfill_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO conversations (id,project_id,agent_id,created_at) VALUES ('c1','p1','codex','t');
+                 INSERT INTO tasks (id,conversation_id,status,created_at,updated_at) VALUES ('t1','c1','queued','t','t');
+                 INSERT INTO tasks (id,conversation_id,status,created_at,updated_at) VALUES ('t2','c1','queued','t','t');
+                 INSERT INTO task_events VALUES ('t1',1,'k','{}','ts');
+                 INSERT INTO task_events VALUES ('t1',2,'k','{}','ts');
+                 INSERT INTO task_events VALUES ('t1',3,'k','{}','ts');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        let hw = |id: &str| -> i64 {
+            db.conn()
+                .query_row("SELECT last_event_seq FROM tasks WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(hw("t1"), 3);
+        assert_eq!(hw("t2"), 0);
+        // Backup of the v1 file exists and is still v1.
+        let backup = dir.path().join("core.sqlite3.pre-v2.bak");
+        assert!(backup.exists());
+        let b = Connection::open(&backup).unwrap();
+        let v: i64 = b
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 1);
+        // Prune the newest event, append: never reuses 3.
+        let log = crate::events::EventLog::new(&db);
+        log.prune_before("t1", 4).unwrap();
+        let e = log.append("t1", "k", &serde_json::json!({}), "ts").unwrap();
+        assert_eq!(e.sequence, 4);
+        drop(db);
+        // Re-open: idempotent, no second backup for an up-to-date schema.
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        assert!(!dir.path().join("core.sqlite3.pre-v2.bak.1").exists());
     }
 
     #[test]

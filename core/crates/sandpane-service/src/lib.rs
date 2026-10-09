@@ -9,15 +9,21 @@
 //! Windows named pipes are a P1 transport deliverable; this scaffold serves
 //! Unix sockets only and says so instead of pretending (see `main.rs`).
 
+pub mod runtime;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::params;
-use sandpane_core::sbx::{SbxCommandBuilder, SbxLocator};
+use sandpane_core::process::RunLimits;
+use sandpane_core::sbx::{
+    classify_failure, parse_daemon_status_json, parse_list_json, SbxCommandBuilder, SbxLocator,
+    SbxVersion, SbxWorkspace,
+};
 use sandpane_core::scheduler::{Admission, Scheduler};
-use sandpane_core::task::TaskStateMachine;
+use sandpane_core::task::{TaskStateMachine, ALL_STATUSES};
 use sandpane_core::validation::Validator;
 use sandpane_core::{git as scoregit, Database, EventLog};
 use sandpane_protocol::{
@@ -73,16 +79,44 @@ pub const MAX_CURSOR_KEY_LEN: usize = 100;
 /// `conversationId`). Core ids are UUIDs; this only refuses absurd input.
 pub const MAX_SCOPING_ID_LEN: usize = 200;
 
+/// Bounds for each class of sbx invocation (see [`RunLimits`]).
+#[derive(Debug, Clone, Copy)]
+pub struct SbxLimits {
+    pub probe: RunLimits,
+    pub query: RunLimits,
+    pub mutation: RunLimits,
+}
+
+impl Default for SbxLimits {
+    fn default() -> Self {
+        Self {
+            probe: RunLimits::PROBE,
+            query: RunLimits::QUERY,
+            mutation: RunLimits::MUTATION,
+        }
+    }
+}
+
 pub struct ServerInner {
     pub db: Mutex<Database>,
     pub scheduler: Mutex<Scheduler>,
     pub sbx_locator: SbxLocator,
+    pub sbx_limits: SbxLimits,
     pub instance_id: String,
     pub git: scoregit::GitRunner,
 }
 
 impl ServerInner {
     pub fn new(db: Database, sbx_locator: SbxLocator) -> Arc<Self> {
+        Self::with_sbx_limits(db, sbx_locator, SbxLimits::default())
+    }
+
+    /// [`Self::new`] with explicit sbx limits (tests shrink the deadlines).
+    pub fn with_sbx_limits(
+        db: Database,
+        sbx_locator: SbxLocator,
+        sbx_limits: SbxLimits,
+    ) -> Arc<Self> {
         // RESTART RECONCILIATION (specs/02 §1/§4, T09): any task row left in
         // an in-flight state belongs to a dead daemon instance. Every such
         // task becomes `interrupted` — durable event + row update — BEFORE
@@ -93,6 +127,7 @@ impl ServerInner {
             db: Mutex::new(db),
             scheduler: Mutex::new(Scheduler::reconciliation_baseline()),
             sbx_locator,
+            sbx_limits,
             instance_id: uuid::Uuid::new_v4().to_string(),
             git: scoregit::GitRunner::default(),
         })
@@ -109,32 +144,33 @@ impl ServerInner {
     }
 }
 
-/// Task statuses that cannot survive the process that was driving them.
-pub const RECONCILABLE_STATUSES: &[&str] = &[
-    "created",
-    "queued",
-    "preparing",
-    "running",
-    "awaiting_input",
-];
+/// Stored names of the task statuses that cannot survive the process that
+/// was driving them — DERIVED from [`TaskStateMachine::reconciled_on_restart`]
+/// over every status (review 0015 bug 1: the old hand-written list missed
+/// `verifying` and named `awaiting_input`, which then had no legal edge and
+/// was silently skipped).
+pub fn reconcilable_statuses() -> Vec<String> {
+    ALL_STATUSES
+        .iter()
+        .copied()
+        .filter(|s| TaskStateMachine::reconciled_on_restart(*s))
+        .filter_map(|s| task_status_stored(s).ok())
+        .collect()
+}
 
 /// Marks every in-flight task `interrupted` with a durable event. Returns the
 /// affected task ids (used by main.rs startup logging and tests).
 pub fn reconcile_after_restart(db: &Database) -> Vec<String> {
     let mut out = Vec::new();
-    let placeholders = RECONCILABLE_STATUSES
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
+    let statuses = reconcilable_statuses();
+    let placeholders = statuses.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let stale: Vec<(String, String)> = match db.conn().prepare(&format!(
         "SELECT id, status FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at"
     )) {
         Ok(mut stmt) => {
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(RECONCILABLE_STATUSES.iter()),
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            );
+            let rows = stmt.query_map(rusqlite::params_from_iter(statuses.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            });
             match rows {
                 Ok(rows) => rows.filter_map(Result::ok).collect(),
                 Err(e) => {
@@ -283,50 +319,102 @@ fn dispatch(
     id: String,
     params: serde_json::Value,
 ) -> RpcResponse {
-    let result =
-        match method {
-            Method::SystemProbe => system_probe(inner),
-            Method::ProjectCreate => {
-                parse_params::<ProjectCreateParams>(params).and_then(|p| project_create(inner, p))
-            }
-            Method::ProjectList => project_list(inner),
-            Method::SandboxList => sandbox_list(inner),
-            Method::SandboxCreate => {
-                parse_params::<SandboxCreateSpec>(params).and_then(|p| sandbox_create(inner, p))
-            }
-            Method::ConversationCreate => parse_params::<ConversationCreateParams>(params)
-                .and_then(|p| conversation_create(inner, p)),
-            Method::ConversationSend => parse_params::<ConversationSendParams>(params)
-                .and_then(|p| conversation_send(inner, p)),
-            Method::ConversationList => parse_params::<ConversationListParams>(params)
-                .and_then(|p| conversation_list(inner, p)),
-            Method::ConversationHistory => parse_params::<ConversationHistoryParams>(params)
-                .and_then(|p| conversation_history(inner, p)),
-            Method::TaskCancel => match string_param(&params, "taskId") {
-                Some(t) => task_cancel(inner, t),
-                None => Err((ErrorCode::ValidationFailed, "taskId required".into())),
-            },
-            Method::TaskList => {
-                parse_params::<TaskListParams>(params).and_then(|p| task_list(inner, p))
-            }
-            Method::TaskSubscribe => {
-                parse_params::<TaskSubscribeParams>(params).and_then(|p| task_subscribe(inner, p))
-            }
-            Method::GitReview => match string_param(&params, "taskId") {
-                Some(t) => git_review(inner, t),
-                None => Err((ErrorCode::ValidationFailed, "taskId required".into())),
-            },
-            Method::GitApply => {
-                parse_params::<GitApplyParams>(params).and_then(|p| git_apply(inner, p))
-            }
-        };
+    let result: Result<serde_json::Value, SvcFailure> = match method {
+        Method::SystemProbe => system_probe(inner).map_err(Into::into),
+        Method::ProjectCreate => parse_params::<ProjectCreateParams>(params)
+            .and_then(|p| project_create(inner, p))
+            .map_err(Into::into),
+        Method::ProjectList => project_list(inner).map_err(Into::into),
+        Method::SandboxList => sandbox_list(inner),
+        Method::SandboxCreate => parse_params::<SandboxCreateSpec>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| sandbox_create(inner, p)),
+        Method::ConversationCreate => parse_params::<ConversationCreateParams>(params)
+            .and_then(|p| conversation_create(inner, p))
+            .map_err(Into::into),
+        Method::ConversationSend => parse_params::<ConversationSendParams>(params)
+            .and_then(|p| conversation_send(inner, p))
+            .map_err(Into::into),
+        Method::ConversationList => parse_params::<ConversationListParams>(params)
+            .and_then(|p| conversation_list(inner, p))
+            .map_err(Into::into),
+        Method::ConversationHistory => parse_params::<ConversationHistoryParams>(params)
+            .and_then(|p| conversation_history(inner, p))
+            .map_err(Into::into),
+        Method::TaskCancel => match string_param(&params, "taskId") {
+            Some(t) => task_cancel(inner, t).map_err(Into::into),
+            None => Err((ErrorCode::ValidationFailed, "taskId required".to_string()).into()),
+        },
+        Method::TaskList => parse_params::<TaskListParams>(params)
+            .and_then(|p| task_list(inner, p))
+            .map_err(Into::into),
+        Method::TaskSubscribe => parse_params::<TaskSubscribeParams>(params)
+            .and_then(|p| task_subscribe(inner, p))
+            .map_err(Into::into),
+        Method::GitReview => match string_param(&params, "taskId") {
+            Some(t) => git_review(inner, t).map_err(Into::into),
+            None => Err((ErrorCode::ValidationFailed, "taskId required".to_string()).into()),
+        },
+        Method::GitApply => parse_params::<GitApplyParams>(params)
+            .and_then(|p| git_apply(inner, p))
+            .map_err(Into::into),
+    };
     match result {
         Ok(value) => RpcResponse::ok(id, value),
-        Err((code, message)) => RpcResponse::err(id, code, message),
+        Err(f) => {
+            let mut resp = RpcResponse::err(id, f.code, f.message);
+            if let sandpane_protocol::RpcOutcome::Err(e) = &mut resp.outcome {
+                // `details` is part of the v1 error envelope already
+                // (schemas/rpc-response.schema.json) — no wire change.
+                e.details = f.details;
+            }
+            resp
+        }
     }
 }
 
 type SvcError = (ErrorCode, String);
+
+/// A structured failure that may carry `details` (remediation hints such as
+/// `sbx login`). Every plain [`SvcError`] converts into one.
+#[derive(Debug, Clone)]
+pub struct SvcFailure {
+    pub code: ErrorCode,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
+}
+
+impl From<SvcError> for SvcFailure {
+    fn from((code, message): SvcError) -> Self {
+        Self {
+            code,
+            message,
+            details: None,
+        }
+    }
+}
+
+impl From<sandpane_core::sbx::SbxFailure> for SvcFailure {
+    fn from(f: sandpane_core::sbx::SbxFailure) -> Self {
+        Self {
+            code: f.code,
+            message: f.message,
+            details: Some(f.details),
+        }
+    }
+}
+
+/// The agent `sandbox.create` passes to `sbx create`. Protocol v1's
+/// `SandboxCreateSpec` carries no agent, and no agent adapter has passed the
+/// P0 gate, so Core uses the neutral built-in `shell` agent (the agent of the
+/// real captured CRUD round trip) rather than implying a verified coding
+/// agent. Choosing the agent per sandbox needs an additive protocol field.
+pub const SANDBOX_CREATE_AGENT: &str = "shell";
+
+/// Map a bounded-runner failure to a structured error.
+fn process_failure(what: &str, e: sandpane_core::process::ProcessError) -> SvcFailure {
+    SvcFailure::from((ErrorCode::Internal, format!("{what}: {e}")))
+}
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> Result<T, SvcError> {
     serde_json::from_value(params)
@@ -447,14 +535,41 @@ fn validate_cursor_map(map: &HashMap<String, i64>) -> Result<(), SvcError> {
     Ok(())
 }
 
+/// Version + daemon probe for an installed sbx: `sbx version` and
+/// `sbx daemon status --json`, both under [`RunLimits::PROBE`] (3 s, 64 KiB each).
+/// Deliberately NOT `sbx ls`, which auto-starts the daemon (captured
+/// `state/ls_json_autostarts_daemon.txt`) — a probe must not change state.
+/// Any failure (timeout, non-zero exit, unparseable output) reports the field
+/// as unknown (`null`), never a guess.
+pub fn probe_sbx(program: &Path, limits: &RunLimits) -> (Option<String>, Option<bool>) {
+    let version = SbxCommandBuilder::version(program)
+        .run(limits)
+        .ok()
+        .filter(|o| o.status.success() && !o.stdout_truncated)
+        .and_then(|o| SbxVersion::parse(&o.stdout_lossy()).ok())
+        .map(|v| v.to_string());
+    let daemon_running = SbxCommandBuilder::daemon_status_json(program)
+        .run(limits)
+        .ok()
+        .filter(|o| o.status.success() && !o.stdout_truncated)
+        .and_then(|o| parse_daemon_status_json(&o.stdout_lossy()));
+    (version, daemon_running)
+}
+
 fn system_probe(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
-    let sbx = match inner.sbx_locator.locate() {
-        Ok(path) => SbxStatus {
-            installed: true,
-            binary_path: Some(path.display().to_string()),
-            version: None, // probed lazily by sandbox operations
-            daemon_running: None,
-        },
+    // No DB lock is held while the probe subprocesses run.
+    let sbx = match inner.sbx_locator.locate_with_source() {
+        Ok((path, _source)) => {
+            let (version, daemon_running) = probe_sbx(&path, &inner.sbx_limits.probe);
+            SbxStatus {
+                installed: true,
+                // The RESOLVED binary (security S8). Its source (env override
+                // vs PATH) has no v1 wire field; main.rs logs it at startup.
+                binary_path: Some(path.display().to_string()),
+                version,
+                daemon_running,
+            }
+        }
         Err(_) => SbxStatus {
             installed: false,
             binary_path: None,
@@ -489,18 +604,72 @@ fn system_probe(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
     serde_json::to_value(caps).map_err(internal)
 }
 
+/// Security W1: resolve a requested repository to the canonical path Core
+/// will store. The path must exist, canonicalize (symlinks resolved), be the
+/// TOP LEVEL of a Git work tree (hardened `git rev-parse --show-toplevel`), be
+/// valid UTF-8, and pass [`Validator::registrable_repository`] (never `/`,
+/// home or its ancestors, `~/.*`, or system trees). Registration is what later
+/// authorizes a (possibly live-writable) mount, so it is fail-closed.
+pub fn canonical_repository(
+    git: &scoregit::GitRunner,
+    raw: &str,
+    home: &Path,
+) -> Result<String, SvcError> {
+    let requested = Path::new(raw);
+    if !requested.is_absolute() {
+        return Err((
+            ErrorCode::ValidationFailed,
+            format!("repository path must be absolute: {raw}"),
+        ));
+    }
+    let canonical = std::fs::canonicalize(requested).map_err(|e| {
+        (
+            ErrorCode::ValidationFailed,
+            format!("repository path not usable: {raw}: {e}"),
+        )
+    })?;
+    let home_c = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    Validator::registrable_repository(&canonical, &home_c)
+        .map_err(|e| (ErrorCode::PermissionDenied, e.to_string()))?;
+    let toplevel = git.show_toplevel(&canonical).map_err(|e| {
+        (
+            ErrorCode::ValidationFailed,
+            format!("{} is not a Git repository: {e}", canonical.display()),
+        )
+    })?;
+    let toplevel_c = std::fs::canonicalize(&toplevel).unwrap_or(toplevel);
+    if toplevel_c != canonical {
+        return Err((
+            ErrorCode::ValidationFailed,
+            format!(
+                "{} is inside a Git repository but is not its top level ({}); register the \
+                 repository root",
+                canonical.display(),
+                toplevel_c.display()
+            ),
+        ));
+    }
+    canonical.to_str().map(str::to_string).ok_or_else(|| {
+        (
+            ErrorCode::ValidationFailed,
+            "repository path must be valid UTF-8".to_string(),
+        )
+    })
+}
+
 fn project_create(
     inner: &ServerInner,
     p: ProjectCreateParams,
 ) -> Result<serde_json::Value, SvcError> {
     Validator::display_text(&p.name, 120)
         .map_err(|e| (ErrorCode::ValidationFailed, format!("project name: {e}")))?;
+    // Resolve every repository BEFORE taking the DB lock (git subprocesses).
+    let home = runtime::home_dir();
+    let mut repositories = Vec::with_capacity(p.repositories.len());
     for repo in &p.repositories {
-        if !Path::new(repo).is_absolute() {
-            return Err((
-                ErrorCode::ValidationFailed,
-                format!("repository path must be absolute: {repo}"),
-            ));
+        let canonical = canonical_repository(&inner.git, repo, &home)?;
+        if !repositories.contains(&canonical) {
+            repositories.push(canonical);
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
@@ -513,7 +682,7 @@ fn project_create(
         params![id, p.name, "", now],
     )
     .map_err(internal)?;
-    for repo in &p.repositories {
+    for repo in &repositories {
         tx.execute(
             "INSERT INTO repositories (id, project_id, canonical_path) VALUES (?1,?2,?3)",
             params![uuid::Uuid::new_v4().to_string(), id, repo],
@@ -526,7 +695,8 @@ fn project_create(
         name: p.name,
         description: String::new(),
         created_at: now,
-        repositories: p.repositories,
+        // The canonical paths Core actually stored (W1), not the raw input.
+        repositories,
     };
     serde_json::to_value(project).map_err(internal)
 }
@@ -588,74 +758,95 @@ fn project_repository_paths(db: &Database) -> Result<HashMap<String, Vec<String>
     Ok(out)
 }
 
-fn sandbox_list(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
-    let program = inner.sbx_locator.locate().map_err(|_| {
-        (
+fn locate_sbx(inner: &ServerInner) -> Result<PathBuf, SvcFailure> {
+    inner.sbx_locator.locate().map_err(|_| {
+        SvcFailure::from((
             ErrorCode::NotInstalled,
             "sbx executable not found".to_string(),
-        )
-    })?;
-    let cmd = SbxCommandBuilder::list(&program, true);
-    let out = std::process::Command::new(&cmd.program)
-        .args(&cmd.args)
-        .output()
-        .map_err(|e| (ErrorCode::Internal, format!("sbx exec failed: {e}")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        // A stopped daemon must surface as DAEMON_DOWN, not a generic failure.
-        let code = if stderr.contains("daemon") || stderr.contains("connect") {
-            ErrorCode::DaemonDown
-        } else {
-            ErrorCode::Internal
-        };
-        return Err((
-            code,
-            format!("sbx exited {}: {}", out.status, stderr.trim()),
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let entries = sandpane_core::sbx::parse_list_json(&stdout)
-        .map_err(|e| (ErrorCode::ValidationFailed, e.to_string()))?;
-    // SBX stays the source of truth for WHICH sandboxes exist; Core only joins
-    // out the workspace mode it recorded itself (specs/02 §7 — `direct_mount`
-    // means live-writable and UIs must label it, so the value has to be real).
-    let db = inner.lock_db();
-    let modes = binding_workspace_modes(&db)?;
-    let summaries: Vec<SandboxSummary> = entries
-        .into_iter()
-        .map(|e| SandboxSummary {
-            name: e.name.clone(),
-            probed_state: Some(e.state),
-            bound_project_id: None,
-            workspace_mode: modes
-                .get(&e.name)
-                .and_then(|m| workspace_mode_from_stored(m)),
-        })
-        .collect();
-    serde_json::to_value(summaries).map_err(internal)
+        ))
+    })
 }
 
-/// Newest recorded `workspace_mode` per sandbox name. Ordering is the recorded
+/// Run `sbx ls --json` and parse it. A non-zero exit is classified against
+/// the captured error texts; truncated or unparseable output fails loudly.
+fn sbx_list(
+    program: &Path,
+    limits: &RunLimits,
+) -> Result<Vec<sandpane_core::sbx::SbxListEntry>, SvcFailure> {
+    let out = SbxCommandBuilder::list(program)
+        .run(limits)
+        .map_err(|e| process_failure("sbx ls", e))?;
+    if !out.status.success() {
+        return Err(classify_failure(&out.status.to_string(), &out.stderr_lossy()).into());
+    }
+    if out.stdout_truncated {
+        return Err(SvcFailure::from((
+            ErrorCode::ValidationFailed,
+            "sbx ls --json output exceeded the size cap; refusing a partial list".to_string(),
+        )));
+    }
+    parse_list_json(&out.stdout_lossy())
+        .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, e.to_string())))
+}
+
+fn sandbox_list(inner: &ServerInner) -> Result<serde_json::Value, SvcFailure> {
+    let program = locate_sbx(inner)?;
+    // Subprocess first, DB lock after: never hold the lock across sbx.
+    let entries = sbx_list(&program, &inner.sbx_limits.query)?;
+    // SBX stays the source of truth for WHICH sandboxes exist; Core only joins
+    // out what it recorded itself: the workspace mode (specs/02 §7 —
+    // `direct_mount` means live-writable and UIs must label it, so the value
+    // has to be real) and the bound project (review 0015 bug 10).
+    let db = inner.lock_db();
+    let bindings = newest_bindings(&db)?;
+    let summaries: Vec<SandboxSummary> = entries
+        .into_iter()
+        .map(|e| {
+            let binding = bindings.get(&e.name);
+            SandboxSummary {
+                name: e.name.clone(),
+                probed_state: Some(e.status.as_str().to_string()),
+                bound_project_id: binding.map(|b| b.project_id.clone()),
+                workspace_mode: binding.and_then(|b| workspace_mode_from_stored(&b.mode)),
+            }
+        })
+        .collect();
+    serde_json::to_value(summaries).map_err(|e| internal(e).into())
+}
+
+/// The binding row currently in force for a sandbox name.
+struct BindingRow {
+    project_id: String,
+    mode: String,
+}
+
+/// Newest recorded binding per sandbox name. Ordering is the recorded
 /// `created_at` with insertion order (`rowid`) as tie-break, so the value
 /// reported is the binding that is currently in force rather than an arbitrary
-/// one. A name Core has no row for is absent from this map, so the field is
+/// one. A name Core has no row for is absent from this map, so the fields are
 /// omitted on the wire.
-fn binding_workspace_modes(db: &Database) -> Result<HashMap<String, String>, SvcError> {
+fn newest_bindings(db: &Database) -> Result<HashMap<String, BindingRow>, SvcError> {
     let mut stmt = db
         .conn()
         .prepare(
-            "SELECT sandbox_name, workspace_mode FROM sandbox_bindings
+            "SELECT sandbox_name, workspace_mode, project_id FROM sandbox_bindings
              ORDER BY created_at DESC, rowid DESC",
         )
         .map_err(internal)?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
         .map_err(internal)?;
-    let mut out: HashMap<String, String> = HashMap::new();
+    let mut out: HashMap<String, BindingRow> = HashMap::new();
     for row in rows {
-        let (name, mode) = row.map_err(internal)?;
+        let (name, mode, project_id) = row.map_err(internal)?;
         // First seen per name = newest (DESC order); later, older rows lose.
-        out.entry(name).or_insert(mode);
+        out.entry(name).or_insert(BindingRow { project_id, mode });
     }
     Ok(out)
 }
@@ -663,36 +854,50 @@ fn binding_workspace_modes(db: &Database) -> Result<HashMap<String, String>, Svc
 fn sandbox_create(
     inner: &ServerInner,
     spec: SandboxCreateSpec,
-) -> Result<serde_json::Value, SvcError> {
-    Validator::sandbox_name(&spec.name)
-        .map_err(|e| (ErrorCode::ValidationFailed, format!("sandbox name: {e}")))?;
+) -> Result<serde_json::Value, SvcFailure> {
+    Validator::sandbox_name(&spec.name).map_err(|e| {
+        SvcFailure::from((ErrorCode::ValidationFailed, format!("sandbox name: {e}")))
+    })?;
+    // host_worktree needs Core-allocated worktrees (git-safe-tasks) that do
+    // not exist yet. Refuse BEFORE touching anything, rather than fall back to
+    // a live bind mount of the host tree under a "safe" label.
+    if matches!(spec.workspace_mode, WorkspaceMode::HostWorktree) {
+        return Err(SvcFailure::from((
+            ErrorCode::ValidationFailed,
+            "workspace mode host_worktree is not implemented in this build (Core does not yet \
+             allocate task worktrees); use sbx_clone, direct_mount (live-writable) or mountless"
+                .to_string(),
+        )));
+    }
     // MOUNT CONTAINMENT (specs/06 §3 "overly broad mounts", §4 canonicalize +
-    // validate before use): a writable workspace path must resolve (symlinks
-    // included) to a repository REGISTERED with this project — never an
-    // arbitrary host path. Mountless mode carries no path by definition.
+    // validate before use): a workspace path must canonicalize (symlinks
+    // resolved) to a path inside a repository REGISTERED with this project.
+    // Registered paths are themselves canonical Git top levels that passed the
+    // W1 denylist at project.create; they are re-canonicalized here so a row
+    // written before W1 is still compared canonically.
     let mount: Option<PathBuf> = if matches!(spec.workspace_mode, WorkspaceMode::Mountless) {
         if spec.repo_path.is_some() {
-            return Err((
+            return Err(SvcFailure::from((
                 ErrorCode::ValidationFailed,
-                "mountless workspace takes no repository path".into(),
-            ));
+                "mountless workspace takes no repository path".to_string(),
+            )));
         }
         None
     } else {
         let Some(raw) = &spec.repo_path else {
-            return Err((
+            return Err(SvcFailure::from((
                 ErrorCode::ValidationFailed,
                 format!(
-                    "{:?} workspace requires a registered repoPath",
-                    spec.workspace_mode
+                    "{} workspace requires a registered repoPath",
+                    workspace_mode_wire(&spec.workspace_mode)
                 ),
-            ));
+            )));
         };
         let candidate = std::fs::canonicalize(raw).map_err(|e| {
-            (
+            SvcFailure::from((
                 ErrorCode::ValidationFailed,
                 format!("repoPath not usable: {e}"),
-            )
+            ))
         })?;
         let registered: Vec<PathBuf> = {
             let db = inner.lock_db();
@@ -710,16 +915,33 @@ fn sandbox_create(
             paths
         };
         if registered.is_empty() {
-            return Err((
+            return Err(SvcFailure::from((
                 ErrorCode::ValidationFailed,
-                "project has no registered repositories to mount".into(),
-            ));
+                "project has no registered repositories to mount".to_string(),
+            )));
         }
-        if !registered.iter().any(|root| candidate.starts_with(root)) {
-            return Err((
+        // EXACT ROOT ONLY (review S-g): the canonical candidate must EQUAL a
+        // registered repository root, not merely lie beneath it. sbx resolves
+        // the path again on its own; with a subdirectory, an agent with write
+        // access inside the repo could swap a path component for a symlink
+        // between Core's canonicalize and sbx's resolve. The root's own
+        // components are outside the repository's contents. (A residual
+        // remains if the root's PARENT chain is attacker-writable — it is the
+        // user's own directory tree, not a sandbox mount.)
+        // The W1 denylist is RE-APPLIED to every stored root: a row written
+        // before registration was hardened (e.g. `$HOME` itself) never
+        // authorizes a mount.
+        let home = runtime::home_dir();
+        let home_c = std::fs::canonicalize(&home).unwrap_or(home);
+        if !registered.iter().any(|root| {
+            candidate == *root && Validator::registrable_repository(root, &home_c).is_ok()
+        }) {
+            return Err(SvcFailure::from((
                 ErrorCode::PermissionDenied,
-                "repoPath is not a repository registered with this project".into(),
-            ));
+                "repoPath must be exactly a repository root registered with this project (an \
+                 allowed repository location); subdirectories are not mountable"
+                    .to_string(),
+            )));
         }
         Some(candidate)
     };
@@ -734,33 +956,61 @@ fn sandbox_create(
             )
             .map_err(internal)?;
         if exists == 0 {
-            return Err((ErrorCode::NotFound, "project not found".into()));
+            return Err(SvcFailure::from((
+                ErrorCode::NotFound,
+                "project not found".to_string(),
+            )));
         }
     }
-    let program = inner.sbx_locator.locate().map_err(|_| {
-        (
-            ErrorCode::NotInstalled,
-            "sbx executable not found".to_string(),
-        )
-    })?;
-    let cmd = SbxCommandBuilder::create(&program, &spec.name, mount.as_deref())
-        .map_err(|e| (ErrorCode::ValidationFailed, e.to_string()))?;
-    let out = std::process::Command::new(&cmd.program)
-        .args(&cmd.args)
-        .output()
-        .map_err(|e| (ErrorCode::Internal, format!("sbx exec failed: {e}")))?;
-    if !out.status.success() {
-        return Err((
-            ErrorCode::Internal,
-            format!(
-                "sbx exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        ));
-    }
-    // RE-QUERY after mutation: exit 0 never means desired state (specs/02 §5).
-    let probed_state = probe_sandbox_state(&program, &spec.name);
+    let program = locate_sbx(inner)?;
+    let workspace = match (&spec.workspace_mode, mount.as_deref()) {
+        (WorkspaceMode::DirectMount, Some(p)) => SbxWorkspace::BindMount(p),
+        (WorkspaceMode::SbxClone, Some(p)) => SbxWorkspace::Clone(p),
+        _ => SbxWorkspace::None,
+    };
+    let cmd = SbxCommandBuilder::create(&program, &spec.name, SANDBOX_CREATE_AGENT, workspace)
+        .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, e.to_string())))?;
+    let probed_state = match cmd.run(&inner.sbx_limits.mutation) {
+        Ok(out) if out.status.success() => {
+            // RE-QUERY after mutation: exit 0 never means desired state
+            // (specs/02 §5).
+            probe_sandbox_state(&program, &spec.name, &inner.sbx_limits.query)
+        }
+        Ok(out) => {
+            // Classified against the real captured errors: not signed in →
+            // PROVIDER_AUTH_REQUIRED, policy not initialized →
+            // PERMISSION_DENIED with the `sbx policy init …` remediation, etc.
+            // (review 0015 bug 5).
+            return Err(classify_failure(&out.status.to_string(), &out.stderr_lossy()).into());
+        }
+        Err(sandpane_core::process::ProcessError::TimedOut(after)) => {
+            // Review S-c: the create was killed at its deadline (or a
+            // descendant held its output open), but the sandbox may exist.
+            // SBX is the source of truth: re-query, and bind what exists
+            // rather than orphan it. Absent → an honest timeout error.
+            match probe_sandbox_state(&program, &spec.name, &inner.sbx_limits.query) {
+                Some(state) => {
+                    eprintln!(
+                        "sandpane-service: sbx create {} exceeded {after:?}; sandbox exists \
+                         on re-query ({state}) and is being bound",
+                        spec.name
+                    );
+                    Some(state)
+                }
+                None => {
+                    return Err(SvcFailure::from((
+                        ErrorCode::Internal,
+                        format!(
+                            "sbx create timed out after {after:?} and sandbox {:?} is not \
+                             present on re-query",
+                            spec.name
+                        ),
+                    )))
+                }
+            }
+        }
+        Err(e) => return Err(process_failure("sbx create", e)),
+    };
     {
         let db = inner.lock_db();
         // Bare wire name (snake_case, unquoted) — matches tasks.status storage
@@ -789,7 +1039,7 @@ fn sandbox_create(
         // direct_mount is live-writable).
         workspace_mode: Some(spec.workspace_mode),
     };
-    serde_json::to_value(summary).map_err(internal)
+    serde_json::to_value(summary).map_err(|e| internal(e).into())
 }
 
 /// Bare snake_case wire name for a workspace mode (no JSON quotes).
@@ -802,21 +1052,13 @@ fn workspace_mode_wire(mode: &WorkspaceMode) -> &'static str {
     }
 }
 
-fn probe_sandbox_state(program: &Path, name: &str) -> Option<String> {
-    let list_cmd = SbxCommandBuilder::list(program, true);
-    let out = std::process::Command::new(&list_cmd.program)
-        .args(&list_cmd.args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let entries =
-        sandpane_core::sbx::parse_list_json(&String::from_utf8_lossy(&out.stdout)).ok()?;
-    entries
+/// Post-mutation re-query. `None` = could not be determined (never guessed).
+fn probe_sandbox_state(program: &Path, name: &str, limits: &RunLimits) -> Option<String> {
+    sbx_list(program, limits)
+        .ok()?
         .into_iter()
         .find(|e| e.name == name)
-        .map(|e| e.state)
+        .map(|e| e.status.as_str().to_string())
 }
 
 fn conversation_create(
@@ -963,11 +1205,18 @@ fn conversation_send(
         match admission {
             Admission::Admitted => {
                 // The honest scaffold event: adapter unavailable, task queued.
+                // PERMISSION_DENIED (review 0015 bug 9): the request is
+                // well-formed, but Core's policy refuses to drive an agent
+                // that has no verified adapter (AGENTS.md rule 5). It used to
+                // claim PROVIDER_AUTH_REQUIRED, which falsely tells the user
+                // that signing in would help. VALIDATION_FAILED was rejected
+                // because nothing in the request is malformed.
                 let ev = AgentEvent::Error {
-                    code: ErrorCode::ProviderAuthRequired,
+                    code: ErrorCode::PermissionDenied,
                     message: format!(
-                        "no verified adapter for agent '{agent_id}' in this build; \
-                         the in-SBX feasibility gate (P0) has not passed — task stays queued"
+                        "no verified agent adapter for '{agent_id}' in this build: \
+                         the in-SBX feasibility gate (P0) has not passed, so Core will not run it \
+                         — task stays queued"
                     ),
                 };
                 log.append(
@@ -1402,7 +1651,10 @@ fn git_review(inner: &ServerInner, task_id: String) -> Result<serde_json::Value,
 }
 
 fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value, SvcError> {
-    Validator::git_ref(&p.expected_base)
+    // Security W3: the client's base assertion must be a FULL object id and
+    // must equal the Core-recorded base EXACTLY — no prefix matching, so a
+    // 1-character "base" can never satisfy the gate.
+    Validator::full_object_id(&p.expected_base)
         .map_err(|e| (ErrorCode::ValidationFailed, format!("expected base: {e}")))?;
     // Real precondition enforcement: when the task carries a Git context, the
     // dirty-host and base-divergence gates run for real and abort structurally
@@ -1412,7 +1664,7 @@ fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value
     // through to the "preconditions passed" branch (review finding #9).
     match git_context(inner, &p.task_id) {
         Ok((repo_path, base_commit)) => {
-            if base_commit != p.expected_base && !base_commit.starts_with(&p.expected_base) {
+            if !base_commit.eq_ignore_ascii_case(&p.expected_base) {
                 let result = ApplyResult {
                     applied: false,
                     abort_reason: Some(format!(
@@ -1423,11 +1675,11 @@ fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value
                 };
                 return serde_json::to_value(result).map_err(internal);
             }
-            if let Err(e) = scoregit::preconditions_for_apply(
-                &inner.git,
-                Path::new(&repo_path),
-                &p.expected_base,
-            ) {
+            // The CORE-RECORDED base drives the host check, never the
+            // client's value.
+            if let Err(e) =
+                scoregit::preconditions_for_apply(&inner.git, Path::new(&repo_path), &base_commit)
+            {
                 let result = ApplyResult {
                     applied: false,
                     abort_reason: Some(format!("precondition failed: {e}")),
@@ -1463,11 +1715,37 @@ fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value
 // Connection serving
 // ---------------------------------------------------------------------------
 
-/// Serve one connection to completion (thread-per-connection; the accept loop
-/// lives in main.rs). UI detach never cancels tasks: dropping this reader only
-/// ends the subscription — DB/scheduler state is untouched.
+/// Serve one connection to completion (thread-per-connection) with the
+/// default [`runtime::ConnectionLimits`]. UI detach never cancels tasks:
+/// dropping this reader only ends the subscription — DB/scheduler state is
+/// untouched.
 #[cfg(unix)]
 pub fn serve_connection(inner: Arc<ServerInner>, stream: std::os::unix::net::UnixStream) {
+    serve_connection_with(inner, stream, &runtime::ConnectionLimits::default());
+}
+
+/// [`serve_connection`] with explicit limits. Security S3: the peer must be
+/// this same OS user (`getpeereid` / `SO_PEERCRED`), else the connection gets
+/// one PERMISSION_DENIED frame and is closed. Security S7: an idle read
+/// timeout and a write timeout bound how long a client can pin a thread.
+#[cfg(unix)]
+pub fn serve_connection_with(
+    inner: Arc<ServerInner>,
+    stream: std::os::unix::net::UnixStream,
+    limits: &runtime::ConnectionLimits,
+) {
+    if !runtime::peer_allowed(runtime::peer_uid(&stream), runtime::euid()) {
+        let mut s = &stream;
+        let resp = err_frame(
+            "",
+            ErrorCode::PermissionDenied,
+            "connection refused: peer is not the Core's OS user",
+        );
+        let _ = writeln!(s, "{resp}");
+        return;
+    }
+    let _ = stream.set_read_timeout(Some(limits.idle_timeout));
+    let _ = stream.set_write_timeout(Some(limits.write_timeout));
     let Ok(write_half) = stream.try_clone() else {
         return;
     };
@@ -1496,7 +1774,9 @@ pub fn serve_connection(inner: Arc<ServerInner>, stream: std::os::unix::net::Uni
             }
             Err(e) => {
                 // Non-UTF-8 frames get a structured refusal like malformed
-                // JSON does — never a silent disconnect (specs/02 §2).
+                // JSON does — never a silent disconnect (specs/02 §2). An idle
+                // timeout (WouldBlock/TimedOut) just closes the connection;
+                // clients reconnect.
                 if e.kind() == std::io::ErrorKind::InvalidData {
                     let resp = err_frame("", ErrorCode::ValidationFailed, "invalid UTF-8 frame");
                     let _ = writeln!(writer, "{resp}");
@@ -1509,38 +1789,78 @@ pub fn serve_connection(inner: Arc<ServerInner>, stream: std::os::unix::net::Uni
     let _ = writer.flush();
 }
 
-/// Socket path policy: explicit `SANDPANE_SOCKET` override, else a per-user
-/// private directory (0700) under the platform app-data location. NEVER TCP.
-pub fn default_socket_path() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("SANDPANE_SOCKET") {
-        return std::path::PathBuf::from(p);
+/// Releases one active-connection slot when dropped (including on unwind).
+#[cfg(unix)]
+struct ConnectionSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(unix)]
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
-    data_dir().join("sandpane.sock")
+}
+
+/// Accept loop with a concurrent-connection cap (security S7). A connect
+/// beyond the cap receives one structured `INTERNAL` "too many connections"
+/// frame and is closed instead of spawning an unbounded thread.
+#[cfg(unix)]
+pub fn serve_listener(
+    inner: Arc<ServerInner>,
+    listener: std::os::unix::net::UnixListener,
+    limits: runtime::ConnectionLimits,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("sandpane-service: accept failed: {e}");
+                continue;
+            }
+        };
+        if active.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
+            active.fetch_sub(1, Ordering::SeqCst);
+            let _ = stream.set_write_timeout(Some(limits.write_timeout));
+            let mut s = &stream;
+            let resp = err_frame(
+                "",
+                ErrorCode::Internal,
+                format!(
+                    "too many connections (limit {}); retry later",
+                    limits.max_connections
+                ),
+            );
+            let _ = writeln!(s, "{resp}");
+            continue;
+        }
+        let inner = Arc::clone(&inner);
+        // Review S-f: the slot is released by a drop guard, so a panicking
+        // handler (unwinding) cannot leak it.
+        let slot = ConnectionSlot(Arc::clone(&active));
+        std::thread::spawn(move || {
+            let _slot = slot;
+            serve_connection_with(inner, stream, &limits);
+        });
+    }
+}
+
+/// Socket path policy: explicit `SANDPANE_SOCKET` override, else
+/// `<data_dir>/sandpane.sock`. NEVER TCP. See [`runtime::socket_path_for`].
+pub fn default_socket_path() -> std::path::PathBuf {
+    runtime::socket_path_for(&runtime::PathEnv::from_process()).0
 }
 
 /// Database path policy: explicit `SANDPANE_DB` override, else the same
 /// per-user private data directory.
 pub fn default_db_path() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("SANDPANE_DB") {
-        return std::path::PathBuf::from(p);
-    }
-    data_dir().join("sandpane.sqlite3")
+    runtime::db_path_for(&runtime::PathEnv::from_process())
 }
 
+/// Sandpane's own per-user data directory (security W5: always ends in
+/// `sandpane`, matching every client). See [`runtime::data_dir_for`].
 pub fn data_dir() -> std::path::PathBuf {
-    if cfg!(target_os = "macos") {
-        home_dir().join("Library/Application Support/sandpane")
-    } else {
-        std::env::var_os("XDG_STATE_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| home_dir().join(".local/state/sandpane"))
-    }
-}
-
-fn home_dir() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+    runtime::data_dir_for(&runtime::PathEnv::from_process())
 }
 
 #[cfg(test)]
@@ -1563,6 +1883,21 @@ mod tests {
         })
         .unwrap();
         serde_json::from_str(&handle_line(i, &line)).unwrap()
+    }
+
+    /// Review S-f: a handler that panics still releases its connection slot.
+    #[test]
+    fn connection_slot_is_released_on_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = Arc::new(AtomicUsize::new(1));
+        let slot = ConnectionSlot(Arc::clone(&active));
+        let r = std::thread::spawn(move || {
+            let _slot = slot;
+            panic!("handler bug");
+        })
+        .join();
+        assert!(r.is_err());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[test]

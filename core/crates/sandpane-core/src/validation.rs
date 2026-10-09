@@ -27,6 +27,39 @@ pub enum ValidationError {
 
 pub struct Validator;
 
+/// System trees that are never registrable as repositories (security W1).
+/// `/private/var` (macOS temp dirs) is deliberately NOT listed.
+pub const SYSTEM_TREES: &[&str] = &[
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/boot",
+    "/System",
+    "/Library",
+    "/private/etc",
+    "/cores",
+];
+
+/// Built-in agents listed by the captured `sbx v0.47.0 create --help`
+/// ("Available agents: …", fixture `help/create.txt`).
+pub const SBX_AGENTS_V0_47: &[&str] = &[
+    "claude",
+    "codex",
+    "copilot",
+    "cursor",
+    "devin",
+    "docker-agent",
+    "droid",
+    "gemini",
+    "kiro",
+    "opencode",
+    "shell",
+];
+
 /// Characters that must never appear in values destined for CLI arguments.
 /// Deliberately stricter than git check-ref-format: no shell metacharacters,
 /// no whitespace, no glob/tilde/brace expansion characters.
@@ -36,27 +69,127 @@ const FORBIDDEN_ARG_CHARS: &[char] = &[
 ];
 
 impl Validator {
-    /// Sandbox names: lowercase alphanumeric + hyphen, must start and end
-    /// alphanumeric, 1..=63 chars (DNS-label-like; matches SBX naming
-    /// expectations and is trivially shell-safe).
+    /// Sandbox names, per the rule `sbx v0.47.0 create --help` documents for
+    /// `--name` (captured fixture `help/create.txt`): "at least two
+    /// characters, starting with a letter or number, containing only letters,
+    /// numbers, hyphens and periods … 'default' is reserved". Uppercase and
+    /// periods are therefore accepted so Core can ADDRESS sandboxes SBX
+    /// itself named (its default is `<agent>-<workdir>`). The 128-char bound
+    /// is Sandpane's own sanity limit (sbx documents none). A leading letter
+    /// or digit means no value can ever be read as an option.
     pub fn sandbox_name(name: &str) -> Result<&str, ValidationError> {
-        Self::bounded(name, 63)?;
+        Self::bounded(name, 128)?;
         for c in name.chars() {
-            if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            if !(c.is_ascii_alphanumeric() || c == '-' || c == '.') {
                 return Err(ValidationError::DisallowedChar { found: c });
             }
         }
-        let alnum = |c: u8| c.is_ascii_alphanumeric();
-        if !name.bytes().next().is_some_and(alnum) || !name.bytes().next_back().is_some_and(alnum) {
+        if name.chars().count() < 2 {
             return Err(ValidationError::InvalidShape {
-                reason: "must start and end with an ASCII letter or digit".into(),
+                reason: "sandbox name must be at least two characters".into(),
             });
         }
-        if name.contains("--") {
-            // Prevents option-smuggling lookalikes and matches common CLI name rules.
-            return Err(ValidationError::DisallowedSequence { found: "--".into() });
+        if !name
+            .bytes()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        {
+            return Err(ValidationError::InvalidShape {
+                reason: "sandbox name must start with an ASCII letter or digit".into(),
+            });
+        }
+        if name.eq_ignore_ascii_case("default") {
+            return Err(ValidationError::InvalidShape {
+                reason: "'default' is a reserved sandbox name".into(),
+            });
         }
         Ok(name)
+    }
+
+    /// Built-in agent for `sbx create AGENT`, from the captured `sbx v0.47.0
+    /// create --help` "Available agents" line. Sandbox-kit references (paths,
+    /// ZIPs, git/OCI refs) are deliberately NOT accepted.
+    pub fn sbx_agent(agent: &str) -> Result<&str, ValidationError> {
+        if SBX_AGENTS_V0_47.contains(&agent) {
+            Ok(agent)
+        } else {
+            Err(ValidationError::InvalidShape {
+                reason: format!("{agent:?} is not a built-in sbx v0.47 agent"),
+            })
+        }
+    }
+
+    /// A host workspace path for `sbx create AGENT PATH`: absolute, valid
+    /// UTF-8, no control characters, and no `:` — sbx parses `PATH:ro` as a
+    /// read-only mount spec (captured `create --help` example), so a colon in
+    /// the path would change the mount's meaning.
+    pub fn sbx_workspace_path(path: &Path) -> Result<&str, ValidationError> {
+        let Some(s) = path.to_str() else {
+            return Err(ValidationError::InvalidShape {
+                reason: "workspace path must be valid UTF-8".into(),
+            });
+        };
+        if !path.is_absolute() {
+            return Err(ValidationError::NotAbsolute { path: s.into() });
+        }
+        Self::bounded(s, 4096)?;
+        for c in s.chars() {
+            if c == ':' || c.is_control() {
+                return Err(ValidationError::DisallowedChar { found: c });
+            }
+        }
+        Ok(s)
+    }
+
+    /// Security W1: may this CANONICAL path be registered as a project
+    /// repository (and therefore later bind-mounted, possibly live-writable)?
+    /// Refuses `/`, the home directory and every ancestor of it, anything
+    /// under a hidden top-level entry of home (`~/.ssh`, `~/.config`, …), and
+    /// system trees. Pure: callers canonicalize `candidate` and `home` first
+    /// and separately require the path to be a Git work-tree top level.
+    pub fn registrable_repository(candidate: &Path, home: &Path) -> Result<(), ValidationError> {
+        let refuse = |why: &str| {
+            Err(ValidationError::InvalidShape {
+                reason: format!("{} cannot be registered: {why}", candidate.display()),
+            })
+        };
+        if !candidate.is_absolute() {
+            return Err(ValidationError::NotAbsolute {
+                path: candidate.display().to_string(),
+            });
+        }
+        if candidate.parent().is_none() {
+            return refuse("the filesystem root");
+        }
+        if home.starts_with(candidate) {
+            return refuse("the home directory or one of its ancestors");
+        }
+        if let Ok(rest) = candidate.strip_prefix(home) {
+            if let Some(Component::Normal(first)) = rest.components().next() {
+                if first.to_string_lossy().starts_with('.') {
+                    return refuse("a hidden directory in home (credentials/config live there)");
+                }
+            }
+        }
+        for sys in SYSTEM_TREES {
+            if candidate.starts_with(sys) {
+                return refuse("a system directory");
+            }
+        }
+        Ok(())
+    }
+
+    /// A FULL Git object id (SHA-1: 40 hex, SHA-256: 64 hex). Used for every
+    /// base-commit ASSERTION: an abbreviation is not an identity (security W3).
+    pub fn full_object_id(value: &str) -> Result<&str, ValidationError> {
+        if (value.len() == 40 || value.len() == 64) && value.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            Ok(value)
+        } else {
+            Err(ValidationError::InvalidShape {
+                reason: "expected a full 40- or 64-hex-digit object id".into(),
+            })
+        }
     }
 
     /// Git branch names for task branches (sandpane/<task-id> style enforced by
@@ -92,12 +225,20 @@ impl Validator {
         Ok(name)
     }
 
-    /// Git refs (commits/tags) accepted as `expected_base` etc.: hex object ids
-    /// or conservative ref names (allowlist enforced by [`Self::branch_name`]).
+    /// Git revisions used as diff/worktree bases: hex object ids of at least
+    /// 7 digits or conservative ref names (allowlist enforced by
+    /// [`Self::branch_name`]). An all-hex value SHORTER than 7 is refused: it
+    /// is an ambiguous abbreviation, not a name (security W3 — `"3"` used to
+    /// pass as a "branch"). Base ASSERTIONS use [`Self::full_object_id`].
     pub fn git_ref(value: &str) -> Result<&str, ValidationError> {
         Self::bounded(value, 200)?;
-        if value.len() >= 7 && value.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(value);
+        if value.chars().all(|c| c.is_ascii_hexdigit()) {
+            if value.len() >= 7 {
+                return Ok(value);
+            }
+            return Err(ValidationError::InvalidShape {
+                reason: "abbreviated object id shorter than 7 hex digits".into(),
+            });
         }
         Self::branch_name(value)
     }
@@ -124,9 +265,12 @@ impl Validator {
         Ok(value)
     }
 
-    /// Canonicalize a host path and ensure it stays inside `root` after
-    /// symlink resolution. Guards against traversal + TOCTOU-shaped inputs
-    /// (callers must still re-check at use time — see specs/06 §4).
+    /// LEXICAL containment check: normalize `.`/`..` in both paths (no
+    /// filesystem access, NO symlink resolution) and require `candidate` to
+    /// stay under `root`. Callers handling real host paths must
+    /// `std::fs::canonicalize` both sides first (as `sandbox.create` does) and
+    /// re-check at use time (specs/06 §4); this alone does not stop a
+    /// symlink escape (security S4).
     pub fn path_within_root(root: &Path, candidate: &Path) -> Result<PathBuf, ValidationError> {
         if !candidate.is_absolute() {
             return Err(ValidationError::NotAbsolute {
@@ -201,8 +345,109 @@ mod tests {
 
     #[test]
     fn sandbox_name_accepts_valid() {
-        for ok in ["a", "auth-sandbox", "atlas-demo-2", "x9"] {
+        // Includes sbx's own default shape `<agent>-<workdir>` with uppercase
+        // and periods (documented as legal by `sbx create --help`).
+        for ok in [
+            "ab",
+            "auth-sandbox",
+            "atlas-demo-2",
+            "x9",
+            "claude-My.Project",
+            "Shell-atlas.v2",
+            "defaults",
+        ] {
             assert!(Validator::sandbox_name(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn sandbox_name_enforces_sbx_documented_rules() {
+        // < 2 chars, reserved 'default' (any case), leading '-'/'.'.
+        for bad in ["a", "7", "default", "DEFAULT", "Default", "-ab", ".ab"] {
+            assert!(Validator::sandbox_name(bad).is_err(), "accepted: {bad:?}");
+        }
+        assert!(Validator::sandbox_name(&"a".repeat(128)).is_ok());
+        assert!(Validator::sandbox_name(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn sbx_agent_allowlist_matches_captured_help() {
+        let help = include_str!("../tests/fixtures/sbx/captured/v0.47.0/help/create.txt");
+        let line = help
+            .lines()
+            .find_map(|l| l.strip_prefix("Available agents: "))
+            .expect("captured create --help lists agents");
+        let captured: Vec<&str> = line.split(", ").map(str::trim).collect();
+        assert_eq!(captured, SBX_AGENTS_V0_47);
+        for a in SBX_AGENTS_V0_47 {
+            assert!(Validator::sbx_agent(a).is_ok());
+        }
+        for bad in ["", "Shell", "./my-kit", "../kit.zip", "--clone", "oci://x"] {
+            assert!(Validator::sbx_agent(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn sbx_workspace_path_rules() {
+        assert_eq!(
+            Validator::sbx_workspace_path(Path::new("/repo/atlas")).unwrap(),
+            "/repo/atlas"
+        );
+        for bad in ["relative/x", "/repo/docs:ro", "/a\nb", "/a:b/c"] {
+            assert!(
+                Validator::sbx_workspace_path(Path::new(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn registrable_repository_denylist() {
+        let home = Path::new("/Users/dev");
+        for ok in [
+            "/Users/dev/code/atlas",
+            "/Users/dev/projects/nova-demo",
+            "/private/var/folders/x/T/tmp1/repo",
+            "/opt/src/orbit",
+        ] {
+            assert!(
+                Validator::registrable_repository(Path::new(ok), home).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "/",
+            "/Users",
+            "/Users/dev",
+            "/Users/dev/.ssh",
+            "/Users/dev/.config/git",
+            "/etc",
+            "/etc/x",
+            "/usr/local/src/repo",
+            "/System/Library",
+            "/Library/x",
+            "/private/etc/x",
+            "relative/repo",
+        ] {
+            assert!(
+                Validator::registrable_repository(Path::new(bad), home).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_object_id_is_exact_length_hex() {
+        assert!(Validator::full_object_id(&"a".repeat(40)).is_ok());
+        assert!(Validator::full_object_id(&"0".repeat(64)).is_ok());
+        for bad in [
+            "3",
+            "abc1234",
+            &"a".repeat(39),
+            &"g".repeat(40),
+            &"a".repeat(41),
+        ] {
+            assert!(Validator::full_object_id(bad).is_err(), "{bad:?}");
         }
     }
 
@@ -217,13 +462,12 @@ mod tests {
             "foo\nbar",
             "--privileged",
             "-x",
-            "foo--bar",
             "foo bar",
-            "FOO",
             "foo/bar",
-            "foo..bar",
+            "foo:bar",
+            "foo_bar",
             "",
-            &"a".repeat(64),
+            &"a".repeat(129),
         ] {
             assert!(Validator::sandbox_name(bad).is_err(), "accepted: {bad:?}");
         }
@@ -247,6 +491,10 @@ mod tests {
         assert!(Validator::git_ref("main").is_ok());
         assert!(Validator::git_ref("feat/x").is_ok());
         assert!(Validator::git_ref("$(git evil)").is_err());
+        // Short all-hex values are ambiguous abbreviations, not names (W3).
+        for short in ["3", "abc", "abc123"] {
+            assert!(Validator::git_ref(short).is_err(), "{short}");
+        }
     }
 
     #[test]

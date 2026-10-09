@@ -23,9 +23,14 @@ impl<'a> EventLog<'a> {
         Self { conn }
     }
 
-    /// Append an event; assigns the next per-task sequence number.
-    /// `timestamp` is RFC3339 UTC supplied by the caller (core owns the clock
-    /// so replays are stable).
+    /// Append an event; assigns the next per-task sequence number from the
+    /// task's durable HIGH-WATER MARK (`tasks.last_event_seq`, schema v2), not
+    /// from `MAX(sequence)` of the surviving rows — after `prune_before`
+    /// removed the newest events, MAX+1 re-issued numbers clients had already
+    /// seen, so a reconnect could skip or mis-order events (review 0015 bug 8).
+    /// A failed insert after the bump leaves a gap, which is harmless; reuse
+    /// never happens. `timestamp` is RFC3339 UTC supplied by the caller (core
+    /// owns the clock so replays are stable).
     pub fn append(
         &self,
         task_id: &str,
@@ -33,8 +38,13 @@ impl<'a> EventLog<'a> {
         payload: &serde_json::Value,
         timestamp: &str,
     ) -> Result<TaskEvent, DbError> {
+        // MAX(...) with the surviving rows is defensive: it keeps sequences
+        // unique even if a row was ever inserted without bumping the mark.
         let next: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM task_events WHERE task_id = ?1",
+            "UPDATE tasks SET last_event_seq = MAX(last_event_seq,
+                 COALESCE((SELECT MAX(sequence) FROM task_events WHERE task_id = ?1), 0)) + 1
+             WHERE id = ?1
+             RETURNING last_event_seq",
             params![task_id],
             |r| r.get(0),
         )?;
@@ -185,6 +195,38 @@ mod tests {
             log.append("t1", "message.delta", &payload, "ts").unwrap();
             let back = log.replay_task("t1", 0).unwrap();
             assert_eq!(back[0].payload, payload);
+        });
+    }
+
+    /// Bug 8: pruning (or deleting) the newest events must never let a later
+    /// append reuse a sequence number a client may already have seen.
+    #[test]
+    fn sequences_are_never_reused_after_prune() {
+        with_task(|db| {
+            let log = EventLog::new(db);
+            for _ in 0..4 {
+                log.append("t1", "k", &json!({}), "ts").unwrap();
+            }
+            // Prune EVERYTHING (keep-from beyond the newest).
+            assert_eq!(log.prune_before("t1", 100).unwrap(), 4);
+            let e = log.append("t1", "k", &json!({}), "ts").unwrap();
+            assert_eq!(e.sequence, 5, "sequence reused after prune");
+            let hw: i64 = db
+                .conn()
+                .query_row("SELECT last_event_seq FROM tasks WHERE id='t1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(hw, 5);
+        });
+    }
+
+    #[test]
+    fn append_to_unknown_task_fails() {
+        with_task(|db| {
+            assert!(EventLog::new(db)
+                .append("missing", "k", &json!({}), "ts")
+                .is_err());
         });
     }
 

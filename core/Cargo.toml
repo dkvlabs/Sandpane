@@ -19,6 +19,9 @@ serde_json = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Already in Cargo.lock transitively (0.2.190); used directly for flock,
+# process-group kill, geteuid and peer credentials (no std equivalent at MSRV).
+libc = "0.2"
 
 sandpane-protocol = { path = "crates/sandpane-protocol" }
 sandpane-core = { path = "crates/sandpane-core" }

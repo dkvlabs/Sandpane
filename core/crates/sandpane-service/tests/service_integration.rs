@@ -2,9 +2,12 @@
 //!
 //! These exercise the same code path a client uses: connect, write a frame,
 //! read the correlated response. SBX scenarios use an explicitly-labeled
-//! stand-in executable (NOT the real Docker SBX CLI, which is absent on this
-//! host — see docs/compatibility.md); they prove OUR exec/parse/re-query
-//! paths, not real SBX behavior.
+//! STAND-IN executable (a test double, NOT the real Docker SBX CLI): it
+//! answers only the argument vectors the real `sbx v0.47.0` accepts, with
+//! output strings copied from the captured fixtures
+//! (`sandpane-core/tests/fixtures/sbx/captured/v0.47.0/`), and logs every argv
+//! it receives so tests assert the EXACT vectors Core executed. It proves our
+//! exec/parse/classify/re-query paths, not real SBX behavior.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -91,18 +94,102 @@ fn no_sbx() -> SbxLocator {
     SbxLocator::with_search(None, vec![])
 }
 
-/// Stand-in executable that mimics the ILLUSTRATIVE fixture shapes. Clearly a
-/// test double: it is a shell script in a temp dir, never presented as sbx.
-fn fake_sbx_dir(list_json: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let script = format!(
-        "#!/bin/sh\ncase \"$1 $2\" in\n\"sandbox list\") cat <<'FIXTURE'\n{list_json}\nFIXTURE\n;;\n\"sandbox create\") exit 0 ;;\n\"sandbox inspect\") cat <<'FIXTURE'\n{list_json}\nFIXTURE\n;;\n*) echo 'unsupported' >&2; exit 64 ;;\nesac\n"
-    );
-    let path = dir.path().join("sbx");
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    dir
+/// Stand-in for `sbx v0.47.0` (see module docs). `list_json` is what
+/// `ls --json` prints (real row shape: `name`/`status`/…); `create_error`, when
+/// set, is printed to stderr by `create` with exit 1 (real error format);
+/// `ls_error` likewise for `ls`. Every invocation's argv is appended to
+/// `argv.log` (one line per call, args separated by U+001F).
+struct FakeSbx {
+    dir: tempfile::TempDir,
 }
+
+impl FakeSbx {
+    fn locator(&self) -> SbxLocator {
+        SbxLocator::with_search(None, vec![self.dir.path().to_path_buf()])
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        std::fs::read_to_string(self.dir.path().join("argv.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                l.split('\u{1f}')
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// The stand-in's program text is a FIXED literal: every variable input
+/// (list JSON, error texts) is a data file beside it, read via `$0`, so no
+/// value is ever interpolated into script source.
+const FAKE_SBX_SCRIPT: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+for a in "$@"; do printf '%s\037' "$a" >> "$d/argv.log"; done
+printf '\n' >> "$d/argv.log"
+case "$*" in
+  'version') echo 'sbx version: v0.47.0 0411f50ee4700fe7bd37e6e7e3aced563e850ca9' ;;
+  'daemon status --json') cat "$d/daemon.json" ;;
+  'ls --json')
+    if [ -f "$d/ls.err" ]; then cat "$d/ls.err" >&2; exit 1; fi
+    cat "$d/ls.json" ;;
+  create\ *)
+    if [ -f "$d/create.sleep" ]; then sleep 5; fi
+    if [ -f "$d/create.err" ]; then cat "$d/create.err" >&2; exit 1; fi
+    exit 0 ;;
+  *) echo 'unsupported by stand-in' >&2; exit 64 ;;
+esac
+"#;
+
+fn fake_sbx(list_json: &str, create_error: Option<&str>, ls_error: Option<&str>) -> FakeSbx {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ls.json"), format!("{list_json}\n")).unwrap();
+    // Captured state/daemon_status_running_json.txt (sanitized).
+    std::fs::write(
+        dir.path().join("daemon.json"),
+        "{\n  \"status\": \"running\",\n  \"socket\": \"$HOME/.sbx/run/d/sandboxd.sock\"\n}\n",
+    )
+    .unwrap();
+    if let Some(e) = create_error {
+        std::fs::write(dir.path().join("create.err"), format!("{e}\n")).unwrap();
+    }
+    if let Some(e) = ls_error {
+        std::fs::write(dir.path().join("ls.err"), format!("{e}\n")).unwrap();
+    }
+    let path = dir.path().join("sbx");
+    std::fs::write(&path, FAKE_SBX_SCRIPT).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    FakeSbx { dir }
+}
+
+/// A real, committed Git repository (project.create requires a Git top
+/// level, security W1). Returns the tempdir and its CANONICAL path string.
+fn git_repo() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "sandpane@test.invalid"]);
+    run(&["config", "user.name", "Sandpane Test"]);
+    std::fs::write(dir.path().join("README.md"), "demo\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-qm", "base"]);
+    let canonical = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .display()
+        .to_string();
+    (dir, canonical)
+}
+
+const ROWS_RUNNING_STOPPED: &str = r#"{"sandboxes":[{"name":"atlas-auth","id":"b5ebec73-e2ae-471a-811a-e011cfb1948e","agent":"shell","status":"running","last_used_at":"2026-10-09T17:31:30.035041Z","workspaces":["/x"],"created_at":"2026-10-09T17:31:28Z"},{"name":"nova-search","id":"c5ebec73-e2ae-471a-811a-e011cfb1948e","agent":"shell","status":"stopped","last_used_at":"2026-10-09T17:31:30Z","workspaces":[],"created_at":"2026-10-09T17:31:28Z"}]}"#;
 
 #[test]
 fn probe_reports_protocol_and_honest_capabilities() {
@@ -166,8 +253,13 @@ fn full_task_lifecycle_over_socket() {
     // Content survived as data, unescaped and unexecuted.
     let user_msg = &arr[1]["payload"];
     assert_eq!(user_msg["text"], "fix auth; rm -rf / $(whoami) `id`");
-    // The honest scaffold event names the unverified adapter gate.
-    assert_eq!(arr[3]["payload"]["code"], "PROVIDER_AUTH_REQUIRED");
+    // The honest scaffold event names the unverified adapter gate with a
+    // policy refusal (review 0015 bug 9) — not a sign-in prompt.
+    assert_eq!(arr[3]["payload"]["code"], "PERMISSION_DENIED");
+    assert!(arr[3]["payload"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no verified agent adapter"));
     let sequences: Vec<i64> = arr
         .iter()
         .map(|e| e["sequence"].as_i64().unwrap())
@@ -246,9 +338,8 @@ fn protocol_violations_are_structured() {
 
 #[test]
 fn sandbox_name_injection_never_reaches_exec() {
-    let fake = fake_sbx_dir(r#"{"sandboxes":[]}"#);
-    let locator = SbxLocator::with_search(None, vec![fake.path().to_path_buf()]);
-    let mut s = start_server(locator);
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    let mut s = start_server(fake.locator());
     let project = s.ok(
         "1",
         "project.create",
@@ -261,6 +352,8 @@ fn sandbox_name_injection_never_reaches_exec() {
         "a|b",
         "--privileged",
         "a b",
+        "default",
+        "x",
     ] {
         let err = s.err(
             "2",
@@ -274,28 +367,34 @@ fn sandbox_name_injection_never_reaches_exec() {
         assert_eq!(err["code"], "VALIDATION_FAILED", "name {evil:?}");
     }
     assert!(!Path::new("/tmp/sandpane-pwned").exists());
+    assert!(
+        fake.calls().is_empty(),
+        "nothing reached sbx: {:?}",
+        fake.calls()
+    );
 }
 
 #[test]
 fn sandbox_list_and_create_with_stand_in_executable() {
-    let list_json = r#"{"sandboxes":[{"name":"atlas-auth","state":"running"},{"name":"nova-search","state":"stopped"}]}"#;
-    let fake = fake_sbx_dir(list_json);
-    let locator = SbxLocator::with_search(None, vec![fake.path().to_path_buf()]);
-    let mut s = start_server(locator);
+    let fake = fake_sbx(ROWS_RUNNING_STOPPED, None, None);
+    let mut s = start_server(fake.locator());
 
     let list = s.ok("1", "sandbox.list", serde_json::json!({}));
     let arr = list.as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["name"], "atlas-auth");
+    // Real rows carry `status` (captured crud/02); it becomes probedState.
     assert_eq!(arr[0]["probedState"], "running");
+    assert_eq!(arr[1]["probedState"], "stopped");
+    assert!(arr[0]["boundProjectId"].is_null(), "not bound yet");
 
     // A writable workspace mode requires a REGISTERED repository path
     // (mount containment, review 0004 Critical #2).
-    let repo_dir = tempfile::tempdir().unwrap();
+    let (_repo, repo_path) = git_repo();
     let project = s.ok(
         "2",
         "project.create",
-        serde_json::json!({"name": "Atlas Demo", "repositories": [repo_dir.path().display().to_string()]}),
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo_path]}),
     );
     let created = s.ok(
         "3",
@@ -304,12 +403,31 @@ fn sandbox_list_and_create_with_stand_in_executable() {
             "name": "atlas-auth",
             "projectId": project["id"],
             "workspaceMode": "sbx_clone",
-            "repoPath": repo_dir.path().display().to_string()
+            "repoPath": repo_path
         }),
     );
     // Exit 0 is NOT trusted: state comes from the re-query.
     assert_eq!(created["probedState"], "running");
     assert_eq!(created["boundProjectId"], project["id"]);
+
+    // The EXACT vectors Core executed, in order: ls (list), create with
+    // --clone for sbx_clone (bug 3), then the post-mutation ls re-query.
+    let calls = fake.calls();
+    assert_eq!(
+        calls,
+        vec![
+            vec!["ls".to_string(), "--json".into()],
+            vec![
+                "create".to_string(),
+                "--clone".into(),
+                "--name".into(),
+                "atlas-auth".into(),
+                "shell".into(),
+                repo_path.clone()
+            ],
+            vec!["ls".to_string(), "--json".into()],
+        ]
+    );
 
     // A binding row exists, with the BARE snake_case mode (no JSON quotes)
     // so live-writable queries by mode work (review 0004 #4).
@@ -327,20 +445,245 @@ fn sandbox_list_and_create_with_stand_in_executable() {
         .unwrap();
     assert_eq!(count, 1);
     assert_eq!(mode, "sbx_clone");
+
+    // Bug 10: sandbox.list now reports the bound project from the binding row.
+    let list = s.ok("4", "sandbox.list", serde_json::json!({}));
+    let bound = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "atlas-auth")
+        .unwrap()
+        .clone();
+    assert_eq!(bound["boundProjectId"], project["id"]);
+    let unbound = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "nova-search")
+        .unwrap()
+        .clone();
+    assert!(unbound["boundProjectId"].is_null());
+}
+
+#[test]
+fn direct_mount_and_mountless_emit_the_real_create_vectors() {
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    let mut s = start_server(fake.locator());
+    let (_repo, repo_path) = git_repo();
+    let project = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo_path]}),
+    );
+    let live = s.ok(
+        "2",
+        "sandbox.create",
+        serde_json::json!({
+            "name": "atlas-live", "projectId": project["id"],
+            "workspaceMode": "direct_mount", "repoPath": repo_path
+        }),
+    );
+    assert_eq!(live["workspaceMode"], "direct_mount");
+    // Not in the re-queried list → state unknown (null), never guessed.
+    assert!(live["probedState"].is_null());
+    s.ok(
+        "3",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-scratch", "projectId": project["id"], "workspaceMode": "mountless"}),
+    );
+    let creates: Vec<Vec<String>> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.first().map(String::as_str) == Some("create"))
+        .collect();
+    assert_eq!(
+        creates,
+        vec![
+            vec![
+                "create".to_string(),
+                "--name".into(),
+                "atlas-live".into(),
+                "shell".into(),
+                repo_path.clone()
+            ],
+            vec![
+                "create".to_string(),
+                "--name".into(),
+                "atlas-scratch".into(),
+                "shell".into()
+            ],
+        ]
+    );
+}
+
+#[test]
+fn host_worktree_is_refused_as_not_implemented_before_any_exec() {
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    let mut s = start_server(fake.locator());
+    let (_repo, repo_path) = git_repo();
+    let project = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo_path]}),
+    );
+    let err = s.err(
+        "2",
+        "sandbox.create",
+        serde_json::json!({
+            "name": "atlas-wt", "projectId": project["id"],
+            "workspaceMode": "host_worktree", "repoPath": repo_path
+        }),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(err["message"].as_str().unwrap().contains("not implemented"));
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+/// Bug 5: real captured sbx errors become structured codes with remediation
+/// in `details` (an existing v1 envelope field).
+#[test]
+fn sbx_failures_are_classified_with_remediation_details() {
+    let policy = fake_sbx(
+        r#"{"sandboxes":[]}"#,
+        Some("error: global network policy has not been initialized\n  try: sbx policy init <allow-all|balanced|deny-all>"),
+        None,
+    );
+    let mut s = start_server(policy.locator());
+    let project = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": []}),
+    );
+    let err = s.err(
+        "2",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-x", "projectId": project["id"], "workspaceMode": "mountless"}),
+    );
+    assert_eq!(err["code"], "PERMISSION_DENIED");
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("sbx policy init <allow-all|balanced|deny-all>"));
+    assert_eq!(
+        err["details"]["hint"],
+        "sbx policy init <allow-all|balanced|deny-all>"
+    );
+    // No binding is recorded for a failed create.
+    let n: i64 = s
+        .inner
+        .lock_db()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM sandbox_bindings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+
+    let auth = fake_sbx(
+        "",
+        Some("error: not signed in to Docker\n  try: sbx login"),
+        Some("error: not signed in to Docker\n  try: sbx login"),
+    );
+    let mut s = start_server(auth.locator());
+    let err = s.err("3", "sandbox.list", serde_json::json!({}));
+    assert_eq!(err["code"], "PROVIDER_AUTH_REQUIRED");
+    assert!(err["message"].as_str().unwrap().contains("sbx login"));
+    assert_eq!(err["details"]["provider"], "docker");
+    assert_eq!(err["details"]["hint"], "sbx login");
+    let project = s.ok(
+        "4",
+        "project.create",
+        serde_json::json!({"name": "Nova Demo", "repositories": []}),
+    );
+    let err = s.err(
+        "5",
+        "sandbox.create",
+        serde_json::json!({"name": "nova-x", "projectId": project["id"], "workspaceMode": "mountless"}),
+    );
+    assert_eq!(err["code"], "PROVIDER_AUTH_REQUIRED");
+}
+
+/// Backlog 6: system.probe runs `sbx version` + `sbx daemon status --json`
+/// and NEVER `ls` (which auto-starts the daemon).
+#[test]
+fn probe_reports_version_and_daemon_without_listing() {
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    let mut s = start_server(fake.locator());
+    let caps = s.ok("1", "system.probe", serde_json::json!({}));
+    assert_eq!(caps["sbx"]["installed"], true);
+    assert_eq!(caps["sbx"]["version"], "0.47.0");
+    assert_eq!(caps["sbx"]["daemonRunning"], true);
+    let bin = fake.dir.path().join("sbx").display().to_string();
+    assert_eq!(caps["sbx"]["binaryPath"], bin);
+    assert_eq!(
+        fake.calls(),
+        vec![
+            vec!["version".to_string()],
+            vec!["daemon".to_string(), "status".into(), "--json".into()]
+        ]
+    );
+}
+
+#[test]
+fn project_create_registers_only_canonical_git_toplevels() {
+    let mut s = start_server(no_sbx());
+    // Not a Git repository → refused.
+    let plain = tempfile::tempdir().unwrap();
+    let err = s.err(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [plain.path().display().to_string()]}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    // A subdirectory of a repository → refused (must be the top level).
+    let (repo, repo_path) = git_repo();
+    std::fs::create_dir(repo.path().join("src")).unwrap();
+    let err = s.err(
+        "2",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo.path().join("src").display().to_string()]}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(err["message"].as_str().unwrap().contains("top level"));
+    // Root, home and system trees → PERMISSION_DENIED (never reaches git).
+    let home = std::env::var("HOME").unwrap();
+    for bad in ["/", home.as_str(), "/etc", "/usr"] {
+        let err = s.err(
+            "3",
+            "project.create",
+            serde_json::json!({"name": "Atlas Demo", "repositories": [bad]}),
+        );
+        assert_eq!(err["code"], "PERMISSION_DENIED", "{bad}");
+    }
+    // A symlink to the repository is stored as the CANONICAL path.
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("atlas-link");
+    std::os::unix::fs::symlink(repo.path(), &link).unwrap();
+    let created = s.ok(
+        "4",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [link.display().to_string()]}),
+    );
+    assert_eq!(created["repositories"][0], repo_path);
+    // Nothing partial was stored by the refused attempts.
+    let n: i64 = s
+        .inner
+        .lock_db()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
 }
 
 #[test]
 fn sandbox_create_enforces_mount_containment() {
-    let list_json = r#"{"sandboxes":[]}"#;
-    let fake = fake_sbx_dir(list_json);
-    let locator = SbxLocator::with_search(None, vec![fake.path().to_path_buf()]);
-    let mut s = start_server(locator);
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    let mut s = start_server(fake.locator());
 
-    let registered = tempfile::tempdir().unwrap();
+    let (registered, registered_path) = git_repo();
     let project = s.ok(
         "1",
         "project.create",
-        serde_json::json!({"name": "Atlas Demo", "repositories": [registered.path().display().to_string()]}),
+        serde_json::json!({"name": "Atlas Demo", "repositories": [registered_path]}),
     );
     let pid = project["id"].as_str().unwrap();
 
@@ -375,22 +718,44 @@ fn sandbox_create_enforces_mount_containment() {
     let err = s.err(
         "4",
         "sandbox.create",
-        serde_json::json!({"name": "atlas-x", "projectId": pid, "workspaceMode": "host_worktree"}),
+        serde_json::json!({"name": "atlas-x", "projectId": pid, "workspaceMode": "direct_mount"}),
     );
     assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(fake.calls().is_empty(), "refusals never reach sbx");
 
-    // A SUBPATH of the registered repository is contained → accepted.
+    // Review S-g: a SUBDIRECTORY of the registered repository is refused —
+    // only the registered root itself may be mounted, so no agent-writable
+    // path component lies between Core's canonicalize and sbx's own resolve.
     let sub = registered.path().join("src");
     std::fs::create_dir_all(&sub).unwrap();
-    let ok = s.ok(
+    let err = s.err(
         "5",
         "sandbox.create",
         serde_json::json!({
-            "name": "atlas-ok", "projectId": pid,
+            "name": "atlas-sub", "projectId": pid,
             "workspaceMode": "sbx_clone", "repoPath": sub.display().to_string()
         }),
     );
+    assert_eq!(err["code"], "PERMISSION_DENIED");
+    assert!(fake.calls().is_empty(), "refusals never reach sbx");
+    // The registered root itself (given via a non-canonical spelling) is
+    // accepted, and the CANONICAL path reaches the argument vector.
+    let ok = s.ok(
+        "5b",
+        "sandbox.create",
+        serde_json::json!({
+            "name": "atlas-ok", "projectId": pid,
+            "workspaceMode": "sbx_clone",
+            "repoPath": registered.path().join("src/..").display().to_string()
+        }),
+    );
     assert_eq!(ok["name"], "atlas-ok");
+    let create = fake
+        .calls()
+        .into_iter()
+        .find(|c| c.first().map(String::as_str) == Some("create"))
+        .unwrap();
+    assert_eq!(create.last().unwrap(), &registered_path);
 
     // Mountless + repoPath → refused (no path by definition).
     let err = s.err(
@@ -1263,12 +1628,10 @@ fn task_subscribe_per_task_cursors_repair_the_shared_scalar_skip() {
 #[test]
 fn project_list_carries_registered_repository_paths_in_order() {
     let mut s = start_server(no_sbx());
-    let repo_a = tempfile::tempdir().unwrap();
-    let repo_b = tempfile::tempdir().unwrap();
-    let paths = vec![
-        repo_a.path().display().to_string(),
-        repo_b.path().display().to_string(),
-    ];
+    // Canonical Git top levels (W1 stores the canonical path).
+    let (_repo_a, path_a) = git_repo();
+    let (_repo_b, path_b) = git_repo();
+    let paths = vec![path_a, path_b];
     let created = s.ok(
         "1",
         "project.create",
@@ -1315,16 +1678,14 @@ fn project_list_carries_registered_repository_paths_in_order() {
 
 #[test]
 fn sandbox_list_joins_workspace_mode_and_omits_it_when_unbound() {
-    let list_json = r#"{"sandboxes":[{"name":"atlas-auth","state":"running"},{"name":"nova-search","state":"stopped"}]}"#;
-    let fake = fake_sbx_dir(list_json);
-    let locator = SbxLocator::with_search(None, vec![fake.path().to_path_buf()]);
-    let mut s = start_server(locator);
+    let fake = fake_sbx(ROWS_RUNNING_STOPPED, None, None);
+    let mut s = start_server(fake.locator());
 
-    let repo = tempfile::tempdir().unwrap();
+    let (repo, repo_path) = git_repo();
     let project = s.ok(
         "1",
         "project.create",
-        serde_json::json!({"name": "Atlas Demo", "repositories": [repo.path().display().to_string()]}),
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo_path]}),
     );
     let created = s.ok(
         "2",
@@ -1452,10 +1813,9 @@ fn legacy_quoted_workspace_mode_row_is_still_reported_and_junk_stays_absent() {
     // reading — hiding it would silently drop a live-writable warning
     // (specs/02 §7, specs/04 §3). A row Core genuinely cannot read stays an
     // ABSENCE; the mode is never invented.
-    let list_json = r#"{"sandboxes":[{"name":"legacy-mount","state":"running"},{"name":"never-bound","state":"running"}]}"#;
-    let fake = fake_sbx_dir(list_json);
-    let locator = SbxLocator::with_search(None, vec![fake.path().to_path_buf()]);
-    let mut s = start_server(locator);
+    let list_json = r#"{"sandboxes":[{"name":"legacy-mount","status":"running"},{"name":"never-bound","status":"running"}]}"#;
+    let fake = fake_sbx(list_json, None, None);
+    let mut s = start_server(fake.locator());
     let project = s.ok(
         "1",
         "project.create",
@@ -1531,4 +1891,251 @@ fn history_first_row_exception_holds_for_multi_byte_content() {
         "history frame was {} bytes",
         frame.len()
     );
+}
+
+/// Bug 1 (review 0015): EVERY TaskStatus seeded as a crashed daemon left it;
+/// a fresh ServerInner reconciles exactly the live states (including
+/// `awaiting_input` and `verifying`, both missed before) to `interrupted`
+/// with a durable event, and leaves `awaiting_review` + terminal states alone.
+#[test]
+fn restart_reconciliation_is_exhaustive_over_every_status() {
+    use sandpane_core::task::{TaskStateMachine, ALL_STATUSES};
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("core.sqlite3");
+    let wire = |st: sandpane_protocol::TaskStatus| {
+        serde_json::to_value(st)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO conversations (id,project_id,agent_id,created_at) VALUES ('c1','p1','codex','t');",
+            )
+            .unwrap();
+        for st in ALL_STATUSES {
+            db.conn()
+                .execute(
+                    "INSERT INTO tasks (id,conversation_id,status,created_at,updated_at) VALUES (?1,'c1',?1,'t','t')",
+                    rusqlite::params![wire(*st)],
+                )
+                .unwrap();
+        }
+    }
+    let s = start_server_at(no_sbx(), dir, db_path);
+    let db = s.inner.lock_db();
+    for st in ALL_STATUSES {
+        let id = wire(*st);
+        let now: String = db
+            .conn()
+            .query_row("SELECT status FROM tasks WHERE id=?1", [&id], |r| r.get(0))
+            .unwrap();
+        let events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=?1 AND kind='status.changed'
+                 AND payload LIKE '%reconciledAfterRestart%'",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if TaskStateMachine::reconciled_on_restart(*st) {
+            assert_eq!(now, "interrupted", "{id} must be reconciled");
+            assert_eq!(events, 1, "{id} needs one durable reconciliation event");
+        } else {
+            assert_eq!(now, id, "{id} must be left untouched");
+            assert_eq!(events, 0, "{id}");
+        }
+    }
+    for (id, expected) in [
+        ("awaiting_input", "interrupted"),
+        ("verifying", "interrupted"),
+        ("awaiting_review", "awaiting_review"),
+    ] {
+        let now: String = db
+            .conn()
+            .query_row("SELECT status FROM tasks WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(now, expected, "{id}");
+    }
+}
+
+/// Security W3: an abbreviated (even 1-char) base can no longer satisfy the
+/// apply gate; only the exact full object id is accepted as an assertion.
+#[test]
+fn git_apply_requires_a_full_object_id() {
+    let mut s = start_server(no_sbx());
+    for short in ["3", "abc1234", "0123456789abcdef0123456789abcdef0123456"] {
+        let err = s.err(
+            "1",
+            "git.apply",
+            serde_json::json!({"taskId": "t-any", "expectedBase": short}),
+        );
+        assert_eq!(err["code"], "VALIDATION_FAILED", "{short}");
+    }
+}
+
+/// Security S7: connections beyond the cap get a structured refusal, and an
+/// idle connection is closed after the idle timeout (clients reconnect).
+#[test]
+fn connection_cap_and_idle_timeout() {
+    use sandpane_service::runtime::ConnectionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("cap.sock");
+    let inner = ServerInner::new(Database::open_in_memory().unwrap(), no_sbx());
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let limits = ConnectionLimits {
+        max_connections: 1,
+        idle_timeout: std::time::Duration::from_millis(1000),
+        write_timeout: std::time::Duration::from_secs(5),
+    };
+    std::thread::spawn(move || sandpane_service::serve_listener(inner, listener, limits));
+
+    let mut first = UnixStream::connect(&socket_path).unwrap();
+    let mut first_reader = BufReader::new(first.try_clone().unwrap());
+    writeln!(
+        first,
+        r#"{{"v":1,"id":"a","method":"system.probe","params":{{}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    first_reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\""), "{line}");
+
+    // Second concurrent connection → refused with a frame, then closed.
+    let second = UnixStream::connect(&socket_path).unwrap();
+    let mut second_reader = BufReader::new(second);
+    let mut refused = String::new();
+    second_reader.read_line(&mut refused).unwrap();
+    assert!(refused.contains("too many connections"), "{refused}");
+
+    // The first connection idles past the timeout → server closes it (EOF).
+    first
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut rest = String::new();
+    let n = first_reader.read_line(&mut rest).unwrap();
+    assert_eq!(n, 0, "idle connection must be closed, got {rest:?}");
+
+    // Its slot is released: a new connection is served again.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut third = UnixStream::connect(&socket_path).unwrap();
+    let mut third_reader = BufReader::new(third.try_clone().unwrap());
+    writeln!(
+        third,
+        r#"{{"v":1,"id":"c","method":"system.probe","params":{{}}}}"#
+    )
+    .unwrap();
+    let mut ok = String::new();
+    third_reader.read_line(&mut ok).unwrap();
+    assert!(ok.contains("\"ok\""), "{ok}");
+}
+
+/// Security W1 for rows written BEFORE registration was hardened: a stored
+/// repository row for HOME must not authorize a mount under HOME. The
+/// denylist is re-applied to registered roots at sandbox.create time.
+#[test]
+fn legacy_overbroad_repository_row_never_authorizes_a_mount() {
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    let mut s = start_server(fake.locator());
+    let project = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": []}),
+    );
+    let pid = project["id"].as_str().unwrap().to_string();
+    let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+    {
+        let db = s.inner.lock_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id, project_id, canonical_path) VALUES ('legacy-home', ?1, ?2)",
+                params![pid, home.display().to_string()],
+            )
+            .unwrap();
+    }
+    // Any existing directory under HOME would be "contained" by that row.
+    let under_home = std::fs::read_dir(&home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_dir() && !p.file_name().unwrap().to_string_lossy().starts_with('.'))
+        .unwrap_or_else(|| home.clone());
+    let err = s.err(
+        "2",
+        "sandbox.create",
+        serde_json::json!({
+            "name": "atlas-home", "projectId": pid,
+            "workspaceMode": "direct_mount",
+            "repoPath": under_home.display().to_string()
+        }),
+    );
+    assert_eq!(err["code"], "PERMISSION_DENIED", "{err}");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+/// Review S-c: when `sbx create` outlives its deadline (killed) the sandbox
+/// may still have been created. Core re-queries `ls --json` and records the
+/// binding of a sandbox that exists instead of orphaning it; an absent one
+/// is reported as a timeout, never as success.
+#[test]
+fn create_timeout_requeries_and_never_orphans_a_created_sandbox() {
+    use sandpane_core::process::RunLimits;
+    use sandpane_service::SbxLimits;
+    let fast = SbxLimits {
+        mutation: RunLimits {
+            timeout: std::time::Duration::from_millis(300),
+            ..RunLimits::MUTATION
+        },
+        ..SbxLimits::default()
+    };
+    // The sandbox shows up in `ls` although `create` never returned.
+    let fake = fake_sbx(
+        r#"{"sandboxes":[{"name":"atlas-slow","status":"running"}]}"#,
+        None,
+        None,
+    );
+    std::fs::write(fake.dir.path().join("create.sleep"), "").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("t.sqlite3")).unwrap();
+    let inner = ServerInner::with_sbx_limits(db, fake.locator(), fast);
+    let project = sandpane_service::handle_line(
+        &inner,
+        r#"{"v":1,"id":"1","method":"project.create","params":{"name":"Atlas Demo","repositories":[]}}"#,
+    );
+    let project: serde_json::Value = serde_json::from_str(&project).unwrap();
+    let pid = project["ok"]["id"].as_str().unwrap().to_string();
+    let call = |name: &str| -> serde_json::Value {
+        let frame = serde_json::json!({"v":1,"id":"2","method":"sandbox.create",
+            "params":{"name": name, "projectId": pid, "workspaceMode": "mountless"}});
+        serde_json::from_str(&sandpane_service::handle_line(&inner, &frame.to_string())).unwrap()
+    };
+    let start = std::time::Instant::now();
+    let found = call("atlas-slow");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "deadline enforced"
+    );
+    assert_eq!(found["ok"]["probedState"], "running", "{found}");
+    let n: i64 = inner
+        .lock_db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sandbox_bindings WHERE sandbox_name='atlas-slow'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "the created sandbox is bound, not orphaned");
+    // A sandbox that is NOT present after the timeout is an error.
+    let missing = call("atlas-missing");
+    assert_eq!(missing["err"]["code"], "INTERNAL", "{missing}");
+    assert!(missing["err"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("timed out"));
 }

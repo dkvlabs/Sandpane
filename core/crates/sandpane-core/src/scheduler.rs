@@ -7,7 +7,7 @@
 //! This module is the in-memory policy engine; durable task rows and events
 //! live in SQLite via [`crate::db`] / [`crate::events`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use sandpane_protocol::WorkspaceMode;
 
@@ -36,10 +36,18 @@ impl Default for Limits {
     }
 }
 
+/// What Core recorded when a task was admitted, so release never depends on
+/// a caller re-supplying the same project/workspace (review 0015 bug 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningEntry {
+    project_id: String,
+    workspace_key: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     limits: Limits,
-    running: HashSet<String>,
+    running: HashMap<String, RunningEntry>,
     running_per_project: HashMap<String, usize>,
     /// workspace key -> task id holding the single writer lock.
     writer_locks: HashMap<String, String>,
@@ -49,7 +57,7 @@ impl Scheduler {
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
-            running: HashSet::new(),
+            running: HashMap::new(),
             running_per_project: HashMap::new(),
             writer_locks: HashMap::new(),
         }
@@ -92,8 +100,11 @@ impl Scheduler {
         Admission::Admitted
     }
 
-    /// Record that `task_id` started. Returns Err(()) when admission would be
-    /// violated (callers must `admit` first; this is the commit point).
+    /// Record that `task_id` started. Returns Err(admission) when admission
+    /// would be violated (callers must `admit` first; this is the commit
+    /// point). IDEMPOTENT: marking an already-running task again changes
+    /// nothing and succeeds — it used to double-count the per-project slot,
+    /// starving that project after a retry.
     pub fn mark_running(
         &mut self,
         task_id: &str,
@@ -101,36 +112,60 @@ impl Scheduler {
         workspace_key: Option<&str>,
         mode: WorkspaceMode,
     ) -> Result<(), Admission> {
+        if self.running.contains_key(task_id) {
+            return Ok(());
+        }
         match self.admit(task_id, project_id, workspace_key, mode) {
             Admission::Admitted => {}
             other => return Err(other),
         }
-        self.running.insert(task_id.to_string());
+        let locked_key = if Self::is_writable(mode) {
+            workspace_key.map(str::to_string)
+        } else {
+            None
+        };
+        self.running.insert(
+            task_id.to_string(),
+            RunningEntry {
+                project_id: project_id.to_string(),
+                workspace_key: locked_key.clone(),
+            },
+        );
         *self
             .running_per_project
             .entry(project_id.to_string())
             .or_insert(0) += 1;
-        if Self::is_writable(mode) {
-            if let Some(ws) = workspace_key {
-                self.writer_locks
-                    .insert(ws.to_string(), task_id.to_string());
-            }
+        if let Some(ws) = locked_key {
+            self.writer_locks.insert(ws, task_id.to_string());
         }
         Ok(())
     }
 
-    /// Release all resources held by a finished/cancelled/interrupted task.
-    pub fn mark_finished(&mut self, task_id: &str, project_id: &str, workspace_key: Option<&str>) {
-        if self.running.remove(task_id) {
-            if let Some(n) = self.running_per_project.get_mut(project_id) {
-                *n = n.saturating_sub(1);
+    /// Release all resources held by a finished/cancelled/interrupted task,
+    /// using the project and workspace recorded at admission. Releasing a
+    /// task that is not running is a no-op (idempotent).
+    pub fn mark_finished(&mut self, task_id: &str) {
+        let Some(entry) = self.running.remove(task_id) else {
+            return;
+        };
+        if let Some(n) = self.running_per_project.get_mut(&entry.project_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.running_per_project.remove(&entry.project_id);
             }
         }
-        if let Some(ws) = workspace_key {
-            if self.writer_locks.get(ws).map(String::as_str) == Some(task_id) {
-                self.writer_locks.remove(ws);
+        if let Some(ws) = entry.workspace_key {
+            if self.writer_locks.get(&ws).map(String::as_str) == Some(task_id) {
+                self.writer_locks.remove(&ws);
             }
         }
+    }
+
+    pub fn running_in_project(&self, project_id: &str) -> usize {
+        self.running_per_project
+            .get(project_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// After a Core restart, reconciliation starts from EMPTY scheduler state:
@@ -177,7 +212,7 @@ mod tests {
             s.admit("t3", "pA", None, WorkspaceMode::Mountless),
             Admission::QueuedConcurrency
         );
-        s.mark_finished("t1", "pA", None);
+        s.mark_finished("t1");
         assert_eq!(
             s.admit("t3", "pA", None, WorkspaceMode::Mountless),
             Admission::Admitted
@@ -229,14 +264,47 @@ mod tests {
             Admission::Admitted
         );
         // Lock releases only when the holder finishes.
-        s.mark_finished("t2", "pA", Some("/repo/atlas")); // not the holder: no-op
+        s.mark_finished("t2"); // not running, not the holder: no-op
         assert_eq!(s.writer_lock_holder("/repo/atlas"), Some("t1"));
-        s.mark_finished("t1", "pA", Some("/repo/atlas"));
+        s.mark_finished("t1");
         assert_eq!(s.writer_lock_holder("/repo/atlas"), None);
         assert_eq!(
             s.admit("t2", "pA", Some("/repo/atlas"), WorkspaceMode::SbxClone),
             Admission::Admitted
         );
+    }
+
+    /// Bug 7: a repeated mark_running (retry / duplicate start) must not
+    /// double-count; one finish fully releases the slot and the lock.
+    #[test]
+    fn mark_running_is_idempotent_and_finish_releases_fully() {
+        let mut s = Scheduler::new(Limits {
+            max_global_running: 2,
+            max_per_project_running: 2,
+        });
+        s.mark_running("t1", "pA", Some("/repo/a"), WorkspaceMode::DirectMount)
+            .unwrap();
+        s.mark_running("t1", "pA", Some("/repo/a"), WorkspaceMode::DirectMount)
+            .unwrap();
+        assert_eq!(s.running_count(), 1);
+        assert_eq!(s.running_in_project("pA"), 1);
+        // Still room for a second task in pA.
+        assert_eq!(
+            s.admit("t2", "pA", None, WorkspaceMode::Mountless),
+            Admission::Admitted
+        );
+        // Idempotent even when the global limit is otherwise exhausted.
+        s.mark_running("t2", "pA", None, WorkspaceMode::Mountless)
+            .unwrap();
+        s.mark_running("t1", "pA", Some("/repo/a"), WorkspaceMode::DirectMount)
+            .unwrap();
+        s.mark_finished("t1");
+        s.mark_finished("t1");
+        assert_eq!(s.running_in_project("pA"), 1);
+        assert_eq!(s.writer_lock_holder("/repo/a"), None);
+        s.mark_finished("t2");
+        assert_eq!(s.running_in_project("pA"), 0);
+        assert_eq!(s.running_count(), 0);
     }
 
     #[test]
