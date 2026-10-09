@@ -6,13 +6,59 @@
  * `replaceChildren`, form values, focus and click listeners.
  *
  * It is a test double for the BROWSER, not for the unit under test: the
- * sidebar script itself is transpiled from source and executed unmodified.
+ * sidebar script itself is compiled from source by the real `tsc` with the
+ * shipped `tsconfig.webview.json` and executed unmodified.
  */
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
-import * as ts from 'typescript';
+
+const CLIENT_ROOT = join(__dirname, '..', '..');
+let compiledSidebar: string | undefined;
+
+/**
+ * Compile `src/webview/app.ts` exactly as `npm run compile` does (same
+ * `tsconfig.webview.json`), into a private temp dir — never `out/`, which a
+ * concurrent `npm run compile` may be writing. TypeScript 7 ships no
+ * `transpileModule` JS API, so this runs the `tsc` CLI: an argument vector via
+ * `execFileSync`, no shell (AGENTS.md rule 1). Compiled once per worker.
+ *
+ * Running the shipped config (not hand-copied options) is the point: if that
+ * config ever emits module syntax (`export {}`, `exports.`), the script fails
+ * inside `node:vm` here just as it would in the webview.
+ */
+function compileSidebar(): string {
+  if (compiledSidebar !== undefined) return compiledSidebar;
+  const requireFromClient = createRequire(join(CLIENT_ROOT, 'package.json'));
+  const tsPackageJson = requireFromClient.resolve('typescript/package.json');
+  const tsManifest = JSON.parse(readFileSync(tsPackageJson, 'utf8')) as { bin?: { tsc?: string } };
+  const tscRelative = tsManifest.bin?.tsc;
+  if (!tscRelative) throw new Error('typescript package.json declares no tsc bin');
+  const tscEntry = join(dirname(tsPackageJson), tscRelative);
+  const outDir = mkdtempSync(join(tmpdir(), 'sandpane-webview-'));
+  try {
+    try {
+      execFileSync(
+        process.execPath,
+        [tscEntry, '-p', join(CLIENT_ROOT, 'tsconfig.webview.json'), '--outDir', outDir],
+        { cwd: CLIENT_ROOT, stdio: 'pipe' },
+      );
+    } catch (error) {
+      const out = error as { stdout?: Buffer; stderr?: Buffer };
+      throw new Error(
+        `tsc failed to compile the sidebar script:\n${out.stdout?.toString() ?? ''}${out.stderr?.toString() ?? ''}`,
+      );
+    }
+    compiledSidebar = readFileSync(join(outDir, 'app.js'), 'utf8');
+    return compiledSidebar;
+  } finally {
+    rmSync(outDir, { recursive: true, force: true });
+  }
+}
 
 type Listener = (event: FakeEvent) => void;
 
@@ -194,7 +240,7 @@ export interface SidebarHarness {
   byId(id: string): FakeElement;
 }
 
-/** Transpile and run the real sidebar script against a fresh fake DOM. */
+/** Compile (once) and run the real sidebar script against a fresh fake DOM. */
 export function loadSidebar(): SidebarHarness {
   const document = new FakeDocument();
   const root = document.createElement('div');
@@ -219,10 +265,7 @@ export function loadSidebar(): SidebarHarness {
     },
   };
 
-  const source = readFileSync(join(__dirname, '..', '..', 'src', 'webview', 'app.ts'), 'utf8');
-  const { outputText } = ts.transpileModule(source, {
-    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
-  });
+  const outputText = compileSidebar();
   const context = createContext({
     window: fakeWindow,
     document,

@@ -1,7 +1,7 @@
 /**
  * `SandpaneSession` wiring against a scripted Core (a fake duplex that answers
  * frames by method — the unit under test is the session, not Core) and the
- * recording `vscode` stub (aliased in vitest.config.ts).
+ * recording `vscode` stub (aliased in vitest.config.mts).
  *
  * Regressions covered: review bugs 1 (diff Uri objects), 3 (rescope on
  * project change), 4 (workspace mode of the SELECTED sandbox gates writable

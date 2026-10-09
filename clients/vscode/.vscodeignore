@@ -14,7 +14,7 @@ out/**/*.map
 tsconfig.json
 tsconfig.build.json
 tsconfig.webview.json
-vitest.config.ts
+vitest.config.mts
 package-lock.json
 INSTALL.md
 *.vsix

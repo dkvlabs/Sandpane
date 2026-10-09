@@ -2,8 +2,7 @@
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022"],
-    "module": "commonjs",
-    "moduleResolution": "node",
+    "module": "node20",
     "rootDir": ".",
     "noEmit": true,
     "strict": true,
@@ -17,6 +16,6 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.mts"],
   "exclude": ["src/webview/app.ts", "out", "node_modules", ".vscode-test"]
 }

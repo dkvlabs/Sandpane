@@ -27,6 +27,10 @@ cargo build -p sandpane-service        # debug build is fine for local use
 
 ## 2. Package the extension
 
+Build tooling needs Node.js 22.12+ or 24.x (`@vscode/vsce` 4 requires Node
+>= 22; vitest 5 requires `^22.12 || ^24 || >=26`). This is the build host only;
+the packaged extension runs on VS Code's own bundled Node.
+
 ```bash
 cd clients/vscode
 npm install --no-audit --no-fund       # dev dependencies only; zero runtime deps

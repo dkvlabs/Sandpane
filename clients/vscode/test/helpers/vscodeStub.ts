@@ -1,5 +1,5 @@
 /**
- * Minimal stand-in for the `vscode` module, aliased in vitest.config.ts so
+ * Minimal stand-in for the `vscode` module, aliased in vitest.config.mts so
  * `src/session.ts` (vscode glue) can run under plain Node. It covers only the
  * API surface the session touches, records every side effect, and lets a test
  * script modal answers. It is a test double for VS Code, not for the session.

@@ -33,7 +33,7 @@ not implemented. Nothing here pretends to be a capability it does not have.
 | Error-code → install/help guidance (`NOT_INSTALLED`, `DAEMON_DOWN`, …) incl. the oversized-replay refusal as recoverable, plus Core's `details.hint` remediation shown verbatim (never executed) | **functional** | `test/diagnostics.test.ts`, `test/coreRemediation.test.ts`, `test/session.test.ts` + live: `task.subscribe` over the frame ceiling ⇒ structured `VALIDATION_FAILED` |
 | Remote-host gate (`env.remoteName`) → explicit unsupported state | **functional** | `test/vscodeGuards.test.ts` |
 | Webview CSP (nonce, `default-src 'none'`, no inline script/style, escaping) | **functional** | `test/webview.test.ts` (8) |
-| Sidebar webview (plain TypeScript): composer built once and never replaced (draft, writable checkbox and focus survive every state push), regions patched in place, pushes coalesced per animation frame, stable ids on task buttons | **functional (headless)** | `test/sidebarApp.test.ts` runs the real `app.ts` (transpiled, `node:vm`) against a minimal fake DOM — no jsdom dependency |
+| Sidebar webview (plain TypeScript): composer built once and never replaced (draft, writable checkbox and focus survive every state push), regions patched in place, pushes coalesced per animation frame, stable ids on task buttons | **functional (headless)** | `test/sidebarApp.test.ts` runs the real `app.ts` (compiled once by the real `tsc` with the shipped `tsconfig.webview.json`, run in `node:vm`) against a minimal fake DOM — no jsdom dependency |
 | Task tree, status bar, 9 commands, the sidebar inside VS Code | **wired, needs a human-in-the-loop run** | compiles; never launched inside a real VS Code window yet |
 
 ### Live integration against a real Core
@@ -114,13 +114,24 @@ publication is deliberately not done yet (licensing gate,
 [`docs/licensing-decision.md`](../../docs/licensing-decision.md)).
 
 No runtime dependencies: Node stdlib + the VS Code API only. `devDependencies`
-are typescript, @types/vscode, @types/node, vitest and @vscode/vsce.
+are typescript, @types/vscode, @types/node, vitest and @vscode/vsce (vite is
+pulled in as vitest's required peer).
+
+### Toolchain and compatibility notes
+
+| Package | Pinned | Why this version |
+|---|---|---|
+| `typescript` | `7.0.2` | Latest. TS 7 removed `moduleResolution: node`/`node10`, `module: none`, `esModuleInterop: false` (always on now) and the classic JS compiler API (the package root now exports only `version`; no `transpileModule`). `tsconfig.json` therefore uses `module: node20` (CommonJS emit, since `package.json` has no `"type"`); `tsconfig.webview.json` uses `module: esnext` + `moduleDetection: legacy`, which emits `app.js` byte-identical to the old `module: none` output (no import/export → classic script). Because `esModuleInterop` is forced on, `out/*.js` now wraps namespace imports (`import * as vscode`) in `__importStar`; no other emit change. |
+| `vitest` | `5.0.3` | Latest. Requires Node `^22.12 \|\| ^24 \|\| >=26` for running tests (not for the extension). Its migration guide had no change applicable here; the config moved from `vitest.config.ts` to `vitest.config.mts` only because Vite 8 (vitest's peer) warns that its planned native config loader rejects ESM syntax in a file loaded as CommonJS. The alias uses `fileURLToPath(new URL(…, import.meta.url))` (Vite's pattern, with `fileURLToPath` instead of `.pathname` so a checkout path with spaces works). |
+| `@vscode/vsce` | `^4.0.0` | Latest stable (`4.0.0`; `4.0.1-*` are prereleases). Requires Node `>= 22` to package. |
+| `@types/vscode` | `1.90.0` (exact) | Must not exceed `engines.vscode` (`^1.90.0`), or typecheck would accept APIs older hosts lack. `1.90.0` is the only published 1.90.x. Pinned exactly so it cannot float to a newer API surface. |
+| `@types/node` | `^22.20.5` | VS Code 1.90's Electron bundles Node 20 (per the project's compatibility target; not independently re-verified here), so `20.x` types would match the runtime best — but vitest 5 declares the peer `@types/node ^22.0.0 \|\| >=24.0.0` and npm hard-fails (`ERESOLVE`) with any 20.x. 22.x is the closest version vitest 5 accepts. Consequence: typecheck no longer flags a Node-22-only API. `src/` imports only `node:net`, `node:fs`, `node:fs/promises` and `node:crypto`; keep new Node API use within Node 20 by review, since this is not machine-checked. |
 
 **Unit tests need no extension host.** Everything under `src/core-client/`,
 `src/state/*` and the pure halves of `src/vscode/*` and `src/webview/html.ts`/
 `bridge.ts` import no `vscode`, so they run under plain Node with an injected
 fake duplex. `src/session.ts` is exercised through `test/helpers/vscodeStub.ts`
-(aliased as `vscode` in `vitest.config.ts`) against a scripted fake Core, and
+(aliased as `vscode` in `vitest.config.mts`) against a scripted fake Core, and
 `src/webview/app.ts` through `test/helpers/fakeDom.ts`.
 
 ## Module layout
@@ -250,8 +261,8 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
   batching and event replay UI land after the Codex-in-SBX feasibility gate.
 - **DEFERRED: React + Tailwind + shadcn/ui webview.** `specs/03 §3` describes
   `App.tsx` + `views/`/`components/`/`dialogs/`. This scaffold ships a plain
-  TypeScript sidebar (`src/webview/app.ts`, compiled with `module: none` so no
-  bundler is needed) because the component tree is only worth building once the
+  TypeScript sidebar (`src/webview/app.ts`, compiled as a classic script — `module: esnext` +
+  `moduleDetection: legacy`, no import/export — so no bundler is needed) because the component tree is only worth building once the
   chat gate defines its real message model. Migration is the VS2 deliverable.
 - **NO LONGER DEFERRED: `conversation.list` / `conversation.history` /
   `task.list` — landed and verified live.** The protocol-v1 discovery revision
