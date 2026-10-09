@@ -16,6 +16,9 @@
 # - "review requirement for destructive command adapter modifications" —
 #   that is branch protection, not expressible in this file.
 # Licensing gates (docs/licensing-decision.md) block publication, not CI.
+# Supply chain: every third-party and first-party action is pinned to a full
+# commit SHA (tag in the trailing comment); cargo-audit is version-pinned; the
+# Gradle wrapper jar is validated before it runs (security review W7).
 name: CI
 
 on:
@@ -38,7 +41,7 @@ jobs:
       desktop: ${{ steps.phases.outputs.desktop }}
       jetbrains: ${{ steps.phases.outputs.jetbrains }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: phases
         run: |
           {
@@ -61,11 +64,12 @@ jobs:
       run:
         working-directory: core
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: core
       - name: Format
@@ -83,9 +87,11 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-audit --locked
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: stable
+      - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo audit
         working-directory: core
 
@@ -96,10 +102,10 @@ jobs:
     name: Schemas + drift gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.x"
       - run: make schema-lint
       - run: make schema-drift
 
@@ -111,10 +117,10 @@ jobs:
     if: ${{ needs.detect.outputs.vscode == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
       - run: npm ci
         working-directory: clients/vscode
       - run: npm run typecheck
@@ -128,10 +134,10 @@ jobs:
     if: ${{ needs.detect.outputs.desktop == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
       - run: npm ci
         working-directory: apps/desktop
       - run: npm run typecheck
@@ -147,13 +153,15 @@ jobs:
     if: ${{ needs.detect.outputs.jetbrains == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: 17
       - name: Wrapper is checked in
         run: test -x clients/jetbrains/gradlew
+      # Validate the checked-in gradle-wrapper.jar before executing it.
+      - uses: gradle/actions/wrapper-validation@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
       - name: Compile
         run: ./gradlew compileKotlin --console=plain
         working-directory: clients/jetbrains
