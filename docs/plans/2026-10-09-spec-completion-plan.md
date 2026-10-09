@@ -24,9 +24,6 @@ Each line is one implementation commit plus its `docs(audit)` log entry. Small s
 
 ### U — Latest dependencies (one area per commit, full suite each)
 
-| # | Area | Target |
-|---|---|---|
-
 Status (09.10.2026): U1 `013ecfd` (0022), U2 `7a0a5b8` (0023), U3 `8b45a9c` (0021), U4 `da20777` (0025) — all done. U4 targets Java 25, not 21: the IDE requires it.
 
 | # | Area | Target |
