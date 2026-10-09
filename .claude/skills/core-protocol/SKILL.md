@@ -9,15 +9,16 @@ From `docs/specs/02_ARCHITECTURE_AND_DATA.md`. One persistent per-user Core; cli
 
 ## Protocol invariants
 
-- Transport: Unix domain socket (per-user perms) / Windows named pipe (user-only DACL). **Never TCP by default.** Newline-delimited JSON frames over the socket.
+- Transport: Unix domain socket (per-user perms) / Windows named pipe (user-only DACL). **Never TCP by default.** Newline-delimited JSON frames over the socket, each capped at `MAX_FRAME_BYTES` (4 MiB, `sandpane-service`); readers must bound reads to the cap (AGENTS.md Code Review rule 9).
 - Every frame: protocol `v`, request `id`, method or correlated response; JSON-schema validated against `schemas/`.
-- Method set starts from the contract in specs/02 §2 (`system.probe`, `project.*`, `sandbox.*`, `conversation.*`, `task.*`, `git.*`). Adding a method = update `sandpane-protocol` types + `schemas/*.json` + each client's typed wrapper together; note drift status in the changelog entry.
-- Structured error codes only: `NOT_INSTALLED`, `DAEMON_DOWN`, `UNSUPPORTED_SBX_VERSION`, `PROVIDER_AUTH_REQUIRED`, `CONFLICT`, `TASK_INTERRUPTED`, `PERMISSION_DENIED`, `VALIDATION_FAILED` (+ transport-level `INTERNAL`). No free-form shell-exec RPC ever.
+- Method set starts from the contract in specs/02 §2; the implemented set is `sandpane_protocol::Method::ALL` (advertised in `CoreCapabilities.methods`, so advertised = dispatched). Adding a method = update `sandpane-protocol` types + `schemas/*.json` + each client's typed wrapper together, run `make schema-drift`, and note drift status in the changelog entry.
+- Read methods (`task.list`, `conversation.list`, `conversation.history`) clamp `limit` (default 200, max 500) and disclose `truncated: true`; never return an unbounded list.
+- Structured error codes only: `NOT_INSTALLED`, `DAEMON_DOWN`, `UNSUPPORTED_SBX_VERSION`, `PROVIDER_AUTH_REQUIRED`, `CONFLICT`, `TASK_INTERRUPTED`, `PERMISSION_DENIED`, `VALIDATION_FAILED`, `NOT_FOUND` (+ transport-level `INTERNAL`). Canonical set: `sandpane_protocol::ErrorCode` — `NOT_FOUND` exists in code but is not yet listed in specs/02 §2. No free-form shell-exec RPC ever.
 - Idempotency keys on sandbox/task creation; cancellation + deadlines on every long call.
 
 ## Events
 
-- Append-only `task_events` (sequence PK per task) written **durably before** subscriber notification; `task.subscribe(afterSequence)` replays from checkpoint — client reconnect must be idempotent.
+- Append-only `task_events` (sequence PK per task) written **durably before** subscriber notification; `task.subscribe` replays from checkpoint — with `taskId`, from the scalar `afterSequence`; without `taskId` (project-wide/global), each task from its own cursor in the `afterSequences` map (bounded: 4096 entries). A replay that cannot fit one frame is refused with `VALIDATION_FAILED`, never emitted oversized. Client reconnect must be idempotent.
 - Normalized `AgentEvent` union (specs/02 §4): `message.delta`, `tool.started/finished`, `file.changed`, `approval.required`, `task.completed`, `error`. This is a Sandpane format; normalize only what the adapter can verify; mark unsupported events explicitly.
 
 ## Task lifecycle (enforced in Core, never in UI)

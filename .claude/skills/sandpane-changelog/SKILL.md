@@ -1,7 +1,6 @@
 ---
 name: sandpane-changelog
 description: Use when a big implementation step has just been completed (a phase, module, client skeleton, docs rebuild, or infrastructure addition is committed or about to be committed), when asked to log an implementation, write an audit record, or update docs/CHANGELOG.md, or when unsure whether a change counts as "big" enough to log.
-priority: 10
 ---
 
 # Sandpane implementation changelog & audit logging

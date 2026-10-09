@@ -20,6 +20,8 @@ Required by `specs/07_ROADMAP_AND_TASKS.md` (P0) and `specs/08_TESTING_AND_RELEA
 | Docker SBX CLI (`sbx`) | `sbx` not on PATH (Python `shutil.which` probe + Core `system.probe` → `sbx.installed:false`) | **P0 BLOCKER — all SBX integration UNVERIFIED** |
 | Codex CLI | `/Users/gabrielgeorgescu/.local/bin/codex`, `codex-cli 0.155.1`; `~/.codex/auth.json` + `config.toml` exist (presence metadata only — contents never read, never logged) | **P0 BLOCKER — never validated inside SBX, so the adapter stays `verified:false`** |
 | Claude Agent SDK | not validated | UNVERIFIED |
+| Claude Code (agent harness, dev tooling only) | `claude --version` → `2.1.288 (Claude Code)` (09.10.2026) | verified (host) — project config in `.claude/` (agents `skills:` preload, commands `argument-hint`) checked against code.claude.com docs, entry 0013 |
+| Superpowers plugin (dev tooling only) | `superpowers@claude-plugins-official` **6.4.1** (`5bf4e78`), project + user scope (`~/.claude/plugins/installed_plugins.json`, 09.10.2026). Upstream latest is **6.4.2** (`8ca22db`, only change: leaner `writing-plans`), but the official marketplace pins `sha 5bf4e78`, so `claude plugin update` reports "already at the latest version (6.4.1)" | verified (installed version); 6.4.2 not available via the official marketplace — re-run `claude plugin marketplace update claude-plugins-official && claude plugin update superpowers@claude-plugins-official --scope project` once the pin moves |
 
 > **P0 blocker attribution, corrected 09.10.2026 by live host probes.** The gate is *not* missing
 > Docker or a missing Codex install — both are present (Docker CLI 29.8.2, `codex-cli 0.155.1`).

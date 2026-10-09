@@ -1,4 +1,5 @@
 ---
+argument-hint: "[step to log; default = most recent big implementation]"
 description: Log a completed implementation — writes docs/audit/NNNN review record + docs/CHANGELOG.md entry per the AGENTS.md rule
 ---
 

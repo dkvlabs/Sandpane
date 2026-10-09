@@ -1,8 +1,9 @@
 ---
+argument-hint: "[phase or client, e.g. P1 | vscode]"
 description: Report Sandpane implementation status against the roadmap phases and logged entries
 ---
 
-Produce a status report for Sandpane implementation progress (optionally focused on one phase, e.g. `P1` or `vscode`). Focus: $ARGUMENTS
+Produce a status report for Sandpane implementation progress (optionally focused on one phase, e.g. `P1` or `vscode`). Focus (may be empty): $ARGUMENTS
 
 1. Read docs/CHANGELOG.md (all entries) and docs/audit/0000-execution-plan.md.
 2. Read docs/specs/07_ROADMAP_AND_TASKS.md phase list and the client deliverable checklists (specs/03 §5, specs/04 §4, specs/05 §4) as relevant.
