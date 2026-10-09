@@ -14,17 +14,37 @@
 
 import {
   ERROR_CODES,
+  MAX_SUBSCRIBE_CURSORS,
   PROTOCOL_VERSION,
   isMethod,
+  type Conversation,
+  type ConversationHistoryParams,
+  type ConversationHistoryResult,
+  type ConversationListParams,
   type CoreCapabilities,
   type ErrorCode,
   type Method,
   type RpcResponseFrame,
   type TaskEvent,
+  type TaskListParams,
   type TaskSubscribeParams,
+  type TaskSummary,
 } from "./protocol";
 import { FrameTooLargeError, MalformedFrameError, encodeFrame } from "./framing";
-import { decodeCoreCapabilities, decodeTaskEvents } from "./decode";
+import {
+  decodeConversationHistory,
+  decodeConversations,
+  decodeCoreCapabilities,
+  decodeTaskEvents,
+  decodeTaskSummaries,
+} from "./decode";
+import {
+  CoreValidationError,
+  buildConversationHistoryParams,
+  buildConversationListParams,
+  buildTaskListParams,
+  buildTaskSubscribeParams,
+} from "./guards";
 
 /** The only thing the client needs from a transport. */
 export interface CoreTransport {
@@ -46,7 +66,11 @@ export type ClientErrorCode =
   | "FRAME_TOO_LARGE"
   | "MALFORMED_FRAME"
   | "VERSION_MISMATCH"
-  | "METHOD_NOT_ALLOWED";
+  | "METHOD_NOT_ALLOWED"
+  /** This client refused a param before writing a frame. Not a Core verdict. */
+  | "INVALID_PARAMS"
+  /** Core refused a replay too large to fit one frame — recoverable, do not retry. */
+  | "REPLAY_TOO_LARGE";
 
 export type ErrorSource = "core" | "client";
 
@@ -273,13 +297,65 @@ export class CoreClient {
     return this.request("git.apply", params);
   }
 
-  /** One replay pass of durable task events. */
+  /**
+   * `task.list` — read-only discovery of Core task state (ADDITIVE v1: a
+   * pre-revision Core does not dispatch it, so callers feature-detect with
+   * `coreAdvertisesMethod(capabilities, "task.list")` first).
+   *
+   * Statuses are displayed exactly as Core stores them; this client computes no
+   * transitions (AGENTS rule 3). Params are guarded before the frame is written.
+   */
+  async listTasks(params: TaskListParams = {}): Promise<TaskSummary[]> {
+    return decodeTaskSummaries(
+      await this.request("task.list", preflight(() => buildTaskListParams(params))),
+    );
+  }
+
+  /**
+   * `conversation.list` — chat enumeration (ADDITIVE v1, feature-gated).
+   * Core excludes archived conversations, so this is what a sidebar may reopen.
+   */
+  async listConversations(
+    params: ConversationListParams = {},
+  ): Promise<Conversation[]> {
+    return decodeConversations(
+      await this.request(
+        "conversation.list",
+        preflight(() => buildConversationListParams(params)),
+      ),
+    );
+  }
+
+  /**
+   * `conversation.history` — bounded transcript read (ADDITIVE v1, feature-gated).
+   * Returns an OBJECT with `truncated` + `nextSequence`; the caller must surface a
+   * truncation rather than present a partial page as the whole conversation.
+   */
+  async getConversationHistory(
+    params: ConversationHistoryParams,
+  ): Promise<ConversationHistoryResult> {
+    return decodeConversationHistory(
+      await this.request(
+        "conversation.history",
+        preflight(() => buildConversationHistoryParams(params)),
+      ),
+    );
+  }
+
+  /**
+   * One replay pass of durable task events.
+   *
+   * The payload is built by `buildTaskSubscribeParams`, which mirrors Core's
+   * cursor rules exactly: a `taskId` request replays that ONE task from the
+   * scalar and never carries a map (Core ignores it); a scope-wide request
+   * replays each task from its own `afterSequences` cursor when the caller holds
+   * per-task checkpoints, and falls back to the shared scalar when it does not.
+   */
   async replayTaskEvents(params: TaskSubscribeParams): Promise<TaskEvent[]> {
-    const raw = await this.request("task.subscribe", {
-      ...(params.projectId !== undefined ? { projectId: params.projectId } : {}),
-      ...(params.taskId !== undefined ? { taskId: params.taskId } : {}),
-      afterSequence: params.afterSequence,
-    });
+    const raw = await this.request(
+      "task.subscribe",
+      preflight(() => buildTaskSubscribeParams(params)),
+    );
     return decodeTaskEvents(raw);
   }
 
@@ -439,6 +515,13 @@ function isErrorCode(code: string): boolean {
 
 export function asCoreRequestError(err: unknown): CoreRequestError {
   if (err instanceof CoreRequestError) return err;
+  if (err instanceof CoreValidationError) {
+    // This client refused it; Core never saw the request. The UI must say which
+    // plane failed, so this is a `source: "client"` error, not a fake Core code.
+    return new CoreRequestError("client", "INVALID_PARAMS", err.message, {
+      field: err.field,
+    });
+  }
   if (err instanceof FrameTooLargeError) {
     return new CoreRequestError("client", "FRAME_TOO_LARGE", err.message);
   }
@@ -450,6 +533,23 @@ export function asCoreRequestError(err: unknown): CoreRequestError {
     "TRANSPORT_UNAVAILABLE",
     err instanceof Error ? err.message : String(err),
   );
+}
+
+/**
+ * Build a request payload behind the guard wall.
+ *
+ * A refusal must reach the caller as the same `CoreRequestError` shape every
+ * other failure uses (so React Query error handling stays uniform), while still
+ * being identifiable as `source: "client"` — Core never saw this request. The
+ * payload is built BEFORE `request()` runs, so nothing is written on a refusal.
+ */
+function preflight<T>(build: () => T): T {
+  try {
+    return build();
+  } catch (err) {
+    if (err instanceof CoreValidationError) throw asCoreRequestError(err);
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +566,12 @@ export interface TaskSubscriptionOptions {
   /** A sequence jump means events exist that this client did not see. */
   onGap?: (info: { taskId: string; from: number; to: number }) => void;
   onError?: (err: CoreRequestError) => void;
+  /**
+   * Core refused THIS scope's replay as too large to fit one frame
+   * (`VALIDATION_FAILED` naming the byte ceiling). The subscription stops
+   * pulling — re-asking can never succeed — and the view says so.
+   */
+  onReplayRefused?: (reason: string) => void;
   onState?: (state: SubscriptionState) => void;
   pollIntervalMs?: number;
   /** Cap on the backoff applied after consecutive failures. */
@@ -476,7 +582,24 @@ export type SubscriptionState =
   | { kind: "idle" }
   | { kind: "polling" }
   | { kind: "backoff"; attempt: number; reason: string }
+  /** Core refused the replay as undeliverable; polling is stopped, not failed. */
+  | { kind: "refused"; reason: string }
   | { kind: "stopped" };
+
+/**
+ * Core's structured refusal of a replay that cannot fit one IPC frame
+ * (`task.subscribe` has no truncation envelope, so it answers `VALIDATION_FAILED`
+ * naming the byte ceiling instead of emitting a frame both ends would reject).
+ *
+ * Detection is deliberately narrow: the code must be Core's `VALIDATION_FAILED`
+ * AND the message must name the replay ceiling, so an ordinary validation failure
+ * is never mislatched as "stop polling".
+ */
+export function isOversizedReplayRefusal(err: unknown): boolean {
+  const error = asCoreRequestError(err);
+  if (error.code !== "VALIDATION_FAILED") return false;
+  return /task\.subscribe/i.test(error.message) && /ceiling/i.test(error.message);
+}
 
 /**
  * Owns per-task sequence checkpoints. One instance per active stream, cancelled
@@ -490,6 +613,8 @@ export class TaskSubscription {
   private stopped = false;
   private inFlight = false;
   private failures = 0;
+  /** Core's verbatim refusal text when the last replay was too large; else null. */
+  private replayRefusal: string | null = null;
   private readonly interval: number;
   private readonly maxInterval: number;
 
@@ -506,6 +631,9 @@ export class TaskSubscription {
 
   get state(): SubscriptionState {
     if (this.stopped) return { kind: "stopped" };
+    if (this.replayRefusal !== null) {
+      return { kind: "refused", reason: this.replayRefusal };
+    }
     if (this.failures > 0) {
       return {
         kind: "backoff",
@@ -516,9 +644,38 @@ export class TaskSubscription {
     return this.running ? { kind: "polling" } : { kind: "idle" };
   }
 
+  /**
+   * Core's refusal text when the last replay could not fit one frame, else null.
+   * A refused replay is NOT retried: re-asking for the same scope can never
+   * succeed, so polling stops until the caller narrows the request.
+   */
+  get replayRefused(): string | null {
+    return this.replayRefusal;
+  }
+
+  /**
+   * Re-arm after the caller narrowed the request (single `taskId`, a higher
+   * cursor, or a smaller project). Nothing is fetched until the next tick.
+   */
+  clearReplayRefusal(): void {
+    this.replayRefusal = null;
+    this.failures = 0;
+    if (!this.stopped && this.timer === null) {
+      this.options.onState?.(this.state);
+      this.tick();
+    } else {
+      this.options.onState?.(this.state);
+    }
+  }
+
   /** Highest checkpoint held, for tests and for status copy. */
   lastSequence(taskId: string): number | undefined {
     return this.checkpoints.get(taskId);
+  }
+
+  /** Every checkpoint held (display-only copy; Core stays the authority). */
+  checkpointSnapshot(): Record<string, number> {
+    return Object.fromEntries(this.checkpoints.entries());
   }
 
   start(): void {
@@ -550,13 +707,45 @@ export class TaskSubscription {
     return this.pass ?? Promise.resolve();
   }
 
+  /**
+   * Run one replay pass immediately from the held per-task cursors.
+   *
+   * The poll loop covers the ordinary case; this is the explicit pull behind a
+   * "Re-check Core" action and behind a reconnect hydration, and it resumes from
+   * the cursors already held, so it never re-floods what was delivered.
+   *
+   * A latched oversized refusal is honored: pulling the SAME scope again could
+   * never fit one frame, so this resolves without writing a request. The caller
+   * narrows first (`clearReplayRefusal` after a smaller scope), then pulls.
+   */
+  async catchUpNow(): Promise<void> {
+    if (this.stopped || this.replayRefusal !== null) return;
+    // Join a pull already in flight instead of returning early: an explicit
+    // "catch up now" that silently no-ops because the poll loop happened to
+    // start a moment earlier would leave the caller believing it is current.
+    if (this.pass) {
+      await this.pass;
+      return;
+    }
+    await this.runPass();
+  }
+
+  /** Seed a checkpoint (used when `task.list` hydration proves a task exists). */
+  noteSequence(taskId: string, sequence: number): void {
+    const held = this.checkpoints.get(taskId) ?? 0;
+    if (sequence > held) this.checkpoints.set(taskId, sequence);
+  }
+
   private pass: Promise<void> | null = null;
 
   private tick(): void {
     if (this.stopped) return;
+    // A refused replay is not a transient failure: re-sending the same scope can
+    // never fit a frame, so the loop stops instead of hammering Core.
+    if (this.replayRefusal !== null) return;
     this.pass = this.runPass().finally(() => {
       this.pass = null;
-      if (this.stopped) return;
+      if (this.stopped || this.replayRefusal !== null) return;
       const delay = this.failures === 0
         ? this.interval
         : Math.min(this.interval * 2 ** Math.min(this.failures, 4), this.maxInterval);
@@ -565,22 +754,34 @@ export class TaskSubscription {
   }
 
   private async runPass(): Promise<void> {
-    if (this.inFlight) return;
+    // Re-entrant safety: a tick that fires while a pass is still running shares
+    // that pass instead of dropping it or racing a second frame on the socket.
+    if (this.inFlight) {
+      await this.pass;
+      return;
+    }
     this.inFlight = true;
     try {
-      const after = this.scopeAfterSequence();
-      const events = await this.client.replayTaskEvents({
-        ...(this.options.taskId !== undefined
-          ? { taskId: this.options.taskId }
-          : {}),
-        ...(this.options.projectId !== undefined
-          ? { projectId: this.options.projectId }
-          : {}),
-        afterSequence: after,
-      });
+      const events = await this.client.replayTaskEvents(this.passParams());
       this.failures = 0;
       this.deliver(events);
     } catch (err) {
+      if (isOversizedReplayRefusal(err)) {
+        const refusal = asCoreRequestError(err);
+        this.replayRefusal = refusal.message;
+        this.options.onError?.(
+          new CoreRequestError(
+            "core",
+            "REPLAY_TOO_LARGE",
+            refusal.message,
+            refusal.details,
+          ),
+        );
+        // Not counted as a backoff attempt: this one needs the caller to narrow
+        // the request, so a retry would be a storm against a fixed verdict.
+        this.options.onReplayRefused?.(refusal.message);
+        return;
+      }
       this.failures += 1;
       this.options.onError?.(asCoreRequestError(err));
     } finally {
@@ -590,14 +791,59 @@ export class TaskSubscription {
   }
 
   /**
-   * `task.subscribe` applies `afterSequence` per task, so the scope's minimum
-   * checkpoint is what we ask for; anything already held is filtered locally.
+   * The cursor set for one pass, honoring Core's rules exactly.
+   *
+   * Task-scoped: that task's own checkpoint as the scalar (a map would be
+   * ignored by Core, so none is built).
+   *
+   * Scope-wide (project or global): once ANY checkpoint is held, the checkpoints
+   * go out as `afterSequences` so each task resumes from its OWN cursor. The
+   * shared scalar is only the floor for the very first pass, when there is
+   * nothing to map — which is the legacy behaviour, unchanged.
+   *
+   * Bounded to `MAX_SUBSCRIBE_CURSORS`: when the checkpoint is larger than the
+   * bound, the OLDEST entries are the ones dropped, so those tasks replay IN
+   * FULL. That is the safe direction — nothing is skipped, the checkpoint simply
+   * re-drops a redelivery — and `cursorsDropped` reports the count so the UI can
+   * say so instead of hiding it.
    */
-  private scopeAfterSequence(): number {
-    if (this.checkpoints.size === 0) return this.options.afterSequence ?? 0;
-    let min = Number.POSITIVE_INFINITY;
-    for (const seq of this.checkpoints.values()) min = Math.min(min, seq);
-    return Number.isFinite(min) ? min : this.options.afterSequence ?? 0;
+  private passParams(): TaskSubscribeParams {
+    const scope = {
+      ...(this.options.taskId !== undefined ? { taskId: this.options.taskId } : {}),
+      ...(this.options.projectId !== undefined
+        ? { projectId: this.options.projectId }
+        : {}),
+    };
+    if (this.options.taskId !== undefined) {
+      return {
+        ...scope,
+        afterSequence: this.checkpoints.get(this.options.taskId) ?? this.options.afterSequence ?? 0,
+      };
+    }
+    const cursors = this.scopeCursors();
+    return {
+      ...scope,
+      afterSequence: this.options.afterSequence ?? 0,
+      ...(cursors === undefined ? {} : { afterSequences: cursors }),
+    };
+  }
+
+  /** Number of checkpoints left out of the last `afterSequences` map, if any. */
+  get cursorsDropped(): number {
+    return this.dropped;
+  }
+
+  private dropped = 0;
+
+  private scopeCursors(): Record<string, number> | undefined {
+    if (this.checkpoints.size === 0) return undefined;
+    const entries = [...this.checkpoints.entries()];
+    if (entries.length > MAX_SUBSCRIBE_CURSORS) {
+      this.dropped = entries.length - MAX_SUBSCRIBE_CURSORS;
+      return Object.fromEntries(entries.slice(this.dropped));
+    }
+    this.dropped = 0;
+    return Object.fromEntries(entries);
   }
 
   private deliver(events: TaskEvent[]): void {

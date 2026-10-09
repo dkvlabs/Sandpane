@@ -9,6 +9,7 @@
 
 import type { ErrorCode } from '../core-client/events';
 import { isErrorCode } from '../core-client/events';
+import { CORE_METHODS } from '../core-client/protocol';
 
 export type ClientFailureReason =
   | 'not_connected'
@@ -122,6 +123,11 @@ const CORE_GUIDANCE: Record<ErrorCode, ErrorGuidance> = {
       'the expected answer for anything that looks like an injected command — content is data, ' +
       'never an argument vector.',
     actions: [{ label: 'Open client logs', command: 'sandpane.openCoreLogs' }],
+    honestUncertainty:
+      'Since the protocol-v1 discovery revision this code also answers a `task.subscribe` replay ' +
+      'that cannot fit one IPC frame. That one is recoverable — narrow the request to a single ' +
+      'taskId, raise the cursor, or drop tasks from afterSequences. Core has no truncation ' +
+      'envelope for that method yet, so this client stops retrying rather than hammering it.',
   },
   NOT_FOUND: {
     headline: 'Core has no record of that id',
@@ -183,8 +189,10 @@ const CLIENT_GUIDANCE: Record<ClientFailureReason, ErrorGuidance> = {
   unknown_method: {
     headline: 'Requested action has no Core method',
     explanation:
-      'The RPC surface is an allowlist of 11 typed methods and there is no free-form execution ' +
-      'method. What you asked for cannot be expressed as an arbitrary command (specs/02 §2).',
+      // Derived from the allowlist so this copy can never quote a stale count.
+      `The RPC surface is an allowlist of ${CORE_METHODS.length} typed methods and there is no ` +
+      'free-form execution method. What you asked for cannot be expressed as an arbitrary ' +
+      'command (specs/02 §2).',
     actions: [],
   },
   validation: {

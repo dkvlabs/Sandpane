@@ -92,6 +92,10 @@ tasks {
 
     test {
         useJUnit()
+        // ProtocolDriftGuardTest reads the Rust sources and schemas to compare wire names against.
+        // `-Dsandpane.repo.root=<checkout>` is forwarded to the test JVM so CI (or a human) can
+        // point the gate at any tree; unset, the test walks up from its working directory.
+        systemProperty("sandpane.repo.root", providers.gradleProperty("sandpaneRepoRoot").getOrElse(""))
     }
 
     // Keep the Kotlin warning surface visible: this scaffold has no baseline to

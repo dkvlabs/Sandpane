@@ -34,6 +34,11 @@ interface ChatLine {
 interface SandboxOption {
   name: string;
   probedState: string | null;
+  /** Core's recorded binding mode; null = Core has no readable binding row. */
+  workspaceMode: string | null;
+  /** Precomputed by the extension side — the webview interprets nothing. */
+  modeBadge: string;
+  modeHostWritable: boolean;
 }
 
 interface HeaderContext {
@@ -170,12 +175,20 @@ function mount(root: HTMLElement, state: SidebarState): void {
     select.appendChild(none);
   } else {
     for (const option of state.sandboxes) {
-      const opt = el(
-        'option',
-        undefined,
-        option.probedState ? `${option.name} · ${option.probedState}` : option.name,
-      );
+      // The mode travels with the name: a `direct_mount` mount is LIVE-WRITABLE
+      // and an unverified one is labelled as such — never left blank so the
+      // user could read it as safe (specs/02 §7).
+      const parts = [option.name];
+      if (option.probedState) parts.push(option.probedState);
+      parts.push(option.modeBadge);
+      const opt = el('option', undefined, parts.join(' · '));
       opt.value = option.name;
+      if (option.modeHostWritable) {
+        opt.setAttribute(
+          'title',
+          `${option.name}: ${option.modeBadge} — the agent can change host files in this workspace.`,
+        );
+      }
       if (option.name === state.selectedSandbox) opt.selected = true;
       select.appendChild(opt);
     }

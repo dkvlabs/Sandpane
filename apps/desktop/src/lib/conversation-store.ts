@@ -1,9 +1,10 @@
 /**
- * Conversations created by this window, in memory only.
+ * Conversations created by THIS window, in memory only.
  *
- * Protocol v1 has no `conversation.list`, so this is the complete and honest
- * scope of what the desktop can show as a chat tab: the conversations IT created.
- * It is not a cache of Core state and is never presented as history.
+ * `conversation.list` (ADDITIVE v1) is what reads Core's real chat list; this
+ * store exists only to cover the gap between creating a chat and the next read,
+ * so a fresh tab appears instantly. Views merge the two and label which half a
+ * row came from — this list alone is never presented as the project's history.
  *
  * The snapshot is replaced rather than mutated because `useSyncExternalStore`
  * compares by identity — pushing into a shared array would silently skip the

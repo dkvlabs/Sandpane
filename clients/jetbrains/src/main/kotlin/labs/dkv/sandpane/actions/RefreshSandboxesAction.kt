@@ -21,7 +21,7 @@ import labs.dkv.sandpane.services.TaskMonitorService
  */
 class RefreshSandboxesAction : AnAction() {
 
-    override fun getUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
+    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 
     override fun update(event: AnActionEvent) {
         // Always available: the honest "Core is down" message is more useful than a greyed item.

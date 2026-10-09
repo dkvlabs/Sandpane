@@ -18,9 +18,11 @@ import {
   type ApplyResult,
   type ChangeSet,
   type Conversation,
+  type ConversationHistoryResult,
   type CoreCapabilities,
   type ErrorCode,
   type FileChange,
+  type MessageRecord,
   type Project,
   type SandboxSummary,
   type TaskEvent,
@@ -102,6 +104,30 @@ function pickEnum<T extends string>(
   return v as T;
 }
 
+/**
+ * An OPTIONAL string array mirroring a Rust `#[serde(default)] Vec<String>`.
+ * Absent stays `undefined` — "this Core did not send the field" is a fact the UI
+ * must be able to show, and inventing `[]` would read as "registered nothing".
+ * A present-but-wrong-typed array is a malformed frame, never coerced.
+ */
+function optStrArray(
+  rec: Rec,
+  key: string,
+  what: string,
+): string[] | undefined {
+  const v = rec[key];
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v)) {
+    throw new MalformedFrameError(`${what}.${key} must be an array of strings`);
+  }
+  return v.map((item, index) => {
+    if (typeof item !== "string") {
+      throw new MalformedFrameError(`${what}.${key}[${index}] must be a string`);
+    }
+    return item;
+  });
+}
+
 export function decodeErrorCode(value: unknown): ErrorCode {
   if (typeof value !== "string" || !ERROR_CODES.includes(value as ErrorCode)) {
     throw new MalformedFrameError(`unknown error code: ${String(value)}`);
@@ -161,6 +187,10 @@ export function decodeCoreCapabilities(value: unknown): CoreCapabilities {
     sbx,
     agents,
     platform: str(rec, "platform", "CoreCapabilities"),
+    // Advertised method surface. Absent stays absent: `coreAdvertisesMethod`
+    // reads that as "not advertised", which is the only safe interpretation of a
+    // response from a Core that predates method advertisement.
+    methods: optStrArray(rec, "methods", "CoreCapabilities"),
   };
 }
 
@@ -168,24 +198,21 @@ export function decodeProjects(value: unknown): Project[] {
   if (!Array.isArray(value)) {
     throw new MalformedFrameError("project.list must return an array");
   }
-  return value.map((item) => {
-    const p = asRecord(item, "Project");
-    return {
-      id: str(p, "id", "Project"),
-      name: str(p, "name", "Project"),
-      description: optStr(p, "description", "Project") ?? "",
-      createdAt: str(p, "createdAt", "Project"),
-    };
-  });
+  return value.map((item) => decodeProjectRow(asRecord(item, "Project")));
 }
 
 export function decodeProject(value: unknown): Project {
-  const p = asRecord(value, "Project");
+  return decodeProjectRow(asRecord(value, "Project"));
+}
+
+function decodeProjectRow(p: Rec): Project {
+  const repositories = optStrArray(p, "repositories", "Project");
   return {
     id: str(p, "id", "Project"),
     name: str(p, "name", "Project"),
     description: optStr(p, "description", "Project") ?? "",
     createdAt: str(p, "createdAt", "Project"),
+    ...(repositories === undefined ? {} : { repositories }),
   };
 }
 
@@ -195,12 +222,68 @@ export function decodeSandboxSummaries(value: unknown): SandboxSummary[] {
   }
   return value.map((item) => {
     const s = asRecord(item, "SandboxSummary");
+    // `workspaceMode` is additive and optional: absent/null means Core has no
+    // readable binding row, which the UI must render as UNVERIFIED (and treat as
+    // live-writable), never as safe. A PRESENT value must be one of Core's four
+    // modes — an unreadable string is a malformed frame, not a guess.
+    const rawMode = s.workspaceMode;
+    const workspaceMode =
+      rawMode === undefined || rawMode === null ? null : decodeWorkspaceMode(rawMode);
     return {
       name: str(s, "name", "SandboxSummary"),
       probedState: optStr(s, "probedState", "SandboxSummary"),
       boundProjectId: optStr(s, "boundProjectId", "SandboxSummary"),
+      workspaceMode,
     };
   });
+}
+
+export function decodeConversations(value: unknown): Conversation[] {
+  if (!Array.isArray(value)) {
+    throw new MalformedFrameError("conversation.list must return an array");
+  }
+  return value.map((item) => decodeConversation(asRecord(item, "Conversation")));
+}
+
+export function decodeTaskSummaries(value: unknown): TaskSummary[] {
+  if (!Array.isArray(value)) {
+    throw new MalformedFrameError("task.list must return an array");
+  }
+  return value.map((item) => decodeTaskSummary(asRecord(item, "TaskSummary")));
+}
+
+/**
+ * `conversation.history` returns an OBJECT with both bounds disclosed — the
+ * decoder enforces that shape so a `truncated` page can never be mistaken for a
+ * complete transcript (AGENTS rule 5: no unverified completeness claim).
+ */
+export function decodeConversationHistory(value: unknown): ConversationHistoryResult {
+  const rec = asRecord(value, "ConversationHistoryResult");
+  const messages: MessageRecord[] = arr(rec, "messages", "ConversationHistoryResult").map(
+    (item) => {
+      const m = asRecord(item, "MessageRecord");
+      const sequence = num(m, "sequence", "MessageRecord");
+      if (!Number.isInteger(sequence) || sequence < 1) {
+        throw new MalformedFrameError("MessageRecord.sequence must be an integer >= 1");
+      }
+      return {
+        id: str(m, "id", "MessageRecord"),
+        conversationId: str(m, "conversationId", "MessageRecord"),
+        role: str(m, "role", "MessageRecord"),
+        content: str(m, "content", "MessageRecord"),
+        sequence,
+      };
+    },
+  );
+  const nextSequence = num(rec, "nextSequence", "ConversationHistoryResult");
+  if (!Number.isInteger(nextSequence) || nextSequence < 0) {
+    throw new MalformedFrameError("ConversationHistoryResult.nextSequence must be >= 0");
+  }
+  return {
+    messages,
+    truncated: bool(rec, "truncated", "ConversationHistoryResult"),
+    nextSequence,
+  };
 }
 
 export function decodeConversation(value: unknown): Conversation {

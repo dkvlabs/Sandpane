@@ -5,17 +5,31 @@ import labs.dkv.sandpane.model.AgentEventCodec
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.ContextRef
 import labs.dkv.sandpane.model.ContextRefKind
+import labs.dkv.sandpane.model.ConversationHistoryParams
+import labs.dkv.sandpane.model.ConversationHistoryResult
+import labs.dkv.sandpane.model.CoreCapabilities
 import labs.dkv.sandpane.model.CoreErrorCodes
 import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.model.DEFAULT_LIST_LIMIT
 import labs.dkv.sandpane.model.FileChange
 import labs.dkv.sandpane.model.FileChangeStatus
+import labs.dkv.sandpane.model.MAX_CURSOR_KEY_LEN
 import labs.dkv.sandpane.model.MAX_FRAME_BYTES
+import labs.dkv.sandpane.model.MAX_HISTORY_BYTES
+import labs.dkv.sandpane.model.MAX_LIST_LIMIT
+import labs.dkv.sandpane.model.MAX_SCOPING_ID_LEN
+import labs.dkv.sandpane.model.MAX_SUBSCRIBE_BYTES
+import labs.dkv.sandpane.model.MAX_SUBSCRIBE_CURSORS
 import labs.dkv.sandpane.model.PROTOCOL_VERSION
+import labs.dkv.sandpane.model.Project
 import labs.dkv.sandpane.model.RpcRequest
 import labs.dkv.sandpane.model.RpcResponseFrame
 import labs.dkv.sandpane.model.SandboxCreateSpec
+import labs.dkv.sandpane.model.SandboxSummary
+import labs.dkv.sandpane.model.TaskListParams
 import labs.dkv.sandpane.model.TaskStatus
+import labs.dkv.sandpane.model.TaskSubscribeParams
 import labs.dkv.sandpane.model.WorkspaceMode
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -33,16 +47,21 @@ import kotlin.test.assertTrue
  * NDJSON framing + wire-name parity tests.
  *
  * ┌──────────────────────────────────────────────────────────────────────────────┐
- * │ STATUS: UNRUN. This host has no Gradle-resolvable IntelliJ Platform artifact │
- * │ and no Kotlin compiler, so nothing here was executed. It is written so JB0   │
- * │ can run `./gradlew test` as the first proof of the transport.                │
+ * │ STATUS: RUN on 09.10.2026 by `./gradlew test` — Gradle wrapper 8.10.2, the   │
+ * │ IntelliJ Community 2024.2.4 platform artifact, Kotlin 2.0.21, JDK toolchain 17.│
+ * │ These are pure-function tests: no IDE instance and no socket is started, and │
+ * │ `runIde` / Plugin Verifier have STILL never run (see README's JB0 table).     │
  * └──────────────────────────────────────────────────────────────────────────────┘
  *
- * Covered offline (pure functions, no IDE and no socket):
+ * Covered here (pure functions, no IDE and no socket):
  *   - frame splitting, multi-byte UTF-8 reassembly, and the MAX_FRAME_BYTES refusal;
  *   - request/response field names and the serde `ok`/`err` outcome shape;
  *   - every snake_case / SCREAMING_SNAKE / camelCase wire name mirrored from
- *     core/crates/sandpane-protocol/src/lib.rs.
+ *     core/crates/sandpane-protocol/src/lib.rs;
+ *   - the protocol-v1 additive fields: an OLD frame parses, and an absent value stays absent on
+ *     the way out instead of becoming `null`, `{}`, or a benign workspace mode;
+ *   - the 14-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
+ *     compared by [ProtocolDriftGuardTest]).
  *
  * NOT covered here, on purpose: a live socket round trip. `SocketChannel` against
  * `UnixDomainSocketAddress` needs a running Sandpane Core (and AF_UNIX at runtime), so it is
@@ -166,9 +185,31 @@ class CoreClientFramingTest {
     @Test
     fun allowlistRejectsFreeFormExecution() {
         assertTrue(CoreMethods.isAllowlisted("task.subscribe"))
+        // The three additive protocol-v1 methods are allowlisted now; they were refused before.
+        assertTrue(CoreMethods.isAllowlisted("task.list"))
+        assertTrue(CoreMethods.isAllowlisted("conversation.list"))
+        assertTrue(CoreMethods.isAllowlisted("conversation.history"))
         assertFalse(CoreMethods.isAllowlisted("shell.exec"))
         assertFalse(CoreMethods.isAllowlisted("system.probe; ls"))
-        assertEquals(11, CoreMethods.ALL.size)
+        assertFalse(CoreMethods.isAllowlisted("task.subscribe "))
+        assertEquals(14, CoreMethods.ALL.size)
+    }
+
+    @Test
+    fun methodListIsInRustMethodAllOrder() {
+        // `CoreCapabilities.methods` is derived from `Method::ALL` in Rust, in that order; this
+        // list is the client mirror of it. [ProtocolDriftGuardTest] re-reads the Rust source and
+        // fails if this order or any name stops matching, so a rename cannot drift silently.
+        assertEquals(
+            listOf(
+                "system.probe", "project.create", "project.list", "sandbox.list", "sandbox.create",
+                "conversation.create", "conversation.send", "conversation.list", "conversation.history",
+                "task.cancel", "task.list", "task.subscribe", "git.review", "git.apply",
+            ),
+            CoreMethods.ALL,
+        )
+        assertEquals(3, CoreMethods.ADDITIVE_IN_V1.size)
+        assertTrue(CoreMethods.ADDITIVE_IN_V1.containsAll(setOf("task.list", "conversation.list", "conversation.history")))
     }
 
     // -----------------------------------------------------------------------
@@ -327,5 +368,198 @@ class CoreClientFramingTest {
             AgentEvent.TaskCompleted(false),
             AgentEventCodec.decode(CoreJson.parseToJsonElement("""{"type":"task.completed","ok":false}""")),
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // protocol-v1 additive fields — a response from an OLDER Core must still parse
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun preRevisionFramesStillDeserialize() {
+        // Mirrors the Rust test `additive_fields_deserialize_from_pre_revision_wire`: every field
+        // this revision added carries a serde default, so absence — not a crash, not a guess — is
+        // what an old Core produces on this side too.
+        val oldProject = CoreJson.decodeFromString(
+            Project.serializer(),
+            """{"id":"p1","name":"Atlas Demo","description":"","createdAt":"t"}""",
+        )
+        assertEquals(emptyList<String>(), oldProject.repositories)
+
+        val oldSandbox = CoreJson.decodeFromString(
+            SandboxSummary.serializer(),
+            """{"name":"atlas-auth","probedState":"running","boundProjectId":null}""",
+        )
+        // Absent, NOT defaulted to a benign mode: an unverified mount is host-writable until Core
+        // says otherwise (docs/specs/02 §7).
+        assertEquals(null, oldSandbox.workspaceMode)
+
+        val oldCaps = CoreJson.decodeFromString(
+            CoreCapabilities.serializer(),
+            """{"protocolVersion":1,"coreVersion":"0.1.0","instanceId":"i","sbx":null,"agents":[],"platform":"macos"}""",
+        )
+        assertEquals(emptyList<String>(), oldCaps.methods)
+        assertFalse(oldCaps.advertises("task.list"))
+
+        val oldSubscribe = CoreJson.decodeFromString(
+            TaskSubscribeParams.serializer(),
+            """{"projectId":"p1","afterSequence":3}""",
+        )
+        assertEquals(null, oldSubscribe.afterSequences)
+        assertEquals(3L, oldSubscribe.afterSequence)
+    }
+
+    @Test
+    fun additiveFieldsAreOmittedWhenAbsent() {
+        // serde uses `skip_serializing_if` on `workspaceMode`; the Kotlin side keeps the same
+        // shape through CoreJson's explicitNulls=false, so an absent mode never becomes `null` on
+        // the wire either.
+        val summary = CoreJson.encodeToString(
+            SandboxSummary.serializer(),
+            SandboxSummary(name = "atlas-auth", probedState = "running", boundProjectId = null),
+        )
+        assertFalse(summary.contains("workspaceMode"), "absent mode must stay absent: $summary")
+
+        val subscribe = CoreJson.encodeToString(
+            TaskSubscribeParams.serializer(),
+            TaskSubscribeParams(projectId = "p1", afterSequence = 4),
+        )
+        assertFalse(subscribe.contains("afterSequences"), "absent map must stay absent: $subscribe")
+    }
+
+    @Test
+    fun projectRepositoriesAndSandboxWorkspaceModeWireNames() {
+        val project = CoreJson.encodeToString(
+            Project.serializer(),
+            Project(
+                id = "p1",
+                name = "Atlas Demo",
+                description = "",
+                createdAt = "t",
+                repositories = listOf("/repos/atlas"),
+            ),
+        )
+        val projectJson = CoreJson.parseToJsonElement(project) as JsonObject
+        assertEquals("p1", projectJson["id"]!!.jsonPrimitive.content)
+        assertEquals("t", projectJson["createdAt"]!!.jsonPrimitive.content)
+        assertEquals("/repos/atlas", (projectJson["repositories"] as JsonArray)[0].jsonPrimitive.content)
+
+        val summary = CoreJson.encodeToString(
+            SandboxSummary.serializer(),
+            SandboxSummary(
+                name = "atlas-auth",
+                probedState = "running",
+                boundProjectId = "p1",
+                workspaceMode = WorkspaceMode.DIRECT_MOUNT,
+            ),
+        )
+        // The mode reuses the established snake_case enum names, under a camelCase KEY.
+        assertEquals("direct_mount", (CoreJson.parseToJsonElement(summary) as JsonObject)["workspaceMode"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun perTaskCursorMapWireShape() {
+        val params = TaskSubscribeParams(
+            projectId = "p1",
+            taskId = null,
+            afterSequence = 0,
+            afterSequences = linkedMapOf("task-a" to 5L, "task-b" to 2L),
+        )
+        val json = CoreJson.parseToJsonElement(CoreJson.encodeToString(TaskSubscribeParams.serializer(), params)) as JsonObject
+        assertEquals(5L, (json["afterSequences"] as JsonObject)["task-a"]!!.jsonPrimitive.content.toLong())
+        assertEquals(2L, (json["afterSequences"] as JsonObject)["task-b"]!!.jsonPrimitive.content.toLong())
+
+        val back = CoreJson.decodeFromString(TaskSubscribeParams.serializer(), json.toString())
+        assertEquals(5L, back.afterSequences?.get("task-a"))
+    }
+
+    @Test
+    fun taskListParamsEncodeStatusesAsCoreStoresThem() {
+        val wire = CoreJson.encodeToString(
+            TaskListParams.serializer(),
+            TaskListParams(projectId = "p1", statuses = listOf(TaskStatus.AWAITING_REVIEW), limit = 50),
+        )
+        val json = CoreJson.parseToJsonElement(wire) as JsonObject
+        assertEquals("p1", json["projectId"]!!.jsonPrimitive.content)
+        assertEquals("awaiting_review", (json["statuses"] as JsonArray)[0].jsonPrimitive.content)
+        assertEquals("50", json["limit"]!!.jsonPrimitive.content)
+
+        // `{}` deserializes: every field is optional on the Rust side.
+        val empty = CoreJson.decodeFromString(TaskListParams.serializer(), "{}")
+        assertEquals(null, empty.projectId)
+        assertEquals(null, empty.limit)
+        assertEquals(emptyList<TaskStatus>(), empty.statuses)
+    }
+
+    @Test
+    fun conversationHistoryResultIsAnObjectWithBothDisclosures() {
+        val wire = """
+            {"messages":[{"id":"m1","conversationId":"c1","role":"user","content":"hi","sequence":1}],
+             "truncated":true,"nextSequence":1}
+        """.trimIndent()
+        val result = CoreJson.decodeFromString(ConversationHistoryResult.serializer(), wire)
+        assertTrue(result.truncated)
+        assertEquals(1L, result.nextSequence)
+        assertEquals("c1", result.messages.single().conversationId)
+
+        // The result re-encodes under the camelCase field names Rust pins in its own test.
+        val json = CoreJson.parseToJsonElement(CoreJson.encodeToString(ConversationHistoryResult.serializer(), result)) as JsonObject
+        assertEquals("c1", (json["messages"] as JsonArray)[0].let { (it as JsonObject)["conversationId"]!!.jsonPrimitive.content })
+        assertEquals(1L, json["nextSequence"]!!.jsonPrimitive.content.toLong())
+        assertNotNull(json["truncated"])
+    }
+
+    /**
+     * A `conversation.history` object with NO `messages` key is a broken answer, not an empty
+     * transcript. With a Kotlin default on the field this decoded into `messages = []` and the UI
+     * would have said "Core reports no messages" about a frame that never said that.
+     */
+    @Test
+    fun historyFrameWithoutMessagesFailsToDecodeRatherThanLookingEmpty() {
+        val withoutMessages = """{"truncated":false,"nextSequence":0}"""
+        // kotlinx raises JsonDecodingException/JsonDataException for a missing required property;
+        // both are IllegalArgumentException, so that is the type asserted rather than a message.
+        val error = assertFailsWith<IllegalArgumentException> {
+            CoreJson.decodeFromString(ConversationHistoryResult.serializer(), withoutMessages)
+        }
+        assertTrue(
+            error.message?.contains("messages") == true,
+            "the refusal should name the missing field, and it must not decode: ${error.message}",
+        )
+
+        // A malformed row inside the list fails the same way instead of vanishing.
+        assertFailsWith<IllegalArgumentException> {
+            CoreJson.decodeFromString(
+                ConversationHistoryResult.serializer(),
+                """{"messages":[{"id":"m1"}],"truncated":false,"nextSequence":0}""",
+            )
+        }
+    }
+
+    @Test
+    fun conversationHistoryParamsAcceptDefaults() {
+        val minimal = CoreJson.decodeFromString(
+            ConversationHistoryParams.serializer(),
+            """{"conversationId":"c1"}""",
+        )
+        assertEquals(0L, minimal.afterSequence)
+        assertEquals(null, minimal.limit)
+        // `limit: Int?` defaults to null → omitted, so Core's own DEFAULT_LIST_LIMIT applies.
+        assertFalse(
+            CoreJson.encodeToString(ConversationHistoryParams.serializer(), minimal).contains("limit"),
+        )
+    }
+
+    @Test
+    fun listLimitConstantsMatchCore() {
+        // Pinned against sandpane-service by ProtocolDriftGuardTest; asserted here so a Kotlin-side
+        // edit that changes the number is caught too.
+        assertEquals(200, DEFAULT_LIST_LIMIT)
+        assertEquals(500, MAX_LIST_LIMIT)
+        assertEquals(2 * 1024 * 1024, MAX_HISTORY_BYTES)
+        assertEquals(4096, MAX_SUBSCRIBE_CURSORS)
+        assertEquals(100, MAX_CURSOR_KEY_LEN)
+        assertEquals(200, MAX_SCOPING_ID_LEN)
+        assertTrue(MAX_HISTORY_BYTES < MAX_FRAME_BYTES, "Core asserts this relationship")
+        assertTrue(MAX_SUBSCRIBE_BYTES < MAX_FRAME_BYTES)
     }
 }

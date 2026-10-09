@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   capabilitiesOf,
+  useCoreConversations,
   useCoreLink,
   useCreateConversation,
   useSessionConversations,
@@ -8,6 +9,8 @@ import {
 } from "../../lib/hooks";
 import { foldAgentView } from "../../lib/reducers";
 import type { Conversation } from "../../lib/protocol";
+import { ConversationTranscript } from "./ConversationTranscript";
+import { FeatureChip } from "../ui/feature-gate";
 import {
   Button,
   EmptyState,
@@ -22,10 +25,12 @@ import { ErrorPanel } from "../../features/projects/ProjectsView";
 /**
  * Chat tab list + composer for one project.
  *
- * Two protocol realities shape this component and are shown rather than hidden:
- * `conversation.list` does not exist in v1, so tabs can only cover conversations
- * this window created; and a message is inert text that Core turns into a task —
- * the desktop never renders a reply it did not receive as an event.
+ * Tabs come from `conversation.list` (ADDITIVE v1) when this Core advertises it,
+ * so a chat started in VS Code or JetBrains reopens here exactly as it is stored
+ * in the shared Core database. When the method is not advertised the panel says
+ * so and falls back to what this window created — it never implies the local
+ * list is complete. Either way a message is inert text that Core turns into a
+ * task, and the desktop never renders a reply it did not receive as an event.
  */
 export function ChatPanel({
   projectId,
@@ -38,9 +43,18 @@ export function ChatPanel({
 }) {
   const link = useCoreLink();
   const capabilities = capabilitiesOf(link);
-  const conversations = useSessionConversations().filter(
-    (c) => c.projectId === projectId,
-  );
+  const session = useSessionConversations();
+  const coreChats = useCoreConversations(projectId);
+  const conversations: Conversation[] = useMemo(() => {
+    const seen = new Set<string>();
+    const out: Conversation[] = [];
+    for (const c of [...coreChats.conversations, ...session]) {
+      if (c.projectId !== projectId || seen.has(c.id)) continue;
+      seen.add(c.id);
+      out.push(c);
+    }
+    return out;
+  }, [coreChats.conversations, session, projectId]);
   const createConversation = useCreateConversation();
   const send = useSendMessage(selectedConversationId);
 
@@ -66,9 +80,15 @@ export function ChatPanel({
   return (
     <Panel
       title="Conversations"
-      description="Tabs here are conversations this window created. Core exposes no conversation.list in protocol v1, so older history from other clients is not invented — it appears once that read method lands (DT1)."
+      description={
+        coreChats.gate.state === "supported"
+          ? "Tabs are the conversations Core holds for this project (conversation.list), plus any created in this window since the last read."
+          : "Core has not answered conversation.list, so these are only the conversations this window created — not the project's whole chat history."
+      }
       actions={
-        <Button
+        <div className="row-actions">
+          <FeatureChip gate={coreChats.gate} method="conversation.list" />
+          <Button
           variant="primary"
           disabled={
             agents.length === 0 ||
@@ -85,6 +105,7 @@ export function ChatPanel({
         >
           New chat
         </Button>
+        </div>
       }
     >
       {agents.length === 0 && (
@@ -159,6 +180,8 @@ export function ChatPanel({
           ))}
         </div>
       )}
+
+      {selected !== null && <ConversationTranscript conversationId={selected.id} />}
 
       {selected !== null && (
         <form

@@ -13,6 +13,7 @@ import { AppShell, ViewHeader } from "../../components/layout/AppShell";
 import { ConnectionBanner, ConnectionChip } from "../../components/layout/ConnectionState";
 import { ProjectSidebar } from "../../components/project/ProjectSidebar";
 import {
+  Badge,
   Button,
   EmptyState,
   Field,
@@ -197,12 +198,39 @@ export function ProjectsView({ route }: { route: Route }) {
         </Panel>
       </div>
 
-      <Panel title="Repositories and context">
+      <Panel
+        title="Repositories and context"
+        description="Registered paths as Core returns them on each project (project.list → repositories)."
+      >
+        {projects.every((project) => project.repositories === undefined) ? (
+          <p className="muted">
+            This Core did not send <Mono>repositories</Mono> on its project rows, so this build
+            cannot show what is registered. It is an additive field: a pre-revision Core omits it,
+            and the desktop does not reconstruct it from local state.
+          </p>
+        ) : (
+          <ul className="list">
+            {projects.map((project) => (
+              <li key={project.id} className="row">
+                <span className="row__title">{project.name}</span>
+                <span className="row__meta">
+                  {(project.repositories ?? []).length === 0 ? (
+                    <Badge tone="neutral">no repository registered</Badge>
+                  ) : (
+                    (project.repositories ?? []).map((path) => (
+                      <Mono key={path}>{path}</Mono>
+                    ))
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
         <p className="muted">
-          Protocol v1 exposes <Mono>project.create</Mono> with repository paths but no{" "}
-          <Mono>repository.list</Mono>, so bound repositories cannot be re-enumerated from Core
-          yet. Rather than show a guess, this view states the limitation: repo grouping, context
-          profiles and per-repo task identity arrive with a Core read method (DT1).
+          These are the strings the caller registered. Core canonicalizes (resolves symlinks) at{" "}
+          <Mono>sandbox.create</Mono> mount time, not at registration, so matching a folder against
+          them is a path match — not proof both names are the same directory. Context profiles and
+          per-repo task identity still have no Core method, so no UI claims them.
         </p>
       </Panel>
     </AppShell>

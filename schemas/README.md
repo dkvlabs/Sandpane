@@ -27,3 +27,19 @@ bindings + drift check", docs/specs/08 §6 "schema/codegen drift"). Until
 codegen lands, any protocol change must update the Rust types AND these files
 in the same commit — the drift gate now enforces it — and say so in the
 changelog entry.
+
+Since entry 0010 the gate also compares a **second** surface: the method set
+`Method::ALL` resolves to `as_str` (i.e. what `system.probe` advertises in
+`core-capabilities.methods`) against `rpc-request.schema.json`'s method enum —
+so a method that Core dispatches but clients cannot discover now fails the
+gate instead of drifting silently.
+
+**Why there is no per-method schema for every method.** Only cross-cutting
+frames (`rpc-request`, `rpc-response`, `agent-event`, `task-event`,
+`core-capabilities`) plus the two payloads a client must construct or consume
+blind (`sandbox-create-spec`, `change-set`) have their own files. Params for
+`task.list` / `conversation.list` / `conversation.history` are defined by the
+Rust types, pinned by the value-set gate and by each client's wire-parity test;
+their `docs/specs/02 §2` contract block is the human-readable form. Adding a
+schema file per method is a codegen concern and belongs with the P1/P7
+generated-bindings deliverable, not here.

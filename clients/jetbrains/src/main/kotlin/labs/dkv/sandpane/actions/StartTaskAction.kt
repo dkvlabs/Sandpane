@@ -11,7 +11,9 @@ import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import labs.dkv.sandpane.core.ConnectionManager
-import labs.dkv.sandpane.model.Project as SandpaneProject
+import labs.dkv.sandpane.core.ErrorAttribution
+import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.services.FolderAssociation
 import labs.dkv.sandpane.services.SandpaneContextProvider
 import labs.dkv.sandpane.services.SbxService
 
@@ -62,7 +64,7 @@ internal fun notify(project: Project?, title: String, content: String, type: Not
  */
 class StartTaskAction : AnAction() {
 
-    override fun getUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
 
     override fun update(event: AnActionEvent) {
         val presentation = event.presentation
@@ -147,22 +149,71 @@ class StartTaskAction : AnAction() {
         }
 
         // 4. Read-only RPC to resolve the project mapping. Nothing is created optimistically.
-        SbxService.instance(project).listProjects().whenComplete { coreProjects, error ->
+        //
+        // `refresh()` pulls `project.list` (with the additive protocol-v1 `repositories`) into the
+        // snapshot that [SbxService.associateFolder] matches against, so the answer below is Core's
+        // data put through the same pure rules the unit tests pin — never a guess. Each branch names
+        // a different fact: matched, claimed by several projects, not registered, and "cannot tell"
+        // are not interchangeable (AGENTS.md rule 5).
+        val sbx = SbxService.instance(project)
+        sbx.refresh().whenComplete { sbxSnapshot, error ->
             if (error != null) {
                 notify(
                     project,
-                    "Sandpane: project.list failed",
-                    error.message ?: error.javaClass.simpleName,
+                    ErrorAttribution.headline(CoreMethods.PROJECT_LIST, error),
+                    ErrorAttribution.describe(CoreMethods.PROJECT_LIST, error),
                     NotificationType.ERROR,
                 )
                 return@whenComplete
             }
-            notify(
-                project,
-                "Sandpane: cannot resolve this folder to a Core project",
-                describeMappingGap(coreProjects.orEmpty(), mapping, snapshot) + "\n\n" + PROTOCOL_GAP_MESSAGE,
-                NotificationType.WARNING,
-            )
+            // A partial refresh is stated rather than hidden; the association still uses whatever
+            // Core answered.
+            sbxSnapshot?.failure?.let {
+                notify(project, "Sandpane: project or sandbox list is incomplete", it, NotificationType.WARNING)
+            }
+            val folder = (mapping as? SandpaneContextProvider.HostMapping.Supported)?.projectRoot
+                ?: snapshot.vcsRoot
+            when (val association = sbx.associateFolder(folder)) {
+                is FolderAssociation.Matched -> notify(
+                    project,
+                    "Sandpane: task creation is not wired up in this build",
+                    "Resolved '${association.matchedRepository}' to Core project " +
+                        "'${association.project.name}' (${association.project.id}) — that mapping is " +
+                        "Core's own, not a guess. Stopping here is this plugin's decision: the " +
+                        "editor-side `conversation.send` path is JB3 work and is unimplemented, so " +
+                        "nothing was sent and no conversation id is invented.\n\n$JB3_GAP_MESSAGE",
+                    NotificationType.WARNING,
+                )
+
+                is FolderAssociation.Ambiguous -> notify(
+                    project,
+                    "Sandpane: several Core projects claim this folder",
+                    "Core lists these projects for the same repository path: " +
+                        association.candidates.joinToString(", ") { "${it.name} (${it.id})" }.let {
+                            "$it. Choosing one is yours to make — taking the first would be this " +
+                                "client inventing a preference it does not have. Nothing was sent."
+                        },
+                    NotificationType.WARNING,
+                )
+
+                FolderAssociation.Unregistered -> notify(
+                    project,
+                    "Sandpane: this folder is not registered with Core",
+                    "No project in Core's `project.list.repositories` resolves to " +
+                        "'${folder ?: "this IDE folder"}'. This is Core's answer, not a lookup " +
+                        "failure: the folder is simply not registered. Register it (desktop app or " +
+                        "Core CLI) and try again — nothing was sent.",
+                    NotificationType.INFORMATION,
+                )
+
+                is FolderAssociation.Indeterminate -> notify(
+                    project,
+                    "Sandpane: cannot tell whether this folder is registered",
+                    "${association.reason} Saying \"not registered\" here would be a false answer " +
+                        "about your setup, so nothing was sent.\n\n$JB3_GAP_MESSAGE",
+                    NotificationType.WARNING,
+                )
+            }
         }
     }
 
@@ -201,34 +252,23 @@ class StartTaskAction : AnAction() {
         append("change comes back as a review you apply explicitly.")
     }
 
-    /**
-     * States, in the user's terms, why the folder cannot be matched to a Core project today.
-     *
-     * A name match would be a guess: `sandpane_protocol::Project` carries id/name/description/
-     * createdAt and no repository paths, so nothing on the wire ties an IDE folder to a project.
-     * Returning a "resolved" project from `project.name == folderName` would be exactly the
-     * fabricated success the specs forbid (AGENTS.md rule 5).
-     */
-    private fun describeMappingGap(
-        coreProjects: List<SandpaneProject>,
-        mapping: SandpaneContextProvider.HostMapping,
-        snapshot: SandpaneContextProvider.Snapshot,
-    ): String {
-        val root = (mapping as? SandpaneContextProvider.HostMapping.Supported)?.projectRoot
-            ?: snapshot.vcsRoot
-            ?: "this IDE folder"
-        val names = coreProjects.joinToString(", ") { it.name }.ifBlank { "none" }
-        return "Core reports ${coreProjects.size} project(s): $names. " +
-            "'$root' cannot be matched to any of them: project.list returns no repository paths."
-    }
-
     companion object {
         private const val DEFAULT_INSTRUCTION = "Explain what this code does and what could break."
 
-        internal const val PROTOCOL_GAP_MESSAGE =
-            "Task creation stopped here on purpose: Sandpane Core cannot yet resolve an IDE folder " +
-                "to a project (project.list returns no repository paths) and has no conversation.list, " +
-                "so no conversation can be selected. Those two methods plus a selection ContextRef " +
-                "identifier contract are protocol items, not UI work — see clients/jetbrains/README.md."
+        /**
+         * What is STILL missing after the protocol-v1 discovery revision, stated without the gaps
+         * that revision closed.
+         *
+         * Folder→project resolution and conversation enumeration became possible once Core added
+         * `project.repositories` and `conversation.list`, and this plugin uses both. What blocks
+         * task creation from the editor popup is client work (the JB3 send path) plus one open
+         * protocol item: `ContextRef(kind: selection)` has no identifier contract, so a selection
+         * can only travel as quoted content, never as an addressable ref.
+         */
+        internal const val JB3_GAP_MESSAGE =
+            "Remaining gaps: the editor-side send path is JB3 work and is not implemented in this " +
+                "build, and Core still gives `ContextRef(kind: selection)` no identifier contract " +
+                "(the selection is quoted into `content` as data, never sent as an addressable ref). " +
+                "See clients/jetbrains/README.md."
     }
 }

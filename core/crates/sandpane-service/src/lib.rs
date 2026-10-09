@@ -9,6 +9,7 @@
 //! Windows named pipes are a P1 transport deliverable; this scaffold serves
 //! Unix sockets only and says so instead of pretending (see `main.rs`).
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,15 +22,56 @@ use sandpane_core::validation::Validator;
 use sandpane_core::{git as scoregit, Database, EventLog};
 use sandpane_protocol::{
     AgentCapability, AgentEvent, ApplyResult, ChangeSet, Conversation, ConversationCreateParams,
+    ConversationHistoryParams, ConversationHistoryResult, ConversationListParams,
     ConversationSendParams, CoreCapabilities, ErrorCode, FileChange, FileChangeStatus,
-    GitApplyParams, Method, Project, ProjectCreateParams, RpcRequest, RpcResponse,
-    SandboxCreateSpec, SandboxSummary, SbxStatus, TaskEvent, TaskStatus, TaskSubscribeParams,
-    TaskSummary, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
+    GitApplyParams, MessageRecord, Method, Project, ProjectCreateParams, RpcRequest, RpcResponse,
+    SandboxCreateSpec, SandboxSummary, SbxStatus, TaskEvent, TaskListParams, TaskStatus,
+    TaskSubscribeParams, TaskSummary, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
 };
 
 /// Bounded frame size: refuse oversized input instead of buffering forever
 /// (docs/specs/02 §2 "bounded responses").
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Rows returned by a list/history method when the caller asks for no limit.
+pub const DEFAULT_LIST_LIMIT: u32 = 200;
+
+/// Hard ceiling on rows from any single bounded read method. A larger request
+/// is clamped, never honoured — an unbounded set is not a valid response
+/// (docs/specs/02 §2).
+pub const MAX_LIST_LIMIT: u32 = 500;
+
+/// Total-bytes ceiling for the stored message content `conversation.history`
+/// may put in one response. Deliberately half of [`MAX_FRAME_BYTES`]: the
+/// headroom absorbs the envelope plus the one row that is ALWAYS allowed through
+/// so paging cannot stall. That exception is safe because `conversation.send` is
+/// the only writer of `messages` and caps content at 65 536 CHARACTERS
+/// (`Validator::display_text(…, 64 * 1024)` counts chars, not bytes) — at most
+/// ~256 KiB UTF-8, ~512 KiB once JSON-escaped. A future writer that stores larger
+/// rows must bound its own row size, or this ceiling stops describing the frame
+/// that leaves the socket.
+pub const MAX_HISTORY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum entries in a `task.subscribe` `afterSequences` map (bounded input).
+pub const MAX_SUBSCRIBE_CURSORS: usize = 4096;
+
+/// Response ceiling for one `task.subscribe` replay. The transport refuses an
+/// inbound frame above [`MAX_FRAME_BYTES`] and every client reader refuses an
+/// inbound frame above the same size, so a replay that would serialize past
+/// this ceiling CANNOT be delivered — it used to be built anyway, producing a
+/// frame the client rejects and disconnects over, with a retry that could never
+/// converge. Core now measures it and answers a structured, actionable refusal
+/// instead. A limit/truncation envelope on this method is the real fix and
+/// needs its own additive protocol decision (docs/specs/02 §2).
+pub const MAX_SUBSCRIBE_BYTES: usize = MAX_FRAME_BYTES - 64 * 1024;
+
+/// Maximum length of a task id used as an `afterSequences` key. Core ids are
+/// UUIDs (36 chars); the bound only stops an absurdly large map key.
+pub const MAX_CURSOR_KEY_LEN: usize = 100;
+
+/// Maximum length of an id that merely SCOPES a read (`projectId`,
+/// `conversationId`). Core ids are UUIDs; this only refuses absurd input.
+pub const MAX_SCOPING_ID_LEN: usize = 200;
 
 pub struct ServerInner {
     pub db: Mutex<Database>,
@@ -241,36 +283,43 @@ fn dispatch(
     id: String,
     params: serde_json::Value,
 ) -> RpcResponse {
-    let result = match method {
-        Method::SystemProbe => system_probe(inner),
-        Method::ProjectCreate => {
-            parse_params::<ProjectCreateParams>(params).and_then(|p| project_create(inner, p))
-        }
-        Method::ProjectList => project_list(inner),
-        Method::SandboxList => sandbox_list(inner),
-        Method::SandboxCreate => {
-            parse_params::<SandboxCreateSpec>(params).and_then(|p| sandbox_create(inner, p))
-        }
-        Method::ConversationCreate => parse_params::<ConversationCreateParams>(params)
-            .and_then(|p| conversation_create(inner, p)),
-        Method::ConversationSend => {
-            parse_params::<ConversationSendParams>(params).and_then(|p| conversation_send(inner, p))
-        }
-        Method::TaskCancel => match string_param(&params, "taskId") {
-            Some(t) => task_cancel(inner, t),
-            None => Err((ErrorCode::ValidationFailed, "taskId required".into())),
-        },
-        Method::TaskSubscribe => {
-            parse_params::<TaskSubscribeParams>(params).and_then(|p| task_subscribe(inner, p))
-        }
-        Method::GitReview => match string_param(&params, "taskId") {
-            Some(t) => git_review(inner, t),
-            None => Err((ErrorCode::ValidationFailed, "taskId required".into())),
-        },
-        Method::GitApply => {
-            parse_params::<GitApplyParams>(params).and_then(|p| git_apply(inner, p))
-        }
-    };
+    let result =
+        match method {
+            Method::SystemProbe => system_probe(inner),
+            Method::ProjectCreate => {
+                parse_params::<ProjectCreateParams>(params).and_then(|p| project_create(inner, p))
+            }
+            Method::ProjectList => project_list(inner),
+            Method::SandboxList => sandbox_list(inner),
+            Method::SandboxCreate => {
+                parse_params::<SandboxCreateSpec>(params).and_then(|p| sandbox_create(inner, p))
+            }
+            Method::ConversationCreate => parse_params::<ConversationCreateParams>(params)
+                .and_then(|p| conversation_create(inner, p)),
+            Method::ConversationSend => parse_params::<ConversationSendParams>(params)
+                .and_then(|p| conversation_send(inner, p)),
+            Method::ConversationList => parse_params::<ConversationListParams>(params)
+                .and_then(|p| conversation_list(inner, p)),
+            Method::ConversationHistory => parse_params::<ConversationHistoryParams>(params)
+                .and_then(|p| conversation_history(inner, p)),
+            Method::TaskCancel => match string_param(&params, "taskId") {
+                Some(t) => task_cancel(inner, t),
+                None => Err((ErrorCode::ValidationFailed, "taskId required".into())),
+            },
+            Method::TaskList => {
+                parse_params::<TaskListParams>(params).and_then(|p| task_list(inner, p))
+            }
+            Method::TaskSubscribe => {
+                parse_params::<TaskSubscribeParams>(params).and_then(|p| task_subscribe(inner, p))
+            }
+            Method::GitReview => match string_param(&params, "taskId") {
+                Some(t) => git_review(inner, t),
+                None => Err((ErrorCode::ValidationFailed, "taskId required".into())),
+            },
+            Method::GitApply => {
+                parse_params::<GitApplyParams>(params).and_then(|p| git_apply(inner, p))
+            }
+        };
     match result {
         Ok(value) => RpcResponse::ok(id, value),
         Err((code, message)) => RpcResponse::err(id, code, message),
@@ -290,6 +339,112 @@ fn string_param(params: &serde_json::Value, key: &str) -> Option<String> {
 
 fn internal<E: std::fmt::Display>(e: E) -> SvcError {
     (ErrorCode::Internal, e.to_string())
+}
+
+/// Rows to return for a bounded read: absent → [`DEFAULT_LIST_LIMIT`], out of
+/// range → clamped into `1..=MAX_LIST_LIMIT`. `limit` is a `u32` on the wire, so
+/// a negative value is refused at parse time (`VALIDATION_FAILED`) instead of
+/// being silently reinterpreted here.
+fn clamp_limit(limit: Option<u32>) -> usize {
+    limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT) as usize
+}
+
+/// The bare snake_case string `tasks.status` stores, derived from serde so a
+/// query value can never drift from the wire names `schemas/` and the drift
+/// gate compare.
+fn task_status_stored(status: TaskStatus) -> Result<String, SvcError> {
+    match serde_json::to_value(status) {
+        Ok(serde_json::Value::String(s)) => Ok(s),
+        Ok(other) => Err((
+            ErrorCode::Internal,
+            format!("task status serialized to {other:?}, expected a bare name"),
+        )),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+/// Read a stored status back into the enum. A value Core does not define is an
+/// INTERNAL error naming the task — it is never normalized into a status that
+/// happens to exist (specs/02 §4: transitions and states are Core's own).
+fn task_status_from_stored(stored: &str, task_id: &str) -> Result<TaskStatus, SvcError> {
+    serde_json::from_value::<TaskStatus>(serde_json::Value::String(stored.to_string())).map_err(
+        |_| {
+            (
+                ErrorCode::Internal,
+                format!("task {task_id} stores status {stored:?}, which is not a Core task status"),
+            )
+        },
+    )
+}
+
+/// Decode a stored `sandbox_bindings.workspace_mode`.
+///
+/// Two stored shapes are recognised, both of them the row's OWN recorded value:
+/// the bare snake_case name written today, and the JSON-quoted form that
+/// `sandbox.create` wrote before review 0004 #4 was fixed (no migration exists
+/// for those rows, so a pre-fix database would otherwise report an undisclosed
+/// absence for a live-writable `direct_mount` mount).
+///
+/// Anything else yields `None` — the field stays ABSENT. Core never turns a
+/// value it cannot read into a mode, because `direct_mount` is a live-writable
+/// claim (specs/02 §7). The unreadable row is surfaced on stderr.
+fn workspace_mode_from_stored(stored: &str) -> Option<WorkspaceMode> {
+    if let Ok(mode) =
+        serde_json::from_value::<WorkspaceMode>(serde_json::Value::String(stored.to_string()))
+    {
+        return Some(mode);
+    }
+    if let Ok(unquoted) = serde_json::from_str::<String>(stored) {
+        if let Ok(mode) =
+            serde_json::from_value::<WorkspaceMode>(serde_json::Value::String(unquoted))
+        {
+            return Some(mode);
+        }
+    }
+    eprintln!("sandpane-service: stored workspace_mode {stored:?} is not a Core mode");
+    None
+}
+
+/// ids that scope a read must at least be ids: non-empty, no control characters,
+/// bounded length — the same validator every other stored value passes through,
+/// so a typo'd empty `projectId` is a structured refusal instead of a silently
+/// empty list that looks like "no tasks".
+fn validate_scoping_id(kind: &str, value: &str) -> Result<(), SvcError> {
+    Validator::display_text(value, MAX_SCOPING_ID_LEN)
+        .map_err(|e| (ErrorCode::ValidationFailed, format!("{kind}: {e}")))?;
+    Ok(())
+}
+
+/// Optional project scope, validated when present. `None` means unscoped;
+/// `Some("")` is a client bug and is refused (see [`validate_scoping_id`]).
+fn optional_scoping_id(kind: &str, value: &Option<String>) -> Result<(), SvcError> {
+    match value {
+        Some(v) => validate_scoping_id(kind, v),
+        None => Ok(()),
+    }
+}
+
+/// Validate the optional per-task cursor map (bounded input): a sane number of
+/// entries and non-empty, id-sized keys. Values are normalised by the caller.
+fn validate_cursor_map(map: &HashMap<String, i64>) -> Result<(), SvcError> {
+    if map.len() > MAX_SUBSCRIBE_CURSORS {
+        return Err((
+            ErrorCode::ValidationFailed,
+            format!(
+                "afterSequences has {} entries, the bound is {MAX_SUBSCRIBE_CURSORS}",
+                map.len()
+            ),
+        ));
+    }
+    for key in map.keys() {
+        if key.is_empty() || key.len() > MAX_CURSOR_KEY_LEN {
+            return Err((
+                ErrorCode::ValidationFailed,
+                format!("afterSequences key must be 1..={MAX_CURSOR_KEY_LEN} bytes"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn system_probe(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
@@ -322,6 +477,14 @@ fn system_probe(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
             supports_resume: false,
         }],
         platform: std::env::consts::OS.to_string(),
+        // Feature discovery: ONE derivation — `Method::wire_names()` is built
+        // from `Method::ALL` over the same enum `dispatch` matches exhaustively
+        // over, so an advertised method always really exists and a handled
+        // method is always advertised. Never a hand-written list.
+        methods: Method::wire_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     };
     serde_json::to_value(caps).map_err(internal)
 }
@@ -363,12 +526,19 @@ fn project_create(
         name: p.name,
         description: String::new(),
         created_at: now,
+        repositories: p.repositories,
     };
     serde_json::to_value(project).map_err(internal)
 }
 
 fn project_list(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
     let db = inner.lock_db();
+    // One extra pass over `repositories` grouped in Rust, rather than a
+    // correlated subquery per project row: the table holds a handful of paths
+    // per project (specs/02 §3) and this keeps the read to two prepared
+    // statements. It is a full scan of that small table — no index on
+    // repositories.project_id exists in schema v1.
+    let repos = project_repository_paths(&db)?;
     let mut stmt = db
         .conn()
         .prepare(
@@ -378,19 +548,44 @@ fn project_list(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
         .map_err(internal)?;
     let rows = stmt
         .query_map([], |r| {
-            Ok(Project {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                description: r.get(2)?,
-                created_at: r.get(3)?,
-            })
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         })
         .map_err(internal)?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.map_err(internal)?);
+        let (id, name, description, created_at) = row.map_err(internal)?;
+        out.push(Project {
+            repositories: repos.get(&id).cloned().unwrap_or_default(),
+            id,
+            name,
+            description,
+            created_at,
+        });
     }
     serde_json::to_value(out).map_err(internal)
+}
+
+/// `repositories.canonical_path` grouped by project id, in insertion order
+/// (`rowid`), which is the order the user registered them in.
+fn project_repository_paths(db: &Database) -> Result<HashMap<String, Vec<String>>, SvcError> {
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT project_id, canonical_path FROM repositories ORDER BY rowid ASC")
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(internal)?;
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (project_id, path) = row.map_err(internal)?;
+        out.entry(project_id).or_default().push(path);
+    }
+    Ok(out)
 }
 
 fn sandbox_list(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
@@ -421,15 +616,48 @@ fn sandbox_list(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let entries = sandpane_core::sbx::parse_list_json(&stdout)
         .map_err(|e| (ErrorCode::ValidationFailed, e.to_string()))?;
+    // SBX stays the source of truth for WHICH sandboxes exist; Core only joins
+    // out the workspace mode it recorded itself (specs/02 §7 — `direct_mount`
+    // means live-writable and UIs must label it, so the value has to be real).
+    let db = inner.lock_db();
+    let modes = binding_workspace_modes(&db)?;
     let summaries: Vec<SandboxSummary> = entries
         .into_iter()
         .map(|e| SandboxSummary {
-            name: e.name,
+            name: e.name.clone(),
             probed_state: Some(e.state),
             bound_project_id: None,
+            workspace_mode: modes
+                .get(&e.name)
+                .and_then(|m| workspace_mode_from_stored(m)),
         })
         .collect();
     serde_json::to_value(summaries).map_err(internal)
+}
+
+/// Newest recorded `workspace_mode` per sandbox name. Ordering is the recorded
+/// `created_at` with insertion order (`rowid`) as tie-break, so the value
+/// reported is the binding that is currently in force rather than an arbitrary
+/// one. A name Core has no row for is absent from this map, so the field is
+/// omitted on the wire.
+fn binding_workspace_modes(db: &Database) -> Result<HashMap<String, String>, SvcError> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT sandbox_name, workspace_mode FROM sandbox_bindings
+             ORDER BY created_at DESC, rowid DESC",
+        )
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(internal)?;
+    let mut out: HashMap<String, String> = HashMap::new();
+    for row in rows {
+        let (name, mode) = row.map_err(internal)?;
+        // First seen per name = newest (DESC order); later, older rows lose.
+        out.entry(name).or_insert(mode);
+    }
+    Ok(out)
 }
 
 fn sandbox_create(
@@ -556,6 +784,10 @@ fn sandbox_create(
         name: spec.name,
         probed_state,
         bound_project_id: Some(spec.project_id),
+        // The mode Core just recorded for this binding — the caller asked for
+        // it explicitly, so it is a fact, not a guess (specs/02 §7:
+        // direct_mount is live-writable).
+        workspace_mode: Some(spec.workspace_mode),
     };
     serde_json::to_value(summary).map_err(internal)
 }
@@ -780,8 +1012,7 @@ fn task_cancel(inner: &ServerInner, task_id: String) -> Result<serde_json::Value
             |r| r.get(0),
         )
         .map_err(|_| (ErrorCode::NotFound, "task not found".to_string()))?;
-    let status: TaskStatus =
-        serde_json::from_value(serde_json::Value::String(current)).map_err(internal)?;
+    let status: TaskStatus = task_status_from_stored(&current, &task_id)?;
     let mut machine = TaskStateMachine::from_status(status);
     machine
         .transition(TaskStatus::Cancelled)
@@ -815,22 +1046,275 @@ fn task_subscribe(
     inner: &ServerInner,
     p: TaskSubscribeParams,
 ) -> Result<serde_json::Value, SvcError> {
+    if let Some(map) = &p.after_sequences {
+        validate_cursor_map(map)?;
+    }
     let db = inner.lock_db();
     let log = EventLog::new(&db);
+    // (task, cursor) pairs: a single `taskId` request keeps the legacy scalar
+    // cursor (the map is deliberately ignored there, so a client sending both
+    // changes nothing — see `TaskSubscribeParams`). Otherwise each task replays
+    // from its OWN cursor; sequences are per task and start at 1, so one shared
+    // scalar skips the unseen events of every task behind it (the recorded v1
+    // gap). A task missing from a supplied map replays from 0 = full history;
+    // with no map at all the legacy shared scalar applies unchanged.
+    let targets: Vec<(String, i64)> = match &p.task_id {
+        Some(task_id) => vec![(task_id.clone(), p.after_sequence)],
+        None => query_task_ids(&db, p.project_id.as_deref())?
+            .into_iter()
+            .map(|tid| {
+                let cursor = match &p.after_sequences {
+                    Some(map) => map.get(&tid).copied().unwrap_or(0).max(0),
+                    None => p.after_sequence,
+                };
+                (tid, cursor)
+            })
+            .collect(),
+    };
+
+    // Bounded response (specs/02 §2). The array shape of `task.subscribe` cannot
+    // disclose truncation, and both ends of the transport refuse a frame above
+    // `MAX_FRAME_BYTES`, so an over-ceiling replay used to be built anyway: the
+    // client dropped the connection over an undeliverable frame and its retry
+    // could never converge. Core now stops gathering and refuses structurally,
+    // naming what the caller can do. A limit/truncation envelope for this method
+    // is a separate additive protocol decision.
     let mut events: Vec<TaskEvent> = Vec::new();
-    if let Some(task_id) = &p.task_id {
-        events.extend(
-            log.replay_task(task_id, p.after_sequence)
-                .map_err(internal)?,
-        );
-    } else {
-        // Project-wide (or global) replay: gather task ids, then replay each.
-        let task_ids = query_task_ids(&db, p.project_id.as_deref())?;
-        for tid in task_ids {
-            events.extend(log.replay_task(&tid, p.after_sequence).map_err(internal)?);
+    let mut replay_bytes = 0usize;
+    let mut replayed_tasks = 0usize;
+    for (task_id, cursor) in targets {
+        let chunk = log.replay_task(&task_id, cursor).map_err(internal)?;
+        if !chunk.is_empty() {
+            replayed_tasks += 1;
+            replay_bytes += replay_frame_bytes(&chunk);
+            events.extend(chunk);
+        }
+        if replay_bytes > MAX_SUBSCRIBE_BYTES {
+            return Err((
+                ErrorCode::ValidationFailed,
+                format!(
+                    "replay of {replayed_tasks} task(s) passed the {MAX_SUBSCRIBE_BYTES}-byte \
+                     ceiling this frame shape can carry ({replay_bytes} bytes so far); narrow \
+                     the request (single taskId, a higher afterSequence, or per-task \
+                     afterSequences) — task.subscribe has no truncation envelope yet \
+                     (docs/specs/02 §2)"
+                ),
+            ));
         }
     }
     serde_json::to_value(events).map_err(internal)
+}
+
+/// Serialized size of one replay chunk — the same JSON the frame carries, plus
+/// the array separator. A payload that cannot serialize counts as over the
+/// ceiling rather than as zero bytes (fail closed, never silently shrink).
+fn replay_frame_bytes(events: &[TaskEvent]) -> usize {
+    events
+        .iter()
+        .map(|e| {
+            serde_json::to_string(e)
+                .map(|s| s.len() + 1)
+                .unwrap_or(MAX_SUBSCRIBE_BYTES + 1)
+        })
+        .sum()
+}
+
+/// `task.list` — read-only discovery of Core task state (docs/compatibility.md
+/// v1 gap 1). Tasks are reached through their conversation for project
+/// scoping, exactly as `task.subscribe` scopes a project-wide replay.
+fn task_list(inner: &ServerInner, p: TaskListParams) -> Result<serde_json::Value, SvcError> {
+    let limit = clamp_limit(p.limit);
+    optional_scoping_id("projectId", &p.project_id)?;
+    // Filter values are Core's OWN stored status names; an unknown status is
+    // rejected by the params type before it ever reaches this query.
+    //
+    // Bounded by construction: `TaskStatus` is a closed 12-state lifecycle and
+    // duplicates mean nothing in an IN-list, so collapsing them caps the bound
+    // placeholder count at 12 + 2 no matter how many entries the caller sent
+    // (SQLite's variable limit can then never turn a big request into an
+    // `INTERNAL` from a failed `prepare`).
+    let mut statuses: Vec<String> = Vec::new();
+    for status in &p.statuses {
+        let stored = task_status_stored(*status)?;
+        if !statuses.contains(&stored) {
+            statuses.push(stored);
+        }
+    }
+
+    // Static SQL; the only thing interpolated is the COUNT of `?n`
+    // placeholders (same reviewed pattern as `reconcile_after_restart`) — no
+    // caller value is ever formatted into the statement.
+    let mut sql = String::from(
+        "SELECT t.id, t.conversation_id, t.status, t.created_at, t.task_branch,
+                t.base_commit, sb.sandbox_name
+         FROM tasks t
+         JOIN conversations c ON c.id = t.conversation_id
+         LEFT JOIN sandbox_bindings sb ON sb.id = t.sandbox_binding_id
+         WHERE (?1 IS NULL OR c.project_id = ?1)",
+    );
+    if !statuses.is_empty() {
+        let placeholders = (2..=(statuses.len() + 1))
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND t.status IN ({placeholders})"));
+    }
+    let limit_idx = statuses.len() + 2;
+    sql.push_str(&format!(
+        " ORDER BY t.created_at ASC, t.id ASC LIMIT ?{limit_idx}"
+    ));
+    let limit_i64 = limit as i64;
+
+    let db = inner.lock_db();
+    let mut stmt = db.conn().prepare(&sql).map_err(internal)?;
+    // Every caller value is BOUND (project id, status names, limit) — never
+    // interpolated into the statement text.
+    let mut args: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(statuses.len() + 2);
+    args.push(&p.project_id);
+    for status in &statuses {
+        args.push(status);
+    }
+    args.push(&limit_i64);
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(internal)?;
+    let mut out: Vec<TaskSummary> = Vec::new();
+    for row in rows {
+        let (id, conversation_id, stored_status, task_branch, base_commit, sandbox_name) =
+            row.map_err(internal)?;
+        out.push(TaskSummary {
+            sandbox_name,
+            task_branch,
+            base_commit,
+            id: id.clone(),
+            conversation_id,
+            status: task_status_from_stored(&stored_status, &id)?,
+        });
+    }
+    serde_json::to_value(out).map_err(internal)
+}
+
+/// `conversation.list` — chat enumeration, previously impossible (v1 gap 1).
+fn conversation_list(
+    inner: &ServerInner,
+    p: ConversationListParams,
+) -> Result<serde_json::Value, SvcError> {
+    let limit = clamp_limit(p.limit);
+    optional_scoping_id("projectId", &p.project_id)?;
+    let limit_i64 = limit as i64;
+    let db = inner.lock_db();
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT id, project_id, title, agent_id, created_at FROM conversations
+             WHERE archived_at IS NULL AND (?1 IS NULL OR project_id = ?1)
+             ORDER BY created_at ASC, id ASC LIMIT ?2",
+        )
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map(params![p.project_id, limit_i64], |r| {
+            Ok(Conversation {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                title: r.get(2)?,
+                agent_id: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })
+        .map_err(internal)?;
+    let out = rows.collect::<Result<Vec<_>, _>>().map_err(internal)?;
+    serde_json::to_value(out).map_err(internal)
+}
+
+/// `conversation.history` — bounded transcript read with disclosure of BOTH
+/// bounds (specs/02 §2 "bounded responses … with truncation disclosure").
+fn conversation_history(
+    inner: &ServerInner,
+    p: ConversationHistoryParams,
+) -> Result<serde_json::Value, SvcError> {
+    let limit = clamp_limit(p.limit);
+    validate_scoping_id("conversationId", &p.conversation_id)?;
+    // A negative cursor is meaningless (sequences start at 1); normalise it
+    // rather than passing a nonsense bound to SQLite.
+    let after = p.after_sequence.max(0);
+    let db = inner.lock_db();
+    // Existence first: an unknown (or archived) conversation is a structured
+    // NOT_FOUND, never an empty-but-successful answer that looks like "no
+    // messages". The id is bound, never interpolated.
+    let known: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE id = ?1 AND archived_at IS NULL",
+            params![p.conversation_id],
+            |r| r.get(0),
+        )
+        .map_err(internal)?;
+    if known == 0 {
+        return Err((ErrorCode::NotFound, "conversation not found".into()));
+    }
+
+    // Read one row MORE than the caller asked for: that probe row proves the
+    // scan was cut short without materialising the whole transcript.
+    let fetch = limit as i64 + 1;
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT id, conversation_id, role, content, sequence FROM messages
+             WHERE conversation_id = ?1 AND sequence > ?2 ORDER BY sequence ASC LIMIT ?3",
+        )
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map(params![p.conversation_id, after, fetch], |r| {
+            Ok(MessageRecord {
+                id: r.get(0)?,
+                conversation_id: r.get(1)?,
+                role: r.get(2)?,
+                content: r.get(3)?,
+                sequence: r.get(4)?,
+            })
+        })
+        .map_err(internal)?;
+
+    let mut messages: Vec<MessageRecord> = Vec::with_capacity(limit.min(64));
+    let mut content_bytes: usize = 0;
+    let mut truncated = false;
+    for row in rows {
+        let record = row.map_err(internal)?;
+        if messages.len() >= limit {
+            truncated = true; // the probe row proves more rows exist
+            break;
+        }
+        // Byte bound over the ACTUAL serialized row bytes (keys, quotes and JSON
+        // escapes included), so the ceiling describes the frame that goes on the
+        // wire rather than an undercount of hostile content. The FIRST row is
+        // always allowed through — see [`MAX_HISTORY_BYTES`] for why that cannot
+        // overflow the frame cap — so paging can never stall on an oversize row.
+        let row_bytes = serde_json::to_string(&record)
+            .map(|s| s.len())
+            .map_err(internal)?;
+        if !messages.is_empty() && content_bytes + row_bytes > MAX_HISTORY_BYTES {
+            truncated = true;
+            break;
+        }
+        content_bytes += row_bytes;
+        messages.push(record);
+    }
+    let next_sequence = messages.last().map(|m| m.sequence).unwrap_or(after);
+    let result = ConversationHistoryResult {
+        messages,
+        truncated,
+        next_sequence,
+    };
+    serde_json::to_value(result).map_err(internal)
 }
 
 fn query_task_ids(db: &Database, project_id: Option<&str>) -> Result<Vec<String>, SvcError> {
@@ -1142,5 +1626,153 @@ mod tests {
             sandpane_protocol::RpcOutcome::Err(e) => assert_eq!(e.code, ErrorCode::NotInstalled),
             _ => panic!("expected NOT_INSTALLED"),
         }
+    }
+
+    #[test]
+    fn list_limits_are_always_bounded() {
+        // Absent → default; out of range → clamped into the bound; never an
+        // unbounded set and never a zero-row "success".
+        assert_eq!(clamp_limit(None), DEFAULT_LIST_LIMIT as usize);
+        assert_eq!(clamp_limit(Some(0)), 1);
+        assert_eq!(clamp_limit(Some(1)), 1);
+        assert_eq!(clamp_limit(Some(MAX_LIST_LIMIT)), MAX_LIST_LIMIT as usize);
+        assert_eq!(clamp_limit(Some(u32::MAX)), MAX_LIST_LIMIT as usize);
+        // The response ceiling must sit strictly under the transport frame cap —
+        // checked at compile time, not at runtime.
+        const _: () = assert!(MAX_HISTORY_BYTES < MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn status_filter_uses_core_stored_wire_names() {
+        // The IN-list values are exactly the bare snake_case names `tasks.status`
+        // stores — the same strings `TaskStatus`' serde produces.
+        for status in [
+            TaskStatus::Created,
+            TaskStatus::Queued,
+            TaskStatus::Preparing,
+            TaskStatus::Running,
+            TaskStatus::Verifying,
+            TaskStatus::AwaitingInput,
+            TaskStatus::AwaitingReview,
+            TaskStatus::Completed,
+            TaskStatus::Rejected,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+            TaskStatus::Interrupted,
+        ] {
+            let stored = task_status_stored(status).unwrap();
+            assert_eq!(
+                stored,
+                serde_json::to_value(status).unwrap().as_str().unwrap(),
+                "stored name must equal the wire name"
+            );
+            assert_eq!(task_status_from_stored(&stored, "t1").unwrap(), status);
+        }
+        // A stored value Core does not define is a loud INTERNAL, never a
+        // silent normalization into a status that happens to exist.
+        let err = task_status_from_stored("half_finished", "t9").unwrap_err();
+        assert_eq!(err.0, ErrorCode::Internal);
+        assert!(err.1.contains("t9") && err.1.contains("half_finished"));
+    }
+
+    #[test]
+    fn cursor_map_input_is_bounded() {
+        let mut ok_map = HashMap::new();
+        ok_map.insert("task-a".to_string(), 3i64);
+        assert!(validate_cursor_map(&ok_map).is_ok());
+
+        let mut empty_key = HashMap::new();
+        empty_key.insert("".to_string(), 0i64);
+        assert_eq!(
+            validate_cursor_map(&empty_key).unwrap_err().0,
+            ErrorCode::ValidationFailed
+        );
+
+        let mut long_key = HashMap::new();
+        long_key.insert("x".repeat(MAX_CURSOR_KEY_LEN + 1), 0i64);
+        assert_eq!(
+            validate_cursor_map(&long_key).unwrap_err().0,
+            ErrorCode::ValidationFailed
+        );
+
+        let huge: HashMap<String, i64> = (0..=MAX_SUBSCRIBE_CURSORS)
+            .map(|i| (format!("t{i}"), 0i64))
+            .collect();
+        assert_eq!(
+            validate_cursor_map(&huge).unwrap_err().0,
+            ErrorCode::ValidationFailed
+        );
+    }
+
+    #[test]
+    fn workspace_mode_is_reported_only_when_core_can_read_it() {
+        assert_eq!(
+            workspace_mode_from_stored("direct_mount"),
+            Some(WorkspaceMode::DirectMount)
+        );
+        assert_eq!(
+            workspace_mode_from_stored("sbx_clone"),
+            Some(WorkspaceMode::SbxClone)
+        );
+        // Never guessed: an unreadable stored value yields NO mode (absent
+        // field), not a stand-in. The JSON-quoted form is the pre-review-0004
+        // storage shape — still the row's OWN recorded value, so it decodes.
+        assert_eq!(
+            workspace_mode_from_stored(r#""direct_mount""#),
+            Some(WorkspaceMode::DirectMount)
+        );
+        assert_eq!(workspace_mode_from_stored("live_writable"), None);
+        assert_eq!(workspace_mode_from_stored("direct mount"), None);
+        assert_eq!(workspace_mode_from_stored(r#""some_other_project""#), None);
+        assert_eq!(workspace_mode_from_stored(""), None);
+    }
+
+    #[test]
+    fn scoping_ids_are_validated_not_guessed() {
+        assert!(validate_scoping_id("projectId", "3f9a1c22-0000-4000-8000-abcdef012345").is_ok());
+        assert!(optional_scoping_id("projectId", &None).is_ok());
+        // An empty id would otherwise scope the read to nothing and answer `[]`
+        // — indistinguishable from "this project has no tasks".
+        assert_eq!(
+            validate_scoping_id("projectId", "").unwrap_err().0,
+            ErrorCode::ValidationFailed
+        );
+        assert_eq!(
+            optional_scoping_id("projectId", &Some(String::new()))
+                .unwrap_err()
+                .0,
+            ErrorCode::ValidationFailed
+        );
+        assert_eq!(
+            validate_scoping_id("conversationId", &"c".repeat(MAX_SCOPING_ID_LEN + 1))
+                .unwrap_err()
+                .0,
+            ErrorCode::ValidationFailed
+        );
+        // Control characters are refused (same validator every stored value uses).
+        assert_eq!(
+            validate_scoping_id("projectId", "p1\u{0}injected")
+                .unwrap_err()
+                .0,
+            ErrorCode::ValidationFailed
+        );
+    }
+
+    #[test]
+    fn oversized_replay_is_refused_structurally() {
+        // A replay that cannot fit one IPC frame used to be built anyway and
+        // then rejected by the client's own reader. The estimate must fail
+        // CLOSED, and the ceiling must be below the frame cap.
+        const _: () = assert!(MAX_SUBSCRIBE_BYTES < MAX_FRAME_BYTES);
+        let small = vec![TaskEvent {
+            task_id: "t".into(),
+            sequence: 1,
+            kind: "message.delta".into(),
+            payload: serde_json::json!({"text": "hi"}),
+            timestamp: "2026-10-09T00:00:00Z".into(),
+        }];
+        assert!(replay_frame_bytes(&small) > 0);
+        assert!(replay_frame_bytes(&small) < MAX_SUBSCRIBE_BYTES);
+        assert_eq!(replay_frame_bytes(&[]), 0);
     }
 }

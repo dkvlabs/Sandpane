@@ -88,14 +88,14 @@ class SandpaneContextProvider(private val project: Project) {
 
     /** Public VCS API only; returns empty when no VCS is mapped, never a guessed `.git` walk. */
     fun vcsRootPaths(): List<String> = try {
-        ProjectLevelVcsManager.getInstance(project).allVcsRoots.mapNotNull { it.path.takeIf { p -> p.isNotBlank() } }
+        ProjectLevelVcsManager.getInstance(project).allVcsRoots.mapNotNull { it.path?.path?.takeIf { p -> p.isNotBlank() } }
     } catch (e: Exception) {
         // VCS not initialized yet (e.g. very early startup): report none rather than guess.
         emptyList()
     }
 
     fun currentFile(): VirtualFile? = try {
-        FileEditorManager.getInstance(project).selectedFile
+        FileEditorManager.getInstance(project).selectedFiles.firstOrNull()
     } catch (e: Exception) {
         null
     }
@@ -113,10 +113,10 @@ class SandpaneContextProvider(private val project: Project) {
             val selection = target?.selectionModel?.selectedText
             val caretModel = target?.caretModel
             val startLine = if (selection.isNullOrEmpty()) null else target?.let { t ->
-                caretModel?.offsetToLogicalPosition(t.selectionModel.selectionStart)?.line?.plus(1)
+                t.offsetToLogicalPosition(t.selectionModel.selectionStart).line.plus(1)
             }
             val endLine = if (selection.isNullOrEmpty()) null else target?.let { t ->
-                caretModel?.offsetToLogicalPosition(t.selectionModel.selectionEnd)?.line?.plus(1)
+                t.offsetToLogicalPosition(t.selectionModel.selectionEnd).line.plus(1)
             }
 
             val raw = selection.orEmpty()

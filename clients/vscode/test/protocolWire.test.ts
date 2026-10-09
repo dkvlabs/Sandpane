@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { isTaskStatus, normalizeAgentEvent, statusFromEvent, TASK_STATUSES, ERROR_CODES } from '../src/core-client/events';
-import { WORKSPACE_MODES, CORE_METHODS, MAX_FRAME_BYTES, PROTOCOL_VERSION } from '../src/core-client/protocol';
+import {
+  WORKSPACE_MODES,
+  CORE_METHODS,
+  MAX_FRAME_BYTES,
+  MAX_LIST_LIMIT,
+  DEFAULT_LIST_LIMIT,
+  MAX_HISTORY_BYTES,
+  MAX_SUBSCRIBE_CURSORS,
+  MAX_CURSOR_KEY_LEN,
+  MAX_SCOPING_ID_LEN,
+  PROTOCOL_VERSION,
+  coreAdvertisesMethod,
+} from '../src/core-client/protocol';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -60,6 +72,59 @@ function toSnakeCase(variant: string): string {
   return variant.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
 }
 
+/**
+ * `Self::Variant => "wire.name",` from Rust's `Method::as_str`.
+ *
+ * Scanned over the whole crate rather than a byte slice: `ErrorCode` has an
+ * `as_str` with the identical signature, and its arms return SCREAMING_SNAKE
+ * names, so the dotted-lowercase requirement is what selects Method's table.
+ */
+function methodWireNames(): Record<string, string> {
+  const table: Record<string, string> = {};
+  for (const m of rustProtocol.matchAll(/Self::([A-Z][A-Za-z0-9]*) => "([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)"/g)) {
+    table[m[1] as string] = m[2] as string;
+  }
+  if (Object.keys(table).length === 0) {
+    throw new Error('no `Self::Variant => "a.b"` arms found — Method::as_str changed shape');
+  }
+  return table;
+}
+
+/**
+ * The order of `Method::ALL` — the list Rust derives `CoreCapabilities.methods`
+ * from. Parsing the block rather than quoting the names means a rename or a
+ * reorder in Rust fails this test instead of silently desyncing the client.
+ */
+function methodAllWireNames(): string[] {
+  const decl = /pub const ALL: \[Method; (\d+)\] = \[([\s\S]*?)\];/.exec(rustProtocol);
+  if (!decl?.[1] || !decl[2]) throw new Error('sandpane-protocol has no `pub const ALL: [Method; N] = [...]`');
+  const declared = Number(decl[1]);
+  const variants = [...decl[2].matchAll(/Self::([A-Z][A-Za-z0-9]*),/g)].map((m) => m[1] as string);
+  expect(variants.length, 'Method::ALL entries vs its declared array length').toBe(declared);
+  const table = methodWireNames();
+  return variants.map((v) => {
+    const name = table[v];
+    if (!name) throw new Error(`Method::ALL names ${v}, which as_str does not map to a wire name`);
+    return name;
+  });
+}
+
+/** `pub const NAME: <type> = <expr>;` from the service crate (RHS, trimmed). */
+function serviceConst(name: string): string {
+  const found = new RegExp(`pub const ${name}: [A-Za-z0-9_<>]+ = ([^;]+);`).exec(serviceLib);
+  const rhs = found?.[1];
+  if (!rhs) throw new Error(`sandpane-service has no \`pub const ${name}\``);
+  return rhs.trim();
+}
+
+/** Evaluate a plain `N`, `N * N` or `N * N * N` constant — nothing else. */
+function evalConst(rhs: string): number {
+  if (!/^\d+(?:\s*\*\s*\d+)*$/.test(rhs)) {
+    throw new Error(`unsupported const expression "${rhs}" — pin it explicitly`);
+  }
+  return rhs.split('*').reduce((acc, part) => acc * Number(part.trim()), 1);
+}
+
 describe('wire names match the Rust protocol crate', () => {
   it('pins the protocol version and the frame ceiling', () => {
     expect(PROTOCOL_VERSION).toBe(1);
@@ -68,10 +133,124 @@ describe('wire names match the Rust protocol crate', () => {
     expect(serviceLib).toContain('pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;');
   });
 
-  it('declares exactly the 11 method names Core parses', () => {
+  it('declares exactly the 14 method names Core parses, in Method::ALL order', () => {
+    // (1) every `"dotted.name" =>` arm of Rust's `Method::parse`.
     const fromRust = [...rustProtocol.matchAll(/"([a-z]+\.[a-z]+)" =>/g)].map((m) => m[1]);
     expect(fromRust.sort()).toEqual([...CORE_METHODS].sort());
-    expect(new Set(fromRust).size).toBe(11);
+    expect(new Set(fromRust).size).toBe(14);
+    // (2) the advertisement list itself, including ORDER — `CoreCapabilities.methods`
+    // is derived from it, and a name that renames in Rust must break here.
+    expect(methodAllWireNames()).toEqual([...CORE_METHODS]);
+    // (3) the schema the drift gate (`make schema-drift`) compares against Rust.
+    const requestSchema = JSON.parse(read('schemas/rpc-request.schema.json')) as {
+      properties: { method: { enum: string[] } };
+    };
+    expect(requestSchema.properties.method.enum).toEqual([...CORE_METHODS]);
+    // (4) every method parses, and none of them is a free-form escape hatch.
+    for (const name of CORE_METHODS) {
+      expect(rustProtocol, `Method::parse arm for ${name}`).toContain(`"${name}" =>`);
+      expect(rustProtocol, `Method::as_str arm for ${name}`).toContain(`=> "${name}"`);
+    }
+    for (const forbidden of ['shell.exec', 'sbx.raw', 'fs.read', 'process.spawn']) {
+      expect(CORE_METHODS).not.toContain(forbidden);
+    }
+    // The new read surface exists on both sides of the wire.
+    for (const added of ['task.list', 'conversation.list', 'conversation.history']) {
+      expect(CORE_METHODS).toContain(added);
+    }
+  });
+
+  it('pins the method advertisement (`Method::ALL` → `CoreCapabilities.methods`)', () => {
+    expect(rustProtocol).toContain('pub const ALL: [Method; 14]');
+    // Derived, never hand-written: `wire_names()` maps over ALL…
+    expect(rustProtocol).toMatch(/pub fn wire_names\(\) -> Vec<&'static str> \{[\s\S]*Self::ALL\.iter\(\)/);
+    // …and the probe answers with it.
+    expect(serviceLib).toMatch(/methods:[\s\S]{0,200}Method::wire_names\(\)/);
+    expect(rustProtocol).toContain('pub methods: Vec<String>');
+    // The client mirrors it as an optional field and feature-detects with it
+    // instead of assuming a method from the protocol version.
+    expect(read('clients/vscode/src/core-client/protocol.ts')).toContain('methods?: string[]');
+    expect(coreAdvertisesMethod({ methods: [...CORE_METHODS] }, 'task.list')).toBe(true);
+    expect(coreAdvertisesMethod({ methods: ['system.probe'] }, 'task.list')).toBe(false);
+    // A pre-discovery Core omits the field: absence must mean "not advertised".
+    expect(coreAdvertisesMethod({}, 'task.list')).toBe(false);
+    expect(coreAdvertisesMethod({ methods: undefined }, 'conversation.history')).toBe(false);
+    const capsSchema = JSON.parse(read('schemas/core-capabilities.schema.json')) as {
+      properties: { methods?: { items: { pattern?: string } }; agents: unknown };
+      required: string[];
+    };
+    expect(capsSchema.properties.methods).toBeDefined();
+    // Additive: not required, so a pre-revision response still validates.
+    expect(capsSchema.required).not.toContain('methods');
+  });
+
+  it('pins the additive v1 field names against the Rust structs', () => {
+    // Every field this revision added is `#[serde(default)]` on the Rust side,
+    // optional on the TS side, and spelled in camelCase on the wire.
+    const added: [string /* rust */, string /* wire */][] = [
+      ['pub methods: Vec<String>', 'methods'],
+      ['pub repositories: Vec<String>', 'repositories'],
+      ['pub workspace_mode: Option<WorkspaceMode>', 'workspaceMode'],
+      ['pub after_sequences: Option<HashMap<String, i64>>', 'afterSequences'],
+      ['pub next_sequence: i64', 'nextSequence'],
+      ['pub truncated: bool', 'truncated'],
+      ['pub messages: Vec<MessageRecord>', 'messages'],
+      ['pub statuses: Vec<TaskStatus>', 'statuses'],
+      ['pub limit: Option<u32>', 'limit'],
+    ];
+    const tsClient =
+      read('clients/vscode/src/core-client/protocol.ts') +
+      read('clients/vscode/src/core-client/events.ts');
+    for (const [rust, wire] of added) {
+      expect(rustProtocol, `rust field "${rust}"`).toContain(rust);
+      expect(tsClient, `TS wire name "${wire}"`).toContain(wire);
+    }
+    // The new payload structs exist in Rust with those exact names.
+    for (const struct of [
+      'pub struct TaskListParams',
+      'pub struct ConversationListParams',
+      'pub struct ConversationHistoryParams',
+      'pub struct MessageRecord',
+      'pub struct ConversationHistoryResult',
+    ]) {
+      expect(rustProtocol).toContain(struct);
+    }
+    // `conversation.history` returns an OBJECT, not a bare array.
+    expect(serviceLib).toContain('fn conversation_history');
+    expect(rustProtocol).toMatch(/pub struct ConversationHistoryResult \{\n\s+pub messages/);
+  });
+
+  it('mirrors the bounded-read constants from sandpane-service', () => {
+    expect(evalConst(serviceConst('DEFAULT_LIST_LIMIT'))).toBe(DEFAULT_LIST_LIMIT);
+    expect(evalConst(serviceConst('MAX_LIST_LIMIT'))).toBe(MAX_LIST_LIMIT);
+    expect(evalConst(serviceConst('MAX_HISTORY_BYTES'))).toBe(MAX_HISTORY_BYTES);
+    expect(evalConst(serviceConst('MAX_SUBSCRIBE_CURSORS'))).toBe(MAX_SUBSCRIBE_CURSORS);
+    expect(evalConst(serviceConst('MAX_CURSOR_KEY_LEN'))).toBe(MAX_CURSOR_KEY_LEN);
+    expect(evalConst(serviceConst('MAX_SCOPING_ID_LEN'))).toBe(MAX_SCOPING_ID_LEN);
+    // The history ceiling is under the frame cap by Core's own compile-time
+    // assertion; the client's copy must keep the same relationship.
+    expect(MAX_HISTORY_BYTES).toBeLessThan(MAX_FRAME_BYTES);
+    expect(serviceLib).toContain('const _: () = assert!(MAX_HISTORY_BYTES < MAX_FRAME_BYTES);');
+  });
+
+  it('mirrors the per-task cursor rules and the oversized-replay refusal', () => {
+    // taskId present → scalar wins, map ignored.
+    expect(serviceLib).toMatch(/Some\(task_id\) => vec!\[\(task_id\.clone\(\), p\.after_sequence\)\]/);
+    // no taskId → own cursor per task, absent from the map ⇒ 0, negative ⇒ 0.
+    expect(serviceLib).toContain('map.get(&tid).copied().unwrap_or(0).max(0)');
+    // no map at all → the legacy shared scalar.
+    expect(serviceLib).toContain('None => p.after_sequence,');
+    // Core refuses an undeliverable replay with a structured VALIDATION_FAILED.
+    expect(serviceLib).toContain('ErrorCode::ValidationFailed');
+    expect(serviceLib).toMatch(/MAX_SUBSCRIBE_BYTES/);
+    // The client maps that refusal to a recoverable, non-retrying state.
+    const catchup = read('clients/vscode/src/core-client/catchup.ts');
+    expect(catchup).toContain('isOversizedReplayRefusal');
+    expect(catchup).toContain('clearReplayRefusal');
+    expect(catchup).toContain('afterSequences');
+    // …and never sends a map alongside taskId, where Core would discard it.
+    const commands = read('clients/vscode/src/core-client/commands.ts');
+    expect(commands).toContain('Core ignores a map alongside taskId');
   });
 
   it('uses the snake_case task statuses Rust serializes', () => {

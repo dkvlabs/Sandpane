@@ -26,7 +26,13 @@ export interface TaskEventStoreOptions {
 export type StoreStatus =
   | { kind: "idle" }
   | { kind: "streaming" }
-  | { kind: "degraded"; reason: string; attempt: number };
+  | { kind: "degraded"; reason: string; attempt: number }
+  /**
+   * Core refused the scope-wide replay as too large for one frame. Polling is
+   * PAUSED, not failed: the same request can never succeed, so the store waits
+   * for a narrower request instead of retrying (no retry storm).
+   */
+  | { kind: "refused"; reason: string };
 
 export class TaskEventStore {
   private readonly projections = new Map<string, TaskProjection>();
@@ -56,6 +62,10 @@ export class TaskEventStore {
       afterSequence: 0,
       onEvents: (events) => this.applyEvents(events),
       onGap: (info) => this.applyGap(info.taskId, info.from, info.to),
+      onReplayRefused: (reason) => {
+        this.setStatus({ kind: "refused", reason });
+        this.notifySoon();
+      },
       onError: (err) => {
         this.setStatus({
           kind: "degraded",
@@ -69,6 +79,7 @@ export class TaskEventStore {
       onState: (state) => {
         if (state.kind === "polling") this.setStatus({ kind: "streaming" });
         else if (state.kind === "stopped") this.setStatus({ kind: "idle" });
+        else if (state.kind === "refused") this.setStatus({ kind: "refused", reason: state.reason });
       },
     });
   }

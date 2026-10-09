@@ -94,6 +94,47 @@ export function isKnownWorkspaceMode(value: unknown): value is WorkspaceMode {
   return typeof value === 'string' && (WORKSPACE_MODES as readonly string[]).includes(value);
 }
 
+/**
+ * The view for a sandbox Core reports with NO readable `sandbox_bindings` row.
+ *
+ * `SandboxSummary.workspaceMode` is absent when Core has no binding row for that
+ * name, and Core never guesses one (specs/02 §7). The client must therefore show
+ * UNVERIFIED — never a neutral "safe" look — because an unverified mount that
+ * turns out to be `direct_mount` is host-writable. Rendered with the loud tone
+ * on purpose: unknown is treated as the worst case, exactly as an unknown mode
+ * name is.
+ */
+export function unverifiedWorkspaceModeView(): WorkspaceModeView {
+  return {
+    mode: 'unknown',
+    label: 'Workspace mode unverified',
+    badge: 'UNVERIFIED — TREAT AS LIVE-WRITABLE',
+    explanation:
+      'Core has no readable sandbox_bindings row for this sandbox, so its workspace mode is ' +
+      'unknown. A `direct_mount` mount writes straight through to these host files, and an ' +
+      'unverified one is treated as live-writable until Core can say otherwise.',
+    tone: 'live_writable',
+    hostWritable: true,
+  };
+}
+
+/**
+ * View for one `SandboxSummary`: the recorded mode when Core returned one, the
+ * unknown-mode view when it returned a string this client cannot name, and the
+ * UNVERIFIED view when the field is absent.
+ *
+ * Honesty boundary from the Rust doc: `probedState` is SBX's last probed state;
+ * `workspaceMode` is Core's RECORD of what it was asked to bind — not a live
+ * SBX verification.
+ */
+export function sandboxWorkspaceModeView(summary: {
+  workspaceMode?: WorkspaceMode | string | null;
+}): WorkspaceModeView {
+  const raw = summary.workspaceMode;
+  if (raw === undefined || raw === null || raw === '') return unverifiedWorkspaceModeView();
+  return isKnownWorkspaceMode(raw) ? workspaceModeView(raw) : unknownWorkspaceModeView(String(raw));
+}
+
 export function workspaceModeLabel(value: unknown): string {
   return isKnownWorkspaceMode(value)
     ? workspaceModeView(value).label

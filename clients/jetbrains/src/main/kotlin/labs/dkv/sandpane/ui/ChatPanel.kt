@@ -8,10 +8,13 @@ import com.intellij.openapi.project.Project
 import labs.dkv.sandpane.actions.ActionIds
 import labs.dkv.sandpane.core.AgentGate
 import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.core.RenderedEvent
 import labs.dkv.sandpane.model.AgentEvent
+import labs.dkv.sandpane.model.Conversation
 import labs.dkv.sandpane.model.ConversationSendParams
 import labs.dkv.sandpane.model.CoreEventKinds
+import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.PROTOCOL_VERSION
 import labs.dkv.sandpane.model.Project as SandpaneProject
 import labs.dkv.sandpane.model.SandboxSummary
@@ -68,11 +71,14 @@ import javax.swing.event.DocumentListener
  * EDT (tool-window content creation), which is also where the timer is started.
  *
  * Known gaps this panel exposes rather than hides:
- *  - `SandboxSummary` carries no `workspaceMode`, so a sandbox picker cannot label a
- *    `direct_mount` binding as live-writable. The protocol needs it (see
- *    [labs.dkv.sandpane.services.EditorDiffProvider.liveWritableNotice]).
- *  - JB2 conversation tabs are not implemented, so there is no conversation to send to;
- *    [selectedConversationId] returns null and the panel says so (AGENTS.md rule 5).
+ *  - the workspace mode a sandbox was bound with is Core's RECORDED `sandbox_bindings` row, not
+ *    a live SBX verification; when the field is absent the picker shows UNVERIFIED — TREAT AS
+ *    LIVE-WRITABLE rather than a neutral look (docs/specs/02 §7). See [SandboxSummary.modeView].
+ *  - the chat picker is filled by `conversation.list`, an ADDITIVE protocol-v1 method. A Core
+ *    that does not advertise it leaves the picker empty with the reason in the tooltip — this
+ *    panel never fabricates a conversation to send to.
+ *  - transcript rows recovered from `conversation.history` are Core's stored messages, rendered
+ *    as plain text; a truncated page says so and gives the cursor that continues it.
  */
 class ChatPanel(
     private val project: Project,
@@ -119,9 +125,20 @@ class ChatPanel(
     private val projectModel = DefaultComboBoxModel<SandpaneProject>()
     private val sandboxModel = DefaultComboBoxModel<SandboxSummary>()
     private val agentModel = DefaultComboBoxModel<String>()
+
+    /**
+     * Conversations Core reports for the selected project (`conversation.list`, additive in
+     * protocol v1). Empty-and-labelled, never invented: when Core does not advertise the method
+     * the model stays empty and [conversationState] carries the reason the UI shows.
+     */
+    private val conversationModel = DefaultComboBoxModel<Conversation>()
     private val projectPicker = JComboBox(projectModel)
     private val sandboxPicker = JComboBox(sandboxModel)
     private val agentPicker = JComboBox(agentModel)
+    private val conversationPicker = JComboBox(conversationModel)
+
+    /** Why the chat picker is empty, when it is: not advertised / loading / failed / none. */
+    private var conversationState: String = "chat enumeration has not run yet"
 
     private val composer = JTextArea(4, 60).apply {
         lineWrap = true
@@ -146,6 +163,10 @@ class ChatPanel(
     private val pendingDeltas = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
     private val flushTimer: Timer
 
+    /** Set once [dispose] runs; guards [onEdt] because the platform offers no Disposable overload. */
+    @Volatile
+    private var panelDisposed: Boolean = false
+
     private var removeStateListener: (() -> Unit)? = null
     private var removeSnapshotListener: (() -> Unit)? = null
     private var removeViewListener: (() -> Unit)? = null
@@ -167,16 +188,123 @@ class ChatPanel(
         attachments.cellRenderer = DefaultListCellRenderer()
 
         flushTimer = Timer(settings.streamFlushIntervalMs) { drainDeltas() }
-        flushTimer.isCoalescesEvents = true
+        flushTimer.isCoalesce = true
         flushTimer.start()
 
         wireCore()
+        // Project changes re-enumerate chats from Core; nothing is cached client-side as truth.
+        projectPicker.addActionListener {
+            if (projectPicker.hasFocus()) onSelectedProjectChanged()
+        }
+        conversationPicker.addActionListener {
+            if (conversationPicker.hasFocus()) loadConversationHistory()
+        }
         addSystemRow(
-            "Sandpane scaffold (JB0/JB1). Projects and sandboxes are read from Core. Chat needs a " +
-                "conversation, and JB2 conversation tabs are not implemented here — so sending " +
-                "from this panel reports that instead of creating one implicitly.",
+            "Sandpane scaffold (JB0/JB1). Projects and sandboxes are read from Core. Chats are " +
+                "enumerated with conversation.list when this Core advertises it; the task list is " +
+                "hydrated with task.list. Nothing is invented when a method is absent.",
         )
         sbx.refresh()
+    }
+
+    /**
+     * `conversation.list` for the selected project, on a background thread, with the outcome
+     * rendered as text — never as a silently empty picker.
+     */
+    private fun onSelectedProjectChanged() {
+        sandboxModel.removeAllElements()
+        val selected = projectModel.selectedItem as? SandpaneProject
+        if (selected == null) {
+            conversationModel.removeAllElements()
+            conversationState = "no project selected"
+            refreshGateUI()
+            return
+        }
+        sbx.sandboxesFor(selected.id).forEach { sandboxModel.addElement(it) }
+        conversationModel.removeAllElements()
+        conversationState = "loading conversations from Core…"
+        sbx.enumerateConversations(selected.id).whenComplete { enumeration, error ->
+            onEdt {
+                if (error != null) {
+                    conversationState = ErrorAttribution.describe(CoreMethods.CONVERSATION_LIST, error)
+                } else {
+                    when (enumeration) {
+                        is SbxService.ConversationEnumeration.Available -> {
+                            enumeration.conversations.forEach { conversationModel.addElement(it) }
+                            conversationState = if (enumeration.conversations.isEmpty()) {
+                                "Core reports no open conversations for this project"
+                            } else {
+                                enumeration.explain()
+                            }
+                        }
+
+                        SbxService.ConversationEnumeration.Unavailable ->
+                            conversationState = "this Core does not advertise conversation.list — " +
+                                "chats cannot be enumerated, and none is invented"
+
+                        is SbxService.ConversationEnumeration.Failed ->
+                            conversationState = enumeration.explain()
+                    }
+                }
+                conversationPicker.toolTipText = conversationState
+                conversationPicker.isEnabled = conversationModel.size > 0
+                refreshGateUI()
+            }
+        }
+        // Task rows come from task.list when advertised; the replay path stays otherwise.
+        tasks.hydrateFromTaskList(selected.id).whenComplete { hydration, error ->
+            onEdt {
+                val text = if (error != null) {
+                    ErrorAttribution.describe(CoreMethods.TASK_LIST, error)
+                } else {
+                    hydration.describe()
+                }
+                gateLabel.toolTipText = text
+                if (hydration is TaskMonitorService.Hydration.Loaded && hydration.tasks.isNotEmpty()) {
+                    addSystemRow(text)
+                }
+            }
+        }
+    }
+
+    /**
+     * `conversation.history` for the selected conversation: one bounded page of Core's stored
+     * messages plus, when the page stopped early, a visible disclosure and the cursor that
+     * continues it. Rows are plain text; content is data and is never rendered as markup.
+     */
+    private fun loadConversationHistory() {
+        val conversation = conversationModel.selectedItem as? Conversation ?: return
+        rowsModel.removeAllElements()
+        rowsById.clear()
+        streamingRows.clear()
+        connection.conversationHistory(conversation.id).whenComplete { page, error ->
+            onEdt {
+                if (error != null) {
+                    // NOT_FOUND on an archived or unknown conversation is Core's verdict and is
+                    // shown as such — not turned into an empty transcript that reads as "no
+                    // messages". A refusal this plugin raised before sending says so instead.
+                    addSystemRow(ErrorAttribution.describe(CoreMethods.CONVERSATION_HISTORY, error))
+                    return@onEdt
+                }
+                if (page == null) return@onEdt
+                for (message in page.messages) {
+                    addRow(
+                        ChatRow(
+                            id = "core-${message.id}",
+                            role = message.role,
+                            text = message.content,
+                            meta = "sequence ${message.sequence} · stored by Core",
+                        ),
+                    )
+                }
+                page.truncationNote()?.let { addSystemRow(it) }
+                addSystemRow(
+                    "transcript from Core: ${page.messages.size} message(s)${
+                        if (page.truncated) " (truncated — resume after sequence ${page.nextSequence})" else ""
+                    }",
+                )
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -194,6 +322,8 @@ class ChatPanel(
         val pickers = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
             add(JLabel("Project"))
             add(projectPicker.apply { preferredSize = Dimension(170, 26) })
+            add(JLabel("Chat"))
+            add(conversationPicker.apply { preferredSize = Dimension(160, 26) })
             add(JLabel("Sandbox"))
             add(sandboxPicker.apply { preferredSize = Dimension(180, 26) })
             add(JLabel("Agent"))
@@ -210,8 +340,40 @@ class ChatPanel(
             ): Component {
                 super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
                 val sandbox = value as? SandboxSummary ?: return this
-                text = sandbox.name + " ● " + (sandbox.probedState ?: "state not probed")
-                toolTipText = "last probed by Core; SBX owns sandbox state"
+                val mode = sandbox.modeView()
+                text = buildString {
+                    append(sandbox.name)
+                    append(" ● ")
+                    append(sandbox.probedState ?: "state not probed")
+                    append(" · ")
+                    append(mode.badge)
+                }
+                // Two different claims, never merged into one: `probedState` is what SBX was last
+                // seen doing; `workspaceMode` is what Core RECORDED it was asked to bind. A null
+                // mode is Core's honest absence and renders as UNVERIFIED, never as safe
+                // (docs/specs/02 §7, specs/04 §3).
+                toolTipText = "state: last probed by Core; SBX owns sandbox state.\n" +
+                    "mode: ${mode.explanation}"
+                return this
+            }
+        }
+
+        conversationPicker.renderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                list: JList<*>?,
+                value: Any?,
+                index: Int,
+                isSelected: Boolean,
+                cellHasFocus: Boolean,
+            ): Component {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
+                val conversation = value as? Conversation
+                text = conversation?.title?.takeIf { it.isNotBlank() }
+                    ?: conversation?.id?.take(8)
+                    ?: "no conversation"
+                toolTipText = conversation?.let {
+                    "Core conversation ${it.id} · agent ${it.agentId} · created ${it.createdAt}"
+                } ?: "conversation.list is not advertised by this Core"
                 return this
             }
         }
@@ -302,6 +464,7 @@ class ChatPanel(
 
         removeSnapshotListener = sbx.addSnapshotListener { snapshot ->
             onEdt {
+                val previouslySelected = (projectModel.selectedItem as? SandpaneProject)?.id
                 projectModel.removeAllElements()
                 snapshot.projects.orEmpty().forEach { projectModel.addElement(it) }
                 sandboxModel.removeAllElements()
@@ -310,6 +473,14 @@ class ChatPanel(
                 banner.text = snapshot.failure
                     ?.let { "Core problem: $it (${snapshot.describeAge()})" }
                     ?: "projects and sandboxes ${snapshot.describeAge()}"
+                // A refresh re-asks Core; it does not reuse a cached conversation list. The
+                // selection is preserved by id when Core still reports that project.
+                if (previouslySelected != null) {
+                    (0 until projectModel.size)
+                        .firstOrNull { projectModel.getElementAt(it).id == previouslySelected }
+                        ?.let { projectModel.setSelectedItem(projectModel.getElementAt(it)) }
+                }
+                onSelectedProjectChanged()
                 refreshGateUI()
             }
         }
@@ -447,8 +618,13 @@ class ChatPanel(
         val conversationId = selectedConversationId()
         if (conversationId == null) {
             addSystemRow(
-                "Nothing was sent: no conversation is selected, and JB2 conversation tabs are not " +
-                    "implemented in this scaffold. Creating one implicitly would be a fake integration.",
+                "Nothing was sent: no conversation is selected. " +
+                    (if (conversationState.contains("does not advertise")) {
+                        "This Core does not advertise conversation.list, so no conversation can be " +
+                            "enumerated — creating one implicitly would be a fake integration."
+                    } else {
+                        "Core reports no open conversation for this project ($conversationState)."
+                    }),
             )
             return
         }
@@ -467,7 +643,7 @@ class ChatPanel(
         tasks.send(params).whenComplete { result, error ->
             onEdt {
                 if (error != null) {
-                    addSystemRow("conversation.send failed: ${error.message}")
+                    addSystemRow(ErrorAttribution.describe(CoreMethods.CONVERSATION_SEND, error))
                 } else if (result != null) {
                     addSystemRow(
                         when (result) {
@@ -532,7 +708,7 @@ class ChatPanel(
 
     private fun trimRows() {
         while (rowsModel.size() > MAX_ROWS) {
-            val dropped = rowsModel.removeAt(0)
+            val dropped = rowsModel.remove(0)
             rowsById.remove(dropped.id)
             streamingRows.entries.removeAll { it.value == dropped.id }
         }
@@ -543,22 +719,31 @@ class ChatPanel(
     }
 
     /**
-     * Conversation selection is Core state (`client_state.selected_conversation`), not an IDE
-     * workspace file, and JB2 owns the tab UI — so in this scaffold there is nothing to select
-     * and this returns null. Kept as the explicit seam rather than inventing a conversation.
+     * The conversation messages are sent to: Core's own record, selected in the picker, and only
+     * ever populated from `conversation.list`. Null when Core does not advertise that method or
+     * reports none — [sendFromComposer] then refuses rather than inventing an id (AGENTS.md
+     * rule 5). Conversation selection is a UI preference; the conversation itself is Core state.
      */
-    private fun selectedConversationId(): String? = null
+    private fun selectedConversationId(): String? =
+        (conversationModel.selectedItem as? Conversation)?.id
 
     private fun shorten(path: String): String =
         if (path.length <= 28) path else "…" + path.takeLast(26)
 
+    /**
+     * The one EDT hop in this panel. `Application.invokeLater` has no `(Runnable, Disposable)`
+     * overload on the pinned baseline, so expiry is a plain disposed flag checked inside the
+     * runnable: a queued row update that lands after the tool window closed is dropped instead
+     * of touching dead components.
+     */
     private fun onEdt(action: () -> Unit) {
         val app = ApplicationManager.getApplication()
-        if (app == null) action() else app.invokeLater(action, parentDisposable)
+        if (app == null || panelDisposed) action() else app.invokeLater { if (!panelDisposed) action() }
     }
 
     /** Detaches every subscription. Core tasks are untouched by design. */
     override fun dispose() {
+        panelDisposed = true
         flushTimer.stop()
         removeStateListener?.invoke()
         removeSnapshotListener?.invoke()

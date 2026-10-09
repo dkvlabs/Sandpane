@@ -3,6 +3,7 @@ import {
   useCancelTask,
   useCoreLink,
   useProjects,
+  useStoreStatus,
   useTaskIndex,
   useTaskProjection,
 } from "../../lib/hooks";
@@ -26,6 +27,7 @@ import {
   Warning,
 } from "../../components/ui/primitives";
 import { ErrorPanel } from "../projects/ProjectsView";
+import { FeatureGateNotice } from "../../components/ui/feature-gate";
 import { navigate, type Route } from "../../app/router";
 import { useProbeRefetch } from "../../components/ui/refresh";
 import type { TaskStatus } from "../../lib/protocol";
@@ -45,7 +47,9 @@ export function TasksView({ route }: { route: Route }) {
   const link = useCoreLink();
   const refetch = useProbeRefetch();
   const { projects } = useProjects();
-  const tasks = useTaskIndex();
+  const index = useTaskIndex();
+  const storeStatus = useStoreStatus();
+  const tasks = index.rows;
   const [filter, setFilter] = useState<Filter>("all");
   const counts = useMemo(() => countTasks(tasks), [tasks]);
   const shown = tasks.filter((t) => FILTER_MATCH[filter](t.status));
@@ -65,12 +69,40 @@ export function TasksView({ route }: { route: Route }) {
     >
       <ViewHeader
         title="Tasks & Review"
-        subtitle="Every row below comes from durable task events replayed through task.subscribe. There is no task.list in protocol v1, so a task with no events is not shown."
-        actions={<Button onClick={refetch}>Refresh from Core</Button>}
+        subtitle={
+          index.gate.state === "supported"
+            ? "Rows are Core's own task records (task.list) merged with the durable events this window replayed (task.subscribe). Each row says which of the two it came from; a task with neither is not shown."
+            : index.gate.state === "unprobed"
+              ? "Rows come from durable task events replayed through task.subscribe. Core has not been probed yet, so this build does not know whether task.list exists here."
+              : "Rows come from durable task events replayed through task.subscribe. This Core does not advertise task.list, so a task that has produced no events in this window is not visible."
+        }
+        actions={
+          <Button
+            onClick={() => {
+              refetch();
+              void index.refresh();
+            }}
+          >
+            Refresh from Core
+          </Button>
+        }
       />
       <ConnectionBanner link={link} onRetry={refetch} />
+      {storeStatus.kind === "refused" && (
+        <Warning tone="attention" title="Event replay is paused, not failed">
+          {storeStatus.reason} One wide replay cannot fit a 4 MiB frame, so this window stopped
+          pulling that scope instead of retrying a request Core can never answer. Open a single
+          task, or a smaller project, to continue.
+        </Warning>
+      )}
 
       {detailTaskId !== null && <TaskDetail taskId={detailTaskId} />}
+
+      <FeatureGateNotice
+        gate={index.gate}
+        title="Task list from Core"
+        onRetry={refetch}
+      />
 
       <Panel
         title="All tasks"
@@ -113,6 +145,7 @@ export function TasksView({ route }: { route: Route }) {
                 <th>Status</th>
                 <th>Conversation</th>
                 <th>Seq</th>
+                <th>Source</th>
                 <th>Actions</th>
               </tr>
             </thead>
@@ -140,6 +173,22 @@ export function TasksView({ route }: { route: Route }) {
                       )}
                     </td>
                     <td>{task.lastSequence}</td>
+                    <td>
+                      <span className="muted" title={task.source === "task.list"
+                        ? "Core's stored task row (task.list)"
+                        : "Folded from durable events (task.subscribe)"}>
+                        {task.source === "task.list" ? "Core row" : "events"}
+                      </span>
+                      {task.disagreement !== null && (
+                        <Badge tone="attention" title={
+                          `Core's event log last said ${taskStatusView(task.disagreement.fromEvents).label} ` +
+                          `while its task row says ${taskStatusView(task.disagreement.fromTaskList).label}. ` +
+                          "The desktop reports both; it never decides which one is current."
+                        }>
+                          reads differ
+                        </Badge>
+                      )}
+                    </td>
                     <td>
                       <Button
                         variant="ghost"

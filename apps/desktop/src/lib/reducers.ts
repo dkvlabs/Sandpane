@@ -6,15 +6,20 @@
  * explicit `unknown`/`unprobed` shape instead of a guess.
  */
 
+import { MAX_HISTORY_BYTES, MAX_LIST_LIMIT } from "./protocol";
 import type {
   AgentCapability,
   ApplyResult,
   ChangeSet,
+  ConversationHistoryResult,
   CoreCapabilities,
   ErrorCode,
   FileChangeStatus,
+  MessageRecord,
+  Project,
   TaskEvent,
   TaskStatus,
+  TaskSummary,
   WorkspaceMode,
 } from "./protocol";
 import type { ProbeOutcome, CoreRequestError } from "./core-client";
@@ -259,31 +264,89 @@ export function countTasks(
 }
 
 /**
- * Core exposes no `task.list` method, so the task index is derived from durable
- * events only (`task.created` + `status.changed`) — the projections this client
- * has actually folded. A task with no events folded in is simply absent; the UI
- * never shows a row it has no evidence for.
+ * The task index the UI renders. Rows come from Core only, from one of two Core
+ * reads, and the source is always disclosed:
+ *
+ * * `"task.list"` — Core's stored task row (ADDITIVE v1 method; available only
+ *   when the probe advertises it). This is how a task Core knows about but this
+ *   window has never folded an event for becomes visible at all — the reconnect
+ *   hydration path.
+ * * `"events"` — the status the durable event replay last reported.
+ *
+ * A row is never invented: with neither source there is no row. When both reads
+ * exist and disagree, that is surfaced as `disagreement` rather than resolved by
+ * a client-side guess — transitions are Core's to decide (AGENTS rule 3).
  */
+export type TaskIndexSource = "task.list" | "events";
+
 export interface TaskIndexEntry {
   taskId: string;
   conversationId: string | null;
   status: TaskStatus | "unknown";
   lastSequence: number;
+  source: TaskIndexSource;
+  sandboxName: string | null;
+  taskBranch: string | null;
+  baseCommit: string | null;
+  /** Set when Core's two reads report different statuses for the same task. */
+  disagreement: { fromEvents: TaskStatus | "unknown"; fromTaskList: TaskStatus } | null;
 }
 
 export function foldTaskIndex(
   projections: ReadonlyMap<string, TaskProjection>,
+  coreTasks: readonly TaskSummary[] = [],
 ): TaskIndexEntry[] {
-  const rows: TaskIndexEntry[] = [];
-  for (const projection of projections.values()) {
-    rows.push({
-      taskId: projection.taskId,
-      conversationId: projection.conversationId,
-      status: projection.status ?? "unknown",
-      lastSequence: projection.lastSequence,
+  const rows = new Map<string, TaskIndexEntry>();
+
+  for (const task of coreTasks) {
+    rows.set(task.id, {
+      taskId: task.id,
+      conversationId: task.conversationId,
+      status: task.status,
+      lastSequence: projections.get(task.id)?.lastSequence ?? 0,
+      source: "task.list",
+      sandboxName: task.sandboxName ?? null,
+      taskBranch: task.taskBranch ?? null,
+      baseCommit: task.baseCommit ?? null,
+      disagreement: null,
     });
   }
-  return rows.sort((a, b) => b.lastSequence - a.lastSequence);
+
+  for (const projection of projections.values()) {
+    const status = projection.status ?? "unknown";
+    const existing = rows.get(projection.taskId);
+    if (existing === undefined) {
+      rows.set(projection.taskId, {
+        taskId: projection.taskId,
+        conversationId: projection.conversationId,
+        status,
+        lastSequence: projection.lastSequence,
+        source: "events",
+        sandboxName: null,
+        taskBranch: null,
+        baseCommit: null,
+        disagreement: null,
+      });
+      continue;
+    }
+    rows.set(projection.taskId, {
+      ...existing,
+      conversationId: existing.conversationId ?? projection.conversationId,
+      lastSequence: Math.max(existing.lastSequence, projection.lastSequence),
+      // Core's stored row stays on screen; the event fold never overwrites it.
+      // A difference between the two Core reads is reported below, not resolved
+      // by a client-side guess (AGENTS rule 3).
+      disagreement:
+        status !== existing.status
+          ? {
+              fromEvents: status,
+              fromTaskList: existing.status as TaskStatus,
+            }
+          : existing.disagreement,
+    });
+  }
+
+  return [...rows.values()].sort((a, b) => b.lastSequence - a.lastSequence);
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +685,108 @@ export function windowEntries<T extends { sequence: number }>(
 }
 
 // ---------------------------------------------------------------------------
+// Conversation transcript (ADDITIVE v1 `conversation.history`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fold paged `conversation.history` results into one rendered transcript.
+ *
+ * `truncated` is Core's disclosure that a row limit OR the byte ceiling stopped
+ * the scan; a truncated page is never rendered as a complete conversation. The
+ * notice is kept on the folded result so the chat view has to show it, and
+ * `nextSequence` stays available as the cursor for the following page.
+ */
+export interface TranscriptEntry extends MessageRecord {
+  /** Messages are listed oldest-first, matching Core's `sequence ASC` order. */
+  order: number;
+}
+
+export interface TranscriptView {
+  entries: TranscriptEntry[];
+  /** True while the newest page Core returned was truncated. */
+  truncated: boolean;
+  /** Highest sequence rendered; the `afterSequence` for the next page. */
+  cursor: number;
+  /** More than one page folded in, so the UI can say "loaded N pages". */
+  pages: number;
+  /** Copy explaining a stop; empty string when nothing is withheld. */
+  notice: string;
+}
+
+export function foldTranscript(
+  pages: readonly ConversationHistoryResult[],
+): TranscriptView {
+  const bySequence = new Map<number, MessageRecord>();
+  let truncated = false;
+  let cursor = 0;
+  for (const page of pages) {
+    for (const message of page.messages) {
+      bySequence.set(message.sequence, message);
+    }
+    if (page.truncated) truncated = true;
+    if (page.nextSequence > cursor) cursor = page.nextSequence;
+  }
+  const entries = [...bySequence.values()]
+    .sort((a, b) => a.sequence - b.sequence)
+    .map((message, index) => ({ ...message, order: index + 1 }));
+  return {
+    entries,
+    truncated,
+    cursor,
+    pages: pages.length,
+    notice: truncated
+      ? `Core stopped this read at ${MAX_HISTORY_BYTES} bytes / ${MAX_LIST_LIMIT} rows per page — this is ${entries.length} message(s) loaded so far, not the whole conversation. Load more to continue from sequence ${cursor}.`
+      : "",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Project ⇄ folder association (ADDITIVE v1 `Project.repositories`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Match a host folder against the repository paths a project registered.
+ *
+ * Deliberately conservative: Core canonicalizes (resolves symlinks) at
+ * `sandbox.create` mount time, NOT at registration, so the stored string is what
+ * the caller typed. This helper compares lexically (trailing slash ignored) and
+ * reports a match as a PATH MATCH, never as proof of identity — only a canonical
+ * comparison on both sides can claim that, and the webview cannot resolve
+ * symlinks.
+ */
+export function normalizeRepoPath(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return "";
+  const withoutTrailing = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  return withoutTrailing.length === 0 ? "/" : withoutTrailing;
+}
+
+export type ProjectAssociation =
+  | { kind: "unregistered" }
+  | { kind: "no-match"; registered: string[] }
+  | { kind: "path-match"; project: Project; registeredPath: string };
+
+export function associateFolder(
+  folder: string,
+  projects: readonly Project[],
+): ProjectAssociation {
+  const wanted = normalizeRepoPath(folder);
+  if (wanted.length === 0) return { kind: "unregistered" };
+  const registered = projects.flatMap((p) => (p.repositories ?? []).map((path) => ({ p, path })));
+  if (registered.length === 0) return { kind: "unregistered" };
+  const hit = registered.find(
+    (entry) => normalizeRepoPath(entry.path) === wanted,
+  );
+  if (hit === undefined) {
+    return {
+      kind: "no-match",
+      registered: registered.map((entry) => entry.path),
+    };
+  }
+  return { kind: "path-match", project: hit.p, registeredPath: hit.path };
+}
+
+// ---------------------------------------------------------------------------
 // Connection / capability folding
 // ---------------------------------------------------------------------------
 
@@ -810,6 +975,77 @@ export function workspaceModeView(mode: WorkspaceMode): WorkspaceModeView {
   return { mode, ...WORKSPACE_MODE_VIEWS[mode] };
 }
 
+/**
+ * How the UI must present the workspace mode of a sandbox row.
+ *
+ * `sandbox.list` now returns the mode Core recorded for the binding, but the
+ * field is ADDITIVE and optional: absent means Core has no readable binding row,
+ * and `direct_mount` means the mount is LIVE-WRITABLE (specs/02 §7). So an
+ * absent mode must render as UNVERIFIED and be treated as live-writable —
+ * blank-as-safe would silently promise protection the app cannot verify.
+ */
+export interface SandboxModeView {
+  label: string;
+  tone: StatusTone;
+  /** True when the mount may write the host tree now — including when unverified. */
+  liveWritable: boolean;
+  /** False only when Core actually reported a mode. */
+  verified: boolean;
+  mode: WorkspaceMode | null;
+  blurb: string;
+}
+
+export const UNVERIFIED_SANDBOX_MODE_VIEW: SandboxModeView = {
+  label: "Workspace mode UNVERIFIED",
+  tone: "attention",
+  liveWritable: true,
+  verified: false,
+  mode: null,
+  blurb:
+    "Core returned no recorded binding mode for this sandbox, so this build cannot prove the " +
+    "mount is isolated. It is shown as live-writable — the unsafe reading — because a " +
+    "direct-mounted host tree is writable immediately and silence would promise otherwise.",
+};
+
+export function sandboxModeView(mode: WorkspaceMode | null | undefined): SandboxModeView {
+  if (mode === undefined || mode === null) return UNVERIFIED_SANDBOX_MODE_VIEW;
+  const view = workspaceModeView(mode);
+  return {
+    label: view.label,
+    tone: view.liveWritable ? "danger" : "success",
+    liveWritable: view.liveWritable,
+    verified: true,
+    mode,
+    blurb: view.blurb,
+  };
+}
+
+/**
+ * Whether the running Core offers a method. `null` link means "not probed yet",
+ * which is NOT "unsupported": the UI must show a pending state rather than
+ * claiming a gap it has not observed (AGENTS rule 5).
+ */
+export interface FeatureGate {
+  state: "unprobed" | "supported" | "unsupported";
+  /** Copy explaining the state, safe to render directly. */
+  note: string;
+}
+
+export function featureGate(
+  advertised: boolean | null,
+  method: string,
+  unsupportedNote: string,
+): FeatureGate {
+  if (advertised === null) {
+    return {
+      state: "unprobed",
+      note: `Core has not been probed yet, so support for ${method} is unknown.`,
+    };
+  }
+  if (advertised) return { state: "supported", note: `${method} is advertised by this Core.` };
+  return { state: "unsupported", note: unsupportedNote };
+}
+
 export function fileChangeLabel(status: FileChangeStatus): string {
   switch (status) {
     case "added":
@@ -945,9 +1181,36 @@ const CORE_ERROR_COPY: Record<ErrorCode, Omit<ErrorCopy, "reason">> = {
 
 export function describeCoreError(err: CoreRequestError): ErrorCopy {
   if (err.isCoreError) {
-    return { ...CORE_ERROR_COPY[err.code as ErrorCode], reason: err.message };
+    const mapped = CORE_ERROR_COPY[err.code as ErrorCode];
+    // A code this build does not have copy for is reported as itself; the UI
+    // never invents reassurance for a verdict it cannot explain.
+    if (mapped === undefined) {
+      return {
+        title: `Core reported ${String(err.code)}`,
+        reason: err.message,
+        action: "Re-check Core and retry; report this code if it repeats.",
+        tone: "danger",
+      };
+    }
+    return { ...mapped, reason: err.message };
   }
   switch (err.code) {
+    case "INVALID_PARAMS":
+      return {
+        title: "Blocked by the desktop before it reached Core",
+        reason: err.message,
+        action:
+          "This request was never written to the socket: the value fails the same check Core applies (a scoping id must be non-empty and bounded, a limit must be a whole number). Fix the value and retry.",
+        tone: "attention",
+      };
+    case "REPLAY_TOO_LARGE":
+      return {
+        title: "Core refused a replay too large for one frame",
+        reason: err.message,
+        action:
+          "Event polling is paused for this scope, not failed: re-asking the same question cannot ever fit. Narrow it — open a single task, or a smaller project — then resume from the task view.",
+        tone: "attention",
+      };
     case "TRANSPORT_UNAVAILABLE":
       return {
         title: "No Core transport",

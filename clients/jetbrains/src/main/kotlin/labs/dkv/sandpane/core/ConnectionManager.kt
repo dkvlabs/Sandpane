@@ -3,12 +3,18 @@ package labs.dkv.sandpane.core
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.Application
 import com.intellij.openapi.application.ApplicationManager
+import labs.dkv.sandpane.model.Conversation
+import labs.dkv.sandpane.model.ConversationHistoryParams
+import labs.dkv.sandpane.model.ConversationHistoryResult
+import labs.dkv.sandpane.model.ConversationListParams
 import labs.dkv.sandpane.model.CoreCapabilities
 import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.PROTOCOL_VERSION
 import labs.dkv.sandpane.model.TaskEvent
+import labs.dkv.sandpane.model.TaskListParams
 import labs.dkv.sandpane.model.TaskSubscribeParams
+import labs.dkv.sandpane.model.TaskSummary
 import labs.dkv.sandpane.settings.SandpaneSettings
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
@@ -91,6 +97,14 @@ class ConnectionManager(private val application: Application) : Disposable {
     @Volatile
     private var lastInstanceId: String? = null
 
+    /**
+     * Non-null while an oversized-replay refusal is outstanding. Set on a background thread, read
+     * from the poll scheduler and the EDT; a plain volatile String because the whole message is
+     * the state (no structured type is worth it for one flag plus one sentence).
+     */
+    @Volatile
+    private var replayRefusalMessage: String? = null
+
     val isReady: Boolean get() = state is State.Ready
 
     val capabilities: CoreCapabilities? get() = (state as? State.Ready)?.capabilities
@@ -141,7 +155,11 @@ class ConnectionManager(private val application: Application) : Disposable {
                     future.completeExceptionally(CoreRpcException(error.code, error.message))
                 } else {
                     val ok = frame.ok
-                        ?: throw CoreRpcException("INTERNAL", "Core returned neither ok nor err for $method")
+                        ?: throw CoreRpcException(
+                            "INTERNAL",
+                            "Core returned neither ok nor err for $method",
+                            raisedByCore = false,
+                        )
                     future.complete(CoreJson.decodeFromJsonElement(deserializer, ok))
                 }
             } catch (t: Throwable) {
@@ -175,7 +193,60 @@ class ConnectionManager(private val application: Application) : Disposable {
             CoreMethods.TASK_SUBSCRIBE,
             CoreJson.encodeToJsonElement(TaskSubscribeParams.serializer(), params),
             ListSerializer(TaskEvent.serializer()),
-        )
+        ).whenComplete { _, error ->
+            // Remember an undeliverable-replay refusal so the poll loop can stop instead of
+            // hammering a request that can never succeed. Recognition only — never a retry here.
+            if (error != null) recordReplayRefusal(unwrap(error))
+        }
+
+    /**
+     * The typed command surface for the read methods (`task.list`, `conversation.list`,
+     * `conversation.history`) plus the cursor-correct `task.subscribe`.
+     *
+     * Built once over this manager, because the feature gate reads [capabilities] live: a
+     * reconnect that lands on a different Core build changes the answer without rebuilding this
+     * object. Nothing here touches Swing.
+     */
+    val commands: CoreCommands by lazy {
+        CoreCommands(rpc = CoreRpc { method, params -> callJson(method, params) }, capabilities = { capabilities })
+    }
+
+    // -----------------------------------------------------------------------
+    // oversized-replay refusal (structured, recoverable, never retried blindly)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Why the last replay was refused, or null when nothing is outstanding.
+     *
+     * Core refuses a `task.subscribe` replay that cannot fit one 4 MiB frame with
+     * `VALIDATION_FAILED` rather than emitting a frame the client must reject. That refusal is
+     * permanent for the same request, so a poll loop that retried it could never converge — the
+     * loop is paused until a human narrows the request or opts into a full resync.
+     */
+    fun replayRefusal(): String? = replayRefusalMessage
+
+    /**
+     * True while an outstanding refusal blocks a project-wide (cursor-less) catch-up. The poll
+     * loop checks this before scheduling another one, so a request that can never converge is
+     * sent once, not forever.
+     */
+    fun replayBlockedForProjectWideCatchUp(): Boolean = replayRefusalMessage != null
+
+    /** Clear the refusal after the request was narrowed or the user chose a full resync. */
+    fun clearReplayRefusal() {
+        replayRefusalMessage = null
+    }
+
+    private fun recordReplayRefusal(error: Throwable) {
+        val (code, message) = when (error) {
+            is CoreRpcException -> error.code to error.message
+            else -> return
+        }
+        if (!CoreGuards.isOversizedReplayRefusal(code, message)) return
+        val description = CoreGuards.describeOversizedReplay(message)
+        replayRefusalMessage = description
+        log("replay refused — automatic catch-up paused: ${truncate(description)}")
+    }
 
     /**
      * Start (or re-start) the connection. Non-blocking; the handshake runs on [io].
@@ -218,16 +289,88 @@ class ConnectionManager(private val application: Application) : Disposable {
     }
 
     /**
-     * Discover task ids for a project. Per-task streams stay the authoritative replay path:
-     * a project-wide `afterSequence` is one checkpoint applied to every task by Core, which
-     * can skip a quieter task's events (see the note on [EventStream]).
+     * Discover task ids for a project by replaying its durable events.
+     *
+     * WITH the per-task cursors this plugin holds, the replay resumes EACH task from its own
+     * checkpoint (`afterSequences`), which is exactly what the old shared scalar could not do: one
+     * scalar applied to tasks at diverging sequences silently skipped the quieter task's newer
+     * events — the recorded protocol-v1 gap (docs/compatibility.md).
+     *
+     * WITHOUT any checkpoint (first call after a fresh connection) it sends the legacy shared
+     * scalar, because an empty `afterSequences` map is a different request from no map at all.
+     *
+     * When a project-wide replay is blocked, the result is a failed future, not an empty 0 —
+     * silence would read as "this project has no tasks" (AGENTS.md rule 5).
+     *
+     * Prefer [listTasks] when Core advertises `task.list`: it enumerates current rows without
+     * replaying any events at all. This path stays for a Core that predates method advertisement.
      */
-    fun discoverTasks(projectId: String, afterSequence: Long = 0, onTaskId: (String) -> Unit): CompletableFuture<Int> =
-        replay(TaskSubscribeParams(projectId = projectId, afterSequence = afterSequence))
-            .thenApply { events ->
-                events.map { it.taskId }.distinct().forEach(onTaskId)
-                events.size
-            }
+    fun discoverTasks(projectId: String, afterSequence: Long = 0, onTaskId: (String) -> Unit): CompletableFuture<Int> {
+        val refusal = replayRefusalMessage
+        if (refusal != null) {
+            // This plugin is withholding the request; Core is not being asked again and is not
+            // answering now, so the pause is typed as a local refusal with Core's earlier words
+            // quoted inside it — never as a fresh CoreRpcException verdict.
+            return CompletableFuture.failedFuture(ReplayPausedException(refusal))
+        }
+        // ONE seam decides the cursor shape, so the rules the tests pin are the rules that ship:
+        // a checkpoint of 0 stays absent, the map is bounded, and what the bound forced out is
+        // disclosed rather than silently dropped (a task left out replays IN FULL).
+        val plan = ReplayCursors.plan(streamCheckpoints())
+        plan.disclosure()?.let { log("cursor map: ${truncate(it)}") }
+        val params = ReplayCursors.request(
+            projectId = projectId,
+            sharedAfterSequence = afterSequence,
+            plan = plan,
+        )
+        return commands.taskSubscribe(params).thenApply { events ->
+            events.map { it.taskId }.distinct().forEach(onTaskId)
+            events.size
+        }
+    }
+
+    /**
+     * This plugin's checkpoint per TRACKED task, as the raw pairs [ReplayCursors.plan] narrows.
+     *
+     * Read from the live registry rather than a parallel copy so the cursors sent can never drift
+     * from what was actually applied. Untracked tasks are deliberately absent, which under the
+     * Core rule means they replay in full — the safe direction (redelivery is dropped by the
+     * idempotent merge in [EventStream.merge]); a shared scalar would instead risk skipping.
+     */
+    private fun streamCheckpoints(): List<Pair<String, Long>> =
+        streams.values.map { it.taskId to it.lastSequence }
+
+    /**
+     * `task.list` for one project — the read-only hydration path Core advertises, in place of a
+     * replay. Feature-detected, so a pre-revision Core is never asked and never blamed.
+     */
+    fun listTasks(projectId: String): CompletableFuture<List<TaskSummary>> =
+        commands.taskList(TaskListParams(projectId = projectId))
+
+    /**
+     * `conversation.list` for one project, or a failed future when this Core does not advertise
+     * it. Chat enumeration was impossible before the discovery revision; it is Core's data, not a
+     * client-side list.
+     */
+    fun listConversations(projectId: String): CompletableFuture<List<Conversation>> =
+        commands.conversationList(ConversationListParams(projectId = projectId))
+
+    /**
+     * The conversation page after [afterSequence], with Core's own truncation disclosure.
+     * Archived or unknown conversations come back as `NOT_FOUND` — never an empty page.
+     */
+    fun conversationHistory(
+        conversationId: String,
+        afterSequence: Long = 0,
+        limit: Int? = null,
+    ): CompletableFuture<ConversationHistoryResult> =
+        commands.conversationHistory(
+            ConversationHistoryParams(
+                conversationId = conversationId,
+                afterSequence = afterSequence,
+                limit = limit,
+            ),
+        )
 
     /** Core is not ours to stop: dispose closes OUR socket and detaches OUR polling. */
     override fun dispose() {
@@ -308,6 +451,10 @@ class ConnectionManager(private val application: Application) : Disposable {
                 reconnectAttempt.set(0)
                 val restarted = lastInstanceId != null && lastInstanceId != caps.instanceId
                 lastInstanceId = caps.instanceId
+                // A refusal belongs to the instance that raised it and to the cursors it was
+                // computed against; a fresh handshake invalidates it rather than leaving a stale
+                // block on a Core that may answer the same request differently.
+                replayRefusalMessage = null
                 if (restarted) {
                     // Core came back under a new instance id. Core reconciles its own task
                     // rows to `interrupted`; this client keeps its checkpoints, replays, and
@@ -431,12 +578,14 @@ class ConnectionManager(private val application: Application) : Disposable {
     private fun unwrap(t: Throwable): Throwable =
         if (t is ExecutionException && t.cause != null) t.cause!! else t
 
-    private fun describe(t: Throwable?): String = when (t) {
-        null -> "socket closed by Core"
-        is CoreTransportException -> t.message ?: "transport failure"
-        is CoreRpcException -> "${t.code}: ${t.message}"
-        else -> "${t.javaClass.simpleName}: ${t.message}"
-    }
+    /**
+     * One sentence for a connection-level failure, from the SAME attribution seam the tool window
+     * uses, so a paused or locally refused request can never read as Core's verdict in one surface
+     * and as this plugin's in another. `null` here is the read loop ending without an error object:
+     * Core's side closed, which is neither a refusal nor a result.
+     */
+    private fun describe(t: Throwable?): String =
+        if (t == null) "socket closed by Core" else ErrorAttribution.describe(t)
 
     /** Bounded, redacted-by-omission log line: never dump a whole frame (rule 7). */
     private fun truncate(line: String): String =

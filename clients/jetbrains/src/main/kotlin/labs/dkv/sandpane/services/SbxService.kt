@@ -2,6 +2,7 @@ package labs.dkv.sandpane.services
 
 import com.intellij.openapi.project.Project
 import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.model.Conversation
 import labs.dkv.sandpane.model.ConversationCreateParams
 import labs.dkv.sandpane.model.CoreJson
@@ -109,8 +110,8 @@ class SbxService(private val project: Project) {
             val projects = runCatching { listProjects().get() }
             val sandboxes = runCatching { listSandboxes().get() }
             val problems = listOfNotNull(
-                projects.exceptionOrNull()?.let { "project.list: ${it.message}" },
-                sandboxes.exceptionOrNull()?.let { "sandbox.list: ${it.message}" },
+                projects.exceptionOrNull()?.let { ErrorAttribution.describe(CoreMethods.PROJECT_LIST, it) },
+                sandboxes.exceptionOrNull()?.let { ErrorAttribution.describe(CoreMethods.SANDBOX_LIST, it) },
             )
             val next = Snapshot(
                 projects = projects.getOrNull(),
@@ -128,6 +129,61 @@ class SbxService(private val project: Project) {
     fun sandboxesFor(projectId: String?): List<SandboxSummary> =
         if (projectId == null) emptyList()
         else snapshot.sandboxes.orEmpty().filter { it.boundProjectId == projectId }
+
+    // -----------------------------------------------------------------------
+    // folder → Core project (protocol-v1 `project.list.repositories`)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Resolve which Core project, if any, this IDE folder belongs to — the answer `StartTaskAction`
+     * needed and JB1 could not get, because `Project` used to carry no repository paths.
+     *
+     * The matching rules live in [FolderMatching] (pure, unit-tested); this only feeds it the
+     * current snapshot. Canonicalizes BOTH sides, because Core stores what was registered and
+     * resolves symlinks only at mount time.
+     */
+    fun associateFolder(folderPath: String?): FolderAssociation =
+        FolderMatching.associate(currentSnapshot().projects, folderPath)
+
+    /**
+     * `conversation.list` for [projectId], or a failed [ConversationEnumeration] when this Core
+     * does not advertise the method. Chat enumeration was impossible before the discovery
+     * revision; the list is Core's, including its exclusion of archived conversations.
+     */
+    fun enumerateConversations(projectId: String): CompletableFuture<ConversationEnumeration> {
+        if (!connection.commands.advertises(CoreMethods.CONVERSATION_LIST)) {
+            return CompletableFuture.completedFuture(ConversationEnumeration.Unavailable)
+        }
+        return connection.listConversations(projectId)
+            .thenApply<ConversationEnumeration> { ConversationEnumeration.Available(it) }
+            .exceptionally { err ->
+                // Attributed, not assumed: this can be a refusal this plugin raised before sending.
+                ConversationEnumeration.Failed(ErrorAttribution.describe(err))
+            }
+    }
+
+    /** Enumeration result as a value, so the UI never has to guess between empty and unknown. */
+    sealed class ConversationEnumeration {
+        data class Available(val conversations: List<Conversation>) : ConversationEnumeration()
+
+        /** Core does not advertise `conversation.list` — nothing was asked, nothing is claimed. */
+        data object Unavailable : ConversationEnumeration()
+
+        /**
+         * The read did not produce a list. `reason` names who refused — Core with its code and its
+         * own wording, or this plugin before a byte was sent — as [ErrorAttribution] puts it.
+         */
+        data class Failed(val reason: String) : ConversationEnumeration()
+
+        val conversationsOrEmpty: List<Conversation>
+            get() = (this as? Available)?.conversations ?: emptyList()
+
+        fun explain(): String = when (this) {
+            is Available -> "${conversations.size} conversation(s) Core reports for this project"
+            Unavailable -> "Chat enumeration is unavailable on this Core (no fake list is shown)."
+            is Failed -> "${CoreMethods.CONVERSATION_LIST} — $reason"
+        }
+    }
 
     // -----------------------------------------------------------------------
     // mutating paths — JB1 wires these to confirmed actions; nothing calls them implicitly
@@ -183,7 +239,9 @@ class SbxService(private val project: Project) {
 }
 
 /**
- * Client-side mirrors of the `schemas/*.json` guards: fast, honest refusals.
+ * Client-side mirrors of the JSON-Schema guards under `schemas/`: fast, honest refusals.
+ * (Note the wording: a literal glob here would open a nested block comment, which is why
+ * this doc does not spell one.)
  *
  * These never replace Core validation and never build a command. A value that passes here is
  * only ever placed into a JSON payload for an allowlisted RPC method; the argument vectors

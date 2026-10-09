@@ -26,11 +26,13 @@ import type {
   Project,
   SandboxSummary,
 } from './core-client/protocol';
+import { coreAdvertisesMethod } from './core-client/protocol';
 import { EMPTY_STATE, reduceTaskView, selectTasks, type TaskViewState } from './state/reducer';
 import { evaluateHostContext, type HostVerdict } from './vscode/host';
 import { explainFailure, toFailure, type GuidanceAction } from './vscode/diagnostics';
 import {
   isKnownWorkspaceMode,
+  sandboxWorkspaceModeView,
   unknownWorkspaceModeView,
   workspaceModeView,
 } from './vscode/workspaces';
@@ -67,6 +69,12 @@ export class SandpaneSession {
   private projects: Project[] = [];
   private sandboxes: SandboxSummary[] = [];
   private conversation: Conversation | null = null;
+  /**
+   * `conversation.list` hydration — Core's own enumeration, cached only for this
+   * session's display. Not a database: it is re-read on every refresh, and an
+   * archived conversation is absent because Core filters it (specs/02 §1).
+   */
+  private conversations: Conversation[] = [];
   private selectedProjectId: string | null = null;
   private selectedSandbox: string | null = null;
   private workspaceMode: string | null = null;
@@ -222,8 +230,65 @@ export class SandpaneSession {
       this.sandboxes = [];
       this.reportError(sandboxes.reason, 'sandbox.list');
     }
+    await this.hydrateFromCore();
     await this.catchUpNow();
     this.emit();
+  }
+
+  /**
+   * Pull the read-only enumerations Core advertises: `task.list` and
+   * `conversation.list`.
+   *
+   * Both are ADDITIVE protocol-v1 methods, so they are FEATURE-DETECTED from
+   * `system.probe`'s `methods` array rather than assumed — a pre-revision Core
+   * answers `VALIDATION_FAILED` for an unknown method, and a client that
+   * assumed it would report a false failure on every refresh.
+   *
+   * Hydration is display-only: `task.list` rows carry Core's stored status and go
+   * straight into the reducer. Nothing here derives, advances or repairs a
+   * lifecycle state (AGENTS.md rule 3).
+   *
+   * Scoping is deliberate: with no project selected nothing is pulled at all. An
+   * unscoped read would be Core-legal, but it would paint other projects' tasks
+   * and chats into a per-project sidebar, which is a display bug the client is
+   * responsible for, not a Core verdict.
+   */
+  private async hydrateFromCore(): Promise<void> {
+    const caps = this.capabilities;
+    const projectId = this.selectedProjectId;
+    if (!caps || !projectId) return;
+
+    if (coreAdvertisesMethod(caps, 'task.list')) {
+      try {
+        const tasks = await this.commands.taskList({ projectId });
+        this.view = reduceTaskView(this.view, { kind: 'taskList', tasks });
+      } catch (error) {
+        this.log(`task.list failed: ${describe(error)}`);
+      }
+    } else {
+      this.log('task.list not advertised by this Core — task history stays unrecovered (no fake list)');
+    }
+
+    if (coreAdvertisesMethod(caps, 'conversation.list')) {
+      try {
+        this.conversations = await this.commands.conversationList({ projectId });
+      } catch (error) {
+        this.conversations = [];
+        this.log(`conversation.list failed: ${describe(error)}`);
+      }
+      // Re-point a restored UI preference at Core's live record when the id still
+      // exists; otherwise drop it rather than rendering a conversation Core does
+      // not have.
+      if (this.conversation) {
+        const live = this.conversations.find((c) => c.id === this.conversation?.id);
+        this.conversation = live ?? null;
+      }
+    } else {
+      this.conversations = [];
+      this.log(
+        'conversation.list not advertised by this Core — chat history cannot be enumerated (no fake list)',
+      );
+    }
   }
 
   async createProject(name: string, repositories: string[]): Promise<Project | undefined> {
@@ -550,7 +615,16 @@ export class SandpaneSession {
         workspaceMode: this.workspaceMode,
         branch: tasks[tasks.length - 1]?.taskBranch ?? null,
       },
-      sandboxes: this.sandboxes.map((s) => ({ name: s.name, probedState: s.probedState ?? null })),
+      sandboxes: this.sandboxes.map((s) => {
+        const mode = sandboxWorkspaceModeView(s);
+        return {
+          name: s.name,
+          probedState: s.probedState ?? null,
+          workspaceMode: s.workspaceMode ?? null,
+          modeBadge: mode.badge,
+          modeHostWritable: mode.hostWritable,
+        };
+      }),
       selectedSandbox: this.selectedSandbox,
       conversation: this.conversation
         ? { id: this.conversation.id, title: this.conversation.title, agentId: this.conversation.agentId }
@@ -637,6 +711,17 @@ export class SandpaneSession {
           this.emit();
         },
         onError: (error) => this.log(`task.subscribe replay failed: ${describe(error)}`),
+        // Core refuses a replay that cannot fit one IPC frame instead of
+        // sending a frame both ends reject. It is recoverable — narrow the
+        // request — and the subscription stops polling so nothing retries in a
+        // loop; surface the guidance rather than hiding it.
+        onReplayRefused: (message) => {
+          this.log(`task.subscribe refused: ${message}`);
+          this.setStatus(
+            'info',
+            'Event replay is larger than one Core frame — narrow to one task or a higher cursor.',
+          );
+        },
       });
     }
     try {

@@ -7,8 +7,10 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.model.ApplyResult
 import labs.dkv.sandpane.model.ChangeSet
+import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.services.TaskMonitorService
 
 /**
@@ -25,7 +27,7 @@ import labs.dkv.sandpane.services.TaskMonitorService
  */
 class ApplyTaskAction : AnAction() {
 
-    override fun getUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
+    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 
     override fun update(event: AnActionEvent) {
         val project = event.project
@@ -97,10 +99,13 @@ class ApplyTaskAction : AnAction() {
         tasks.apply(candidate.taskId, selectedFiles = null, expectedBase = reviewed.baseCommit)
             .whenComplete { result, error ->
                 if (error != null) {
+                    // Attribution seam again: this action must not announce a client-side refusal
+                    // as git.apply failing at Core — an apply that never left is a different fact
+                    // from one Core rejected.
                     notify(
                         project,
-                        "Sandpane: git.apply failed",
-                        "${error.message ?: error.javaClass.simpleName}",
+                        ErrorAttribution.headline(CoreMethods.GIT_APPLY, error),
+                        ErrorAttribution.describe(CoreMethods.GIT_APPLY, error),
                         NotificationType.ERROR,
                     )
                     return@whenComplete

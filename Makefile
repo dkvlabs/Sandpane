@@ -10,9 +10,12 @@ NPM ?= npm
 .PHONY: check core-check core-fmt core-clippy core-test vscode-check desktop-check jetbrains-check schema-lint schema-drift clean
 
 ## Everything currently verifiable on this host. Client checks need their
-## npm dependencies installed first (cd <dir> && npm install).
-check: core-check schema-lint schema-drift vscode-check desktop-check
-	@echo "make check: OK (core + schemas + vscode + desktop). jetbrains-check is excluded: nothing Kotlin has been compiled on this host yet (JB0 gate, docs/compatibility.md) — run it explicitly on a networked machine."
+## npm dependencies installed first (cd <dir> && npm install); the JetBrains
+## build additionally needs the Gradle wrapper's IntelliJ Platform artifacts
+## already resolved — it runs --offline for exactly that reason (see
+## docs/compatibility.md, Gradle/Kotlin row).
+check: core-check schema-lint schema-drift vscode-check desktop-check jetbrains-check
+	@echo "make check: OK (core + schemas + vscode + desktop + jetbrains)."
 
 core-check: core-fmt core-clippy core-test
 
@@ -35,7 +38,7 @@ desktop-check:
 
 jetbrains-check:
 	@test -d clients/jetbrains || { echo "clients/jetbrains: phase not landed"; exit 1; }
-	cd clients/jetbrains && ./gradlew build --console=plain
+	cd clients/jetbrains && ./gradlew build --console=plain --offline
 
 ## JSON syntax check for the protocol schemas.
 schema-lint:

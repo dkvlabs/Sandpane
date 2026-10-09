@@ -19,7 +19,7 @@
       "maxLength": 128
     },
     "method": {
-      "description": "Allowlisted dotted method name. There is deliberately no free-form execution method.",
+      "description": "Allowlisted dotted method name. There is deliberately no free-form execution method. The set is additive for protocol v1: discovery revision 1 adds conversation.list, conversation.history and task.list (a Core advertises exactly what it handles via core-capabilities.methods).",
       "type": "string",
       "enum": [
         "system.probe",
@@ -29,7 +29,10 @@
         "sandbox.create",
         "conversation.create",
         "conversation.send",
+        "conversation.list",
+        "conversation.history",
         "task.cancel",
+        "task.list",
         "task.subscribe",
         "git.review",
         "git.apply"

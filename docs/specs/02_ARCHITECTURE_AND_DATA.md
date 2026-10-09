@@ -52,24 +52,36 @@ Requirements:
 - Operation idempotency keys for sandbox/task creation and client retries.
 - Structured errors: `NOT_INSTALLED`, `DAEMON_DOWN`, `UNSUPPORTED_SBX_VERSION`, `PROVIDER_AUTH_REQUIRED`, `CONFLICT`, `TASK_INTERRUPTED`, `PERMISSION_DENIED`, `VALIDATION_FAILED`.
 
-Example proposed contract:
+Implemented contract (protocol v1, additively revised — see the revision note under the block):
 
 ```ts
 interface SandpaneRpc {
-  'system.probe': { request: {}; response: CoreCapabilities };
-  'project.create': { request: { name: string; repositories: string[] }; response: Project };
-  'sandbox.list': { request: {}; response: SandboxSummary[] };
+  'system.probe': { request: {}; response: CoreCapabilities /* + methods: string[] (feature discovery) */ };
+  'project.create': { request: { name: string; repositories: string[] }; response: Project /* + repositories: string[] */ };
+  'project.list': { request: {}; response: Project[] };
+  'sandbox.list': { request: {}; response: SandboxSummary[] /* each may carry workspaceMode; ABSENT when unbound */ };
   'sandbox.create': { request: SandboxCreateSpec; response: SandboxSummary };
   'conversation.create': { request: { projectId: string; agentId: string; sandboxId?: string }; response: Conversation };
   'conversation.send': { request: { conversationId: string; content: string; attachments?: ContextRef[] }; response: { taskId: string } };
+  'conversation.list': { request: { projectId?: string; limit?: number }; response: Conversation[] };
+  'conversation.history': { request: { conversationId: string; afterSequence?: number; limit?: number }; response: { messages: MessageRecord[]; truncated: boolean; nextSequence: number } };
   'task.cancel': { request: { taskId: string }; response: { requested: boolean } };
-  'task.subscribe': { request: { projectId?: string; afterSequence?: number }; response: TaskEvent[] };
+  'task.list': { request: { projectId?: string; statuses?: TaskStatus[]; limit?: number }; response: TaskSummary[] };
+  'task.subscribe': { request: { projectId?: string; taskId?: string; afterSequence?: number; afterSequences?: Record<string, number> }; response: TaskEvent[] };
   'git.review': { request: { taskId: string }; response: ChangeSet };
   'git.apply': { request: { taskId: string; selectedFiles?: string[]; expectedBase: string }; response: ApplyResult };
 }
 ```
 
 Neither prompts nor file paths are executable commands. CLI operations are implemented as specific backend methods with strictly constructed argument arrays.
+
+**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 14-method v1 surface (`docs/CHANGELOG.md` 0010). Rules that keep it honest:
+
+- **`PROTOCOL_VERSION` stays `1`** — the revision is additive only: new methods, new optional request fields, new response fields that are absent-tolerant (`#[serde(default)]`). Nothing was renamed or removed, so an older client's frames still parse.
+- **`task.subscribe` cursor semantics** are now explicit, because one scalar `afterSequence` applied across a project-wide replay silently skips the unseen events of tasks whose per-task sequences are lower (sequences restart at 1 per task): when `taskId` is present the scalar governs and `afterSequences` is ignored; without `taskId`, each task replays from `afterSequences[taskId]` (a task absent from the map replays from 0); with no map at all the legacy shared-scalar behavior is preserved. Clients that need correct catch-up across tasks must send the map.
+- **Bounded reads.** `task.list`, `conversation.list` and `conversation.history` clamp `limit` (default 200, max 500) and `conversation.history` additionally caps serialized bytes, disclosing `truncated: true` when either ceiling stopped the scan; a `task.subscribe` replay that cannot fit one IPC frame is refused with `VALIDATION_FAILED` rather than emitted oversized. Bounded responses with truncation disclosure is a §2 requirement, not a nicety.
+- **Feature discovery is the client's obligation**: `system.probe` advertises the method list it actually dispatches (`CoreCapabilities.methods`), and a client must gate a call on that advertisement instead of assuming. `scripts/schema_drift.py` now compares that advertised set against the schema enum, so "handled but undiscoverable" fails the gate.
+- **Known spec-vs-code deviations, still open:** `conversation.send` currently responds with a full `TaskSummary` rather than `{ taskId }`, and `ContextRef` kind `selection` has no Core-defined target grammar. Both are recorded in `docs/compatibility.md` ("Protocol v1 gaps") and are deliberately NOT silently rewritten here.
 
 ## 3. Data model
 

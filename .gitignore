@@ -40,3 +40,9 @@ apps/desktop/src-tauri/gen/schemas/
 .env.*
 *.pem
 *.key
+
+# Local tool/session artifacts (not project work)
+.mimosa/
+.v2c/
+.video_agent/
+.zcodeignore

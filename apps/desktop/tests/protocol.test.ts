@@ -1,17 +1,20 @@
 /**
  * Wire-fidelity suite.
  *
- * Every literal below is copied from an assertion in
- * `core/crates/sandpane-protocol/src/lib.rs` or a `schemas/*.json` requirement,
- * so this file is the drift check between the Rust types, the JSON schemas and
- * this TypeScript mirror (AGENTS.md §Conventions: protocol change touches
- * schemas + client types together).
+ * The value SETS here are read from the authoritative sources (see
+ * `tests/protocol-drift.test.ts` + `tests/support/rust-source.ts`), not copied
+ * into this file, so the mirror cannot drift and stay green. What this file does
+ * assert literally is the DECODED SHAPE of a wire payload — the exact field names
+ * Core puts on the socket, pinned from the Rust structs' `serde` spelling.
  */
 
 import { describe, expect, it } from "vitest";
 import {
   decodeAgentEvent,
   decodeApplyResult,
+  decodeConversationHistory,
+  decodeConversations,
+  decodeTaskSummaries,
   decodeChangeSet,
   decodeConversation,
   decodeCoreCapabilities,
@@ -31,45 +34,40 @@ import {
   CORE_EVENT_KINDS,
   ERROR_CODES,
   METHODS,
+  coreAdvertisesMethod,
   PROTOCOL_VERSION,
   TASK_STATUSES,
   WORKSPACE_MODES,
 } from "../src/lib/protocol";
+import {
+  readSchema,
+  rustMethodAll,
+  rustProtocolVersionConst,
+  schemaMethodEnum,
+} from "./support/rust-source";
 
 describe("constants match the Rust side", () => {
   it("protocol version is 1", () => {
     expect(PROTOCOL_VERSION).toBe(1);
+    expect(rustProtocolVersionConst()).toBe(PROTOCOL_VERSION);
   });
 
-  it("method allowlist matches schemas/rpc-request.schema.json", () => {
-    expect(METHODS).toEqual([
-      "system.probe",
-      "project.create",
-      "project.list",
-      "sandbox.list",
-      "sandbox.create",
-      "conversation.create",
-      "conversation.send",
-      "task.cancel",
-      "task.subscribe",
-      "git.review",
-      "git.apply",
-    ]);
+  it("method allowlist is Core's, read from the crate and the shipped schema", () => {
+    // NOT a literal in this file: a method added, renamed or dropped in Rust (or
+    // in schemas/rpc-request.schema.json) fails here even though the TS mirror
+    // would still be self-consistent.
+    expect(METHODS).toEqual(rustMethodAll().names);
+    expect(METHODS).toEqual(schemaMethodEnum());
+    expect(METHODS.length).toBe(14);
   });
 
   it("error codes match the schema enum", () => {
-    expect(ERROR_CODES).toEqual([
-      "NOT_INSTALLED",
-      "DAEMON_DOWN",
-      "UNSUPPORTED_SBX_VERSION",
-      "PROVIDER_AUTH_REQUIRED",
-      "CONFLICT",
-      "TASK_INTERRUPTED",
-      "PERMISSION_DENIED",
-      "VALIDATION_FAILED",
-      "NOT_FOUND",
-      "INTERNAL",
-    ]);
+    const schema = readSchema<{ properties: { err: { properties: { code: { enum: string[] } } } } }>(
+      "rpc-response",
+    );
+    expect([...ERROR_CODES].sort()).toEqual(
+      [...schema.properties.err.properties.code.enum].sort(),
+    );
   });
 
   it("task statuses and workspace modes match the snake_case wire names", () => {
@@ -287,5 +285,140 @@ describe("decodeAgentEvent — the tagged union from agent-event.schema.json", (
     expect(() => decodeAgentEvent({ type: "tool.started", name: "x" })).toThrow(
       MalformedFrameError,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADDITIVE-v1 payloads: the mirror must read Core's real shapes
+// ---------------------------------------------------------------------------
+
+describe("additive fields deserialize from a pre-revision wire AND the new one", () => {
+  const baseCaps = {
+    protocolVersion: 1,
+    coreVersion: "0.1.0",
+    instanceId: "i",
+    sbx: null,
+    agents: [],
+    platform: "macos",
+  };
+
+  it("keeps an absent `methods` absent — never inventing a full list", () => {
+    const old = decodeCoreCapabilities(baseCaps);
+    expect(old.methods).toBeUndefined();
+    expect(coreAdvertisesMethod(old, "task.list")).toBe(false);
+  });
+
+  it("reads the advertised list verbatim", () => {
+    const caps = decodeCoreCapabilities({ ...baseCaps, methods: [...METHODS] });
+    expect(caps.methods).toEqual([...METHODS]);
+    expect(coreAdvertisesMethod(caps, "conversation.history")).toBe(true);
+  });
+
+  it("refuses a non-string in the advertised list instead of filtering it", () => {
+    expect(() => decodeCoreCapabilities({ ...baseCaps, methods: ["task.list", 7] })).toThrow(
+      MalformedFrameError,
+    );
+  });
+
+  it("Project.repositories is optional and stays undefined when Core omits it", () => {
+    const before = decodeProjects([
+      { id: "p1", name: "Atlas Demo", createdAt: "2026-10-09T00:00:00Z" },
+    ]);
+    expect(before[0]?.repositories).toBeUndefined();
+    const after = decodeProjects([
+      { ...before[0], repositories: ["/repos/atlas", "/repos/atlas-api"] },
+    ]);
+    expect(after[0]?.repositories).toEqual(["/repos/atlas", "/repos/atlas-api"]);
+    // Order is Core's insertion order and must survive the round trip.
+    expect(after[0]?.repositories?.[0]).toBe("/repos/atlas");
+  });
+
+  it("SandboxSummary.workspaceMode: absent is null (unverified), unknown is refused", () => {
+    const rows = decodeSandboxSummaries([
+      { name: "no-row", probedState: "running", boundProjectId: null },
+      {
+        name: "mounted",
+        probedState: "running",
+        boundProjectId: "p1",
+        workspaceMode: "direct_mount",
+      },
+      {
+        name: "cloned",
+        probedState: null,
+        boundProjectId: null,
+        workspaceMode: "sbx_clone",
+      },
+    ]);
+    expect(rows[0]?.workspaceMode).toBeNull();
+    expect(rows[1]?.workspaceMode).toBe("direct_mount");
+    expect(rows[2]?.workspaceMode).toBe("sbx_clone");
+    expect(() =>
+      decodeSandboxSummaries([
+        { name: "x", probedState: null, boundProjectId: null, workspaceMode: "bind_mount" },
+      ]),
+    ).toThrow(MalformedFrameError);
+  });
+});
+
+describe("the three new reads keep Core's envelope shapes", () => {
+  it("conversation.list is an array of Conversation", () => {
+    expect(
+      decodeConversations([
+        {
+          id: "c1",
+          projectId: "p1",
+          title: "Auth flow",
+          agentId: "codex",
+          createdAt: "2026-10-09T00:00:00Z",
+        },
+      ]),
+    ).toHaveLength(1);
+    expect(() => decodeConversations({ nope: 1 })).toThrow(MalformedFrameError);
+  });
+
+  it("task.list is an array of TaskSummary with Core's stored status", () => {
+    const rows = decodeTaskSummaries([
+      { id: "t1", conversationId: "c1", status: "awaiting_review", baseCommit: "abc" },
+    ]);
+    expect(rows[0]).toMatchObject({ status: "awaiting_review", baseCommit: "abc" });
+    // An unknown status is refused, not normalized to something nearby.
+    expect(() =>
+      decodeTaskSummaries([{ id: "t", conversationId: "c", status: "resumed" }]),
+    ).toThrow(MalformedFrameError);
+  });
+
+  it("conversation.history is an OBJECT with both bounds disclosed", () => {
+    const result = decodeConversationHistory({
+      messages: [
+        {
+          id: "m1",
+          conversationId: "c1",
+          role: "user",
+          content: "hi",
+          sequence: 1,
+        },
+      ],
+      truncated: true,
+      nextSequence: 1,
+    });
+    expect(result.truncated).toBe(true);
+    expect(result.nextSequence).toBe(1);
+    expect(result.messages[0]?.content).toBe("hi");
+  });
+
+  it("a history result missing its disclosure is not accepted as complete", () => {
+    expect(() =>
+      decodeConversationHistory({ messages: [], nextSequence: 0 }),
+    ).toThrow(MalformedFrameError);
+    expect(() =>
+      decodeConversationHistory({ messages: [], truncated: false }),
+    ).toThrow(MalformedFrameError);
+    expect(() =>
+      decodeConversationHistory({
+        messages: [{ id: "m", conversationId: "c", role: "user", content: "", sequence: 0 }],
+        truncated: false,
+        nextSequence: 0,
+      }),
+    ).toThrow(/sequence/);
   });
 });

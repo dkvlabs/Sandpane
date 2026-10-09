@@ -3,7 +3,9 @@ import {
   DIRECT_MOUNT_LIVE_WRITABLE,
   allWorkspaceModeViews,
   isKnownWorkspaceMode,
+  sandboxWorkspaceModeView,
   unknownWorkspaceModeView,
+  unverifiedWorkspaceModeView,
   workspaceModeLabel,
   workspaceModeView,
 } from '../src/vscode/workspaces';
@@ -39,6 +41,36 @@ describe('workspace mode labels (specs/02 §7, specs/06 §6)', () => {
     expect(view.hostWritable).toBe(true);
     expect(view.badge).toMatch(/UNKNOWN.*LIVE-WRITABLE/);
     expect(workspaceModeLabel('docker_forever')).toContain('docker_forever');
+  });
+
+  /**
+   * `SandboxSummary.workspaceMode` is ABSENT when Core has no readable
+   * `sandbox_bindings` row, and Core never guesses one. The client must render
+   * that as UNVERIFIED — a blank cell would read as "no risk".
+   */
+  it('renders an absent sandbox mode as UNVERIFIED, never as safe', () => {
+    for (const absent of [{}, { workspaceMode: null }, { workspaceMode: undefined }]) {
+      const view = sandboxWorkspaceModeView(absent);
+      expect(view.badge).toMatch(/UNVERIFIED/);
+      expect(view.hostWritable).toBe(true);
+      expect(view.tone).toBe('live_writable');
+      // Saying "unknown" is not the same as promising isolation.
+      expect(`${view.label} ${view.badge} ${view.explanation}`).not.toMatch(/isolated\b/i);
+    }
+    expect(unverifiedWorkspaceModeView().badge).toContain('LIVE-WRITABLE');
+  });
+
+  it('keeps the recorded direct_mount sandbox loud, and an unknown string loudest', () => {
+    expect(sandboxWorkspaceModeView({ workspaceMode: 'direct_mount' }).badge).toBe(
+      DIRECT_MOUNT_LIVE_WRITABLE,
+    );
+    expect(sandboxWorkspaceModeView({ workspaceMode: 'sbx_clone' }).hostWritable).toBe(false);
+    // A mode name from a newer Core is treated as host-writable, not hidden.
+    const future = sandboxWorkspaceModeView({ workspaceMode: 'bind_forever' });
+    expect(future.hostWritable).toBe(true);
+    expect(future.badge).toMatch(/UNKNOWN/);
+    // Absent and unknown are distinct statements; both are loud.
+    expect(sandboxWorkspaceModeView({}).badge).not.toBe(future.badge);
   });
 });
 

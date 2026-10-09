@@ -1,4 +1,6 @@
+import { useMemo } from "react";
 import {
+  useCoreConversations,
   useCoreLink,
   useProjects,
   useSessionConversations,
@@ -17,25 +19,50 @@ import {
   Panel,
   Warning,
 } from "../../components/ui/primitives";
+import { FeatureChip, FeatureGateNotice } from "../../components/ui/feature-gate";
 import { navigate, type Route, useRoute } from "../../app/router";
 import { useProbeRefetch } from "../../components/ui/refresh";
 import { IconRefresh } from "../../components/layout/icons";
+import type { Conversation } from "../../lib/protocol";
 
 /**
  * Chats index.
  *
- * The IA demands a Chats destination, and protocol v1 gives it no read method:
- * there is no `conversation.list`, no message history query and no archive or
- * export RPC. So this view lists what this window legitimately knows (the
- * conversations it created) and states the gap, rather than showing sample chats
- * from the design mockups.
+ * `conversation.list` (ADDITIVE v1) makes the real cross-client list possible:
+ * Core holds every non-archived conversation, including chats started in VS Code
+ * or JetBrains. Support is still probed rather than assumed — a Core that does
+ * not advertise the method falls back to the conversations this window created,
+ * and the view says which of the two it is showing. Message history comes from
+ * `conversation.history` inside the workspace, not from a local cache.
  */
 export function ChatsView({ route }: { route: Route }) {
   const link = useCoreLink();
   const refetch = useProbeRefetch();
   const { projects } = useProjects();
-  const conversations = useSessionConversations();
+  const session = useSessionConversations();
+  const core = useCoreConversations(null);
   const current = useRoute();
+
+  const rows: (Conversation & { fromCore: boolean })[] = useMemo(() => {
+    const seen = new Set<string>();
+    const out: (Conversation & { fromCore: boolean })[] = [];
+    // Core's list wins; the local list only adds rows Core has not returned yet
+    // (a conversation created seconds ago, before the next read).
+    for (const conversation of core.conversations) {
+      if (seen.has(conversation.id)) continue;
+      seen.add(conversation.id);
+      out.push({ ...conversation, fromCore: true });
+    }
+    for (const conversation of session) {
+      if (seen.has(conversation.id)) continue;
+      seen.add(conversation.id);
+      out.push({ ...conversation, fromCore: false });
+    }
+    return out;
+  }, [core.conversations, session]);
+
+  const projectName = (projectId: string): string =>
+    projects.find((p) => p.id === projectId)?.name ?? "unknown project";
 
   return (
     <AppShell
@@ -44,7 +71,12 @@ export function ChatsView({ route }: { route: Route }) {
       statusLeading={<ConnectionChip link={link} onRetry={refetch} />}
       statusTrailing={
         <span className="statusbar__counts">
-          {conversations.length} conversation(s) created in this window
+          {rows.length} conversation(s) ·{" "}
+          {core.gate.state === "supported"
+            ? "read from Core"
+            : core.gate.state === "unprobed"
+              ? "Core not probed yet"
+              : "this window only"}
         </span>
       }
     >
@@ -56,7 +88,11 @@ export function ChatsView({ route }: { route: Route }) {
             <Button onClick={refetch}>
               <IconRefresh /> Re-check Core
             </Button>
-            <Button variant="primary" onClick={() => navigate("projects")} disabled={projects.length === 0}>
+            <Button
+              variant="primary"
+              onClick={() => navigate("projects")}
+              disabled={projects.length === 0}
+            >
               New chat in a project
             </Button>
           </>
@@ -64,19 +100,40 @@ export function ChatsView({ route }: { route: Route }) {
       />
       <ConnectionBanner link={link} onRetry={refetch} />
 
-      <Panel title="Conversations this window created">
-        {conversations.length === 0 ? (
+      <FeatureGateNotice gate={core.gate} title="Conversation list from Core" onRetry={refetch} />
+      {core.error !== null && (
+        <Warning tone="danger" title={`Core refused conversation.list`}>
+          {core.error.message}
+        </Warning>
+      )}
+
+      <Panel
+        title={
+          core.gate.state === "supported"
+            ? "Conversations Core holds"
+            : "Conversations this window created"
+        }
+        description={
+          core.gate.state === "supported"
+            ? "Read through conversation.list. Archived chats are excluded by Core, so everything here can actually be reopened."
+            : "Core has not answered conversation.list, so this is only what THIS window created — never the whole picture, and never sample data."
+        }
+        actions={<FeatureChip gate={core.gate} method="conversation.list" />}
+      >
+        {core.isLoading && core.gate.state === "supported" ? (
+          <p className="muted">Reading conversations from Core…</p>
+        ) : rows.length === 0 ? (
           <EmptyState
-            heading="No conversations in this window"
+            heading="No conversations to show"
             body={
               link.kind === "attached"
-                ? "Open a project workspace and use New chat. Conversations are stored in the shared Core SQLite store, so a chat started in VS Code is the same chat — this desktop just cannot enumerate them yet."
+                ? "Open a project workspace and use New chat. Conversations live in the shared Core SQLite store, so a chat started in VS Code is the same chat."
                 : "Core is unreachable, so nothing can be created or read."
             }
           />
         ) : (
           <ul className="list">
-            {conversations.map((conversation) => (
+            {rows.map((conversation) => (
               <li key={conversation.id}>
                 <button
                   type="button"
@@ -90,10 +147,16 @@ export function ChatsView({ route }: { route: Route }) {
                     })
                   }
                 >
-                  <span className="row__title">{conversation.title}</span>
+                  <span className="row__title">
+                    {conversation.title}{" "}
+                    <span className="muted">· {projectName(conversation.projectId)}</span>
+                  </span>
                   <span className="row__meta">
                     <Badge tone="neutral">agent {conversation.agentId}</Badge> ·{" "}
-                    <Mono>{conversation.id.slice(0, 8)}</Mono> · {conversation.createdAt}
+                    <Badge tone={conversation.fromCore ? "success" : "neutral"}>
+                      {conversation.fromCore ? "from Core" : "this window"}
+                    </Badge>{" "}
+                    · <Mono>{conversation.id.slice(0, 8)}</Mono> · {conversation.createdAt}
                   </span>
                 </button>
               </li>
@@ -102,15 +165,16 @@ export function ChatsView({ route }: { route: Route }) {
         )}
       </Panel>
 
-      <Warning tone="neutral" title="What protocol v1 cannot do yet">
+      <Warning tone="neutral" title="What this build still cannot do">
         <ul className="bullets">
           <li>
-            <Mono>conversation.list</Mono> / message history — chat tabs and cross-client history
-            stay local to this window (DT1).
+            Search, archive and export of Sandpane-owned history (specs/05 §3.A): no Core method
+            exists for any of the three, so no UI is faked.
           </li>
           <li>
-            Search and archive of Sandpane-owned history, plus export on request (specs/05 §3.A) —
-            no Core method exists, so no UI is faked.
+            Transcript paging is bounded by Core: <Mono>conversation.history</Mono> answers up to{" "}
+            <Mono>500</Mono> rows and stops on its own byte ceiling, and when it does,{" "}
+            <Mono>truncated</Mono> is shown rather than a partial chat looking complete.
           </li>
           <li>
             Provider session recovery: only <Mono>system.probe</Mono> <Mono>agents[]</Mono>{" "}

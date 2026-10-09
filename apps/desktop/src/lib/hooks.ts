@@ -8,7 +8,7 @@
  * UI remembers, and it only ever asks Core for events after it.
  */
 
-import { useCallback, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   useMutation,
   useQuery,
@@ -39,18 +39,31 @@ import {
   decodeSandboxSummaries,
   decodeTaskSummary,
 } from "./decode";
-import { foldCoreLink, foldTaskIndex, type CoreLinkState, type TaskProjection } from "./reducers";
-import type {
-  ApplyResult,
-  ChangeSet,
-  Conversation,
-  CoreCapabilities,
-  GitApplyParams,
-  Project,
-  SandboxCreateSpec,
-  SandboxSummary,
-  TaskStatus,
-  TaskSummary,
+import {
+  foldCoreLink,
+  foldTaskIndex,
+  foldTranscript,
+  featureGate,
+  type CoreLinkState,
+  type TaskIndexEntry,
+  type FeatureGate,
+  type TaskProjection,
+  type TranscriptView,
+} from "./reducers";
+import {
+  coreAdvertisesMethod,
+  type ApplyResult,
+  type ChangeSet,
+  type Conversation,
+  type ConversationHistoryResult,
+  type CoreCapabilities,
+  type GitApplyParams,
+  type Method,
+  type Project,
+  type SandboxCreateSpec,
+  type SandboxSummary,
+  type TaskStatus,
+  type TaskSummary,
 } from "./protocol";
 
 export interface AppDeps {
@@ -68,6 +81,11 @@ export const queryKeys = {
   projects: ["core", "projects"] as const,
   sandboxes: ["core", "sandboxes"] as const,
   review: (taskId: string) => ["core", "git", "review", taskId] as const,
+  conversations: (projectId: string | null) =>
+    ["core", "conversations", projectId ?? "*"] as const,
+  coreTasks: (projectId: string | null) =>
+    ["core", "task-list", projectId ?? "*"] as const,
+  history: (conversationId: string) => ["core", "history", conversationId] as const,
 };
 
 // ---------------------------------------------------------------------------
@@ -190,15 +208,83 @@ export function useTaskProjection(taskId: string | null): TaskProjection | null 
 }
 
 /**
- * The task index Core implies through its durable events (there is no
- * `task.list` method in protocol v1).
+ * Does the attached Core advertise `method`?
+ *
+ * `null` while unprobed (NOT the same as unsupported). Nothing in this app may
+ * call a method it has not seen advertised, because a pre-revision Core does not
+ * dispatch the additive v1 reads (AGENTS rule 5: no claimed capability without a
+ * verified path).
  */
-export function useTaskIndex() {
+export function useAdvertisesMethod(method: Method): boolean | null {
+  const link = useCoreLink();
+  const capabilities = capabilitiesOf(link);
+  if (capabilities === null) return null;
+  return coreAdvertisesMethod(capabilities, method);
+}
+
+/**
+ * Core's stored task rows via `task.list` — the read that makes reconnect
+ * hydration possible. A task Core knows about but this window never folded an
+ * event for was invisible before this method existed; now the row can be shown
+ * with its status exactly as Core stores it (no transition is computed here).
+ *
+ * Disabled — never optimistically called — when the probe does not advertise it.
+ */
+export function useCoreTasks(projectId: string | null = null): {
+  tasks: TaskSummary[];
+  gate: FeatureGate;
+  isLoading: boolean;
+  error: CoreRequestError | null;
+} {
+  const deps = useDeps();
+  const gate = useCoreFeatureGate("task.list", "task.list");
+  const query = useQuery<TaskSummary[]>({
+    queryKey: queryKeys.coreTasks(projectId),
+    queryFn: () => deps.client.listTasks({ ...(projectId === null ? {} : { projectId }) }),
+    enabled: deps.transportAvailable && gate.state === "supported",
+    staleTime: 5_000,
+    refetchInterval: 20_000,
+    refetchOnReconnect: "always",
+  });
+  return {
+    tasks: query.data ?? [],
+    gate,
+    isLoading: query.isPending && gate.state === "supported" && deps.transportAvailable,
+    error: query.error ? asCoreRequestError(query.error) : null,
+  };
+}
+
+/**
+ * The task index: Core's rows where `task.list` is advertised, plus every task
+ * the durable event replay reported. Sources are labelled per row and a
+ * disagreement between Core's two reads is surfaced, never silently resolved.
+ *
+ * Views read `gate.state` for their own copy rather than a derived mode, because
+ * "unprobed" and "not advertised" are different statements.
+ */
+export function useTaskIndex(projectId: string | null = null): {
+  rows: TaskIndexEntry[];
+  gate: FeatureGate;
+  error: CoreRequestError | null;
+  refresh: () => Promise<unknown>;
+} {
   const projections = useTaskProjections();
-  return useMemo(() => {
+  const { tasks, gate, error } = useCoreTasks(projectId);
+  const deps = useDeps();
+  const rows = useMemo(() => {
     const map = new Map(projections.map((p) => [p.taskId, p]));
-    return foldTaskIndex(map);
-  }, [projections]);
+    // Only hand Core's rows to the fold when the method was actually advertised
+    // and answered; otherwise the index stays the event-derived one.
+    const coreRows = gate.state === "supported" ? tasks : [];
+    return foldTaskIndex(map, coreRows);
+  }, [projections, tasks, gate.state]);
+  return {
+    rows,
+    gate,
+    error,
+    refresh: () =>
+      deps.queryClient.invalidateQueries({ queryKey: queryKeys.coreTasks(projectId) }),
+  };
 }
 
 export function useStoreStatus() {
@@ -207,8 +293,115 @@ export function useStoreStatus() {
   return deps.store.getStatus();
 }
 
+/** Conversations created in this window (in-memory; survives no reload by design). */
 export function useSessionConversations(): readonly Conversation[] {
   return useSyncExternalStore(subscribeConversations, listConversations);
+}
+
+/**
+ * `conversation.list` — every non-archived conversation Core holds for a
+ * project, which is what lets the cockpit show chats this window never created.
+ */
+export function useCoreConversations(projectId: string | null): {
+  conversations: Conversation[];
+  gate: FeatureGate;
+  isLoading: boolean;
+  error: CoreRequestError | null;
+  refetch: () => void;
+} {
+  const deps = useDeps();
+  const gate = useCoreFeatureGate("conversation.list", "conversation.list");
+  const query = useQuery<Conversation[]>({
+    queryKey: queryKeys.conversations(projectId),
+    queryFn: () =>
+      deps.client.listConversations({ ...(projectId === null ? {} : { projectId }) }),
+    enabled: deps.transportAvailable && gate.state === "supported",
+    staleTime: 5_000,
+  });
+  return {
+    conversations: query.data ?? [],
+    gate,
+    isLoading: query.isPending && gate.state === "supported" && deps.transportAvailable,
+    error: query.error ? asCoreRequestError(query.error) : null,
+    refetch: () => void query.refetch(),
+  };
+}
+
+/**
+ * Paged `conversation.history` for one conversation.
+ *
+ * Pages accumulate one bounded read at a time (each asks Core for
+ * `nextSequence` onward) and every page keeps Core's own `truncated`
+ * disclosure, so the transcript can always say "this is what N bounded pages
+ * returned", never "this is the whole conversation".
+ */
+export function useConversationHistory(conversationId: string | null): {
+  transcript: TranscriptView;
+  gate: FeatureGate;
+  isLoading: boolean;
+  error: CoreRequestError | null;
+  loadMore: () => void;
+} {
+  const deps = useDeps();
+  const gate = useCoreFeatureGate("conversation.history", "conversation.history");
+  const enabled = deps.transportAvailable && conversationId !== null && gate.state === "supported";
+  const [pages, setPages] = useState<ConversationHistoryResult[]>([]);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<CoreRequestError | null>(null);
+  const client = deps.client;
+
+  const load = useCallback(
+    async (after: number) => {
+      if (conversationId === null) return;
+      setPending(true);
+      setError(null);
+      try {
+        const page = await client.getConversationHistory({
+          conversationId,
+          afterSequence: after,
+        });
+        setPages((current) => [...current, page]);
+      } catch (err) {
+        setError(asCoreRequestError(err));
+      } finally {
+        setPending(false);
+      }
+    },
+    [client, conversationId],
+  );
+
+  // First page when a conversation is opened; a clean slate when it changes, so
+  // one chat's transcript is never shown under another chat's header.
+  const loadedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!enabled || conversationId === null) return;
+    if (loadedFor.current === conversationId) return;
+    loadedFor.current = conversationId;
+    setPages([]);
+    void load(0);
+  }, [conversationId, enabled, load]);
+
+  const transcript = useMemo(() => foldTranscript(pages), [pages]);
+  return {
+    transcript,
+    gate,
+    isLoading: pending || (enabled && pages.length === 0 && error === null),
+    error,
+    loadMore: () => void load(transcript.cursor),
+  };
+}
+
+/**
+ * A capability gate for one ADDITIVE method, folded from the probe so no view
+ * has to remember that "not advertised" and "not probed" are different answers.
+ */
+export function useCoreFeatureGate(method: Method, label?: string): FeatureGate {
+  const advertised = useAdvertisesMethod(method);
+  return featureGate(
+    advertised,
+    `\`${label ?? method}\``,
+    `This Core does not advertise \`${label ?? method}\`, so the data behind this view does not exist here — it is not hidden, it is unavailable.`,
+  );
 }
 
 // ---------------------------------------------------------------------------

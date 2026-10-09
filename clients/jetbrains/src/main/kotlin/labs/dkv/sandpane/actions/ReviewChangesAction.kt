@@ -8,7 +8,9 @@ import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vcs.ProjectLevelVcsManager
 import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.model.ChangeSet
+import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.services.EditorDiffProvider
 import labs.dkv.sandpane.services.TaskMonitorService
 
@@ -23,7 +25,7 @@ import labs.dkv.sandpane.services.TaskMonitorService
  */
 class ReviewChangesAction : AnAction() {
 
-    override fun getUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
+    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 
     override fun update(event: AnActionEvent) {
         val project = event.project
@@ -63,10 +65,12 @@ class ReviewChangesAction : AnAction() {
         val chosen = candidates.first()
         tasks.review(chosen.taskId).whenComplete { changeSet, error ->
             if (error != null) {
+                // Title and body both come from the attribution seam: a refusal raised here before
+                // a byte was written must never be announced as git.review failing at Core.
                 notify(
                     project,
-                    "Sandpane: git.review failed",
-                    "${error.message ?: error.javaClass.simpleName}\nfor task ${chosen.taskId}",
+                    ErrorAttribution.headline(CoreMethods.GIT_REVIEW, error),
+                    ErrorAttribution.describe(CoreMethods.GIT_REVIEW, error) + "\nfor task ${chosen.taskId}",
                     NotificationType.ERROR,
                 )
                 return@whenComplete
@@ -86,7 +90,7 @@ class ReviewChangesAction : AnAction() {
         candidateCount: Int,
     ) {
         val diff = EditorDiffProvider.instance(project)
-        val repositoryRoot = ProjectLevelVcsManager.getInstance(project).allVcsRoots.firstOrNull()?.path
+        val repositoryRoot = ProjectLevelVcsManager.getInstance(project).allVcsRoots.firstOrNull()?.path?.path
             ?: project.basePath
         val target = diff.resolve(changeSet, repositoryRoot)
         val summary = diff.summarize(target, null)

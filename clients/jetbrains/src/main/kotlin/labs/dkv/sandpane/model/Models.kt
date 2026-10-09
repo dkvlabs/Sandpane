@@ -42,6 +42,51 @@ const val PROTOCOL_VERSION: Int = 1
 const val MAX_FRAME_BYTES: Int = 4 * 1024 * 1024
 
 /**
+ * Rows Core returns from a bounded read when the caller asks for no limit; mirrors
+ * `sandpane_service::DEFAULT_LIST_LIMIT`. The client does NOT substitute it onto the wire —
+ * `limit` stays absent so Core's own default is the one that applies.
+ */
+const val DEFAULT_LIST_LIMIT: Int = 200
+
+/**
+ * Hard ceiling on rows from any single bounded read method; mirrors
+ * `sandpane_service::MAX_LIST_LIMIT`. A larger request is clamped by Core, never honoured, so
+ * the client clamps identically before sending (a local clamp is a display preference; Core's
+ * clamp is the authority).
+ */
+const val MAX_LIST_LIMIT: Int = 500
+
+/**
+ * Content ceiling behind `conversation.history`'s `truncated` flag; mirrors
+ * `sandpane_service::MAX_HISTORY_BYTES`. Used only to EXPLAIN a truncation — Core measures the
+ * actual serialized bytes. Kept under [MAX_FRAME_BYTES] by Core's own compile-time assertion.
+ */
+const val MAX_HISTORY_BYTES: Int = 2 * 1024 * 1024
+
+/** Maximum entries in a `task.subscribe` `afterSequences` map (`sandpane_service::MAX_SUBSCRIBE_CURSORS`). */
+const val MAX_SUBSCRIBE_CURSORS: Int = 4096
+
+/**
+ * Maximum UTF-8 BYTE length of an `afterSequences` key; mirrors `sandpane_service::MAX_CURSOR_KEY_LEN`.
+ * Rust measures `str::len()` (bytes), not characters, so the guard below must count bytes too.
+ */
+const val MAX_CURSOR_KEY_LEN: Int = 100
+
+/**
+ * Maximum length of an id that merely SCOPES a read (`projectId`, `conversationId`); mirrors
+ * `sandpane_service::MAX_SCOPING_ID_LEN`. Core validates it through `Validator::display_text`,
+ * which counts CHARACTERS — a different unit from the cursor-key bound above.
+ */
+const val MAX_SCOPING_ID_LEN: Int = 200
+
+/**
+ * Response ceiling for one `task.subscribe` replay (`sandpane_service::MAX_SUBSCRIBE_BYTES`).
+ * Core refuses a replay that cannot fit one frame with a structured `VALIDATION_FAILED` instead
+ * of emitting a frame the client must reject; the refusal is recoverable, see [CoreErrorCodes].
+ */
+const val MAX_SUBSCRIBE_BYTES: Int = MAX_FRAME_BYTES - 64 * 1024
+
+/**
  * Single Json configuration for the whole client. `ignoreUnknownKeys` is what lets a newer
  * Core add fields without breaking this plugin; `encodeDefaults` is what makes serde
  * `#[serde(default)]` fields (e.g. `attachments: []`) actually appear in requests.
@@ -63,6 +108,11 @@ val CoreJson: Json = Json {
  * The complete allowlisted method surface (`sandpane_protocol::Method`). There is
  * deliberately no free-form execution method, and a client must never invent one: an
  * unknown name is rejected by Core with `VALIDATION_FAILED`.
+ *
+ * [ALL] is an ORDERED list mirroring `Method::ALL` in Rust — the single list `CoreCapabilities.methods`
+ * is derived from — because [labs.dkv.sandpane.core.ProtocolDriftGuardTest] compares order as well as
+ * membership. The three additive protocol-v1 methods (`conversation.list`, `conversation.history`,
+ * `task.list`) sit at their Rust positions; nothing existing was renamed or removed.
  */
 object CoreMethods {
     const val SYSTEM_PROBE: String = "system.probe"
@@ -72,18 +122,28 @@ object CoreMethods {
     const val SANDBOX_CREATE: String = "sandbox.create"
     const val CONVERSATION_CREATE: String = "conversation.create"
     const val CONVERSATION_SEND: String = "conversation.send"
+    const val CONVERSATION_LIST: String = "conversation.list"
+    const val CONVERSATION_HISTORY: String = "conversation.history"
     const val TASK_CANCEL: String = "task.cancel"
+    const val TASK_LIST: String = "task.list"
     const val TASK_SUBSCRIBE: String = "task.subscribe"
     const val GIT_REVIEW: String = "git.review"
     const val GIT_APPLY: String = "git.apply"
 
-    /** Sent only to Core after this check; nothing here reaches a shell. */
-    val ALL: Set<String> = setOf(
+    /** Wire order of `Method::ALL` — 14 methods as of the protocol-v1 discovery revision. */
+    val ALL: List<String> = listOf(
         SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST, SANDBOX_LIST, SANDBOX_CREATE,
-        CONVERSATION_CREATE, CONVERSATION_SEND, TASK_CANCEL, TASK_SUBSCRIBE,
-        GIT_REVIEW, GIT_APPLY,
+        CONVERSATION_CREATE, CONVERSATION_SEND, CONVERSATION_LIST, CONVERSATION_HISTORY,
+        TASK_CANCEL, TASK_LIST, TASK_SUBSCRIBE, GIT_REVIEW, GIT_APPLY,
     )
 
+    /**
+     * The methods this revision ADDED, which a pre-discovery Core does NOT dispatch. Feature
+     * detection is mandatory for exactly these — see [CoreCapabilities.advertises].
+     */
+    val ADDITIVE_IN_V1: Set<String> = setOf(CONVERSATION_LIST, CONVERSATION_HISTORY, TASK_LIST)
+
+    /** Sent only to Core after this check; nothing here reaches a shell. */
     fun isAllowlisted(method: String): Boolean = ALL.contains(method)
 }
 
@@ -173,8 +233,22 @@ data class CoreCapabilities(
     val sbx: SbxStatus? = null,
     val agents: List<AgentCapability> = emptyList(),
     val platform: String,
+    /**
+     * Wire names of every method THIS Core actually dispatches, derived in Rust from
+     * `Method::ALL` (never a hand-written list). Additive in protocol v1: a pre-discovery Core
+     * omits it (`#[serde(default)]` on the Rust side), so an absent or empty list means
+     * **"not advertised"**, never "everything".
+     */
+    val methods: List<String> = emptyList(),
 ) {
     val versionCompatible: Boolean get() = protocolVersion == PROTOCOL_VERSION
+
+    /**
+     * Feature discovery: does THIS Core advertise `method`? A version number is not evidence —
+     * `protocolVersion` stayed `1` across the discovery revision, so `task.list` and friends are
+     * gated on this list instead of being assumed.
+     */
+    fun advertises(method: String): Boolean = methods.contains(method)
 
     /**
      * Honest gate for JB2: chat/agent features may only be advertised when Core itself
@@ -213,6 +287,17 @@ data class Project(
     val name: String,
     val description: String = "",
     @SerialName("createdAt") val createdAt: String,
+    /**
+     * Host paths registered with this project (the `repositories` table's `canonical_path`,
+     * insertion-ordered). Additive in protocol v1: a pre-revision Core omits it, so the Kotlin
+     * default is the EMPTY list — "Core told me nothing", never "the project has no folders".
+     *
+     * Honest caveat carried from the Rust doc: `project.create` requires an ABSOLUTE path but
+     * Core canonicalizes (resolves symlinks) at `sandbox.create` mount time, NOT at registration.
+     * A client matching an IDE folder against these values must canonicalize BOTH sides — never
+     * plain string-compare. See [labs.dkv.sandpane.services.SbxService.associateFolder].
+     */
+    val repositories: List<String> = emptyList(),
 )
 
 @Serializable
@@ -235,7 +320,22 @@ data class SandboxSummary(
     /** Last probed state — never assumed, never inferred from a cached row. */
     @SerialName("probedState") val probedState: String? = null,
     @SerialName("boundProjectId") val boundProjectId: String? = null,
-)
+    /**
+     * The workspace mode recorded in Core's newest `sandbox_bindings` row for this name — a
+     * RECORD of what Core was asked to bind, NOT a live SBX verification ([probedState] is the
+     * probe). Additive in protocol v1.
+     *
+     * NULL means Core has no readable binding row for this name, and it never guesses one. A UI
+     * that shows `probedState` with a null mode must render the mode as UNVERIFIED — never as
+     * safe — because an unverified `direct_mount` mount writes straight through to host files
+     * (docs/specs/02 §7). Do not default this to a benign mode; [WorkspaceModeView] is the
+     * single place that turns absence into the explicit unverified label.
+     */
+    @SerialName("workspaceMode") val workspaceMode: WorkspaceMode? = null,
+) {
+    /** Presentation of the mode exactly as Core reported it (absent ⇒ unverified, never safe). */
+    fun modeView(): WorkspaceModeView = WorkspaceModeView.forSandbox(this)
+}
 
 /** Workspace mapping modes (specs/02 §7). */
 @Serializable
@@ -274,6 +374,84 @@ data class Conversation(
     @SerialName("agentId") val agentId: String,
     @SerialName("createdAt") val createdAt: String,
 )
+
+/**
+ * `conversation.list` params — read-only chat enumeration (ADDITIVE protocol v1).
+ *
+ * Every field is optional: absent `projectId` means "every conversation Core knows about", and
+ * absent `limit` means "Core's own [DEFAULT_LIST_LIMIT]". A wrapper must therefore keep the
+ * field null rather than inventing a value — see [labs.dkv.sandpane.core.CoreCommands].
+ */
+@Serializable
+data class ConversationListParams(
+    @SerialName("projectId") val projectId: String? = null,
+    /** Rows to return; Core clamps to `1..=[MAX_LIST_LIMIT]` and defaults to 200. */
+    val limit: Int? = null,
+)
+
+/**
+ * `conversation.history` params — bounded transcript read (ADDITIVE protocol v1).
+ *
+ * `conversationId` is REQUIRED on the wire (`conversation.history` on an unknown or archived
+ * conversation is Core's `NOT_FOUND`, never an empty-but-successful answer that reads as
+ * "no messages").
+ */
+@Serializable
+data class ConversationHistoryParams(
+    @SerialName("conversationId") val conversationId: String,
+    /** Return messages strictly after this per-conversation sequence; negative ⇒ Core reads 0. */
+    @SerialName("afterSequence") val afterSequence: Long = 0,
+    val limit: Int? = null,
+)
+
+/**
+ * One stored chat message (the `messages` table). Content is data, never a command: it is
+ * rendered as plain text and is never interpreted (docs/specs/02 §3).
+ */
+@Serializable
+data class MessageRecord(
+    val id: String,
+    @SerialName("conversationId") val conversationId: String,
+    val role: String,
+    val content: String,
+    val sequence: Long,
+)
+
+/**
+ * `conversation.history` result — an OBJECT, not a bare array, because BOTH bounds are
+ * disclosed. When the row limit OR the [MAX_HISTORY_BYTES] ceiling stopped the scan,
+ * [truncated] is true and [nextSequence] is the last sequence actually returned, so paging
+ * forward cannot lose rows.
+ */
+@Serializable
+data class ConversationHistoryResult(
+    /**
+     * REQUIRED, with no Kotlin default. Rust always serialises it, so a frame without `messages`
+     * is a broken answer, not an empty transcript: defaulting it here would let a malformed page
+     * render as "Core reports no messages" (AGENTS.md rule 5).
+     */
+    val messages: List<MessageRecord>,
+    val truncated: Boolean,
+    /** Highest sequence returned, or the request cursor when nothing was returned. */
+    @SerialName("nextSequence") val nextSequence: Long,
+) {
+    /**
+     * How to say "the page filled up" honestly. A byte-ceiling stop and a row-limit stop are
+     * indistinguishable from the frame alone, so the disclosure names both possibilities rather
+     * than guessing one (AGENTS.md rule 5).
+     */
+    fun truncationNote(): String? = when {
+        !truncated -> null
+        messages.isEmpty() ->
+            "Core returned no rows yet reports more remain — the transcript cannot be read from " +
+                "here; retry from the same cursor and narrow the request."
+
+        else ->
+            "${messages.size} message(s) returned and Core says more remain (stopped by the row " +
+                "limit or the ${MAX_HISTORY_BYTES / 1024 / 1024} MiB content ceiling — the frame " +
+                "does not say which). Continue from sequence $nextSequence."
+    }
+}
 
 @Serializable
 data class ConversationSendParams(
@@ -315,6 +493,20 @@ data class TaskSubscribeParams(
     @SerialName("taskId") val taskId: String? = null,
     /** Replay everything strictly after this per-task sequence number. */
     @SerialName("afterSequence") val afterSequence: Long = 0,
+    /**
+     * Per-task replay cursors for a project-wide (or global) replay: task id → last sequence the
+     * client has durably seen for THAT task. Additive in protocol v1; sequences are not
+     * comparable across tasks, which is why one shared scalar could skip a quieter task's events
+     * (the recorded v1 gap in docs/compatibility.md).
+     *
+     * NULL means "no map at all" — Core then applies the shared [afterSequence] scalar to every
+     * task, exactly the legacy behaviour. Absence must stay absence: an empty map is NOT the same
+     * request as no map (Core would replay every named-in-scope task from 0), so
+     * [labs.dkv.sandpane.core.CoreCommands.taskSubscribe] refuses to put an empty map on the wire.
+     *
+     * IGNORED by Core whenever [taskId] is set (the scalar is that task's cursor).
+     */
+    @SerialName("afterSequences") val afterSequences: Map<String, Long>? = null,
 )
 
 /** Durable, replayable task log entry (`task_events`). */
@@ -349,6 +541,28 @@ enum class TaskStatus {
             this == CANCELLED || this == INTERRUPTED
 }
 
+/**
+ * `task.list` params — read-only discovery of Core task state (ADDITIVE protocol v1).
+ *
+ * This is the method that removes the old client-side workaround: a project's tasks can be
+ * enumerated without replaying the whole event log, and a *checkpointed* poll can now see a
+ * brand-new task (whose sequence restarts at 1).
+ */
+@Serializable
+data class TaskListParams(
+    /** Scope to one project (tasks reached through its conversations). Absent = every task. */
+    @SerialName("projectId") val projectId: String? = null,
+    /**
+     * Only tasks currently in one of these statuses. These are Core's OWN stored values;
+     * an unknown status string is refused, never normalized (AGENTS.md rule 3 — the client does
+     * not get to invent a state).
+     */
+    val statuses: List<TaskStatus> = emptyList(),
+    /** Rows to return; Core clamps to `1..=[MAX_LIST_LIMIT]` and defaults to 200. */
+    val limit: Int? = null,
+)
+
+/** Core's one task row, exactly as stored. Read and displayed here; never advanced here. */
 @Serializable
 data class TaskSummary(
     val id: String,

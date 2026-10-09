@@ -28,6 +28,33 @@ const MAX_ID_CHARS: usize = 128;
 /// How long to wait for Core's answer before giving the webview a typed error.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Methods with no server-side effect, so re-sending one after a failed READ is
+/// safe. Everything else must never be re-issued blindly: `write_and_read`
+/// finishes `write_all` before the read can fail or time out, so Core may already
+/// have executed the request — retrying `conversation.send` would append a second
+/// message row and queue a second task, and retrying `git.apply` would re-run an
+/// apply the user only confirmed once (docs/specs/06 §10: "Multiple clients cannot
+/// accidentally issue duplicate create/start tasks after reconnect"). Core has no
+/// idempotency keys yet (a P1 item in docs/specs/02 §2), so the proxy is the only
+/// place this can be prevented for the desktop shell.
+///
+/// `task.cancel` is deliberately excluded even though it is idempotent in effect:
+/// Core answers the second cancel with `CONFLICT`, which would surface to the user
+/// as a spurious failure of an operation that already succeeded.
+fn replay_safe(method: Method) -> bool {
+    matches!(
+        method,
+        Method::SystemProbe
+            | Method::ProjectList
+            | Method::SandboxList
+            | Method::TaskList
+            | Method::ConversationList
+            | Method::ConversationHistory
+            | Method::TaskSubscribe
+            | Method::GitReview
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyError {
     /// Stable machine-readable code; the UI maps it to copy.
@@ -187,8 +214,8 @@ pub fn core_request_frame(
     state: State<'_, CoreProxy>,
     line: String,
 ) -> Result<String, ProxyError> {
-    use std::io::{BufRead, Write};
-
+    // No `std::io` imports here: every socket read/write goes through
+    // `write_and_read`, which owns the traits it needs.
     let request = validate_frame(&line)?;
     let path = socket_path();
 
@@ -217,6 +244,18 @@ pub fn core_request_frame(
             }
             Err(err) => {
                 *guard = None;
+                // A mutating frame must not be re-sent: `write_all` already
+                // succeeded, so Core may have applied it. Report the loss with
+                // the instruction the user can actually act on.
+                if !replay_safe(request.method) {
+                    return Err(ProxyError::new(
+                        err.code,
+                        format!(
+                            "{} — the frame was already written to Core, so it may have been applied; inspect Core's state instead of retrying",
+                            err.message
+                        ),
+                    ));
+                }
                 if attempt == 1 {
                     return Err(err);
                 }
@@ -235,10 +274,12 @@ fn write_and_read(
     line: &str,
     out: &mut String,
 ) -> Result<(), ProxyError> {
-    use std::io::{BufRead, Write};
+    // `Read` must be in scope for `.take()` (the bounded-read guard); `Take<R>`
+    // then implements `BufRead`, which is what supplies `read_line`.
+    use std::io::{BufRead, Read, Write};
 
     let payload = line.trim_end_matches('\n');
-    if payload.as_bytes().len() > MAX_FRAME_BYTES {
+    if payload.len() > MAX_FRAME_BYTES {
         return Err(ProxyError::new("FRAME_TOO_LARGE", "frame exceeds the cap"));
     }
     conn.writer
@@ -250,7 +291,8 @@ fn write_and_read(
         .map_err(|err| ProxyError::new("WRITE_FAILED", format!("socket flush: {err}")))?;
 
     // Bounded read: at most cap + 1 byte, so an oversized answer cannot grow us.
-    let limited = (&mut conn.reader).take(MAX_FRAME_BYTES as u64 + 1);
+    // `mut` is required: `read_line` advances the limiter's internal allowance.
+    let mut limited = (&mut conn.reader).take(MAX_FRAME_BYTES as u64 + 1);
     let read = limited
         .read_line(out)
         .map_err(|err| ProxyError::new("READ_FAILED", format!("socket read: {err}")))?;
@@ -260,7 +302,7 @@ fn write_and_read(
             "Core closed the connection before answering",
         ));
     }
-    if out.as_bytes().len() > MAX_FRAME_BYTES {
+    if out.len() > MAX_FRAME_BYTES {
         return Err(ProxyError::new(
             "FRAME_TOO_LARGE",
             "Core answered with a frame over the cap",
@@ -332,6 +374,91 @@ mod tests {
     fn allowlisted_method_passes() {
         assert!(validate_frame(&frame("system.probe")).is_ok());
         assert!(validate_frame(&frame("task.subscribe")).is_ok());
+    }
+
+    /// The proxy holds no method list of its own: `validate_frame` asks
+    /// `sandpane_protocol::Method::parse`, so the ADDITIVE-v1 reads are forwarded
+    /// the moment Core's crate gains them — and this shell can never advertise a
+    /// method Core does not dispatch.
+    #[test]
+    fn additive_v1_reads_are_forwarded() {
+        for method in ["task.list", "conversation.list", "conversation.history"] {
+            assert!(
+                validate_frame(&frame(method)).is_ok(),
+                "{method} must be allowlisted because Core's crate parses it"
+            );
+        }
+        // The crate is the whole allowlist; assert the count so a silent removal
+        // in Rust shows up here rather than as a mystery METHOD_NOT_ALLOWED.
+        assert_eq!(Method::ALL.len(), 14);
+    }
+
+    /// The proxy's one reconnect attempt must only ever re-issue a method with no
+    /// server-side effect. `write_all` completes before a read can fail, so a blind
+    /// retry of `conversation.send` would append a second message and queue a
+    /// second task; `git.apply` would re-run a one-time confirmation.
+    #[test]
+    fn only_read_only_methods_may_be_re_sent_after_a_lost_answer() {
+        let safe: Vec<&str> = Method::ALL
+            .iter()
+            .filter(|m| replay_safe(**m))
+            .map(|m| m.as_str())
+            .collect();
+        assert_eq!(
+            safe,
+            vec![
+                "system.probe",
+                "project.list",
+                "sandbox.list",
+                "conversation.list",
+                "conversation.history",
+                "task.list",
+                "task.subscribe",
+                "git.review",
+            ],
+            "the replay-safe set is exactly the read-only methods"
+        );
+        // Spelled out so a future "retry everything for robustness" change fails here.
+        for m in [
+            Method::ProjectCreate,
+            Method::SandboxCreate,
+            Method::ConversationCreate,
+            Method::ConversationSend,
+            Method::GitApply,
+            Method::TaskCancel,
+        ] {
+            assert!(
+                !replay_safe(m),
+                "{:?} ({}) must never be re-sent after the answer is lost",
+                m,
+                m.as_str()
+            );
+        }
+    }
+
+    /// A `task.subscribe` frame carrying the per-task cursor map must survive the
+    /// proxy — `params` is opaque JSON here and stays that way.
+    ///
+    /// Note on framing: the proxy writes the ORIGINAL line bytes to the socket
+    /// (`write_and_read(conn, &line, …)`); the parsed `RpcRequest` is used only
+    /// for validation. Re-serializing it would NOT be byte-identical, because the
+    /// default `serde_json` map is sorted — which is exactly why the forward path
+    /// must not resend a re-encoded frame.
+    #[test]
+    fn subscribe_cursor_map_passes_through_untouched() {
+        let line = format!(
+            r#"{{"v":{PROTOCOL_VERSION},"id":"desk-2","method":"task.subscribe","params":{{"projectId":"p1","afterSequence":0,"afterSequences":{{"t-a":4,"t-b":11}}}}}}"#
+        );
+        let request = validate_frame(&line).expect("cursor map must validate");
+        assert_eq!(request.params["afterSequences"]["t-a"], 4);
+        assert_eq!(request.params["afterSequences"]["t-b"], 11);
+        assert_eq!(request.params["projectId"], "p1");
+        // The documented asymmetry: with a `taskId`, Core ignores the map. The
+        // proxy does not interpret that — it forwards whatever the client sent.
+        let scalar_only = r#"{"v":1,"id":"desk-3","method":"task.subscribe","params":{"taskId":"t-a","afterSequence":7}}"#;
+        let parsed = validate_frame(scalar_only).expect("scalar cursor must validate");
+        assert_eq!(parsed.params["afterSequence"], 7);
+        assert!(parsed.params.get("afterSequences").is_none());
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! They are never to be confused with official Docker SBX, Codex, or Claude wire formats.
 //! Wire format: newline-delimited JSON over a Unix domain socket / Windows named pipe.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any breaking frame/semantics change; negotiated in `system.probe`.
@@ -111,7 +113,10 @@ impl ErrorCode {
 }
 
 /// Known RPC methods (docs/specs/02 §2 contract). Unknown methods are rejected
-/// with `VALIDATION_FAILED` — there is deliberately no free-form execution method.
+/// with `VALIDATION_FAILED` — there is deliberately no free-form execution
+/// method. Every addition here is additive for protocol v1 (no existing wire
+/// value is renamed or removed) and must land in `parse`, `as_str`, [`Method::ALL`]
+/// and `schemas/rpc-request.schema.json` together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Method {
     #[serde(rename = "system.probe")]
@@ -128,8 +133,14 @@ pub enum Method {
     ConversationCreate,
     #[serde(rename = "conversation.send")]
     ConversationSend,
+    #[serde(rename = "conversation.list")]
+    ConversationList,
+    #[serde(rename = "conversation.history")]
+    ConversationHistory,
     #[serde(rename = "task.cancel")]
     TaskCancel,
+    #[serde(rename = "task.list")]
+    TaskList,
     #[serde(rename = "task.subscribe")]
     TaskSubscribe,
     #[serde(rename = "git.review")]
@@ -139,6 +150,34 @@ pub enum Method {
 }
 
 impl Method {
+    /// The complete supported surface, in wire order. This is the single list
+    /// that backs feature discovery (`CoreCapabilities.methods`): it is derived
+    /// from the enum rather than hand-written, and `dispatch` must match
+    /// exhaustively over the same enum, so an advertised method always really
+    /// exists and a handled method is always advertised.
+    pub const ALL: [Method; 14] = [
+        Self::SystemProbe,
+        Self::ProjectCreate,
+        Self::ProjectList,
+        Self::SandboxList,
+        Self::SandboxCreate,
+        Self::ConversationCreate,
+        Self::ConversationSend,
+        Self::ConversationList,
+        Self::ConversationHistory,
+        Self::TaskCancel,
+        Self::TaskList,
+        Self::TaskSubscribe,
+        Self::GitReview,
+        Self::GitApply,
+    ];
+
+    /// Wire names of every method in [`Method::ALL`] — derived, never a list a
+    /// caller could keep stale.
+    pub fn wire_names() -> Vec<&'static str> {
+        Self::ALL.iter().copied().map(Self::as_str).collect()
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "system.probe" => Self::SystemProbe,
@@ -148,7 +187,10 @@ impl Method {
             "sandbox.create" => Self::SandboxCreate,
             "conversation.create" => Self::ConversationCreate,
             "conversation.send" => Self::ConversationSend,
+            "conversation.list" => Self::ConversationList,
+            "conversation.history" => Self::ConversationHistory,
             "task.cancel" => Self::TaskCancel,
+            "task.list" => Self::TaskList,
             "task.subscribe" => Self::TaskSubscribe,
             "git.review" => Self::GitReview,
             "git.apply" => Self::GitApply,
@@ -165,7 +207,10 @@ impl Method {
             Self::SandboxCreate => "sandbox.create",
             Self::ConversationCreate => "conversation.create",
             Self::ConversationSend => "conversation.send",
+            Self::ConversationList => "conversation.list",
+            Self::ConversationHistory => "conversation.history",
             Self::TaskCancel => "task.cancel",
+            Self::TaskList => "task.list",
             Self::TaskSubscribe => "task.subscribe",
             Self::GitReview => "git.review",
             Self::GitApply => "git.apply",
@@ -189,6 +234,13 @@ pub struct CoreCapabilities {
     /// Agent adapters compiled into this core and their verification state.
     pub agents: Vec<AgentCapability>,
     pub platform: String,
+    /// Wire names of every method THIS core actually dispatches, derived from
+    /// [`Method::ALL`] (never a hand-written list that can drift). Clients use
+    /// this for feature discovery — e.g. whether `task.list` exists — instead
+    /// of assuming it from a version number (`#[serde(default)]` so a response
+    /// from a pre-discovery core still deserializes).
+    #[serde(default)]
+    pub methods: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +272,17 @@ pub struct Project {
     #[serde(default)]
     pub description: String,
     pub created_at: String,
+    /// Repository host paths registered with this project (the `repositories`
+    /// table's `canonical_path` column), ordered by insertion. An IDE uses these
+    /// to resolve a folder to a Core project. NOTE, honestly: the stored value
+    /// is what the caller registered — `project.create` requires an ABSOLUTE
+    /// path but Core canonicalizes (resolves symlinks) at mount time in
+    /// `sandbox.create`, not at registration. A client comparing a folder path
+    /// must therefore canonicalize both sides before matching, not string-compare.
+    /// `#[serde(default)]` keeps responses from an older Core deserializable
+    /// (additive v1 field).
+    #[serde(default)]
+    pub repositories: Vec<String>,
 }
 
 /// `project.create` params.
@@ -251,6 +314,16 @@ pub struct SandboxSummary {
     /// SBX is the source of truth; this is the last probed state, never assumed.
     pub probed_state: Option<String>,
     pub bound_project_id: Option<String>,
+    /// Workspace mapping mode as recorded in Core's newest `sandbox_bindings`
+    /// row for this name — `direct_mount` means the mount is LIVE-WRITABLE and
+    /// UIs must label it as such (specs/04 §3, specs/02 §7). It is the recorded
+    /// binding, NOT a live SBX verification: SBX owns sandbox state and is
+    /// probed for `probedState`, while the mode is what Core was asked to bind.
+    /// A client rendering `probedState` present with no mode must show the mode
+    /// as UNVERIFIED, never as safe. Absent means Core has no readable binding
+    /// row for this name; the mode is never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mode: Option<WorkspaceMode>,
 }
 
 /// Workspace mapping modes (docs/specs/02 §7).
@@ -314,6 +387,26 @@ pub enum ContextRefKind {
 }
 
 /// `task.subscribe` params.
+///
+/// CURSOR AMBIGUITY (resolved by this revision, specs/02 §2): event sequences
+/// are per task and start at 1, so one scalar cursor cannot describe several
+/// tasks. The two cursors apply to different request shapes:
+///
+/// * `taskId` present → replay that ONE task from the scalar `afterSequence`
+///   (unchanged legacy behaviour; `afterSequences` is IGNORED on this path, so
+///   a client that sends both keeps its old semantics).
+/// * `taskId` absent (project-wide or global replay) → when `afterSequences` is
+///   present, EACH task is replayed from its own cursor (`afterSequences[taskId]`,
+///   defaulting to 0 — i.e. the full history — for tasks missing from the map);
+///   when it is absent, every task falls back to the shared scalar
+///   `afterSequence`, exactly as before.
+///
+/// Clients that keep per-task checkpoints should therefore send the map with
+/// `projectId` and no `taskId`. CONSEQUENCE TO PLAN FOR: a map that names only
+/// some tasks means the UNNAMED ones replay in full (cursor 0), so a client
+/// catching up a large project should name every task it has already seen.
+/// Core refuses a replay that cannot fit one IPC frame rather than sending a
+/// frame a client must reject, and says so with `VALIDATION_FAILED`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSubscribeParams {
@@ -321,9 +414,92 @@ pub struct TaskSubscribeParams {
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
-    /// Replay everything strictly after this per-task sequence number.
+    /// Replay everything strictly after this sequence. Scalar semantics per the
+    /// table above: the cursor of a single `taskId` request, else the fallback
+    /// shared cursor of a project-wide replay when `after_sequences` is absent.
     #[serde(default)]
     pub after_sequence: i64,
+    /// Per-task replay cursors for a project-wide (or global) replay: task id →
+    /// last sequence the client has durably seen for THAT task. Sequences are
+    /// not comparable across tasks, so a shared scalar can skip events of a
+    /// low-sequence task (recorded v1 gap, docs/compatibility.md). Negative
+    /// values are normalised to 0 by Core; the map is ignored when `task_id`
+    /// is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequences: Option<HashMap<String, i64>>,
+}
+
+/// `task.list` params — read-only discovery of Core task state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskListParams {
+    /// Scope to one project (tasks reached through that project's
+    /// conversations). Absent = every task Core knows about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Only tasks currently in one of these statuses. Statuses are Core's own
+    /// stored values; an unknown status string is rejected, never normalized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statuses: Vec<TaskStatus>,
+    /// Rows to return. Core clamps to `1..=500` and defaults to 200 — the
+    /// response is always bounded (specs/02 §2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `conversation.list` params — read-only chat enumeration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationListParams {
+    /// Scope to one project. Absent = every conversation Core knows about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Rows to return; clamped to `1..=500`, default 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `conversation.history` params — bounded transcript read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationHistoryParams {
+    pub conversation_id: String,
+    /// Return messages strictly after this per-conversation sequence. Negative
+    /// values are normalised to 0 by Core.
+    #[serde(default)]
+    pub after_sequence: i64,
+    /// Rows to return; clamped to `1..=500`, default 200. Core additionally
+    /// stops on a total-bytes ceiling, so a single message larger than the
+    /// ceiling never overflows the 4 MiB frame cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One stored chat message (`messages` table). Content is data, never a
+/// command; Core returns it verbatim (specs/02 §3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub role: String,
+    pub content: String,
+    pub sequence: i64,
+}
+
+/// `conversation.history` response. Both bounds are disclosed: when the row
+/// limit or the byte ceiling stopped the scan, `truncated` is true and
+/// `next_sequence` is the last sequence actually returned, so the caller can
+/// page forward without losing rows (specs/02 §2 "bounded responses … with
+/// truncation disclosure").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationHistoryResult {
+    pub messages: Vec<MessageRecord>,
+    pub truncated: bool,
+    /// Highest sequence returned, or the request cursor when nothing was
+    /// returned — ready-made input for the next call's `afterSequence`.
+    pub next_sequence: i64,
 }
 
 /// Durable, replayable task event (specs/02 §3 `task_events`).
@@ -499,6 +675,182 @@ mod tests {
         // No free-form execution method exists.
         assert_eq!(Method::parse("shell.exec"), None);
         assert_eq!(Method::parse("system.probe; ls"), None);
+    }
+
+    /// THE wire-name pin for the drift gate (`scripts/schema_drift.py` reads
+    /// these exact strings out of `as_str`): all 14 methods must round-trip
+    /// through `parse`, `as_str` and serde, and `Method::ALL` must cover every
+    /// one of them exactly once — `CoreCapabilities.methods` is derived from it.
+    #[test]
+    fn all_fourteen_methods_round_trip() {
+        const EXPECTED: [&str; 14] = [
+            "system.probe",
+            "project.create",
+            "project.list",
+            "sandbox.list",
+            "sandbox.create",
+            "conversation.create",
+            "conversation.send",
+            "conversation.list",
+            "conversation.history",
+            "task.cancel",
+            "task.list",
+            "task.subscribe",
+            "git.review",
+            "git.apply",
+        ];
+        assert_eq!(Method::ALL.len(), EXPECTED.len());
+        assert_eq!(Method::wire_names(), EXPECTED.to_vec());
+        for name in EXPECTED {
+            let m = Method::parse(name).unwrap_or_else(|| panic!("{name} does not parse"));
+            assert_eq!(m.as_str(), name, "{name}: as_str disagrees with parse");
+            // serde name of the enum == the dotted wire name.
+            let json = serde_json::to_string(&m).unwrap();
+            assert_eq!(json, format!("\"{name}\""), "{name}: serde rename drift");
+            let back: Method = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, m);
+            assert_eq!(Method::parse(m.as_str()), Some(m));
+        }
+        // ALL must list every variant exactly once (no duplicate cursor target,
+        // no method dispatched but unadvertised).
+        let mut seen: Vec<&str> = Method::ALL.iter().map(|m| m.as_str()).collect();
+        let total = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "duplicate wire name in Method::ALL");
+        // Derived list must equal the pinned set (order included).
+        let mut derived = Method::wire_names();
+        derived.sort_unstable();
+        let mut expected = EXPECTED.to_vec();
+        expected.sort_unstable();
+        assert_eq!(derived, expected);
+    }
+
+    #[test]
+    fn additive_fields_deserialize_from_pre_revision_wire() {
+        // A response frame from an OLDER Core must still parse: every field
+        // added by this revision has a serde default, and none was renamed.
+        let old_project = r#"{"id":"p1","name":"Atlas Demo","description":"","createdAt":"t"}"#;
+        let p: Project = serde_json::from_str(old_project).unwrap();
+        assert!(p.repositories.is_empty());
+
+        let old_sandbox = r#"{"name":"atlas-auth","probedState":"running","boundProjectId":null}"#;
+        let s: SandboxSummary = serde_json::from_str(old_sandbox).unwrap();
+        assert_eq!(s.workspace_mode, None);
+        // Absent, not guessed: `None` is not serialized at all.
+        assert!(!serde_json::to_string(&s).unwrap().contains("workspaceMode"));
+
+        let old_caps = r#"{"protocolVersion":1,"coreVersion":"0.1.0","instanceId":"i","sbx":null,"agents":[],"platform":"macos"}"#;
+        let c: CoreCapabilities = serde_json::from_str(old_caps).unwrap();
+        assert!(c.methods.is_empty());
+
+        let old_sub = r#"{"projectId":"p1","afterSequence":3}"#;
+        let t: TaskSubscribeParams = serde_json::from_str(old_sub).unwrap();
+        assert_eq!(t.after_sequences, None);
+        assert_eq!(t.after_sequence, 3);
+    }
+
+    #[test]
+    fn task_subscribe_per_task_cursors_wire_shape() {
+        let mut map = HashMap::new();
+        map.insert("task-a".to_string(), 5i64);
+        map.insert("task-b".to_string(), 2i64);
+        let p = TaskSubscribeParams {
+            project_id: Some("p1".into()),
+            task_id: None,
+            after_sequence: 0,
+            after_sequences: Some(map),
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["afterSequences"]["task-a"], 5);
+        assert_eq!(json["afterSequences"]["task-b"], 2);
+        let back: TaskSubscribeParams = serde_json::from_value(json).unwrap();
+        assert_eq!(back.after_sequences.unwrap().get("task-a"), Some(&5));
+        // Absent map is omitted entirely (additive, not a required field).
+        let legacy = TaskSubscribeParams {
+            project_id: Some("p1".into()),
+            task_id: None,
+            after_sequence: 4,
+            after_sequences: None,
+        };
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("afterSequences"));
+    }
+
+    #[test]
+    fn list_and_history_params_accept_empty_object() {
+        // `{}` must deserialize for every new read method (all fields optional
+        // except conversation.history's required conversationId).
+        let t: TaskListParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(t.project_id, None);
+        assert!(t.statuses.is_empty());
+        assert_eq!(t.limit, None);
+        let c: ConversationListParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(c.limit, None);
+        let h: ConversationHistoryParams =
+            serde_json::from_value(serde_json::json!({"conversationId": "c1"})).unwrap();
+        assert_eq!(h.after_sequence, 0);
+        assert_eq!(h.limit, None);
+        let missing = serde_json::from_value::<ConversationHistoryParams>(serde_json::json!({}));
+        assert!(missing.is_err(), "conversationId is required");
+        // Statuses are Core's own stored values — an unknown one is rejected,
+        // never normalized into something else.
+        let bad = serde_json::from_value::<TaskListParams>(
+            serde_json::json!({"statuses": ["half_finished"]}),
+        );
+        assert!(bad.is_err());
+        // Negative limit is not representable (u32) — rejected at parse time.
+        let neg = serde_json::from_value::<TaskListParams>(serde_json::json!({"limit": -5}));
+        assert!(neg.is_err());
+    }
+
+    #[test]
+    fn history_result_wire_shape_is_camel_case_object() {
+        let r = ConversationHistoryResult {
+            messages: vec![MessageRecord {
+                id: "m1".into(),
+                conversation_id: "c1".into(),
+                role: "user".into(),
+                content: "hi".into(),
+                sequence: 1,
+            }],
+            truncated: true,
+            next_sequence: 1,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["messages"][0]["conversationId"], "c1");
+        assert_eq!(v["messages"][0]["sequence"], 1);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["nextSequence"], 1);
+        let back: ConversationHistoryResult = serde_json::from_value(v).unwrap();
+        assert_eq!(back.messages[0].content, "hi");
+    }
+
+    #[test]
+    fn project_and_sandbox_additive_fields_wire_shape() {
+        let p = Project {
+            id: "p1".into(),
+            name: "Atlas Demo".into(),
+            description: String::new(),
+            created_at: "t".into(),
+            repositories: vec!["/repos/atlas".into()],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["repositories"][0], "/repos/atlas");
+        assert_eq!(v["id"], "p1"); // existing fields keep their names
+        assert_eq!(v["createdAt"], "t");
+
+        let s = SandboxSummary {
+            name: "atlas-auth".into(),
+            probed_state: Some("running".into()),
+            bound_project_id: Some("p1".into()),
+            workspace_mode: Some(WorkspaceMode::DirectMount),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        // Reuses the established snake_case enum names (specs/02 §7).
+        assert_eq!(v["workspaceMode"], "direct_mount");
+        assert_eq!(v["probedState"], "running");
     }
 
     #[test]

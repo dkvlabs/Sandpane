@@ -6,8 +6,8 @@ import {
   useProjects,
   useSandboxes,
 } from "../../lib/hooks";
-import { foldAgentView, workspaceModeView } from "../../lib/reducers";
-import { WORKSPACE_MODES, type WorkspaceMode } from "../../lib/protocol";
+import { associateFolder, foldAgentView, workspaceModeView } from "../../lib/reducers";
+import { WORKSPACE_MODES, type Project, type WorkspaceMode } from "../../lib/protocol";
 import {
   QUICK_STEPS,
   STEP_TITLES,
@@ -230,6 +230,10 @@ export function SandboxWizard() {
               />
             )}
           </Field>
+          {draft.repoPath.trim().length > 0 && (
+            <FolderAssociation repoPath={draft.repoPath} projects={projects} />
+          )}
+
           <Warning tone="neutral" title="Advanced options are not available">
             Mounts beyond this path, resource limits, templates, network restrictions and
             environment settings require SBX feature detection that this Core build does not
@@ -345,5 +349,50 @@ function trySpec(draft: SandboxDraft) {
     return buildSpec(draft);
   } catch {
     return null;
+  }
+}
+/**
+ * Folder association from `project.list` → `Project.repositories` (ADDITIVE v1).
+ *
+ * The wizard used to have no way to say whether the path being typed is a path
+ * Core has ever heard of. Now it can compare against the registered paths — but
+ * only a LEXICAL compare is honest here: Core canonicalizes (resolves symlinks)
+ * at mount time, not at registration, and a webview cannot resolve symlinks, so a
+ * match is reported as a path match and an absence as "no registered path equals
+ * this", never as proof the two are or are not the same directory.
+ */
+function FolderAssociation({
+  repoPath,
+  projects,
+}: {
+  repoPath: string;
+  projects: readonly Project[];
+}) {
+  const association = associateFolder(repoPath, projects);
+  switch (association.kind) {
+    case "unregistered":
+      return (
+        <Warning tone="neutral" title="No registered repository paths to compare against">
+          No Core project has a <Mono>repositories</Mono> entry yet (this field is additive: a
+          pre-revision Core omits it entirely). The path is still sent to{" "}
+          <Mono>sandbox.create</Mono>, which validates and canonicalizes it.
+        </Warning>
+      );
+    case "no-match":
+      return (
+        <Warning tone="attention" title="This path is not registered with any project">
+          Nothing says this folder is wrong — only that no <Mono>project.create</Mono> registered
+          this exact string, and lexical equality is the strongest claim this build can make.
+          Registered: {association.registered.map((path) => <Mono key={path}>{path}</Mono>)}
+        </Warning>
+      );
+    case "path-match":
+      return (
+        <Warning tone="info" title={`Path matches the project ${association.project.name}`}>
+          <Mono>{association.registeredPath}</Mono> is the path that project registered. A
+          symlink pointing elsewhere still compares equal only after canonicalization, which
+          happens in Core at mount, not here.
+        </Warning>
+      );
   }
 }

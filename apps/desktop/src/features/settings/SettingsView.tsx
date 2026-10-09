@@ -5,7 +5,7 @@ import {
   useStoreStatus,
 } from "../../lib/hooks";
 import { foldSbxView, taskStatusView, workspaceModeView } from "../../lib/reducers";
-import { PROTOCOL_VERSION, WORKSPACE_MODES } from "../../lib/protocol";
+import { PROTOCOL_VERSION, WORKSPACE_MODES, coreAdvertisesMethod } from "../../lib/protocol";
 import { AppShell, ViewHeader } from "../../components/layout/AppShell";
 import {
   ConnectionBanner,
@@ -120,6 +120,47 @@ export function SettingsView({ route }: { route: Route }) {
                   {storeStatus.kind}
                 </Badge>
               )}
+            </dd>
+          </div>
+          <div className="kv">
+            <dt>Advertised methods</dt>
+            <dd>
+              {capabilities === null ? (
+                <Badge tone="neutral">not probed</Badge>
+              ) : capabilities.methods === undefined ? (
+                <Badge tone="attention">
+                  this Core does not advertise its methods — nothing beyond the original surface is
+                  assumed
+                </Badge>
+              ) : (
+                <>
+                  <Badge tone="success">{capabilities.methods.length} advertised</Badge>{" "}
+                  <Mono>{capabilities.methods.join(", ")}</Mono>
+                </>
+              )}
+            </dd>
+          </div>
+          <div className="kv">
+            <dt>Additive reads this view can use</dt>
+            <dd>
+              <div className="badges">
+                {(["task.list", "conversation.list", "conversation.history"] as const).map(
+                  (method) => {
+                    const on =
+                      capabilities !== null &&
+                      coreAdvertisesMethod(capabilities, method);
+                    return (
+                      <Badge key={method} tone={on ? "success" : "neutral"}>
+                        {method}: {on ? "advertised" : "absent"}
+                      </Badge>
+                    );
+                  },
+                )}
+              </div>
+              <span className="muted">
+                Support is read from <Mono>system.probe</Mono>, never inferred from a version
+                number. A method this Core does not advertise is not called anywhere in the app.
+              </span>
             </dd>
           </div>
         </dl>

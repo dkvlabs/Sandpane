@@ -26,6 +26,43 @@ export const PROTOCOL_VERSION = 1 as const;
  */
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 
+/**
+ * `sandpane_service::DEFAULT_LIST_LIMIT` — rows Core returns when a bounded read
+ * asks for no limit. The client never substitutes it into a payload: leaving
+ * `limit` absent means Core's own default is the one that applies.
+ */
+export const DEFAULT_LIST_LIMIT = 200;
+
+/**
+ * `sandpane_service::MAX_LIST_LIMIT` — hard ceiling on rows from any single
+ * bounded read. Core clamps an oversized request rather than honouring it, so
+ * the client clamps identically *before writing the frame* (AGENTS rule 2:
+ * validate before the argument) and the two verdicts cannot disagree.
+ */
+export const MAX_LIST_LIMIT = 500;
+
+/**
+ * `sandpane_service::MAX_HISTORY_BYTES` — the content ceiling behind
+ * `conversation.history`'s `truncated` flag. Used only to explain a truncation
+ * to the user; Core measures the actual serialized bytes.
+ */
+export const MAX_HISTORY_BYTES = 2 * 1024 * 1024;
+
+/** `sandpane_service::MAX_SUBSCRIBE_CURSORS` — entries in an `afterSequences` map. */
+export const MAX_SUBSCRIBE_CURSORS = 4096;
+
+/** `sandpane_service::MAX_CURSOR_KEY_LEN` — BYTE length of an `afterSequences` key. */
+export const MAX_CURSOR_KEY_LEN = 100;
+
+/**
+ * `sandpane_service::MAX_SCOPING_ID_LEN` — length bound on an id that merely
+ * scopes a read (`projectId`, `conversationId`). Core runs it through
+ * `Validator::display_text`, which refuses an empty value; the client mirrors
+ * that so a typo'd blank id is a local, structured refusal instead of a
+ * silently empty list that reads as "no tasks".
+ */
+export const MAX_SCOPING_ID_LEN = 200;
+
 // ---------------------------------------------------------------------------
 // Error codes + methods
 // ---------------------------------------------------------------------------
@@ -57,9 +94,15 @@ export const ERROR_CODES: readonly ErrorCode[] = [
 ];
 
 /**
- * The complete allowlisted method surface (`sandpane_protocol::Method`).
- * Deliberately there is no free-form execution method — a client must never
- * invent one, and an unknown name is rejected by Core with `VALIDATION_FAILED`.
+ * The complete allowlisted method surface (`sandpane_protocol::Method`), in the
+ * order of Rust's `Method::ALL` — the list that backs
+ * `CoreCapabilities.methods`. Deliberately there is no free-form execution
+ * method — a client must never invent one, and an unknown name is rejected by
+ * Core with `VALIDATION_FAILED`.
+ *
+ * `conversation.list`, `conversation.history` and `task.list` are ADDITIVE v1
+ * methods: a pre-revision Core does not dispatch them, so callers feature-detect
+ * with `coreAdvertisesMethod` instead of assuming (AGENTS rule 5).
  */
 export const METHODS = [
   "system.probe",
@@ -69,7 +112,10 @@ export const METHODS = [
   "sandbox.create",
   "conversation.create",
   "conversation.send",
+  "conversation.list",
+  "conversation.history",
   "task.cancel",
+  "task.list",
   "task.subscribe",
   "git.review",
   "git.apply",
@@ -79,6 +125,22 @@ export type Method = (typeof METHODS)[number];
 
 export function isMethod(value: string): value is Method {
   return (METHODS as readonly string[]).includes(value);
+}
+
+/**
+ * Feature discovery: does THIS Core advertise `method` in `system.probe`?
+ *
+ * `CoreCapabilities.methods` is derived from Rust's `Method::ALL`, so it is what
+ * the running service actually dispatches — a protocol version number is not.
+ * An absent or empty list means the Core predates method advertisement, which
+ * means "not advertised", never "assume yes".
+ */
+export function coreAdvertisesMethod(
+  capabilities: Pick<CoreCapabilities, "methods"> | null | undefined,
+  method: Method,
+): boolean {
+  const advertised = capabilities?.methods;
+  return Array.isArray(advertised) && advertised.includes(method);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +193,13 @@ export interface CoreCapabilities {
   sbx: SbxStatus | null;
   agents: AgentCapability[];
   platform: string;
+  /**
+   * Wire names of every method THIS Core dispatches (`Method::ALL`). Feature
+   * discovery goes through `coreAdvertisesMethod`, never a version guess.
+   * Optional because a pre-discovery Core omits it (`#[serde(default)]`); an
+   * absent/empty list means "not advertised", not "all".
+   */
+  methods?: string[];
 }
 
 export interface SbxStatus {
@@ -155,6 +224,17 @@ export interface Project {
   name: string;
   description: string;
   createdAt: string;
+  /**
+   * Host paths registered with this project (`repositories.canonical_path`,
+   * insertion-ordered). Optional: a pre-revision Core omits it.
+   *
+   * Honest caveat carried from the Rust doc — the stored value is what the
+   * CALLER registered. `project.create` requires an absolute path, and Core
+   * canonicalizes (resolves symlinks) at `sandbox.create` mount time, not at
+   * registration. A client matching a folder against these must canonicalize
+   * both sides; a plain string compare is not proof of identity.
+   */
+  repositories?: string[];
 }
 
 export interface ProjectCreateParams {
@@ -174,6 +254,16 @@ export interface SandboxSummary {
   /** Last probed state — never assumed, never inferred from a cached row. */
   probedState: string | null;
   boundProjectId: string | null;
+  /**
+   * The workspace mode recorded in Core's newest `sandbox_bindings` row for this
+   * name — a RECORD of what Core was asked to bind, not a live SBX verification.
+   * `direct_mount` is LIVE-WRITABLE and must be labelled as such (specs/02 §7).
+   *
+   * `null` means Core has no readable binding row (or an unreadable stored
+   * value). A UI showing a probed state with no mode must render the mode as
+   * UNVERIFIED and treat it as live-writable — never blank-as-safe.
+   */
+  workspaceMode: WorkspaceMode | null;
 }
 
 export type WorkspaceMode =
@@ -218,11 +308,89 @@ export interface ConversationSendParams {
   attachments: ContextRef[];
 }
 
+/**
+ * `task.subscribe` params. Cursor rules mirrored exactly from
+ * `TaskSubscribeParams` in Rust (the v1 cursor-ambiguity resolution):
+ *
+ * * `taskId` present → that ONE task replays from the scalar `afterSequence`;
+ *   `afterSequences` is IGNORED by Core, so this client never puts it on the
+ *   wire alongside a `taskId` (sending it would suggest it does something).
+ * * `taskId` absent → with `afterSequences`, EACH task replays from its OWN
+ *   cursor (`afterSequences[taskId]`, missing ⇒ 0 = full history); without it,
+ *   every task falls back to the shared scalar exactly as before.
+ *
+ * Consequence to plan for: a map naming only SOME tasks means the unnamed ones
+ * replay IN FULL, so a client catching up a large project must name every task
+ * it has already seen.
+ */
 export interface TaskSubscribeParams {
   projectId?: string;
   taskId?: string;
   /** Replay everything strictly after this per-task sequence number. */
   afterSequence: number;
+  /**
+   * task id → last sequence durably seen for THAT task. Sequences are per task
+   * and start at 1, so a shared scalar cannot describe several tasks — that was
+   * the recorded v1 gap. Ignored when `taskId` is set.
+   */
+  afterSequences?: Record<string, number>;
+}
+
+/**
+ * `task.list` params — read-only discovery of Core task state.
+ * ADDITIVE v1 method: feature-detect before calling against an unknown Core.
+ */
+export interface TaskListParams {
+  /** Scope to one project (tasks reached through its conversations). Absent = all. */
+  projectId?: string;
+  /**
+   * Only tasks currently in one of these statuses. These are Core's OWN stored
+   * values; an unknown status string is refused, never normalized.
+   */
+  statuses?: readonly TaskStatus[];
+  /** Rows to return; Core clamps to 1..=500 and defaults to 200. */
+  limit?: number;
+}
+
+/** `conversation.list` params — read-only chat enumeration (ADDITIVE v1). */
+export interface ConversationListParams {
+  /** Scope to one project. Absent = every conversation Core knows about. */
+  projectId?: string;
+  /** Rows to return; Core clamps to 1..=500 and defaults to 200. */
+  limit?: number;
+}
+
+/** `conversation.history` params — bounded transcript read (ADDITIVE v1). */
+export interface ConversationHistoryParams {
+  conversationId: string;
+  /** Return messages strictly after this per-conversation sequence. */
+  afterSequence?: number;
+  /**
+   * Rows to return; Core clamps to 1..=500, defaults to 200, and additionally
+   * stops on a total-bytes ceiling so one huge row cannot overflow the frame.
+   */
+  limit?: number;
+}
+
+/** One stored chat message (`messages` table). Content is data, never a command. */
+export interface MessageRecord {
+  id: string;
+  conversationId: string;
+  role: string;
+  content: string;
+  sequence: number;
+}
+
+/**
+ * `conversation.history` result — an OBJECT, not an array. Both bounds are
+ * disclosed: `truncated` is true when the row limit OR the byte ceiling cut the
+ * scan short, and `nextSequence` is the last sequence actually returned (or the
+ * request cursor when nothing was returned) — ready-made input for the next page.
+ */
+export interface ConversationHistoryResult {
+  messages: MessageRecord[];
+  truncated: boolean;
+  nextSequence: number;
 }
 
 /** Durable, replayable task event (`task_events`). */

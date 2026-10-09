@@ -4,7 +4,7 @@ import {
   useCoreLink,
   useSandboxes,
 } from "../../lib/hooks";
-import { foldSbxView, workspaceModeView } from "../../lib/reducers";
+import { foldSbxView, sandboxModeView } from "../../lib/reducers";
 import { AppShell, ViewHeader } from "../../components/layout/AppShell";
 import {
   ConnectionBanner,
@@ -159,7 +159,21 @@ function SandboxList({
                     {" "}
                     · project <Mono>{sandbox.boundProjectId.slice(0, 8)}</Mono>
                   </>
-                )}
+                )}{" "}
+                {/* Core's recorded binding mode, or the UNVERIFIED reading — a
+                    sandbox with a probed state but no mode is never shown safe. */}
+                <Badge
+                  tone={
+                    sandboxModeView(sandbox.workspaceMode).verified
+                      ? sandboxModeView(sandbox.workspaceMode).liveWritable
+                        ? "danger"
+                        : "neutral"
+                      : "attention"
+                  }
+                  title={sandboxModeView(sandbox.workspaceMode).blurb}
+                >
+                  {sandboxModeView(sandbox.workspaceMode).label}
+                </Badge>
               </span>
             </li>
           ))}
@@ -271,7 +285,8 @@ export function SandboxDetailView({ route }: { route: Route }) {
   const { sandboxes, error } = useSandboxes();
   const name = route.params.sandboxName ?? "";
   const sandbox = sandboxes.find((s) => s.name === name) ?? null;
-  const mode = workspaceModeView("sbx_clone");
+  // Read from Core's binding record for this name — never a guessed default.
+  const mode = sandboxModeView(sandbox?.workspaceMode);
 
   return (
     <AppShell
@@ -303,8 +318,18 @@ export function SandboxDetailView({ route }: { route: Route }) {
             <div className="kv">
               <dt>workspace mode</dt>
               <dd>
-                {mode.label} (binding mode is stored by Core but not returned by sandbox.list in
-                protocol v1)
+                <Badge tone={mode.verified ? (mode.liveWritable ? "danger" : "neutral") : "attention"}>
+                  {mode.label}
+                </Badge>{" "}
+                {mode.blurb}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>live-writable</dt>
+              <dd>
+                {mode.liveWritable
+                  ? "YES — treat files in this workspace as possibly already written to your tree."
+                  : "no — Core recorded a mode that keeps edits away from your working tree."}
               </dd>
             </div>
           </dl>

@@ -3,6 +3,7 @@ package labs.dkv.sandpane.services
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.core.EventStream
 import labs.dkv.sandpane.core.RenderedEvent
 import labs.dkv.sandpane.core.toRenderedEvent
@@ -36,17 +37,20 @@ import java.util.concurrent.CopyOnWriteArrayList
  * transition, guesses `running`, or promotes a row after a restart (AGENTS.md rule 3). Where
  * Core says "queued, no verified adapter", the UI says exactly that.
  *
- * PROTOCOL GAPS FOUND while designing the replay path (reported, not silently worked around):
- *  1. There is no `task.list` method, so discovering which tasks a project has requires a
- *     project-wide `task.subscribe(afterSequence = 0)` — a full replay. A brand-new task starts
- *     at sequence 1, so a *checkpointed* project poll could never see it; discovery therefore
- *     runs only on an explicit refresh, never on a timer. `task.list` (or per-task checkpoints
- *     in the request) belongs in the protocol and `schemas/` in the same commit (rule 8).
- *  2. `conversation.send` response: docs/specs/02 §2 promises `{ taskId }`, while
- *     `sandpane-service::conversation_send` returns a full `TaskSummary`. This client accepts
- *     both ([SendResult]) so either resolution works; the protocol must pick one.
- *  3. A project-wide `afterSequence` is applied per task by Core, so concurrent tasks with
- *     diverging sequences can be skipped — see the note on [EventStream].
+ * PROTOCOL STATUS (re-checked 09.10.2026 against the protocol-v1 discovery revision): the three
+ * gaps this class used to report are now CLOSED on the wire, and this client uses the fixes:
+ *  1. **CLOSED — `task.list` exists.** Rows come from [hydrateFromTaskList] instead of a full
+ *     `task.subscribe(afterSequence = 0)` replay, and a checkpointed refresh can now see a task
+ *     whose sequence restarted at 1. Gated on advertisement, because a pre-revision Core does not
+ *     dispatch it. The old replay path ([discoverTasks]) stays as the fallback for such a Core and
+ *     now sends per-task cursors.
+ *  2. **OPEN — `conversation.send` response.** docs/specs/02 §2 promises `{ taskId }` while
+ *     `sandpane-service::conversation_send` returns a full `TaskSummary`. This client still
+ *     accepts both ([SendResult]); the protocol must pick one.
+ *  3. **CLOSED — per-task cursors.** `task.subscribe` accepts `afterSequences`, so a project-wide
+ *     replay resumes EACH task from its own checkpoint instead of applying one scalar to all of
+ *     them (which could skip a quieter task's newer events). See
+ *     [labs.dkv.sandpane.core.ConnectionManager.discoverTasks].
  */
 class TaskMonitorService(private val project: Project) : Disposable {
 
@@ -146,9 +150,67 @@ class TaskMonitorService(private val project: Project) : Disposable {
         connection.releaseTask(taskId)
     }
 
-    /** Explicit discovery on a user refresh — see protocol gap 1 (never on a timer). */
+    /** Explicit discovery on a user refresh — the pre-advertisement path (see gap 1). */
     fun discoverTasks(projectId: String): CompletableFuture<Int> =
         connection.discoverTasks(projectId) { taskId -> track(taskId) }
+
+    /**
+     * Hydrate this window's task rows from `task.list` instead of replaying the event log.
+     *
+     * The protocol-v1 answer to old gap 1: current rows are readable directly, so a refresh no
+     * longer needs a full `task.subscribe(afterSequence = 0)` replay, and a task created since the
+     * last poll is visible even when every tracked stream has a checkpoint.
+     *
+     * Strictly read-only projection: each row carries Core's stored status verbatim, and every
+     * task still gets its own [EventStream] for durable replay (AGENTS.md rule 3 — this client
+     * computes no transition and promotes nothing).
+     *
+     * When Core does not advertise the method nothing is sent and the result says so; the caller
+     * keeps the replay path rather than showing an invented list.
+     */
+    fun hydrateFromTaskList(projectId: String): CompletableFuture<Hydration> {
+        if (!connection.commands.advertises(CoreMethods.TASK_LIST)) {
+            return CompletableFuture.completedFuture(
+                Hydration.NotAdvertised(
+                    "this Core does not advertise task.list — rows stay at whatever was replayed",
+                ),
+            )
+        }
+        return connection.listTasks(projectId)
+            .thenApply<Hydration> { summaries ->
+                summaries.forEach { summary -> track(summary.id, summary.conversationId, summary) }
+                Hydration.Loaded(summaries)
+            }
+            .exceptionally { err ->
+                // Attributed through the shared seam: a guard refusal from this plugin must not
+                // read as a `task.list` that ran and failed at Core.
+                Hydration.Failed(
+                    ErrorAttribution.describe(CoreMethods.TASK_LIST, err) +
+                        " — rows stay at whatever was already replayed; nothing is invented",
+                )
+            }
+    }
+
+    /** Outcome of a `task.list` hydration, as a value so "empty" and "unknown" stay distinct. */
+    sealed class Hydration {
+        /** Core's rows, in Core's order. Display-only — no status is derived from them. */
+        data class Loaded(val tasks: List<TaskSummary>) : Hydration()
+
+        /** Nothing was sent: the method is not advertised by this Core. */
+        data class NotAdvertised(val reason: String) : Hydration()
+
+        /** Core answered with an error; the reason is Core's, kept verbatim. */
+        data class Failed(val reason: String) : Hydration()
+
+        val rows: List<TaskSummary>
+            get() = (this as? Loaded)?.tasks ?: emptyList()
+
+        fun describe(): String = when (this) {
+            is Loaded -> "task.list returned ${tasks.size} row(s) (statuses as Core stores them)"
+            is NotAdvertised -> "task.list unavailable: $reason"
+            is Failed -> "task.list failed: $reason"
+        }
+    }
 
     // -----------------------------------------------------------------------
     // RPC paths (all dispatched off the EDT by ConnectionManager)

@@ -38,7 +38,7 @@ export function DashboardView({ route }: { route: Route }) {
   const link = useCoreLink();
   const refetch = useProbeRefetch();
   const { projects, isLoading: projectsLoading, error: projectsError } = useProjects();
-  const tasks = useTaskIndex();
+  const tasks = useTaskIndex().rows;
   const projections = useTaskProjections();
   const storeStatus = useStoreStatus();
   const attached = link.kind === "attached";

@@ -10,9 +10,22 @@ import {
   taskStatusView,
   windowEntries,
   markReplayGap,
+  associateFolder,
+  featureGate,
+  foldTranscript,
+  normalizeRepoPath,
+  sandboxModeView,
   workspaceModeView,
+  type TaskProjection,
 } from "../src/lib/reducers";
-import { TASK_STATUSES, type TaskEvent, type TaskSummary } from "../src/lib/protocol";
+import {
+  TASK_STATUSES,
+  type ConversationHistoryResult,
+  type Project,
+  type TaskEvent,
+  type TaskStatus,
+  type TaskSummary,
+} from "../src/lib/protocol";
 
 function event(
   taskId: string,
@@ -298,5 +311,185 @@ describe("reviewSummary", () => {
     expect(
       reviewSummary(changeSet, { applied: true, conflictedFiles: [] }).headline,
     ).toBe("Applied");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADDITIVE-v1 folds: hydration, live-writable disclosure, transcript bounds
+// ---------------------------------------------------------------------------
+
+describe("sandboxModeView — an absent mode is never blank-as-safe", () => {
+  it("renders a missing workspaceMode as UNVERIFIED and live-writable", () => {
+    for (const missing of [null, undefined]) {
+      const view = sandboxModeView(missing);
+      expect(view.verified).toBe(false);
+      expect(view.liveWritable).toBe(true);
+      expect(view.label).toContain("UNVERIFIED");
+      expect(view.mode).toBeNull();
+    }
+  });
+
+  it("keeps direct_mount loud and the isolated modes calm", () => {
+    expect(sandboxModeView("direct_mount").liveWritable).toBe(true);
+    expect(sandboxModeView("direct_mount").tone).toBe("danger");
+    expect(sandboxModeView("direct_mount").verified).toBe(true);
+    expect(sandboxModeView("sbx_clone").liveWritable).toBe(false);
+    expect(sandboxModeView("host_worktree").liveWritable).toBe(false);
+    expect(sandboxModeView("mountless").liveWritable).toBe(false);
+  });
+});
+
+describe("featureGate — 'not probed' is not 'unsupported'", () => {
+  it("keeps the unprobed state distinct so no view claims a gap it never observed", () => {
+    expect(featureGate(null, "`task.list`", "nope").state).toBe("unprobed");
+    expect(featureGate(true, "`task.list`", "nope").state).toBe("supported");
+    expect(featureGate(false, "`task.list`", "this Core lacks it").note).toBe(
+      "this Core lacks it",
+    );
+  });
+});
+
+describe("foldTaskIndex — Core's rows and the event replay, neither invented", () => {
+  const projection = (
+    taskId: string,
+    lastSequence: number,
+    status: TaskStatus | null,
+  ): TaskProjection => ({
+    ...emptyProjection(taskId),
+    lastSequence,
+    status,
+    conversationId: "c1",
+  });
+
+  it("shows a task the event stream never reached, sourced to task.list", () => {
+    const rows = foldTaskIndex(new Map(), [
+      {
+        id: "t-never-seen",
+        conversationId: "c-ns",
+        status: "interrupted",
+      },
+    ]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      taskId: "t-never-seen",
+      status: "interrupted",
+      source: "task.list",
+      // An interrupted row must never be displayed as running/resumed.
+      lastSequence: 0,
+    });
+  });
+
+  it("still folds events-only rows when task.list is unavailable", () => {
+    const map = new Map([["t1", projection("t1", 7, "running")]]);
+    expect(foldTaskIndex(map)).toEqual([
+      expect.objectContaining({ taskId: "t1", status: "running", source: "events" }),
+    ]);
+  });
+
+  it("reports a disagreement between Core's two reads instead of picking one", () => {
+    const map = new Map([["t1", projection("t1", 9, "running")]]);
+    const rows = foldTaskIndex(map, [
+      { id: "t1", conversationId: "c1", status: "awaiting_review" },
+    ]);
+    expect(rows[0]?.source).toBe("task.list");
+    expect(rows[0]?.status).toBe("awaiting_review");
+    expect(rows[0]?.disagreement).toEqual({
+      fromEvents: "running",
+      fromTaskList: "awaiting_review",
+    });
+    // No client-side transition was computed: both sides are Core's own values.
+  });
+
+  it("keeps conversation and sequence facts from whichever read supplied them", () => {
+    const map = new Map([["t1", projection("t1", 3, "queued")]]);
+    const rows = foldTaskIndex(map, [
+      {
+        id: "t1",
+        conversationId: "c1",
+        status: "queued",
+        sandboxName: "atlas-auth",
+        taskBranch: "sp/t1",
+        baseCommit: "abc1234",
+      },
+    ]);
+    expect(rows[0]).toMatchObject({
+      lastSequence: 3,
+      sandboxName: "atlas-auth",
+      taskBranch: "sp/t1",
+      baseCommit: "abc1234",
+      disagreement: null,
+    });
+  });
+});
+
+describe("foldTranscript — bounded pages stay disclosed", () => {
+  const page = (
+    sequences: number[],
+    truncated: boolean,
+    nextSequence: number,
+  ): ConversationHistoryResult => ({
+    messages: sequences.map((sequence) => ({
+      id: `m${sequence}`,
+      conversationId: "c1",
+      role: sequence % 2 === 1 ? "user" : "assistant",
+      content: `message ${sequence}`,
+      sequence,
+    })),
+    truncated,
+    nextSequence,
+  });
+
+  it("carries Core's truncation into a notice the view must show", () => {
+    const view = foldTranscript([page([1, 2], true, 2)]);
+    expect(view.truncated).toBe(true);
+    expect(view.cursor).toBe(2);
+    expect(view.notice).toContain("not the whole conversation");
+    expect(view.notice).toContain("sequence 2");
+  });
+
+  it("says nothing is withheld only when Core said so", () => {
+    const view = foldTranscript([page([1, 2, 3], false, 3)]);
+    expect(view.truncated).toBe(false);
+    expect(view.notice).toBe("");
+  });
+
+  it("merges pages without duplicating a re-delivered row", () => {
+    const view = foldTranscript([page([1, 2], true, 2), page([2, 3], false, 3)]);
+    expect(view.entries.map((e) => e.sequence)).toEqual([1, 2, 3]);
+    expect(view.pages).toBe(2);
+    expect(view.cursor).toBe(3);
+  });
+});
+
+describe("associateFolder — a path match is not proof of identity", () => {
+  const project: Project = {
+    id: "p1",
+    name: "Atlas Demo",
+    description: "",
+    createdAt: "2026-10-09T00:00:00Z",
+    repositories: ["/repos/atlas"],
+  };
+
+  it("reports unregistered when no Core project names a repository", () => {
+    expect(associateFolder("/repos/atlas", []).kind).toBe("unregistered");
+    expect(
+      associateFolder("/repos/atlas", [{ ...project, repositories: undefined }]).kind,
+    ).toBe("unregistered");
+  });
+
+  it("matches a trailing slash but never invents a project", () => {
+    const hit = associateFolder("/repos/atlas/", [project]);
+    expect(hit.kind).toBe("path-match");
+    if (hit.kind === "path-match") expect(hit.project.id).toBe("p1");
+    const miss = associateFolder("/repos/other", [project]);
+    expect(miss.kind).toBe("no-match");
+  });
+
+  it("normalizes only lexically — symlink resolution is Core's, not ours", () => {
+    expect(normalizeRepoPath("  /repos/atlas  ")).toBe("/repos/atlas");
+    expect(normalizeRepoPath("/")).toBe("/");
+    expect(normalizeRepoPath("   ")).toBe("");
+    // A symlinked path is NOT claimed to match its target: no client-side guess.
+    expect(associateFolder("/tmp-link/atlas", [project]).kind).toBe("no-match");
   });
 });

@@ -17,7 +17,12 @@ license = "MIT"
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sandpane-protocol = { path = "../../core/crates/sandpane-protocol" }
+# Three levels up, not two: src-tauri → desktop → apps → repo root. The
+# previous `../../core/...` resolved to `apps/core/crates/sandpane-protocol`,
+# which does not exist, so `cargo check` failed at dependency resolution
+# ("no matching package named `sandpane-protocol`") and this crate had never
+# been compiled. See docs/audit/ and apps/desktop/README.md "Verification".
+sandpane-protocol = { path = "../../../core/crates/sandpane-protocol" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

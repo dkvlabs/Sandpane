@@ -4,14 +4,15 @@ import {
   useCoreLink,
   useProjects,
   useSandboxes,
+  useStoreStatus,
   useTaskIndex,
   useTaskProjection,
 } from "../../lib/hooks";
 import {
   describeTaskAction,
   foldSbxView,
+  sandboxModeView,
   taskStatusView,
-  workspaceModeView,
 } from "../../lib/reducers";
 import type { WorkspaceMode } from "../../lib/protocol";
 import { AppShell, ViewHeader } from "../../components/layout/AppShell";
@@ -45,24 +46,39 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
   const { projects } = useProjects();
   const { sandboxes } = useSandboxes();
   const preferences = useUiPreferences().preferences;
-  const taskIndex = useTaskIndex();
+  const index = useTaskIndex(projectId === "" ? null : projectId);
+  const taskIndex = index.rows;
+  const storeStatus = useStoreStatus();
 
   const [focusedTask, setFocusedTask] = useState<string | null>(null);
-  const [mode, setMode] = useState<WorkspaceMode>("sbx_clone");
+  const [focusedSandbox, setFocusedSandbox] = useState<string | null>(null);
 
   const project = projects.find((p) => p.id === projectId) ?? null;
 
   const tasksForProject = useMemo(() => {
-    // A task belongs to a conversation, and conversations are known to this
-    // window; with no conversation.list in v1 the workspace narrows by the
-    // conversations it created and falls back to the whole index otherwise.
-    const scoped = conversationId === null
+    // Scoped by the conversation actually open; otherwise every row Core named
+    // (task.list) or the replay reached (task.subscribe) for this project.
+    return conversationId === null
       ? taskIndex
       : taskIndex.filter((t) => t.conversationId === conversationId);
-    return scoped;
   }, [taskIndex, conversationId]);
 
   const selectedTask = focusedTask ?? tasksForProject[0]?.taskId ?? null;
+  // Live-writable disclosure must come from Core's recorded binding, never from
+  // a local default. With no focused sandbox there is no mount to claim, so the
+  // honest answer is "nothing bound"; with one whose mode Core did not return,
+  // `sandboxModeView` says UNVERIFIED and treats it as writable.
+  const focusedRow = sandboxes.find((s) => s.name === focusedSandbox) ?? null;
+  const isolation =
+    focusedRow === undefined || focusedRow === null
+      ? {
+          label: "No sandbox bound here",
+          liveWritable: false,
+          verified: true,
+          blurb:
+            "No sandbox is focused, so this workspace claims no mount: nothing is being written to your tree through Core from this view.",
+        }
+      : sandboxModeView(focusedRow.workspaceMode);
   const projection = useTaskProjection(selectedTask);
   const actions = describeTaskAction(
     projection?.status === "unknown" ? undefined : projection?.status,
@@ -102,6 +118,35 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
 
       <ConnectionBanner link={link} onRetry={refetch} />
 
+      {storeStatus.kind === "refused" && (
+        <Warning tone="attention" title="Event replay is paused for this scope">
+          {storeStatus.reason} This window stopped pulling that replay rather than retrying a
+          request Core can never deliver in one frame. Task rows Core already returned through{" "}
+          <Mono>task.list</Mono> stay visible.
+        </Warning>
+      )}
+
+      {project !== null && project.repositories !== undefined && (
+        <Warning tone="neutral" title="Repositories registered with this project">
+          <ul className="bullets">
+            {project.repositories.length === 0 ? (
+              <li>
+                Core registered <em>no</em> repository path for this project.
+              </li>
+            ) : (
+              project.repositories.map((path) => (
+                <li key={path}>
+                  <Mono>{path}</Mono>
+                </li>
+              ))
+            )}
+          </ul>
+          These are the paths exactly as they were registered. Core canonicalizes (resolves
+          symlinks) when a sandbox is created, not here, so a folder matching one of these
+          strings is a path match — not proof that both names are the same directory.
+        </Warning>
+      )}
+
       {project === null && (
         <Warning tone="attention" title="This project id is not in the current Core list">
           It may be archived, or created by another client after the last refresh. The workspace
@@ -115,22 +160,23 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
             name: s.name,
             bound: s.boundProjectId === projectId,
             state: s.probedState,
+            mode: s.workspaceMode,
           }))}
-          mode={mode}
-          onMode={setMode}
+          focused={focusedSandbox}
+          onFocus={setFocusedSandbox}
         />
         <Panel title="Isolation for this workspace">
           <div className="badges">
-            <Badge tone={workspaceModeView(mode).liveWritable ? "attention" : "success"}>
-              {workspaceModeView(mode).label}
+            <Badge tone={isolation.verified ? (isolation.liveWritable ? "danger" : "success") : "attention"}>
+              {isolation.label}
             </Badge>
             <SbxBadge view={foldSbxView(capabilitiesOf(link))} />
           </div>
-          <p className="muted">{workspaceModeView(mode).blurb}</p>
+          <p className="muted">{isolation.blurb}</p>
           <p className="muted">
-            Binding a sandbox to this project needs a Core method that protocol v1 does not expose
-            (bindings are written by <Mono>sandbox.create</Mono> only), so the picker states the
-            link read from <Mono>sandbox.list</Mono> instead of asserting a new one.
+            {focusedSandbox === null
+              ? "No sandbox focused yet, so this workspace states the safest thing it can: nothing is bound until one is chosen."
+              : `Read from Core's binding record for ${focusedSandbox} (sandbox.list). Binding a new sandbox needs a method protocol v1 does not expose — sandbox.create writes bindings only.`}
           </p>
         </Panel>
       </div>
@@ -187,7 +233,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
           )}
         </div>
         <div>
-          <ReviewPanel taskId={selectedTask} liveWritable={workspaceModeView(mode).liveWritable} />
+          <ReviewPanel taskId={selectedTask} liveWritable={isolation.liveWritable} />
           {selectedTask !== null && (
             <Panel title="Task actions">
               <div className="row-actions">
@@ -239,12 +285,17 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
 
 function SandboxPicker({
   sandboxes,
-  mode,
-  onMode,
+  focused,
+  onFocus,
 }: {
-  sandboxes: { name: string; bound: boolean; state: string | null }[];
-  mode: WorkspaceMode;
-  onMode: (mode: WorkspaceMode) => void;
+  sandboxes: {
+    name: string;
+    bound: boolean;
+    state: string | null;
+    mode: WorkspaceMode | null;
+  }[];
+  focused: string | null;
+  onFocus: (name: string) => void;
 }) {
   return (
     <Panel
@@ -264,14 +315,17 @@ function SandboxPicker({
       ) : (
         <ul className="list">
           {sandboxes.map((sandbox) => (
-            <li key={sandbox.name} className="row">
+            <li key={sandbox.name} className={`row${sandbox.name === focused ? " row--active" : ""}`}>
               <span className="row__title">
                 <Mono>{sandbox.name}</Mono>
                 {sandbox.bound && <Badge tone="success"> this project</Badge>}
               </span>
               <span className="row__meta">
-                {sandbox.state ?? "state not probed"}
-                <Button variant="ghost" onClick={() => onMode(mode)}>
+                {sandbox.state ?? "state not probed"} ·{" "}
+                <Badge tone={sandboxModeView(sandbox.mode).verified ? (sandboxModeView(sandbox.mode).liveWritable ? "danger" : "neutral") : "attention"}>
+                  {sandboxModeView(sandbox.mode).label}
+                </Badge>
+                <Button variant="ghost" onClick={() => onFocus(sandbox.name)}>
                   Focus
                 </Button>
               </span>

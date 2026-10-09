@@ -53,7 +53,7 @@ class CoreClient(
     private val onUnsolicited: (String) -> Unit = { },
     /** Fires exactly once when the read side ends: EOF, IOException, or [close]. */
     private val onClosed: (Throwable?) -> Unit = { },
-) {
+) : AutoCloseable {
 
     private val writeLock = Object()
     private val pending = ConcurrentHashMap<String, CompletableFuture<RpcResponseFrame>>()
@@ -112,14 +112,18 @@ class CoreClient(
      * the correlated frame, or fails with [TimeoutException] / [CoreTransportException].
      *
      * The method name is checked against [CoreMethods] before anything is written: there is
-     * no free-form execution RPC, and a client must never invent one.
+     * no free-form execution RPC, and a client must never invent one. An un-allowlisted method is
+     * refused with [CoreValidationException] — THIS CLIENT's word, because no byte reached Core —
+     * never with a [CoreRpcException], which would render a request Core never saw as Core's own
+     * verdict (AGENTS.md rule 5).
      */
     fun request(method: String, params: JsonElement = buildJsonObject { }): CompletableFuture<RpcResponseFrame> {
         if (!CoreMethods.isAllowlisted(method)) {
             return CompletableFuture.failedFuture(
-                CoreRpcException(
-                    "VALIDATION_FAILED",
-                    "'$method' is not an allowlisted Core method; there is no free-form RPC",
+                CoreValidationException(
+                    "method",
+                    "'$method' is not an allowlisted Core method; there is no free-form RPC, " +
+                        "and nothing was sent",
                 ),
             )
         }
@@ -170,7 +174,8 @@ class CoreClient(
         val frame = request(method, params).get(requestTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
         val error = frame.err
         if (error != null) throw CoreRpcException(error.code, error.message)
-        val ok = frame.ok ?: throw CoreRpcException("INTERNAL", "empty ok payload for $method")
+        val ok = frame.ok
+            ?: throw CoreRpcException("INTERNAL", "empty ok payload for $method", raisedByCore = false)
         return CoreJson.decodeFromJsonElement(deserializer, ok)
     }
 
@@ -180,15 +185,19 @@ class CoreClient(
         val frame = request(method, params).get(requestTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
         val error = frame.err
         if (error != null) throw CoreRpcException(error.code, error.message)
-        return frame.ok ?: throw CoreRpcException("INTERNAL", "empty ok payload for $method")
+        return frame.ok
+            ?: throw CoreRpcException("INTERNAL", "empty ok payload for $method", raisedByCore = false)
     }
 
     private fun writeFrame(line: String) {
         val bytes = line.toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_FRAME_BYTES) {
-            throw CoreRpcException(
-                "VALIDATION_FAILED",
-                "outgoing frame is ${bytes.size} bytes, over the $MAX_FRAME_BYTES NDJSON cap",
+            // This plugin refused its OWN outgoing frame; Core never saw it, so this is a client
+            // guard, not a Core verdict.
+            throw CoreValidationException(
+                "frame",
+                "outgoing frame is ${bytes.size} bytes, over the $MAX_FRAME_BYTES NDJSON cap — " +
+                    "nothing was written",
             )
         }
         val ch = channel ?: throw CoreTransportException("not connected")
@@ -378,8 +387,35 @@ sealed class CoreTransportState {
 
 class CoreTransportException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
-/** A structured `err` frame from Core. `code` is SCREAMING_SNAKE_CASE. */
-class CoreRpcException(val code: String, override val message: String) : Exception("$code: $message")
+/**
+ * A structured `err` frame from Core. `code` is SCREAMING_SNAKE_CASE; `message` is Core's own
+ * wording, kept VERBATIM and deliberately WITHOUT a prefix.
+ *
+ * The split is load-bearing in both directions:
+ *
+ *  * `.message` must stay unprefixed because
+ *    [ConnectionManager.recordReplayRefusal] hands `code to message` to
+ *    [CoreGuards.isOversizedReplayRefusal], which recognises Core's refusal by the FIRST WORDS of
+ *    its sentence (`"replay of …"`). Prefixing `.message` would silently unmake that recognition.
+ *  * The code is part of the verdict, so it must survive every rendering that does not read
+ *    `.message`: `getLocalizedMessage()` composes `CODE: message`, and `Throwable.toString()` is
+ *    specified as `ClassName: getLocalizedMessage()` — which is what a stack trace, a log line,
+ *    and the message of the [java.util.concurrent.CompletionException] a
+ *    `whenComplete { _, error -> }` handler receives are built from. A verdict rendered WITHOUT
+ *    its code reads exactly like this client's own `field: message` refusal, which AGENTS.md rule 5
+ *    forbids.
+ *
+ * @param raisedByCore false when this plugin raised the code itself because Core's reply was
+ *   unusable (a frame with neither `ok` nor `err`, an empty `ok`). Core never answered those
+ *   requests with this code, so they are attributed to the wire, not to Core's judgment.
+ */
+class CoreRpcException(
+    val code: String,
+    override val message: String,
+    val raisedByCore: Boolean = true,
+) : Exception(message) {
+    override fun getLocalizedMessage(): String = "$code: $message"
+}
 
 /** Raised when a single NDJSON frame would exceed [MAX_FRAME_BYTES]; the stream is dropped. */
 class FrameExceedsCapException(val limitBytes: Int, val sawBytes: Int) :
@@ -403,7 +439,7 @@ class NdjsonFramer(private val maxFrameBytes: Int = MAX_FRAME_BYTES) {
      * Feed one socket chunk; returns every complete line, without its delimiter.
      * @throws FrameExceedsCapException when the in-progress frame passes the cap.
      */
-    fun feed(chunk: ByteArray, offset: Int = 0, length: Int = chunk.length - offset): List<String> {
+    fun feed(chunk: ByteArray, offset: Int = 0, length: Int = chunk.size - offset): List<String> {
         val lines = ArrayList<String>()
         var i = offset
         val end = offset + length

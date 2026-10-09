@@ -23,6 +23,16 @@ export interface HeaderContext {
 export interface SandboxOption {
   name: string;
   probedState: string | null;
+  /**
+   * Core's RECORDED binding mode for this name — `null` means Core has no
+   * readable binding row, which the client renders as UNVERIFIED, never as
+   * safe (specs/02 §7). Computed here so the webview interprets nothing.
+   */
+  workspaceMode: WorkspaceMode | string | null;
+  /** Badge text, e.g. `LIVE-WRITABLE` / `ISOLATED` / `UNVERIFIED — …`. */
+  modeBadge: string;
+  /** True when host files can change while an agent works (incl. unverified). */
+  modeHostWritable: boolean;
 }
 
 export interface ChatLine {

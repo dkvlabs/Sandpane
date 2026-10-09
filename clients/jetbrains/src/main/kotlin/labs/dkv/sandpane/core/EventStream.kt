@@ -14,15 +14,19 @@ import java.util.concurrent.CopyOnWriteArrayList
  * replay from [lastSequence] and must be idempotent — a duplicate or stale replay is
  * dropped here, never re-rendered as new activity.
  *
- * PROTOCOL-SEMANTICS FINDING (reported, not worked around silently): Core's
+ * PROTOCOL-SEMANTICS NOTE (a finding this revision closes): Core's
  * `task.subscribe(projectId, afterSequence)` applies ONE checkpoint to every task it
- * replays (`sandpane-service::task_subscribe` → `replay_task(tid, p.after_sequence)` per
- * task). With several concurrent tasks whose sequences differ, a project-wide checkpoint
- * can skip a quieter task's newer events. So this client subscribes per task for anything
- * it actually tracks (each stream owns its own checkpoint) and uses a project-wide poll
- * only to DISCOVER task ids. A server-side per-task checkpoint map (or an
- * `(taskId, afterSequence)` list in the request) is the fix; it belongs in the protocol,
- * not in a client-side cache.
+ * replays when no `afterSequences` map is supplied (`sandpane-service::task_subscribe` →
+ * the shared scalar per task). With several concurrent tasks whose sequences differ, a
+ * project-wide checkpoint can skip a quieter task's newer events — the recorded protocol-v1 gap.
+ * `TaskSubscribeParams.afterSequences` is now the server-side per-task checkpoint map that gap
+ * asked for, and [labs.dkv.sandpane.core.ConnectionManager.discoverTasks] builds it from exactly
+ * these streams' [lastSequence] values, so the cursor Core resumes from is the one this plugin
+ * durably applied.
+ *
+ * This is why a stream owns its own checkpoint instead of trusting a shared one: an untracked
+ * task left out of the map replays IN FULL (cursor 0), which is the safe direction — duplicate
+ * events are dropped by [merge] rather than re-rendered, while a shared scalar risks silence.
  *
  * Bounded by design (docs/specs/04 §5 risk 2): at most [capacity] events are retained per
  * task; eviction drops the oldest and is reported, never silent.

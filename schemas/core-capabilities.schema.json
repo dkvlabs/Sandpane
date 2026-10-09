@@ -36,6 +36,15 @@
         }
       }
     },
-    "platform": { "type": "string" }
+    "platform": { "type": "string" },
+    "methods": {
+      "type": "array",
+      "description": "Feature discovery: the dotted wire names of EVERY method this Core actually dispatches, derived from sandpane_protocol::Method::ALL (never a hand-written list). Clients use it to detect optional methods (task.list, conversation.list, conversation.history) instead of assuming them from a version number. Absent only from a pre-discovery v1 Core, so it is not required here (additive); every current Core emits it.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+      }
+    }
   }
 }

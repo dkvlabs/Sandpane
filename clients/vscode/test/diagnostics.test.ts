@@ -121,6 +121,31 @@ describe('error code → human guidance', () => {
     expect(text).toContain('Input was rejected by validation');
   });
 
+  /**
+   * `task.subscribe` now answers an undeliverable replay with VALIDATION_FAILED
+   * instead of emitting an oversized frame. That must read as recoverable, and
+   * the rendered text keeps Core's own guidance verbatim alongside it.
+   */
+  it('treats the oversized-replay refusal as recoverable, not fatal', () => {
+    const refusal = new CoreRpcError(
+      {
+        code: 'VALIDATION_FAILED',
+        message:
+          'replay of 2 task(s) passed the 4161536-byte ceiling this frame shape can carry; ' +
+          'narrow the request (single taskId, a higher afterSequence, or per-task ' +
+          'afterSequences) — task.subscribe has no truncation envelope yet',
+      },
+      'r11',
+    );
+    const guidance = explainFailure(refusal);
+    expect(guidance.headline).toBe('Input was rejected by validation');
+    expect(guidance.honestUncertainty).toMatch(/recoverable/);
+    expect(guidance.honestUncertainty).toMatch(/afterSequences/);
+    expect(guidance.honestUncertainty).toMatch(/stops retrying/);
+    const text = formatGuidance(guidance, refusal.message);
+    expect(text).toContain('4161536-byte ceiling');
+  });
+
   it('covers the full wire enum so a new Rust code cannot slip through silently', () => {
     const codes: ErrorCode[] = [
       'NOT_INSTALLED',

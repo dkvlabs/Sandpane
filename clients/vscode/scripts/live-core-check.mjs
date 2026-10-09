@@ -15,7 +15,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -88,7 +88,7 @@ async function main() {
   const { CoreConnection, FrameTooLargeError } = await import(
     pathToFileURL(join(clientRoot, 'out', 'core-client', 'connection.js')).href
   );
-  const { MAX_FRAME_BYTES } = await import(
+  const { MAX_FRAME_BYTES, CORE_METHODS, coreAdvertisesMethod } = await import(
     pathToFileURL(join(clientRoot, 'out', 'core-client', 'protocol.js')).href
   );
   const { createSocketTransport } = await import(
@@ -96,6 +96,12 @@ async function main() {
   );
   const { CoreCommands } = await import(
     pathToFileURL(join(clientRoot, 'out', 'core-client', 'commands.js')).href
+  );
+  const { isOversizedReplayRefusal } = await import(
+    pathToFileURL(join(clientRoot, 'out', 'core-client', 'catchup.js')).href
+  );
+  const { explainCoreErrorCode } = await import(
+    pathToFileURL(join(clientRoot, 'out', 'vscode', 'diagnostics.js')).href
   );
 
   const conn = new CoreConnection({
@@ -119,6 +125,29 @@ async function main() {
     JSON.stringify(codex),
   );
 
+  // ---- method advertisement (the discovery revision) --------------------
+  check(
+    'system.probe advertises exactly the 14 methods the client allowlists',
+    Array.isArray(caps.methods) && caps.methods.length === 14 && caps.methods.join(',') === CORE_METHODS.join(','),
+    (caps.methods ?? []).join(','),
+  );
+  const schemaMethods = JSON.parse(
+    readFileSync(join(repoRoot, 'schemas', 'rpc-request.schema.json'), 'utf8'),
+  ).properties.method.enum;
+  check(
+    'Core\'s advertised list equals schemas/rpc-request.schema.json (no drift)',
+    JSON.stringify(caps.methods) === JSON.stringify(schemaMethods),
+    `core=${(caps.methods ?? []).length} schema=${schemaMethods.length}`,
+  );
+  check(
+    'the client feature-detects the additive methods from the probe, not a version',
+    coreAdvertisesMethod(caps, 'task.list') &&
+      coreAdvertisesMethod(caps, 'conversation.list') &&
+      coreAdvertisesMethod(caps, 'conversation.history') &&
+      coreAdvertisesMethod({ methods: ['system.probe'] }, 'task.list') === false,
+    `task.list=${coreAdvertisesMethod(caps, 'task.list')}`,
+  );
+
   // ---- two clients, one core (specs/03 §6.3) ---------------------------
   const second = new CoreConnection({
     transportFactory: () => createSocketTransport({ path: socket, connectTimeoutMs: 3_000 }),
@@ -137,6 +166,13 @@ async function main() {
   check('project.create returns a Core id', typeof project.id === 'string' && project.id.length > 0, project.id);
   const projects = await commands.projectList();
   check('project.list shows the created project', projects.length === 1 && projects[0].name === 'Atlas Demo', JSON.stringify(projects));
+  check(
+    'project.list returns the repository paths it was created with',
+    Array.isArray(projects[0]?.repositories) &&
+      projects[0].repositories.length === 1 &&
+      projects[0].repositories[0] === repoPath,
+    JSON.stringify(projects[0]?.repositories),
+  );
 
   // ---- sandbox.list must surface NOT_INSTALLED, not an empty list ------
   let sandboxError = null;
@@ -330,6 +366,230 @@ async function main() {
     '25 concurrent requests each correlate back to their own id',
     finalCount === 5 && many.every((r, i) => Array.isArray(r) && r.length === Math.max(0, finalCount - i)),
     `final=${finalCount} · ${many.map((r) => r.length).join(',')}`,
+  );
+
+  // ===== protocol-v1 discovery revision: new reads, per-task cursors, ceiling ===
+  // Everything above is the pre-existing surface. From here the checks exercise
+  // the added methods against the real service.
+
+  // ---- conversation.history round-trip with truncation disclosure -------
+  const history1 = await commands.conversationHistory({ conversationId: conversation.id });
+  check(
+    'conversation.history returns an object disclosing truncated + nextSequence',
+    Array.isArray(history1.messages) && history1.truncated === false && history1.nextSequence === 1,
+    JSON.stringify({ n: history1.messages.length, truncated: history1.truncated, next: history1.nextSequence }),
+  );
+  check(
+    'history returns the stored message verbatim (hostile content stays inert data)',
+    history1.messages.length === 1 &&
+      history1.messages[0].content === hostile &&
+      history1.messages[0].role === 'user' &&
+      history1.messages[0].conversationId === conversation.id,
+    JSON.stringify(String(history1.messages[0]?.content).slice(0, 40)),
+  );
+
+  const conversationB = await commands.conversationCreate({
+    projectId: project.id,
+    agentId: 'codex',
+    title: 'live check two',
+  });
+  const taskB = await commands.conversationSend({
+    conversationId: conversationB.id,
+    content: 'queued task in chat two',
+    attachments: [],
+  });
+  const historyEmptyPage = await commands.conversationHistory({
+    conversationId: conversation.id,
+    afterSequence: history1.nextSequence,
+  });
+  check(
+    'paging past the last message returns none and keeps the cursor (never rewinds)',
+    historyEmptyPage.messages.length === 0 &&
+      historyEmptyPage.nextSequence === history1.nextSequence &&
+      historyEmptyPage.truncated === false,
+    JSON.stringify(historyEmptyPage),
+  );
+  const taskC = await commands.conversationSend({
+    conversationId: conversation.id,
+    content: 'second message in chat one',
+    attachments: [],
+  });
+  const history2 = await commands.conversationHistory({
+    conversationId: conversation.id,
+    afterSequence: history1.nextSequence,
+  });
+  check(
+    'a new message advances nextSequence and pages forward without losing rows',
+    history2.messages.length === 1 &&
+      history2.messages[0].sequence === 2 &&
+      history2.nextSequence === 2 &&
+      history2.truncated === false,
+    JSON.stringify({ n: history2.messages.length, next: history2.nextSequence }),
+  );
+
+  // ---- conversation.list --------------------------------------------------
+  const convList = await commands.conversationList({ projectId: project.id });
+  check(
+    'conversation.list enumerates both live conversations of the project',
+    convList.length === 2 &&
+      [conversation.id, conversationB.id].every((id) => convList.some((c) => c.id === id)) &&
+      convList.every((c) => c.projectId === project.id && c.agentId === 'codex'),
+    convList.map((c) => c.title).join(','),
+  );
+  const scopedEmpty = await commands.conversationList({ projectId: 'no-such-project' });
+  check(
+    'conversation.list scoping an unknown project is an empty list, not an error',
+    Array.isArray(scopedEmpty) && scopedEmpty.length === 0,
+    `n=${scopedEmpty.length}`,
+  );
+  let blankScope = null;
+  await commands.conversationList({ projectId: '' }).catch((e) => {
+    blankScope = e;
+  });
+  check(
+    'a blank projectId is refused client-side before the frame is written',
+    blankScope?.name === 'CoreValidationError' && blankScope?.field === 'projectId',
+    `${blankScope?.name}: ${String(blankScope?.message).slice(0, 80)}`,
+  );
+
+  // ---- task.list: project scoping + a real status filter ------------------
+  const projectTasks = await commands.taskList({ projectId: project.id });
+  const queuedRows = await commands.taskList({ projectId: project.id, statuses: ['queued'] });
+  check(
+    'task.list scopes to the project and filters by Core status',
+    projectTasks.length === 3 &&
+      queuedRows.length === 2 &&
+      queuedRows.every((t) => t.status === 'queued') &&
+      projectTasks.some((t) => t.id === summary.id && t.status === 'cancelled'),
+    JSON.stringify(projectTasks.map((t) => `${t.id.slice(0, 8)}:${t.status}`)),
+  );
+  const unscoped = await commands.taskList({ statuses: ['cancelled'] });
+  check(
+    'task.list without a project scope still finds the cancelled task by status',
+    unscoped.some((t) => t.id === summary.id && t.status === 'cancelled'),
+    JSON.stringify(unscoped.map((t) => `${t.id.slice(0, 8)}:${t.status}`)),
+  );
+  const boundedRows = await commands.taskList({ projectId: project.id, limit: 1 });
+  check(
+    'task.list honours a bounded limit (limit=1 returns one row)',
+    boundedRows.length === 1,
+    `n=${boundedRows.length}`,
+  );
+  let badStatus = null;
+  await commands.taskList({ statuses: ['half_finished'] }).catch((e) => {
+    badStatus = e;
+  });
+  check(
+    'a status outside Core\'s closed enum is refused before the request is written',
+    badStatus?.name === 'CoreValidationError' && badStatus?.field === 'statuses',
+    `${badStatus?.name}: ${String(badStatus?.message).slice(0, 90)}`,
+  );
+
+  // ---- the recorded cursor defect, proved fixed against real events --------
+  // Make the two logs uneven by cancelling only taskB: 5 events vs taskC's 4.
+  await commands.taskCancel(taskB.id);
+  const bEvents = await commands.taskSubscribe({ taskId: taskB.id, afterSequence: 0 });
+  const cEvents = await commands.taskSubscribe({ taskId: taskC.id, afterSequence: 0 });
+  check(
+    'the two tasks have UNEVEN per-task sequences (5 vs 4) — the shape a shared cursor breaks on',
+    bEvents.length === 5 && cEvents.length === 4,
+    `b=${bEvents.length} c=${cEvents.length}`,
+  );
+  const sharedCursor = bEvents[bEvents.length - 1].sequence;
+  const legacy = await commands.taskSubscribe({ projectId: project.id, afterSequence: sharedCursor });
+  check(
+    'LEGACY SHAPE: one shared scalar skips every unseen event of the behind task',
+    legacy.length === 0,
+    `afterSequence=${sharedCursor} → ${legacy.length} events (taskC still had 3 and 4 unseen)`,
+  );
+  const mapped = await commands.taskSubscribe({
+    projectId: project.id,
+    afterSequence: sharedCursor,
+    afterSequences: {
+      [summary.id]: finalCount,
+      [taskB.id]: sharedCursor,
+      [taskC.id]: 2,
+    },
+  });
+  check(
+    'afterSequences replays EACH task from its own cursor — unseen events arrive',
+    mapped.length === 2 &&
+      mapped.every((e) => e.taskId === taskC.id && (e.sequence === 3 || e.sequence === 4)),
+    mapped.map((e) => `${e.taskId.slice(0, 8)}:${e.sequence}`).join(','),
+  );
+  const unmapped = await commands.taskSubscribe({
+    projectId: project.id,
+    afterSequence: sharedCursor,
+    afterSequences: { [summary.id]: finalCount, [taskB.id]: sharedCursor },
+  });
+  check(
+    'a task absent from the map replays IN FULL (cursor 0), exactly as documented',
+    unmapped.filter((e) => e.taskId === taskC.id).length === 4,
+    `n=${unmapped.filter((e) => e.taskId === taskC.id).length}`,
+  );
+  let badCursorKey = null;
+  await commands
+    .taskSubscribe({ projectId: project.id, afterSequence: 0, afterSequences: { '': 1 } })
+    .catch((e) => {
+      badCursorKey = e;
+    });
+  check(
+    'an empty afterSequences key is refused locally, before any frame is written',
+    badCursorKey?.name === 'CoreValidationError',
+    `${badCursorKey?.name}: ${String(badCursorKey?.message).slice(0, 80)}`,
+  );
+
+  // ---- the oversized-replay refusal: structured, mapped, recoverable ------
+  // Core must refuse a replay that cannot fit one frame rather than emit a frame
+  // the client would drop. Grow the log past the ceiling with the largest legal
+  // prompts (Core caps conversation.send content at 64 KiB).
+  const bulk = 'x'.repeat(64 * 1024 - 8);
+  let bulkSent = 0;
+  for (let i = 0; i < 90; i += 1) {
+    await commands.conversationSend({
+      conversationId: conversationB.id,
+      content: `${i} ${bulk}`,
+      attachments: [],
+    });
+    bulkSent += 1;
+  }
+  check('bulk fill sent 90 maximum-legal prompts', bulkSent === 90, '≈5.9 MB of durable events');
+
+  let replayRefusal = null;
+  await commands.taskSubscribe({ projectId: project.id, afterSequence: 0 }).catch((e) => {
+    replayRefusal = e;
+  });
+  check(
+    'an over-ceiling replay is refused with structured VALIDATION_FAILED',
+    replayRefusal?.code === 'VALIDATION_FAILED' && /ceiling/.test(String(replayRefusal?.message)),
+    `${replayRefusal?.code ?? '(no error)'}: ${String(replayRefusal?.message).slice(0, 140)}`,
+  );
+  check(
+    'the client classifies it as a refusal and maps it to recoverable guidance',
+    isOversizedReplayRefusal(replayRefusal) === true &&
+      /recoverable/.test(explainCoreErrorCode('VALIDATION_FAILED').honestUncertainty ?? ''),
+    `isOversizedReplayRefusal=${isOversizedReplayRefusal(replayRefusal)}`,
+  );
+  const narrowed = await commands.taskSubscribe({ taskId: summary.id, afterSequence: 0 });
+  check(
+    'narrowing to one taskId still succeeds — the refusal is recoverable, not fatal',
+    Array.isArray(narrowed) && narrowed.length === 5,
+    `n=${narrowed.length}`,
+  );
+  const boundedUnderLoad = await commands.conversationHistory({
+    conversationId: conversationB.id,
+    limit: 2,
+  });
+  check(
+    'a bounded read discloses truncation instead of overflowing the frame',
+    boundedUnderLoad.messages.length === 2 &&
+      boundedUnderLoad.truncated === true &&
+      boundedUnderLoad.nextSequence === 2,
+    JSON.stringify({
+      n: boundedUnderLoad.messages.length,
+      truncated: boundedUnderLoad.truncated,
+      next: boundedUnderLoad.nextSequence,
+    }),
   );
 
   conn.dispose();

@@ -20,6 +20,7 @@ import {
   type ErrorCode,
 } from './events';
 import {
+  CORE_METHODS,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   isCoreMethodName,
@@ -51,7 +52,9 @@ export class UnknownMethodError extends Error {
   constructor(method: string) {
     super(
       `"${method}" is not a Sandpane Core method. The RPC surface is an allowlist ` +
-        '(11 typed methods); there is no free-form execution method (specs/02 §2).',
+        // Derived from the allowlist so this text can never quote a stale count.
+        `(${CORE_METHODS.length} typed methods); there is no free-form execution ` +
+        'method (specs/02 §2).',
     );
     this.name = 'UnknownMethodError';
   }

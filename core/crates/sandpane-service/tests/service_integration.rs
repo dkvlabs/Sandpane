@@ -12,8 +12,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
 
+use rusqlite::params;
 use sandpane_core::sbx::SbxLocator;
-use sandpane_core::Database;
+use sandpane_core::{Database, EventLog};
+use sandpane_protocol::Method;
 use sandpane_service::{serve_connection, ServerInner};
 
 struct TestServer {
@@ -661,4 +663,872 @@ fn oversized_frame_is_refused_without_hanging() {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     assert!(line.contains("frame too large"), "got: {line}");
+}
+
+// ---------------------------------------------------------------------------
+// Discovery revision: task.list / conversation.list / conversation.history,
+// per-task replay cursors, project repositories, sandbox workspaceMode,
+// feature discovery (docs/compatibility.md "Protocol v1 gaps").
+// ---------------------------------------------------------------------------
+
+/// Seed stored chat rows directly through the real `messages` table. This is
+/// test-only data setup (the read path under test is `conversation.history`);
+/// the row shape matches what `conversation.send` writes.
+fn seed_messages(server: &TestServer, conversation_id: &str, contents: &[&str]) {
+    let db = server.inner.lock_db();
+    for (i, content) in contents.iter().enumerate() {
+        db.conn()
+            .execute(
+                "INSERT INTO messages (id, conversation_id, role, content, sequence)
+                 VALUES (?1,?2,'user',?3,?4)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    conversation_id,
+                    content,
+                    (i + 1) as i64
+                ],
+            )
+            .unwrap();
+    }
+}
+
+/// Create a project + conversation and return their ids.
+fn make_project_and_conversation(
+    server: &mut TestServer,
+    name: &str,
+    repos: Vec<String>,
+) -> (String, String) {
+    let project = server.ok(
+        "p",
+        "project.create",
+        serde_json::json!({"name": name, "repositories": repos}),
+    );
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let conv = server.ok(
+        "c",
+        "conversation.create",
+        serde_json::json!({"projectId": project_id, "agentId": "codex", "title": "chat"}),
+    );
+    (project_id, conv["id"].as_str().unwrap().to_string())
+}
+
+/// Append `n` durable events to a task through the PRODUCTION append path.
+fn append_events(server: &TestServer, task_id: &str, n: usize) {
+    append_events_with(server, task_id, n, "message.delta", &serde_json::json!({}))
+}
+
+/// Same, with a caller-chosen kind/payload — used to build a replay whose frame
+/// really does exceed the transport cap.
+fn append_events_with(
+    server: &TestServer,
+    task_id: &str,
+    n: usize,
+    kind: &str,
+    payload: &serde_json::Value,
+) {
+    let db = server.inner.lock_db();
+    let log = EventLog::new(&db);
+    for i in 0..n {
+        let mut payload = payload.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("i".to_string(), serde_json::json!(i));
+        }
+        log.append(task_id, kind, &payload, "2026-10-09T00:00:00Z")
+            .unwrap();
+    }
+}
+
+fn insert_task(server: &TestServer, conversation_id: &str, task_id: &str, created_at: &str) {
+    let db = server.inner.lock_db();
+    db.conn()
+        .execute(
+            "INSERT INTO tasks (id, conversation_id, status, created_at, updated_at)
+             VALUES (?1,?2,'queued',?3,?3)",
+            params![task_id, conversation_id, created_at],
+        )
+        .unwrap();
+}
+
+#[test]
+fn task_list_scopes_by_project_filters_by_status_and_clamps_limit() {
+    let mut s = start_server(no_sbx());
+    let (p1, c1) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let (_p2, c2) = make_project_and_conversation(&mut s, "Nova Demo", vec![]);
+    let t1 = s.ok(
+        "s1",
+        "conversation.send",
+        serde_json::json!({"conversationId": c1, "content": "one"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let t2 = s.ok(
+        "s2",
+        "conversation.send",
+        serde_json::json!({"conversationId": c2, "content": "two"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Make the two projects hold different Core statuses.
+    s.ok("x", "task.cancel", serde_json::json!({"taskId": &t1}));
+
+    // Project scoping: only this project's task, with Core's stored status and
+    // its real conversation id.
+    let scoped = s.ok("l1", "task.list", serde_json::json!({"projectId": &p1}));
+    let arr = scoped.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "got: {scoped}");
+    assert_eq!(arr[0]["id"], t1);
+    assert_eq!(arr[0]["conversationId"], c1);
+    assert_eq!(arr[0]["status"], "cancelled", "status is Core state");
+
+    // Unscoped = every task Core knows about.
+    let all = s.ok("l2", "task.list", serde_json::json!({}));
+    let ids: Vec<&str> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&t1.as_str()) && ids.contains(&t2.as_str()));
+
+    // Status filter, single and multi-valued.
+    let queued = s.ok(
+        "l3",
+        "task.list",
+        serde_json::json!({"statuses": ["queued"]}),
+    );
+    let arr = queued.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], t2);
+    assert_eq!(arr[0]["status"], "queued");
+    let either = s.ok(
+        "l4",
+        "task.list",
+        serde_json::json!({"statuses": ["queued", "cancelled"]}),
+    );
+    assert_eq!(either.as_array().unwrap().len(), 2);
+    // A status Core does not store is rejected — never normalized into one
+    // that is (specs/02 §4).
+    let err = s.err(
+        "l5",
+        "task.list",
+        serde_json::json!({"statuses": ["half_finished"]}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    // A filter that repeats one status thousands of times is still a bounded
+    // query: duplicates carry no meaning in an IN-list, so they collapse and the
+    // answer is unchanged (no SQLite variable-limit blow-up).
+    let spam: Vec<String> = (0..2_000).map(|_| "queued".to_string()).collect();
+    let deduped = s.ok("l5b", "task.list", serde_json::json!({"statuses": spam}));
+    let arr = deduped.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "got: {deduped}");
+    assert_eq!(arr[0]["id"], t2);
+
+    // Limit clamping: 0 is normalised up to a usable bound, an absurd limit is
+    // clamped to MAX_LIST_LIMIT — the response is never an unbounded set.
+    let zero = s.ok("l6", "task.list", serde_json::json!({"limit": 0}));
+    assert_eq!(zero.as_array().unwrap().len(), 1);
+    let huge = s.ok(
+        "l7",
+        "task.list",
+        serde_json::json!({"limit": sandpane_service::MAX_LIST_LIMIT * 10}),
+    );
+    assert!(huge.as_array().unwrap().len() <= sandpane_service::MAX_LIST_LIMIT as usize);
+    let mid = s.ok("l8", "task.list", serde_json::json!({"limit": 1}));
+    assert_eq!(mid.as_array().unwrap().len(), 1);
+
+    // Every caller value is BOUND (project id, status names, limit) — never
+    // interpolated into the statement text. Also: an empty `projectId` is a
+    // refusal, not a silent `[]` that looks like an empty project.
+    let err = s.err("l10", "task.list", serde_json::json!({"projectId": ""}));
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    // …while an UNKNOWN project legitimately has no tasks.
+    let none = s.ok(
+        "l11",
+        "task.list",
+        serde_json::json!({"projectId": "no-such-project"}),
+    );
+    assert!(none.as_array().unwrap().is_empty());
+}
+
+#[test]
+fn task_list_orders_by_created_at_then_id_deterministically() {
+    // Deterministic seeding: `created_at` has SECOND resolution in Core, so
+    // wall-clock tasks can straddle a boundary. Explicit distinct stamps plus
+    // ids whose lexicographic order DISAGREES with the time order prove the
+    // ORDER BY, and two tasks sharing a stamp prove the id tie-break.
+    let mut s = start_server(no_sbx());
+    let (pid, cid) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let second = s.ok(
+        "c",
+        "conversation.create",
+        serde_json::json!({"projectId": pid, "agentId": "codex", "title": "two"}),
+    );
+    let cid2 = second["id"].as_str().unwrap().to_string();
+    // Newest-looking ids first in time order: zebra(01), apple(02), then the
+    // tie pair (mango/xray) sharing 03.
+    insert_task(&s, &cid, "zzz-earliest", "2026-10-09T00:00:01Z");
+    insert_task(&s, &cid, "aaa-middle", "2026-10-09T00:00:02Z");
+    insert_task(&s, &cid2, "tie-zulu", "2026-10-09T00:00:03Z");
+    insert_task(&s, &cid2, "tie-alpha", "2026-10-09T00:00:03Z");
+
+    let all = s.ok("l1", "task.list", serde_json::json!({"projectId": &pid}));
+    let ids: Vec<&str> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "zzz-earliest",
+            "aaa-middle",
+            // same created_at → id ASC decides
+            "tie-alpha",
+            "tie-zulu",
+        ],
+        "task.list must be ordered by (created_at, id)"
+    );
+    // Stable across calls (a set that reordered would make client paging lossy).
+    let again = s.ok("l2", "task.list", serde_json::json!({"projectId": &pid}));
+    assert_eq!(again, all);
+    // Conversation scoping is real: the tie pair lives in the second
+    // conversation but the same project, so a project query sees all four.
+    assert_eq!(all.as_array().unwrap().len(), 4);
+    let one_conversation: Vec<&serde_json::Value> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["conversationId"] == cid)
+        .collect();
+    assert_eq!(one_conversation.len(), 2);
+}
+
+#[test]
+fn conversation_list_scopes_by_project_and_clamps_limit() {
+    let mut s = start_server(no_sbx());
+    let (p1, _c1) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let second = s.ok(
+        "c2",
+        "conversation.create",
+        serde_json::json!({"projectId": p1, "agentId": "codex", "title": "second"}),
+    );
+    let (p2, _c2) = make_project_and_conversation(&mut s, "Nova Demo", vec![]);
+
+    let scoped = s.ok(
+        "l1",
+        "conversation.list",
+        serde_json::json!({"projectId": &p1}),
+    );
+    let arr = scoped.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "got: {scoped}");
+    for c in arr {
+        assert_eq!(c["projectId"], p1);
+        assert!(!c["id"].as_str().unwrap().is_empty());
+        assert_eq!(c["agentId"], "codex");
+    }
+    assert!(arr
+        .iter()
+        .any(|c| c["id"] == second["id"] && c["title"] == "second"));
+
+    let all = s.ok("l2", "conversation.list", serde_json::json!({}));
+    assert_eq!(all.as_array().unwrap().len(), 3);
+    for c in all.as_array().unwrap() {
+        assert!(c["projectId"] == p1 || c["projectId"] == p2);
+    }
+
+    let clamped = s.ok(
+        "l3",
+        "conversation.list",
+        serde_json::json!({"limit": 999_999}),
+    );
+    assert!(clamped.as_array().unwrap().len() <= sandpane_service::MAX_LIST_LIMIT as usize);
+    let one = s.ok("l4", "conversation.list", serde_json::json!({"limit": 1}));
+    assert_eq!(one.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn conversation_history_orders_pages_and_discloses_row_truncation() {
+    let mut s = start_server(no_sbx());
+    let (_p, cid) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    for content in ["m1", "m2", "m3", "m4"] {
+        s.ok(
+            "send",
+            "conversation.send",
+            serde_json::json!({"conversationId": &cid, "content": content}),
+        );
+    }
+
+    // Full read: ascending sequence, no truncation, cursor = last row.
+    let all = s.ok(
+        "h1",
+        "conversation.history",
+        serde_json::json!({"conversationId": &cid}),
+    );
+    let msgs = all["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 4);
+    assert_eq!(
+        msgs.iter()
+            .map(|m| m["sequence"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        msgs.iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["m1", "m2", "m3", "m4"],
+        "stored content comes back verbatim, in order"
+    );
+    assert_eq!(all["truncated"], false);
+    assert_eq!(all["nextSequence"], 4);
+    assert_eq!(msgs[0]["conversationId"], cid);
+    assert_eq!(msgs[0]["role"], "user");
+    assert!(!msgs[0]["id"].as_str().unwrap().is_empty());
+
+    // Row-bounded page + forward paging from the disclosed cursor.
+    let page1 = s.ok(
+        "h2",
+        "conversation.history",
+        serde_json::json!({"conversationId": &cid, "limit": 2}),
+    );
+    assert_eq!(page1["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(page1["truncated"], true, "row limit stopped the scan");
+    assert_eq!(page1["nextSequence"], 2);
+    let page2 = s.ok(
+        "h3",
+        "conversation.history",
+        serde_json::json!({
+            "conversationId": &cid,
+            "afterSequence": page1["nextSequence"],
+            "limit": 2
+        }),
+    );
+    let msgs = page2["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["content"], "m3");
+    assert_eq!(page2["truncated"], false);
+    assert_eq!(page2["nextSequence"], 4);
+
+    // Past the end: nothing returned, cursor echoed back unchanged.
+    let empty = s.ok(
+        "h4",
+        "conversation.history",
+        serde_json::json!({"conversationId": &cid, "afterSequence": 4}),
+    );
+    assert!(empty["messages"].as_array().unwrap().is_empty());
+    assert_eq!(empty["truncated"], false);
+    assert_eq!(empty["nextSequence"], 4);
+
+    // A negative cursor is normalised, not rejected into nonsense.
+    let neg = s.ok(
+        "h5",
+        "conversation.history",
+        serde_json::json!({"conversationId": &cid, "afterSequence": -7}),
+    );
+    assert_eq!(neg["messages"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn conversation_history_byte_ceiling_truncates_without_losing_rows() {
+    let mut s = start_server(no_sbx());
+    let (_p, cid) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    // 40 rows × 60 000 chars ≈ 2.4 MB of stored content — above the response
+    // ceiling, and far below the row count that would be needed otherwise.
+    let big = "x".repeat(60 * 1000);
+    let contents: Vec<&str> = (0..40).map(|_| big.as_str()).collect();
+    seed_messages(&s, &cid, &contents);
+
+    let first = s.ok(
+        "h1",
+        "conversation.history",
+        serde_json::json!({"conversationId": &cid, "limit": sandpane_service::MAX_LIST_LIMIT}),
+    );
+    let msgs = first["messages"].as_array().unwrap();
+    assert!(
+        msgs.len() < 40,
+        "the byte ceiling must stop the scan, not the row limit ({} rows)",
+        msgs.len()
+    );
+    assert_eq!(first["truncated"], true);
+    let bytes: usize = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap().len())
+        .sum();
+    assert!(
+        bytes <= sandpane_service::MAX_HISTORY_BYTES + big.len(),
+        "response content {bytes} bytes exceeds the ceiling beyond one \
+         progress-guarantee row"
+    );
+
+    // Disclosure is actionable: paging from nextSequence returns the rest with
+    // nothing lost and nothing duplicated.
+    let next = s.ok(
+        "h2",
+        "conversation.history",
+        serde_json::json!({
+            "conversationId": &cid,
+            "afterSequence": first["nextSequence"],
+            "limit": sandpane_service::MAX_LIST_LIMIT
+        }),
+    );
+    let rest = next["messages"].as_array().unwrap();
+    assert_eq!(
+        rest.len(),
+        40 - msgs.len(),
+        "no row may be lost or repeated"
+    );
+    assert_eq!(next["truncated"], false);
+    assert_eq!(rest[0]["sequence"].as_i64().unwrap(), msgs.len() as i64 + 1);
+}
+
+#[test]
+fn conversation_history_error_paths_are_structured() {
+    let mut s = start_server(no_sbx());
+    // Unknown conversation → NOT_FOUND (never a panic, never an empty lie).
+    let err = s.err(
+        "e1",
+        "conversation.history",
+        serde_json::json!({"conversationId": "no-such-conversation"}),
+    );
+    assert_eq!(err["code"], "NOT_FOUND");
+    // Missing required id → VALIDATION_FAILED.
+    let err = s.err(
+        "e2",
+        "conversation.history",
+        serde_json::json!({"afterSequence": 3}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    // An empty id is a refusal, not a conversation that happens to be empty.
+    let err = s.err(
+        "e2b",
+        "conversation.history",
+        serde_json::json!({"conversationId": ""}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    // Hostile id is just an id: bound parameter, unknown → NOT_FOUND.
+    let err = s.err(
+        "e3",
+        "conversation.history",
+        serde_json::json!({"conversationId": "x'; DROP TABLE messages; --"}),
+    );
+    assert_eq!(err["code"], "NOT_FOUND");
+    // The connection is still healthy and a real, message-free conversation
+    // answers with an empty bounded page (not an error, not a fabricated row).
+    let (_p, cid) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let empty = s.ok(
+        "e4",
+        "conversation.history",
+        serde_json::json!({"conversationId": &cid}),
+    );
+    assert!(empty["messages"].as_array().unwrap().is_empty());
+    assert_eq!(empty["truncated"], false);
+    assert_eq!(empty["nextSequence"], 0);
+    // And the injected id did not damage the messages table.
+    s.ok("e5", "conversation.list", serde_json::json!({}));
+}
+
+#[test]
+fn task_subscribe_per_task_cursors_repair_the_shared_scalar_skip() {
+    let mut s = start_server(no_sbx());
+    let (pid, cid) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    // THREE tasks with deliberately UNEVEN event counts: A=5, B=2, C=1.
+    insert_task(&s, &cid, "task-a", "2026-10-09T00:00:01Z");
+    insert_task(&s, &cid, "task-b", "2026-10-09T00:00:02Z");
+    insert_task(&s, &cid, "task-c", "2026-10-09T00:00:03Z");
+    append_events(&s, "task-a", 5);
+    append_events(&s, "task-b", 2);
+    append_events(&s, "task-c", 1);
+
+    let grouped = |v: &serde_json::Value| -> std::collections::BTreeMap<String, Vec<i64>> {
+        let mut m: std::collections::BTreeMap<String, Vec<i64>> = Default::default();
+        for e in v.as_array().unwrap() {
+            m.entry(e["taskId"].as_str().unwrap().to_string())
+                .or_default()
+                .push(e["sequence"].as_i64().unwrap());
+        }
+        m
+    };
+
+    // (a) THE RECORDED DEFECT: one shared scalar applied to every task means a
+    // client that legitimately saw task-a up to 3 loses the unseen events of
+    // the low-sequence tasks entirely.
+    let legacy = s.ok(
+        "c1",
+        "task.subscribe",
+        serde_json::json!({"projectId": &pid, "afterSequence": 3}),
+    );
+    let legacy = grouped(&legacy);
+    assert_eq!(
+        legacy.get("task-a").map(Vec::as_slice),
+        Some(&[4i64, 5][..])
+    );
+    assert_eq!(
+        legacy.get("task-b"),
+        None,
+        "documented v1 gap: the shared scalar skips task-b's unseen event 2"
+    );
+    assert_eq!(
+        legacy.get("task-c"),
+        None,
+        "documented v1 gap: the shared scalar skips task-c's unseen event 1"
+    );
+
+    // (b) THE FIX: per-task cursors return exactly the unseen events of each
+    // task; a task absent from the map replays from 0 (its full history).
+    let fixed = s.ok(
+        "c2",
+        "task.subscribe",
+        serde_json::json!({
+            "projectId": &pid,
+            "afterSequences": {"task-a": 3, "task-b": 1}
+        }),
+    );
+    let fixed = grouped(&fixed);
+    assert_eq!(fixed.get("task-a").map(Vec::as_slice), Some(&[4i64, 5][..]));
+    assert_eq!(fixed.get("task-b").map(Vec::as_slice), Some(&[2i64][..]));
+    assert_eq!(
+        fixed.get("task-c").map(Vec::as_slice),
+        Some(&[1i64][..]),
+        "a task missing from the map defaults to cursor 0"
+    );
+
+    // (c) Legacy shapes are untouched: no map = shared scalar; explicit 0 =
+    // the full replay.
+    let full = s.ok(
+        "c3",
+        "task.subscribe",
+        serde_json::json!({"projectId": &pid}),
+    );
+    assert_eq!(full.as_array().unwrap().len(), 8, "5 + 2 + 1 events");
+    let scalar_only = s.ok(
+        "c4",
+        "task.subscribe",
+        serde_json::json!({"projectId": &pid, "afterSequence": 4}),
+    );
+    assert_eq!(
+        scalar_only.as_array().unwrap().len(),
+        1,
+        "only task-a seq 5"
+    );
+
+    // (d) Documented ambiguity: a single `taskId` request keeps scalar
+    // semantics and ignores the map.
+    let single = s.ok(
+        "c5",
+        "task.subscribe",
+        serde_json::json!({
+            "taskId": "task-a",
+            "afterSequence": 3,
+            "afterSequences": {"task-a": 0}
+        }),
+    );
+    assert_eq!(
+        single.as_array().unwrap().len(),
+        2,
+        "the scalar cursor must win for a single-task request"
+    );
+
+    // (e) Negative cursors are normalised to 0 rather than passed through.
+    let neg = s.ok(
+        "c6",
+        "task.subscribe",
+        serde_json::json!({"projectId": &pid, "afterSequences": {"task-a": -9}}),
+    );
+    assert_eq!(neg.as_array().unwrap().len(), 8);
+
+    // (f) Bounded input: an absurd cursor map is refused structurally.
+    let mut huge = serde_json::Map::new();
+    for i in 0..sandpane_service::MAX_SUBSCRIBE_CURSORS + 1 {
+        huge.insert(format!("task-{i}"), serde_json::json!(0));
+    }
+    let err = s.err(
+        "c7",
+        "task.subscribe",
+        serde_json::json!({"projectId": &pid, "afterSequences": huge}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    // Empty keys are refused too (a zero-length id is not an id).
+    let err = s.err(
+        "c8",
+        "task.subscribe",
+        serde_json::json!({"projectId": &pid, "afterSequences": {"": 1}}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+}
+
+#[test]
+fn project_list_carries_registered_repository_paths_in_order() {
+    let mut s = start_server(no_sbx());
+    let repo_a = tempfile::tempdir().unwrap();
+    let repo_b = tempfile::tempdir().unwrap();
+    let paths = vec![
+        repo_a.path().display().to_string(),
+        repo_b.path().display().to_string(),
+    ];
+    let created = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": paths}),
+    );
+    // The create response already carries them (same field, same values).
+    assert_eq!(created["repositories"].as_array().unwrap().len(), 2);
+    assert_eq!(created["repositories"][0], paths[0]);
+
+    let list = s.ok("2", "project.list", serde_json::json!({}));
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0]["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        paths,
+        "registered paths come back in insertion order"
+    );
+    // Existing fields are untouched (additive revision).
+    assert_eq!(arr[0]["name"], "Atlas Demo");
+    assert!(!arr[0]["id"].as_str().unwrap().is_empty());
+    assert!(!arr[0]["createdAt"].as_str().unwrap().is_empty());
+
+    // A project without repositories reports an EMPTY list, not a missing
+    // field and not a guess.
+    let _bare = s.ok(
+        "3",
+        "project.create",
+        serde_json::json!({"name": "Orbit Demo", "repositories": []}),
+    );
+    let list = s.ok("4", "project.list", serde_json::json!({}));
+    let bare = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "Orbit Demo")
+        .unwrap();
+    assert_eq!(bare["repositories"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn sandbox_list_joins_workspace_mode_and_omits_it_when_unbound() {
+    let list_json = r#"{"sandboxes":[{"name":"atlas-auth","state":"running"},{"name":"nova-search","state":"stopped"}]}"#;
+    let fake = fake_sbx_dir(list_json);
+    let locator = SbxLocator::with_search(None, vec![fake.path().to_path_buf()]);
+    let mut s = start_server(locator);
+
+    let repo = tempfile::tempdir().unwrap();
+    let project = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo.path().display().to_string()]}),
+    );
+    let created = s.ok(
+        "2",
+        "sandbox.create",
+        serde_json::json!({
+            "name": "atlas-auth",
+            "projectId": project["id"],
+            "workspaceMode": "direct_mount",
+            "repoPath": repo.path().display().to_string()
+        }),
+    );
+    // The create response states the mode it just recorded.
+    assert_eq!(created["workspaceMode"], "direct_mount");
+
+    // sandbox.list joins it out of sandbox_bindings; an SBX sandbox Core has
+    // no binding row for gets NO mode — never a guessed one.
+    let list = s.ok("3", "sandbox.list", serde_json::json!({}));
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    let bound = arr
+        .iter()
+        .find(|e| e["name"] == "atlas-auth")
+        .expect("atlas-auth listed by SBX");
+    assert_eq!(
+        bound["workspaceMode"], "direct_mount",
+        "live-writable mode must be truthfully joined (specs/02 §7)"
+    );
+    let unbound = arr
+        .iter()
+        .find(|e| e["name"] == "nova-search")
+        .expect("nova-search listed by SBX");
+    assert!(
+        unbound.get("workspaceMode").is_none(),
+        "unbound sandbox must not report a mode: {unbound}"
+    );
+    assert_eq!(unbound["probedState"], "stopped", "probed state still real");
+}
+
+#[test]
+fn probe_advertises_every_dispatched_method_and_nothing_else() {
+    let mut s = start_server(no_sbx());
+    let caps = s.ok("1", "system.probe", serde_json::json!({}));
+    let advertised: Vec<&str> = caps["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_str().unwrap())
+        .collect();
+    // Derived from the same enum dispatch matches exhaustively over.
+    let expected: Vec<&str> = Method::ALL.iter().map(|m| m.as_str()).collect();
+    assert_eq!(advertised, expected);
+    for m in ["task.list", "conversation.list", "conversation.history"] {
+        assert!(advertised.contains(&m), "{m} must be discoverable");
+    }
+    // NO FAKE CAPABILITY: every advertised name really reaches a dispatch
+    // branch — an unhandled one would answer "unknown method".
+    for m in &advertised {
+        let resp = s.rpc("2", m, serde_json::json!({}));
+        let msg = resp["err"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !msg.contains("unknown method"),
+            "{m} is advertised but dispatch rejected it: {msg}"
+        );
+    }
+    // Unknown methods stay refused, so the advertised set is the whole surface.
+    let err = s.err("3", "task.delete", serde_json::json!({}));
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(err["message"].as_str().unwrap().contains("unknown method"));
+}
+
+#[test]
+fn oversized_replay_is_refused_structurally_instead_of_wedging_the_client() {
+    // `task.subscribe` returns a bare array with NO way to disclose truncation,
+    // and both ends of the transport refuse a frame above MAX_FRAME_BYTES. So an
+    // over-ceiling replay must be refused with a structured, actionable error
+    // rather than built and handed to a client that disconnects over it — a
+    // failure whose retry could never converge.
+    let mut s = start_server(no_sbx());
+    let (pid, cid) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    insert_task(&s, &cid, "big-task", "2026-10-09T00:00:01Z");
+    let blob = serde_json::json!({"text": "y".repeat(60 * 1000)});
+    let mut events = 0usize;
+    loop {
+        append_events_with(&s, "big-task", 1, "message.delta", &blob);
+        events += 1;
+        if events * 60_000 > sandpane_service::MAX_SUBSCRIBE_BYTES {
+            break;
+        }
+    }
+    assert!(
+        events >= 2,
+        "the fixture must span several events to be a replay, not one row: {events}"
+    );
+
+    let err = s.err(
+        "b1",
+        "task.subscribe",
+        serde_json::json!({"projectId": &pid, "afterSequence": 0}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    let msg = err["message"].as_str().unwrap();
+    assert!(msg.contains("ceiling"), "got: {msg}");
+    assert!(
+        msg.contains("afterSequence"),
+        "the refusal must tell the caller how to narrow the request: {msg}"
+    );
+    // The method itself still works when the request fits — nothing was lost,
+    // and the cursor at the end of the log replays nothing.
+    let tail = s.ok(
+        "b2",
+        "task.subscribe",
+        serde_json::json!({"taskId": "big-task", "afterSequence": events}),
+    );
+    assert!(tail.as_array().unwrap().is_empty());
+    // The connection survived the refusal (no disconnect, no wedge).
+    let caps = s.ok("b3", "system.probe", serde_json::json!({}));
+    assert_eq!(caps["protocolVersion"], 1);
+}
+
+#[test]
+fn legacy_quoted_workspace_mode_row_is_still_reported_and_junk_stays_absent() {
+    // Pre-review-0004 databases stored the JSON-QUOTED mode in
+    // `sandbox_bindings.workspace_mode` and nothing migrated them. Those rows
+    // still record a live-writable mount, so joining them out is the truthful
+    // reading — hiding it would silently drop a live-writable warning
+    // (specs/02 §7, specs/04 §3). A row Core genuinely cannot read stays an
+    // ABSENCE; the mode is never invented.
+    let list_json = r#"{"sandboxes":[{"name":"legacy-mount","state":"running"},{"name":"never-bound","state":"running"}]}"#;
+    let fake = fake_sbx_dir(list_json);
+    let locator = SbxLocator::with_search(None, vec![fake.path().to_path_buf()]);
+    let mut s = start_server(locator);
+    let project = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": []}),
+    );
+    let pid = project["id"].as_str().unwrap().to_string();
+    {
+        let db = s.inner.lock_db();
+        db.conn()
+            .execute(
+                "INSERT INTO sandbox_bindings (id, project_id, sandbox_name, workspace_mode, created_at)
+                 VALUES ('bind-legacy',?1,'legacy-mount','\"direct_mount\"','2026-10-09T00:00:00Z')",
+                params![pid],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sandbox_bindings (id, project_id, sandbox_name, workspace_mode, created_at)
+                 VALUES ('bind-junk',?1,'never-bound','live_writable','2026-10-09T00:00:01Z')",
+                params![pid],
+            )
+            .unwrap();
+    }
+
+    let list = s.ok("2", "sandbox.list", serde_json::json!({}));
+    let arr = list.as_array().unwrap();
+    let legacy = arr.iter().find(|e| e["name"] == "legacy-mount").unwrap();
+    assert_eq!(legacy["workspaceMode"], "direct_mount", "got: {legacy}");
+    let junk = arr
+        .iter()
+        .find(|e| e["name"] == "never-bound")
+        .expect("never-bound listed by SBX");
+    assert!(
+        junk.get("workspaceMode").is_none(),
+        "an unreadable mode is absent, never invented: {junk}"
+    );
+    assert_eq!(junk["probedState"], "running", "probed state stays real");
+}
+
+#[test]
+fn history_first_row_exception_holds_for_multi_byte_content() {
+    // `conversation.send` bounds content by CHARACTERS (65 536), so one row can
+    // be ~3× that in UTF-8 bytes. The "first row always passes" paging escape
+    // must still stay inside the frame cap and return the content verbatim.
+    let mut s = start_server(no_sbx());
+    let (_p, cid) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let multibyte = "日本語".repeat(20_000); // 60 000 chars (under the cap), 180 000 bytes
+    assert_eq!(multibyte.chars().count(), 60_000);
+    assert_eq!(multibyte.len(), 180_000);
+    s.ok(
+        "m1",
+        "conversation.send",
+        serde_json::json!({"conversationId": &cid, "content": &multibyte}),
+    );
+
+    let page = s.ok(
+        "m2",
+        "conversation.history",
+        serde_json::json!({"conversationId": &cid, "limit": 1}),
+    );
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(
+        msgs.len(),
+        1,
+        "a 180 KB multi-byte row must still be delivered"
+    );
+    assert_eq!(msgs[0]["content"].as_str().unwrap(), multibyte);
+    assert_eq!(page["nextSequence"], 1);
+    // And the whole frame really did stay under the transport cap.
+    let frame = serde_json::to_string(&page).unwrap();
+    assert!(
+        frame.len() < sandpane_service::MAX_FRAME_BYTES,
+        "history frame was {} bytes",
+        frame.len()
+    );
 }

@@ -63,6 +63,13 @@ export type TaskViewAction =
   | { kind: 'taskEvents'; events: TaskEvent[] }
   | /** `conversation.send` / Core-supplied summary — a Core verdict, displayable. */
     { kind: 'taskSummary'; summary: TaskSummary }
+  | /**
+   * `task.list` hydration: Core's stored statuses, verbatim, so a reopened
+   * window can show tasks it has not replayed events for. A summary is a Core
+   * verdict — this is NOT a client-side transition, and a status this client
+   * cannot name is never mapped onto one it can.
+   */
+    { kind: 'taskList'; tasks: TaskSummary[] }
   | { kind: 'reset' };
 
 export const EMPTY_STATE: TaskViewState = { tasks: {}, order: [] };
@@ -295,6 +302,41 @@ function uniq(list: string[], value: string): string[] {
   return list.includes(value) ? list : [...list, value];
 }
 
+/**
+ * Display one Core `TaskSummary`. `status` is copied exactly as Core stored it:
+ * a value this client cannot name is recorded in `unknownKinds` and the previous
+ * status is KEPT, because guessing a lifecycle state here would be inventing a
+ * transition (AGENTS.md rule 3).
+ */
+function applySummary(state: TaskViewState, summary: TaskSummary): TaskViewState {
+  const previous = state.tasks[summary.id] ?? blankTask(summary.id);
+  const named = isTaskStatus(summary.status);
+  const task: TaskView = {
+    ...previous,
+    // Core's verdict verbatim — no local transition arithmetic.
+    status: named ? summary.status : previous.status,
+    conversationId: summary.conversationId,
+    ...(summary.sandboxName !== undefined ? { sandboxName: summary.sandboxName } : {}),
+    ...(summary.taskBranch !== undefined ? { taskBranch: summary.taskBranch } : {}),
+    ...(summary.baseCommit !== undefined ? { baseCommit: summary.baseCommit } : {}),
+    ...(named
+      ? {}
+      : {
+          unknownKinds: uniq(previous.unknownKinds, `status:${String(summary.status)}`),
+          lines: [
+            ...previous.lines,
+            {
+              role: 'system' as const,
+              text: `Core reported an unknown task status "${String(summary.status)}" — status left unchanged`,
+              sequence: previous.lastSequence,
+              unsupported: true,
+            },
+          ],
+        }),
+  };
+  return withTask(state, task);
+}
+
 export function reduceTaskView(state: TaskViewState, action: TaskViewAction): TaskViewState {
   switch (action.kind) {
     case 'reset':
@@ -310,18 +352,15 @@ export function reduceTaskView(state: TaskViewState, action: TaskViewAction): Ta
       }
       return next;
     }
-    case 'taskSummary': {
-      const previous = state.tasks[action.summary.id] ?? blankTask(action.summary.id);
-      const task: TaskView = {
-        ...previous,
-        // Core's verdict verbatim — no local transition arithmetic.
-        status: isTaskStatus(action.summary.status) ? action.summary.status : previous.status,
-        conversationId: action.summary.conversationId,
-        ...(action.summary.sandboxName !== undefined ? { sandboxName: action.summary.sandboxName } : {}),
-        ...(action.summary.taskBranch !== undefined ? { taskBranch: action.summary.taskBranch } : {}),
-        ...(action.summary.baseCommit !== undefined ? { baseCommit: action.summary.baseCommit } : {}),
-      };
-      return withTask(state, task);
+    case 'taskSummary':
+      return applySummary(state, action.summary);
+    case 'taskList': {
+      // Hydration only: every row is displayed as Core returned it, in Core's
+      // order. No row is dropped, reordered into a "newer" state, or completed
+      // locally.
+      let next = state;
+      for (const summary of action.tasks) next = applySummary(next, summary);
+      return next;
     }
     default: {
       const _exhaustive: never = action;

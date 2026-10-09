@@ -5,7 +5,8 @@ import {
   selectTask,
   selectTasks,
 } from '../src/state/reducer';
-import type { TaskEvent } from '../src/core-client/events';
+import type { TaskEvent, TaskStatus } from '../src/core-client/events';
+import type { TaskSummary } from '../src/core-client/protocol';
 import { isTerminalStatus, normalizeAgentEvent, TASK_STATUSES } from '../src/core-client/events';
 
 function ev(taskId: string, sequence: number, kind: string, payload: unknown): TaskEvent {
@@ -197,6 +198,96 @@ describe('task-status reducer is display-only', () => {
     ]);
     expect(isTerminalStatus('running')).toBe(false);
     expect(isTerminalStatus('awaiting_review')).toBe(false);
+  });
+});
+
+/**
+ * `task.list` hydration (the additive protocol-v1 method). The rule under test
+ * is AGENTS.md rule 3: a hydrated row is Core's stored status displayed, never a
+ * state the client derived — so every assertion here compares against the exact
+ * status string Core returned and checks that nothing else was invented.
+ */
+describe('task.list hydration is display-only', () => {
+  function summary(id: string, status: string): TaskSummary {
+    return {
+      id,
+      conversationId: `c-${id}`,
+      status: status as TaskStatus,
+      sandboxName: 'atlas-auth',
+      taskBranch: `sandpane/${id}`,
+      baseCommit: 'b71995fc',
+    };
+  }
+
+  it('shows every Core status verbatim, in Core order, inventing nothing', () => {
+    const state = reduceTaskView(EMPTY_STATE, {
+      kind: 'taskList',
+      tasks: [summary('t1', 'queued'), summary('t2', 'awaiting_review'), summary('t3', 'interrupted')],
+    });
+    expect(selectTasks(state).map((t) => [t.taskId, t.status])).toEqual([
+      ['t1', 'queued'],
+      ['t2', 'awaiting_review'],
+      ['t3', 'interrupted'],
+    ]);
+    for (const task of selectTasks(state)) {
+      // A summary is not an event: no transcript line and no sequence is invented.
+      expect(task.lines).toEqual([]);
+      expect(task.lastSequence).toBe(0);
+      expect(task.conversationId).toBe(`c-${task.taskId}`);
+      expect(task.sandboxName).toBe('atlas-auth');
+      expect(task.baseCommit).toBe('b71995fc');
+    }
+  });
+
+  it('displays exactly the statuses Core defines', () => {
+    for (const status of TASK_STATUSES) {
+      const state = reduceTaskView(EMPTY_STATE, { kind: 'taskList', tasks: [summary('t1', status)] });
+      expect(selectTask(state, 't1')?.status).toBe(status);
+    }
+  });
+
+  it('never maps a status it cannot name onto one it can', () => {
+    const state = reduceTaskView(EMPTY_STATE, {
+      kind: 'taskList',
+      tasks: [summary('t1', 'queued'), summary('t2', 'half_finished')],
+    });
+    const unknown = selectTask(state, 't2');
+    expect(unknown?.status).toBeNull(); // not coerced into queued/running/failed
+    expect(unknown?.unknownKinds).toEqual(['status:half_finished']);
+    expect(unknown?.lines.some((l) => l.unsupported === true)).toBe(true);
+    // The named row is unaffected by its neighbour.
+    expect(selectTask(state, 't1')?.status).toBe('queued');
+  });
+
+  it('a refresh carries the Core verdict without touching event-derived state', () => {
+    let state = reduceTaskView(EMPTY_STATE, {
+      kind: 'taskEvents',
+      events: [
+        ev('t1', 1, 'status.changed', { to: 'running' }),
+        ev('t1', 2, 'file.changed', { type: 'file.changed', path: 'a.ts' }),
+      ],
+    });
+    expect(selectTask(state, 't1')?.status).toBe('running');
+
+    state = reduceTaskView(state, { kind: 'taskList', tasks: [summary('t1', 'completed')] });
+    const task = selectTask(state, 't1');
+    expect(task?.status).toBe('completed');
+    expect(task?.lastSequence).toBe(2); // a summary is not an event — no fake seq
+    expect(task?.files).toEqual(['a.ts']); // the transcript survived the refresh
+
+    // The client adds no ordering rule of its own: whatever Core's row says is
+    // what gets painted, in both directions.
+    state = reduceTaskView(state, { kind: 'taskList', tasks: [summary('t1', 'running')] });
+    expect(selectTask(state, 't1')?.status).toBe('running');
+  });
+
+  it('an empty task.list leaves the display untouched (no invented "no tasks" state)', () => {
+    const before = reduceTaskView(EMPTY_STATE, {
+      kind: 'taskEvents',
+      events: [ev('t1', 1, 'status.changed', { to: 'queued' })],
+    });
+    const after = reduceTaskView(before, { kind: 'taskList', tasks: [] });
+    expect(selectTasks(after).map((t) => t.status)).toEqual(['queued']);
   });
 });
 

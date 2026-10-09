@@ -164,7 +164,10 @@ class EditorDiffProvider(private val project: Project) {
      * pending (docs/specs/04 §3, specs/02 §7). Same for `host_worktree` when the worktree is
      * the one the IDE is editing.
      */
-    fun liveWritableNotice(mode: WorkspaceMode): String? = when (mode) {
+    fun liveWritableNotice(mode: WorkspaceMode?): String? = when (mode) {
+        null ->
+            "Workspace mode is UNVERIFIED: Core has no readable sandbox_bindings row for this " +
+                "binding, and it never guesses one. Treated as live-writable until verified (specs/02 §7)."
         WorkspaceMode.DIRECT_MOUNT ->
             "Workspace mode direct_mount is live-writable: these edits are already applied on the host, " +
                 "and reviewing them cannot undo them."

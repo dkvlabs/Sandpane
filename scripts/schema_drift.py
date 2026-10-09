@@ -3,9 +3,12 @@
 
 The Rust crate `core/crates/sandpane-protocol` is the source of truth and the
 JSON Schemas in `schemas/` are hand-synced (schemas/README.md). This script
-compares the exact WIRE VALUE SETS on both sides — methods, error codes,
-agent event types, file change statuses, workspace modes, protocol version —
-and fails on any mismatch so drift cannot hide. Field-level shapes
+compares the exact WIRE VALUE SETS on both sides — methods, the advertised
+capability set (`Method::ALL`, which backs `core-capabilities.methods`), error
+codes, agent event types, file change statuses, workspace modes, protocol
+version — and fails on any mismatch so drift cannot hide. Every comparison is a
+value SET (adding a method on both sides keeps the gate green; a value missing
+on either side fails it), never a hard-coded snapshot. Field-level shapes
 (additionalProperties etc.) are NOT compared (P1/P7 codegen territory).
 
 Exit codes: 0 = in sync, 1 = drift found, 2 = the checker itself could not run
@@ -21,6 +24,10 @@ import sys
 from pathlib import Path
 
 RUST_WIRE = r'Self::\w+ => "([^"]+)"'
+# Same arms, capturing the variant so `Method::ALL` can be resolved to wire
+# names (the set `system.probe` advertises as `methods`).
+RUST_WIRE_ARM = r'Self::(\w+) => "([^"]+)"'
+RUST_METHOD_ALL = r"pub const ALL: \[Method; \d+\] = \[(.*?)\n\s*\];"
 
 # The protocol crate is a single lib.rs today; a module split must update this
 # path (that fails as exit 2 — "cannot read", not as fake drift).
@@ -69,7 +76,12 @@ def unit_variants(body: str, name: str) -> set:
 
 
 def dotted(s: str) -> bool:
-    return bool(re.fullmatch(r"[a-z][a-z]*(\.[a-z][a-z]*)+", s))
+    # Dotted method convention (specs/02 §2). The segment charset MUST stay in
+    # step with `core-capabilities.schema.json` -> methods.items.pattern: a name
+    # the schema would accept but this classifier rejects would surface as
+    # exit 2 ("cannot classify") instead of the actionable exit 1 (drift) when
+    # someone mistypes a wire name.
+    return bool(re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", s))
 
 
 def screaming(s: str) -> bool:
@@ -87,6 +99,29 @@ def parse_rust(src: str) -> dict:
     if unknown:
         raise HarnessError(f"unclassifiable Rust wire strings: {sorted(unknown)}")
 
+    # `Method::ALL` is the array `system.probe` advertises as
+    # `core-capabilities.methods`, so feature discovery is a THIRD surface that
+    # has to carry every method. Resolving its variants through the `as_str`
+    # arms catches "dispatch handles it, but clients cannot discover it" (the
+    # compiler cannot: an explicit-count array stays valid when a variant is
+    # added elsewhere).
+    arms = {v: name for v, name in re.findall(RUST_WIRE_ARM, src) if dotted(name)}
+    m_all = re.search(RUST_METHOD_ALL, src, re.DOTALL)
+    if not m_all:
+        raise HarnessError(
+            "Method::ALL const not found in protocol source — update the "
+            "checker's extraction (feature discovery is a compared surface)"
+        )
+    all_variants = re.findall(r"Self::(\w+)", m_all.group(1))
+    if len(all_variants) != len(set(all_variants)):
+        raise HarnessError(f"Method::ALL contains duplicate variants: {all_variants}")
+    unresolved = sorted(set(all_variants) - set(arms))
+    if unresolved:
+        raise HarnessError(
+            f"Method::ALL variants with no dotted wire name in as_str: {unresolved}"
+        )
+    advertised = {arms[v] for v in all_variants}
+
     # Variant-level serde renames sit at exactly 4-space depth; deeper ones
     # are field renames (requestId/providerType) and must not contaminate.
     agent_block = enum_body(src, "AgentEvent")
@@ -101,6 +136,7 @@ def parse_rust(src: str) -> dict:
         raise HarnessError("PROTOCOL_VERSION constant not found in protocol source")
     return {
         "methods": methods,
+        "methods_advertised": advertised,
         "codes": codes,
         "agent_types": agent_types,
         "change_statuses": change_statuses,
@@ -175,6 +211,11 @@ def main(repo_root: Path) -> int:
 
     checks = [
         ("methods (rpc-request.method)", rust["methods"], sch["methods"]),
+        (
+            "advertised methods (Method::ALL -> core-capabilities.methods)",
+            rust["methods_advertised"],
+            sch["methods"],
+        ),
         ("error codes (rpc-response.err.code)", rust["codes"], sch["response_codes"]),
         ("error codes (agent-event error.code)", rust["codes"], sch["event_codes"]),
         ("agent event types (agent-event oneOf)", rust["agent_types"], sch["agent_types"]),
