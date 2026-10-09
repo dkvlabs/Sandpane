@@ -22,6 +22,20 @@ Superpowers methodology (MIT, Jesse Vincent — vendored under `.qwen/skills/`):
 | 0006 | JetBrains plugin | `clients/jetbrains/` Gradle IntelliJ Platform 2.x skeleton per `specs/04`: plugin.xml, tool window, core client, actions, services | file-level checks only; Gradle build NOT verifiable locally (no toolchain) — recorded honestly |
 | 0007 | CI + integration | `.github/workflows/ci.yml` per `specs/08` §6, `Makefile`, final README/docs sync | fresh full verification run of all suites |
 
+## Actual entry mapping (updated 09.10.2026 as phases land)
+
+Changelog numbers are assigned by **commit chronology**, not by this plan's table (which stays as the original plan of record):
+
+| Plan entry | Actually became | Why |
+|---|---|---|
+| 0003 Protocol + Rust Core | CHANGELOG **0004** | User-requested superpowers v6.4.2 install took 0003 mid-session |
+| 0007 CI + integration | CHANGELOG **0005** | CI/drift-gate work is non-overlapping with the client scaffolds, so it landed first while three client agents ran in the background |
+| 0004 VS Code client | next free number when its agent returns (0006+) | parallel scaffold |
+| 0005 Desktop app | next free number when its agent returns (0006+) | parallel scaffold |
+| 0006 JetBrains plugin | next free number when its agent returns (0006+) | parallel scaffold |
+
+The plan's "Definition of done" item 1 ("All 7 entries") therefore reads: every planned deliverable logged under its actual chronological number, one `docs/audit/NNNN` record per implementation commit.
+
 ## Scope boundaries (honest limits)
 
 - P0 legal clearance and real `sbx` fixtures cannot be produced on this machine (`sbx` not installed; Docker written position requires humans). `docs/licensing-decision.md` and `docs/compatibility.md` record the gates as OPEN; SBX adapter fixtures are explicitly marked illustrative until captured from a real CLI.
