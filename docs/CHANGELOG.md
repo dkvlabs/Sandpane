@@ -334,4 +334,37 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0020 — JetBrains review fixes (F4)
+
+- **date:** 2026-10-09
+- **phase:** P6 (JetBrains) hardening
+- **commit:** `af8949b` (fix(jetbrains): security and correctness fixes from the review (F4))
+- **details:** Fixes JetBrains bugs 1–12 and security S1/W4, then the re-review's W1/W2 and suggestions 1–8.
+  - **Lifecycle:**
+    - correct dispose guard;
+    - no reconnect after an intentional close (version mismatch is terminal);
+    - single-flight connect;
+    - typed RPCs require Ready.
+  - **Streams:**
+    - ref-counted per-task streams across windows, with a snapshot handover;
+    - per-stream replay refusal;
+    - a real gap resync;
+    - hole fills never roll status back.
+  - **Chat:**
+    - selection reconciled by id and project;
+    - streaming text ordered by sequence.
+  - **Apply:** sends exactly the reviewed paths.
+  - **Security:**
+    - Swing HTML disabled on Core text;
+    - socket owner/mode check.
+  - **Other:** UTF-8 context budget; settings wired.
+- **files:** `clients/jetbrains/**` (32 files)
+- **verification:**
+  - `./gradlew test --rerun`: 161 tests, 0 failures.
+  - `buildPlugin` and `verifyPluginStructure` pass offline.
+  - `runIde`, Plugin Verifier and a live Core round trip: UNVERIFIED.
+- **review:** [audit/0020-jetbrains-review-fixes-review.md](audit/0020-jetbrains-review-fixes-review.md) — two rounds; PASS (timing-test suggestion deferred)
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
