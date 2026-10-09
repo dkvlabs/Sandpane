@@ -43,12 +43,12 @@ class SandpaneSettings : PersistentStateComponent<SandpaneSettings.State> {
         /** Per-request deadline; a slow Core must not pin a background thread forever. */
         var requestTimeoutMs: Int = DEFAULT_REQUEST_TIMEOUT_MS
 
-        /** Refuse to send a prompt larger than Core's own `display_text` bound. */
+        /**
+         * Refuse to send a prompt larger than Core's own `display_text` bound. Despite the
+         * (persisted, therefore kept) name, Core counts Unicode code points, not bytes, and so
+         * does the clamp that reads this value.
+         */
         var maxContentBytes: Int = DEFAULT_MAX_CONTENT_BYTES
-
-        // Transient/debug knobs are never persisted.
-        @Transient
-        var verboseIpcLogging: Boolean = false
     }
 
     private var state = State()
@@ -112,7 +112,10 @@ class SandpaneSettings : PersistentStateComponent<SandpaneSettings.State> {
         const val MIN_REQUEST_TIMEOUT_MS = 1_000
         const val MAX_REQUEST_TIMEOUT_MS = 120_000
 
-        /** Mirrors the service-side `Validator.display_text(&content, 64 * 1024)` bound. */
+        /**
+         * Mirrors the service-side `Validator.display_text(&content, 64 * 1024)` bound, which
+         * counts Unicode code points (`chars().count()`), not bytes.
+         */
         const val DEFAULT_MAX_CONTENT_BYTES = 64 * 1024
         const val MIN_MAX_CONTENT_BYTES = 1_024
         const val MAX_MAX_CONTENT_BYTES = 64 * 1024

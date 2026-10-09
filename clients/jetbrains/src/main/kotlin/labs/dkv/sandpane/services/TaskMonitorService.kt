@@ -3,6 +3,7 @@ package labs.dkv.sandpane.services
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.CoreRpcException
 import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.core.EventStream
 import labs.dkv.sandpane.core.RenderedEvent
@@ -65,6 +66,11 @@ class TaskMonitorService(private val project: Project) : Disposable {
         val lastSequence: Long,
         val lastEventAt: String?,
         val notes: List<String>,
+        /**
+         * Core's refusal of this task's replay (too large for one frame), while outstanding. Polling
+         * for the task is stopped and the transcript may be incomplete; null when not refused.
+         */
+        val replayRefusal: String? = null,
     ) {
         val awaitingReview: Boolean get() = status == TaskStatus.AWAITING_REVIEW
 
@@ -87,7 +93,11 @@ class TaskMonitorService(private val project: Project) : Disposable {
     }
 
     private val views = ConcurrentHashMap<String, TaskView>()
-    private val tracked = ConcurrentHashMap<String, EventStream>()
+
+    /** One shared stream reference plus THIS service's listener on it, released together. */
+    private class Tracking(val stream: EventStream, val removeListener: () -> Unit)
+
+    private val tracked = ConcurrentHashMap<String, Tracking>()
 
     /** taskId → the change set this client reviewed, so apply can assert the same base. */
     private val reviewedBases = ConcurrentHashMap<String, ChangeSet>()
@@ -133,20 +143,33 @@ class TaskMonitorService(private val project: Project) : Disposable {
                 TaskView(taskId, conversationId, null, null, null, null, 0, null, emptyList()),
             )
         }
-        if (!tracked.containsKey(taskId)) {
-            // computeIfAbsent keeps the listener attachment atomic: two windows opening at
-            // once must not register the same projector twice.
-            tracked.computeIfAbsent(taskId) { id ->
-                val stream = connection.subscribeTask(id)
-                stream.addListener { batch -> onBatch(id, batch) }
-                stream
-            }
+        // computeIfAbsent keeps the reference + listener attachment atomic per project: this
+        // service holds exactly one stream reference and one listener per task, and keeps the
+        // remover so untrack/dispose can detach it (review bug 4: the remover used to be dropped,
+        // leaking this Project through the application-scoped stream).
+        // The listener is attached before the first poll can run, and a window joining a stream
+        // another window already polls is handed the retained events and any outstanding refusal
+        // (review suggestion 6) — see ConnectionManager.subscribeTask(taskId, listener).
+        tracked.computeIfAbsent(taskId) { id ->
+            val subscription = connection.subscribeTask(
+                id,
+                object : EventStream.Listener {
+                    override fun onEvents(events: List<TaskEvent>) = onBatch(id, events)
+                    override fun onReplayRefusalChanged(message: String?) = onReplayRefusal(id, message)
+                },
+            )
+            Tracking(subscription.stream, subscription.removeListener)
         }
     }
 
-    /** Detach this window's view. The task keeps running in Core (docs/specs/04 §5 risk 5). */
+    /**
+     * Detach this window's view. Gives back only THIS window's reference, so another IDE window
+     * watching the same task keeps its polling; the task keeps running in Core regardless
+     * (docs/specs/04 §5 risk 5). Untracking a task this window never tracked does nothing.
+     */
     fun untrack(taskId: String) {
-        tracked.remove(taskId)
+        val tracking = tracked.remove(taskId) ?: return
+        tracking.removeListener()
         connection.releaseTask(taskId)
     }
 
@@ -264,14 +287,11 @@ class TaskMonitorService(private val project: Project) : Disposable {
      * Apply is an explicit Git operation performed by Core, gated by the base recorded at
      * review time — a mismatch aborts there (docs/specs/06 §6). Nothing is written here.
      */
-    fun apply(taskId: String, selectedFiles: List<String>?, expectedBase: String): CompletableFuture<ApplyResult> {
-        require(expectedBase.isNotBlank()) { "expectedBase is required for an apply" }
+    fun apply(params: GitApplyParams): CompletableFuture<ApplyResult> {
+        require(params.expectedBase.isNotBlank()) { "expectedBase is required for an apply" }
         return connection.call(
             CoreMethods.GIT_APPLY,
-            CoreJson.encodeToJsonElement(
-                GitApplyParams.serializer(),
-                GitApplyParams(taskId = taskId, selectedFiles = selectedFiles, expectedBase = expectedBase),
-            ),
+            CoreJson.encodeToJsonElement(GitApplyParams.serializer(), params),
             ApplyResult.serializer(),
         )
     }
@@ -279,10 +299,9 @@ class TaskMonitorService(private val project: Project) : Disposable {
     fun replay(taskId: String, afterSequence: Long = 0): CompletableFuture<List<TaskEvent>> =
         connection.replay(TaskSubscribeParams(taskId = taskId, afterSequence = afterSequence))
 
-    /** Detach every view of this project. Core keeps running. */
+    /** Detach every view of this project. Core keeps running; other windows keep their streams. */
     override fun dispose() {
-        tracked.keys().toList().forEach { connection.releaseTask(it) }
-        tracked.clear()
+        tracked.keys().toList().forEach { untrack(it) }
         reviewedBases.clear()
         listeners.clear()
     }
@@ -296,23 +315,20 @@ class TaskMonitorService(private val project: Project) : Disposable {
             val rendered = event.toRenderedEvent()
             val current = views[taskId]
                 ?: TaskView(taskId, null, null, null, null, null, 0, null, emptyList())
-            val nextStatus = decodeStatusChange(event) ?: current.status
-            val note = rendered.note
-            val notes = when {
-                note == null -> current.notes
-                current.notes.lastOrNull() == note -> current.notes
-                else -> (current.notes + note).takeLast(MAX_NOTES)
-            }
-            val updated = current.copy(
-                conversationId = current.conversationId ?: conversationHint(event),
-                status = nextStatus,
-                lastSequence = event.sequence,
-                lastEventAt = event.timestamp,
-                notes = notes,
-            )
+            val updated = fold(current, event, rendered)
             views[taskId] = updated
             for (l in listeners) runCatching { l.onView(taskId, updated, rendered) }
         }
+    }
+
+    /** Core refused (or a handshake re-armed) this task's replay: show it on the row, verbatim. */
+    private fun onReplayRefusal(taskId: String, message: String?) {
+        val current = views[taskId]
+            ?: TaskView(taskId, null, null, null, null, null, 0, null, emptyList())
+        if (current.replayRefusal == message) return
+        val updated = current.copy(replayRefusal = message)
+        views[taskId] = updated
+        for (l in listeners) runCatching { l.onView(taskId, updated, null) }
     }
 
     private fun applySummary(summary: TaskSummary) {
@@ -327,34 +343,77 @@ class TaskMonitorService(private val project: Project) : Disposable {
             lastSequence = prior?.lastSequence ?: 0,
             lastEventAt = prior?.lastEventAt,
             notes = prior?.notes ?: emptyList(),
+            replayRefusal = prior?.replayRefusal,
         )
     }
 
-    /** `status.changed` payload is `{ "to": <TaskStatus> }` as produced by sandpane-service. */
-    @OptIn(ExperimentalSerializationApi::class)
-    private fun decodeStatusChange(event: TaskEvent): TaskStatus? {
-        if (event.kind != "status.changed") return null
-        return runCatching {
-            CoreJson.decodeFromJsonElement(StatusChangedPayload.serializer(), event.payload).to
-        }.getOrNull()
-    }
-
-    private fun conversationHint(event: TaskEvent): String? =
-        runCatching { (event.payload as? JsonObject)?.get("conversationId")?.asStringOrNull() }.getOrNull()
-
-    /** Accept both documented shapes until the protocol resolves gap 2. */
-    @OptIn(ExperimentalSerializationApi::class)
-    private fun decodeSendResult(element: JsonElement): SendResult {
-        val summary = runCatching {
-            CoreJson.decodeFromJsonElement(TaskSummary.serializer(), element)
-        }.getOrNull()
-        if (summary != null) return SendResult.FromSummary(summary)
-        val taskId = (element as? JsonObject)?.get("taskId")?.asStringOrNull()
-        return SendResult.TaskIdOnly(taskId ?: "")
-    }
 
     companion object {
         private const val MAX_NOTES = 12
+
+        /**
+         * Project one durable event onto a task row. Pure.
+         *
+         * Review W1 (AGENTS.md rule 3): a hole-filling resync delivers OLDER sequences after newer
+         * ones. Such an event is history the row has already moved past — it may still fill in a
+         * missing conversation id, but it never changes `status`, `lastEventAt` or `notes`, so a
+         * late `status.changed → running` can never roll an `awaiting_review` row back.
+         */
+        internal fun fold(current: TaskView, event: TaskEvent, rendered: RenderedEvent): TaskView {
+            val conversationId = current.conversationId ?: conversationHint(event)
+            if (event.sequence < current.lastSequence) {
+                return current.copy(conversationId = conversationId)
+            }
+            val note = rendered.note
+            val notes = when {
+                note == null -> current.notes
+                current.notes.lastOrNull() == note -> current.notes
+                else -> (current.notes + note).takeLast(MAX_NOTES)
+            }
+            return current.copy(
+                conversationId = conversationId,
+                status = decodeStatusChange(event) ?: current.status,
+                lastSequence = event.sequence,
+                lastEventAt = event.timestamp,
+                notes = notes,
+            )
+        }
+
+        /** `status.changed` payload is `{ "to": <TaskStatus> }` as produced by sandpane-service. */
+        @OptIn(ExperimentalSerializationApi::class)
+        private fun decodeStatusChange(event: TaskEvent): TaskStatus? {
+            if (event.kind != "status.changed") return null
+            return runCatching {
+                CoreJson.decodeFromJsonElement(StatusChangedPayload.serializer(), event.payload).to
+            }.getOrNull()
+        }
+
+        private fun conversationHint(event: TaskEvent): String? =
+            runCatching { (event.payload as? JsonObject)?.get("conversationId")?.asStringOrNull() }.getOrNull()
+
+        /**
+         * Accept both documented shapes until the protocol resolves gap 2 — and nothing else.
+         *
+         * A reply that is neither a `TaskSummary` with an id nor `{ "taskId": "<non-blank>" }`
+         * is NOT a success: it fails with an `INTERNAL` code attributed to this plugin
+         * (`raisedByCore = false`), so the UI can never print "Core accepted task " with an empty
+         * id (review bug 11).
+         */
+        @OptIn(ExperimentalSerializationApi::class)
+        internal fun decodeSendResult(element: JsonElement): SendResult {
+            val summary = runCatching {
+                CoreJson.decodeFromJsonElement(TaskSummary.serializer(), element)
+            }.getOrNull()
+            if (summary != null && summary.id.isNotBlank()) return SendResult.FromSummary(summary)
+            val taskId = (element as? JsonObject)?.get("taskId")?.asStringOrNull()
+            if (!taskId.isNullOrBlank()) return SendResult.TaskIdOnly(taskId)
+            throw CoreRpcException(
+                "INTERNAL",
+                "conversation.send answered without a task id (neither a TaskSummary nor { taskId }); " +
+                    "nothing is shown as accepted",
+                raisedByCore = false,
+            )
+        }
 
         fun instance(project: Project): TaskMonitorService =
             project.getService(TaskMonitorService::class.java)

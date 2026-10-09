@@ -13,9 +13,11 @@ import com.intellij.openapi.ui.Messages
 import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.ui.PlainText
 import labs.dkv.sandpane.services.FolderAssociation
 import labs.dkv.sandpane.services.SandpaneContextProvider
 import labs.dkv.sandpane.services.SbxService
+import labs.dkv.sandpane.ui.NotificationText
 
 /** Action ids declared in plugin.xml; the tool window toolbar is built from this list. */
 object ActionIds {
@@ -42,7 +44,14 @@ internal fun confirm(project: Project, title: String, message: String, yesLabel:
 internal fun notify(project: Project?, title: String, content: String, type: NotificationType) {
     val group = NotificationGroupManager.getInstance().getNotificationGroup(NOTIFICATION_GROUP_ID)
         ?: return
-    val notification: Notification = group.createNotification(title, content, type)
+    // IntelliJ renders notification title/content as HTML, and both routinely carry Core- or
+    // user-provided text (abort reasons, conflicted paths, error messages). They are escaped here,
+    // once, so no caller can forget (security review S1).
+    val notification: Notification = group.createNotification(
+        NotificationText.escape(title),
+        NotificationText.escapeMultiline(content),
+        type,
+    )
     notification.notify(project)
 }
 
@@ -83,7 +92,7 @@ class StartTaskAction : AnAction() {
         val problem = connection.connectionProblem()
         if (problem != null) {
             presentation.isEnabled = false
-            presentation.description = problem
+            presentation.description = PlainText.inert(problem)
         }
         if (editor != null && editor.selectionModel.hasSelection()) {
             presentation.text = "Sandpane: Start Task with Selection"

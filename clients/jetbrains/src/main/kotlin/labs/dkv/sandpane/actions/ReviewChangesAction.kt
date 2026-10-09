@@ -11,6 +11,7 @@ import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.ui.PlainText
 import labs.dkv.sandpane.services.EditorDiffProvider
 import labs.dkv.sandpane.services.TaskMonitorService
 
@@ -31,13 +32,14 @@ class ReviewChangesAction : AnAction() {
         val project = event.project
         val presentation = event.presentation
         if (project == null || DumbService.isDumb(project)) {
+            // Visible-but-disabled while indexing; hidden without a project.
+            presentation.isVisible = project != null
             presentation.isEnabled = false
-            presentation.isEnabledAndVisible = project != null
             return
         }
         val problem = ConnectionManager.instance().connectionProblem()
         presentation.isEnabled = problem == null
-        if (problem != null) presentation.description = problem
+        if (problem != null) presentation.description = PlainText.inert(problem)
     }
 
     override fun actionPerformed(event: AnActionEvent) {

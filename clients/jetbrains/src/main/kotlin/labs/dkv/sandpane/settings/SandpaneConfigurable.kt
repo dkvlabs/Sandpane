@@ -2,6 +2,7 @@ package labs.dkv.sandpane.settings
 
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.ui.LabeledComponent
+import labs.dkv.sandpane.core.ConnectionManager
 import java.awt.BorderLayout
 import javax.swing.BorderFactory
 import javax.swing.BoxLayout
@@ -27,6 +28,13 @@ class SandpaneConfigurable : Configurable {
     private val socketField = JTextField(40)
     private val autoConnectBox = JCheckBox(AUTO_CONNECT_LABEL, true)
 
+    /**
+     * Session-only diagnostics switch (review bug 12): it used to exist only as an unread settings
+     * field. It now drives [ConnectionManager.verboseLogging] directly and is deliberately NOT
+     * persisted, so an IPC trace can never stay switched on across restarts by accident.
+     */
+    private val verboseLoggingBox = JCheckBox(VERBOSE_LABEL, false)
+
     override fun getDisplayName(): String = DISPLAY_NAME
 
     override fun createComponent(): JComponent {
@@ -38,6 +46,7 @@ class SandpaneConfigurable : Configurable {
             border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
             add(LabeledComponent.create(socketField, "Core socket path (empty = per-user default)"))
             add(autoConnectBox)
+            add(verboseLoggingBox.apply { toolTipText = VERBOSE_TOOLTIP })
             add(JLabel(NOTICE).apply { border = BorderFactory.createEmptyBorder(12, 0, 0, 0) })
         }
 
@@ -53,21 +62,30 @@ class SandpaneConfigurable : Configurable {
     override fun isModified(): Boolean {
         val settings = SandpaneSettings.instance()
         return socketField.text.orEmpty().trim() != settings.socketPathOverride ||
-            autoConnectBox.isSelected != settings.autoConnect
+            autoConnectBox.isSelected != settings.autoConnect ||
+            verboseLoggingBox.isSelected != ConnectionManager.verboseLogging
     }
 
     override fun apply() {
         val settings = SandpaneSettings.instance()
+        val socketChanged = socketField.text.orEmpty().trim() != settings.socketPathOverride
         // Mutate the live state instead of replacing it: a fresh State would silently
         // reset the rendering/timeout preferences that this page does not own.
         settings.setSocketPathOverride(socketField.text.orEmpty())
         settings.setAutoConnect(autoConnectBox.isSelected)
+        ConnectionManager.verboseLogging = verboseLoggingBox.isSelected
+        if (socketChanged) {
+            // The old socket stays attached otherwise until it happens to drop (review bug 12).
+            // reconnect() is non-blocking: the old client is closed on the IPC executor.
+            ConnectionManager.instance().reconnect("socket path changed in Settings")
+        }
     }
 
     override fun reset() {
         val settings = SandpaneSettings.instance()
         socketField.text = settings.socketPathOverride
         autoConnectBox.isSelected = settings.autoConnect
+        verboseLoggingBox.isSelected = ConnectionManager.verboseLogging
     }
 
     override fun disposeUIResources() {
@@ -77,6 +95,10 @@ class SandpaneConfigurable : Configurable {
     companion object {
         const val DISPLAY_NAME = "Sandpane"
         private const val AUTO_CONNECT_LABEL = "Connect to the local Sandpane Core when the tool window opens"
+        private const val VERBOSE_LABEL = "Verbose IPC logging for this IDE session (not saved)"
+        private const val VERBOSE_TOOLTIP =
+            "Writes bounded connection/poll diagnostics to the IDE's stderr log. Frames are truncated " +
+                "and never dumped whole; turn it off again when done. Resets on IDE restart."
         private const val SOCKET_TOOLTIP =
             "Local Unix socket path only (Windows named pipes are not implemented by Core yet). " +
                 "TCP is never used (docs/specs/02 §2)."

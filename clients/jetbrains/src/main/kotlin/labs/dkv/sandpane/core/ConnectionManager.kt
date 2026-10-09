@@ -24,17 +24,19 @@ import kotlinx.serialization.json.buildJsonObject
 import java.io.File
 import java.net.UnixDomainSocketAddress
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.CompletionException
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Application-scoped owner of the single Core connection shared by every IDE window.
@@ -48,8 +50,21 @@ import java.util.concurrent.atomic.AtomicInteger
  * Ownership boundary (docs/specs/04 §2, §5 risk 5): disposing this service, closing a
  * project, or hiding the tool window detaches UI subscriptions only. It never tells Core
  * to stop, and it never infers that a task ended because a window closed.
+ *
+ * Connection lifecycle invariants (review bug 2):
+ *  - at most one connect attempt runs at a time ([connecting] is single-flight and is released
+ *    only by the attempt that took it);
+ *  - at most one retry is scheduled at a time ([pendingRetry]);
+ *  - only the CURRENT client's unexpected close schedules a reconnect: every client carries the
+ *    [generation] it was created under, and a retired client's late EOF is ignored;
+ *  - intentionally retired clients do not report their close at all ([CoreClient] contract);
+ *  - [State.VersionMismatch] and [State.TransportUnsupported] halt automatic retries; only an
+ *    explicit user action (tool-window activation, refresh, settings change) tries again.
+ *
+ * @param application nullable only for the headless unit tests, which construct this class
+ *   directly; the JVM signature is unchanged for the platform's service instantiation.
  */
-class ConnectionManager(private val application: Application) : Disposable {
+class ConnectionManager(private val application: Application?) : Disposable {
 
     /** Connection surface as the UI sees it. Every state names a reason; no fake green. */
     sealed class State {
@@ -78,20 +93,47 @@ class ConnectionManager(private val application: Application) : Disposable {
         Executors.newSingleThreadScheduledExecutor(threadFactory("sandpane-core-scheduler"))
 
     private val stateListeners = CopyOnWriteArrayList<(State) -> Unit>()
-    private val streams = ConcurrentHashMap<String, EventStream>()
+    private val streams = StreamRegistry { settings().retainedEventCap }
     private val connecting = AtomicBoolean(false)
     private val disposed = AtomicBoolean(false)
     private val reconnectAttempt = AtomicInteger(0)
 
+    /** Bumped for every client created; a close callback from an older generation is stale. */
+    private val generation = AtomicInteger(0)
+
+    /** The single scheduled retry, if any. Guarded by [retryLock]. */
+    private val retryLock = Any()
+    private var pendingRetry: ScheduledFuture<*>? = null
+
+    /** Set by VersionMismatch / TransportUnsupported: no timer-driven retry until a user asks. */
+    @Volatile
+    private var autoRetryHalted: Boolean = false
+
+    /** A forced reconnect (settings change) arrived while an attempt was in flight. */
+    private val forceRequested = AtomicBoolean(false)
+
+    /**
+     * A scheduled retry fired while an attempt was in flight (review suggestion 1). Replayed when
+     * that attempt ends — but only if it neither connected, halted, nor scheduled its own retry.
+     */
+    private val retryRequested = AtomicBoolean(false)
+
+    /** Socket path of the last Ready connection; a different path is treated as a different Core. */
+    @Volatile
+    private var lastReadyPath: String? = null
+
     /** Used only when the settings service is unavailable (headless test path). */
     private val fallbackSettings = SandpaneSettings()
+
+    /** Test seam: settings to use instead of the application service. */
+    @Volatile
+    internal var settingsOverride: SandpaneSettings? = null
 
     @Volatile
     var state: State = State.Idle
         private set
 
-    @Volatile
-    private var client: CoreClient? = null
+    private val clientRef = AtomicReference<CoreClient?>(null)
 
     /** Last negotiated instance id, so a Core restart is visible instead of implicit. */
     @Volatile
@@ -141,8 +183,8 @@ class ConnectionManager(private val application: Application) : Disposable {
     @OptIn(ExperimentalSerializationApi::class)
     fun <T> call(method: String, params: JsonElement, deserializer: KSerializer<T>): CompletableFuture<T> {
         val future = CompletableFuture<T>()
-        val active = client
-        if (active == null || !active.isOpen) {
+        val active = readyClient()
+        if (active == null) {
             future.completeExceptionally(CoreTransportException(notReadyReason()))
             return future
         }
@@ -169,11 +211,22 @@ class ConnectionManager(private val application: Application) : Disposable {
         return future
     }
 
+    /**
+     * The client typed RPCs may use: open AND past the handshake. A socket that is connected but
+     * still negotiating is not usable — a poll sent then could reach a new Core before its
+     * checkpoint reset (or version check) ran.
+     */
+    private fun readyClient(): CoreClient? {
+        val active = clientRef.get() ?: return null
+        if (!active.isOpen) return null
+        return if (state is State.Ready) active else null
+    }
+
     /** RPC for responses with no typed shape yet: the raw `ok` element. */
     fun callJson(method: String, params: JsonElement): CompletableFuture<JsonElement> {
         val future = CompletableFuture<JsonElement>()
-        val active = client
-        if (active == null || !active.isOpen) {
+        val active = readyClient()
+        if (active == null) {
             future.completeExceptionally(CoreTransportException(notReadyReason()))
             return future
         }
@@ -187,16 +240,20 @@ class ConnectionManager(private val application: Application) : Disposable {
         return future
     }
 
-    /** Replay a batch of durable events for one scope. The result is Core's, not ours. */
+    /**
+     * Replay a batch of durable events for one scope. The result is Core's, not ours.
+     *
+     * Only a PROJECT-WIDE (no `taskId`) refusal is recorded globally here; a single task's refusal
+     * belongs to that task's [EventStream] and is handled by its poll chain (review bug 5), so one
+     * oversized task can no longer block project-wide discovery for every other task.
+     */
     fun replay(params: TaskSubscribeParams): CompletableFuture<List<TaskEvent>> =
         call(
             CoreMethods.TASK_SUBSCRIBE,
             CoreJson.encodeToJsonElement(TaskSubscribeParams.serializer(), params),
             ListSerializer(TaskEvent.serializer()),
         ).whenComplete { _, error ->
-            // Remember an undeliverable-replay refusal so the poll loop can stop instead of
-            // hammering a request that can never succeed. Recognition only — never a retry here.
-            if (error != null) recordReplayRefusal(unwrap(error))
+            if (error != null && params.taskId == null) recordReplayRefusal(unwrap(error))
         }
 
     /**
@@ -238,55 +295,107 @@ class ConnectionManager(private val application: Application) : Disposable {
     }
 
     private fun recordReplayRefusal(error: Throwable) {
-        val (code, message) = when (error) {
-            is CoreRpcException -> error.code to error.message
-            else -> return
-        }
-        if (!CoreGuards.isOversizedReplayRefusal(code, message)) return
-        val description = CoreGuards.describeOversizedReplay(message)
+        val description = oversizedRefusalOrNull(error) ?: return
         replayRefusalMessage = description
         log("replay refused — automatic catch-up paused: ${truncate(description)}")
     }
 
+    /** Core's oversized-replay refusal as a user sentence, or null for any other failure. */
+    private fun oversizedRefusalOrNull(error: Throwable): String? {
+        val rpc = error as? CoreRpcException ?: return null
+        if (!CoreGuards.isOversizedReplayRefusal(rpc.code, rpc.message)) return null
+        return CoreGuards.describeOversizedReplay(rpc.message)
+    }
+
     /**
      * Start (or re-start) the connection. Non-blocking; the handshake runs on [io].
-     * Safe to call from the EDT and on repeated tool-window activations.
+     * Safe to call from the EDT and on repeated tool-window activations: an attempt already in
+     * flight, or a connection already Ready, makes this a no-op.
      */
-    fun connectAsync(reason: String) {
+    fun connectAsync(reason: String) = connectAsync(reason, force = false, fromRetry = false)
+
+    /**
+     * Retire the current connection and connect again — used when the socket override changes.
+     * The old client is closed on [io] (its reader join can take up to 2 s), never on the caller's
+     * thread, so this is EDT-safe.
+     */
+    fun reconnect(reason: String) = connectAsync(reason, force = true, fromRetry = false)
+
+    private fun connectAsync(reason: String, force: Boolean, fromRetry: Boolean) {
         if (disposed.get()) return
-        if (!connecting.compareAndSet(false, true)) return
-        io.execute {
-            try {
-                openAndHandshake(reason)
-            } catch (t: Throwable) {
-                scheduleReconnect(unwrap(t))
-            } finally {
-                connecting.set(false)
+        if (!connecting.compareAndSet(false, true)) {
+            // One attempt at a time. A forced request or a timer retry is remembered and replayed
+            // when the in-flight attempt ends, so neither is silently dropped.
+            if (force) forceRequested.set(true)
+            if (fromRetry) retryRequested.set(true)
+            return
+        }
+        try {
+            io.execute {
+                try {
+                    openAndHandshake(reason, force)
+                } catch (t: Throwable) {
+                    scheduleReconnect(unwrap(t))
+                } finally {
+                    connecting.set(false)
+                    afterAttempt(reason)
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            connecting.set(false) // disposed while scheduling
+        }
+    }
+
+    /** Replay whatever arrived while the attempt that just ended was running. */
+    private fun afterAttempt(reason: String) {
+        if (disposed.get()) return
+        if (forceRequested.compareAndSet(true, false)) {
+            retryRequested.set(false)
+            connectAsync("$reason (queued)", force = true, fromRetry = false)
+            return
+        }
+        if (retryRequested.compareAndSet(true, false)) {
+            val retryAlreadyScheduled = synchronized(retryLock) { pendingRetry != null }
+            if (!autoRetryHalted && state !is State.Ready && !retryAlreadyScheduled) {
+                connectAsync("$reason (queued retry)", force = false, fromRetry = true)
             }
         }
     }
 
     /**
-     * Track one task's durable event stream. Idempotent per taskId: the same [EventStream]
-     * (and therefore the same checkpoint) is returned, so re-subscribing after a reconnect
-     * replays exactly once.
+     * Track one task's durable event stream. Idempotent per taskId: every holder shares the same
+     * [EventStream] (and therefore the same checkpoint and poll chain); each call takes one
+     * reference that [releaseTask] gives back.
      */
-    fun subscribeTask(taskId: String): EventStream {
-        streams[taskId]?.let { return it }
-        val created = EventStream(taskId, settings().retainedEventCap)
-        val prior = streams.putIfAbsent(taskId, created)
-        val stream = prior ?: created
-        if (prior == null) schedulePoll(stream, 0L)
-        return stream
+    fun subscribeTask(taskId: String): EventStream = subscribeTask(taskId, null).stream
+
+    /** One holder's reference to a task stream plus its listener; [removeListener] detaches it. */
+    class TaskSubscription(val stream: EventStream, val removeListener: () -> Unit)
+
+    /**
+     * [subscribeTask] with [listener] attached BEFORE the first poll is scheduled (review
+     * suggestion 6), so the creating window cannot miss the first batch, and with the stream's
+     * retained window replayed to it, so a window joining an existing stream sees what the other
+     * window already merged.
+     */
+    fun subscribeTask(taskId: String, listener: EventStream.Listener?): TaskSubscription {
+        val acquired = streams.acquire(taskId)
+        val remove = listener?.let { acquired.stream.addListenerWithSnapshot(it) } ?: {}
+        if (acquired.created) schedulePoll(acquired.stream, 0L)
+        return TaskSubscription(acquired.stream, remove)
     }
 
     /**
-     * Detach a view from a task's stream. The task keeps running in Core — possibly started
-     * by another client — so this only stops OUR polling (docs/specs/04 §5 risk 5).
+     * Give back one reference to a task's stream. The task keeps running in Core — possibly
+     * started by another client — so this only stops OUR polling, and only when no other IDE
+     * window still holds the task (docs/specs/04 §5 risk 5, review bug 4).
      */
     fun releaseTask(taskId: String) {
-        streams.remove(taskId)
+        streams.release(taskId)
     }
+
+    /** Holders of [taskId]'s stream in this IDE process (diagnostics and tests). */
+    internal fun streamReferenceCount(taskId: String): Int = streams.referenceCount(taskId)
 
     /**
      * Discover task ids for a project by replaying its durable events.
@@ -323,10 +432,15 @@ class ConnectionManager(private val application: Application) : Disposable {
             sharedAfterSequence = afterSequence,
             plan = plan,
         )
-        return commands.taskSubscribe(params).thenApply { events ->
-            events.map { it.taskId }.distinct().forEach(onTaskId)
-            events.size
-        }
+        return commands.taskSubscribe(params)
+            .whenComplete { _, error ->
+                // The project-wide request is the one the global pause exists for.
+                if (error != null) recordReplayRefusal(unwrap(error))
+            }
+            .thenApply { events ->
+                events.map { it.taskId }.distinct().forEach(onTaskId)
+                events.size
+            }
     }
 
     /**
@@ -338,7 +452,7 @@ class ConnectionManager(private val application: Application) : Disposable {
      * idempotent merge in [EventStream.merge]); a shared scalar would instead risk skipping.
      */
     private fun streamCheckpoints(): List<Pair<String, Long>> =
-        streams.values.map { it.taskId to it.lastSequence }
+        streams.all().map { it.taskId to it.lastSequence }
 
     /**
      * `task.list` for one project — the read-only hydration path Core advertises, in place of a
@@ -376,8 +490,8 @@ class ConnectionManager(private val application: Application) : Disposable {
     override fun dispose() {
         if (!disposed.compareAndSet(false, true)) return
         streams.clear()
-        client?.close()
-        client = null
+        cancelPendingRetry()
+        clientRef.getAndSet(null)?.let { runCatching { it.close() } }
         scheduler.shutdownNow()
         io.shutdownNow()
         state = State.Idle
@@ -401,31 +515,54 @@ class ConnectionManager(private val application: Application) : Disposable {
     // connection lifecycle
     // -----------------------------------------------------------------------
 
-    private fun openAndHandshake(reason: String) {
+    private fun openAndHandshake(reason: String, force: Boolean) {
         CoreClient.assertNotEdt("ConnectionManager.openAndHandshake()")
+        val current = clientRef.get()
+        if (!force && current != null && current.isOpen && state is State.Ready) return
+        // Whatever was there is retired ON PURPOSE: it must not schedule a reconnect of its own.
+        retire(current)
+        // An explicit attempt (user action or retry) lifts a halt; a mismatch below re-applies it.
+        autoRetryHalted = false
+
         val path = socketPath()
         when (val transport = CoreClient.resolveTransport(path)) {
             is CoreTransportState.Unsupported -> {
                 // Terminal for this host until Core grows the transport: no retry storm.
+                haltAutoRetry()
                 publish(State.TransportUnsupported(transport.reason))
             }
 
             is CoreTransportState.Local -> {
                 publish(State.Connecting(path, reconnectAttempt.get()))
+                when (val verdict = SocketTrust.checkForCurrentUser(transport.path)) {
+                    SocketTrust.Verdict.Trusted -> Unit
+                    SocketTrust.Verdict.Missing ->
+                        throw CoreTransportException("no Core socket at $path (is the Sandpane Core service running?)")
+                    is SocketTrust.Verdict.Refused ->
+                        // This plugin's refusal, before a byte was written; the retry loop keeps
+                        // checking so a Core restarted with correct permissions is picked up.
+                        throw CoreTransportException("refused by this plugin before connecting: ${verdict.reason}")
+                }
+
+                val myGeneration = generation.incrementAndGet()
                 val next = CoreClient(
                     socketAddress = UnixDomainSocketAddress.of(transport.path),
                     requestTimeoutMs = settings().requestTimeoutMs,
                     onUnsolicited = { line -> log("unsolicited frame: ${truncate(line)}") },
-                    onClosed = { cause -> if (!disposed.get()) scheduleReconnect(cause ?: EOF) },
+                    onClosed = { cause -> onClientClosed(myGeneration, cause) },
                 )
                 try {
                     next.connect()
                 } catch (e: CoreTransportException) {
                     next.close()
-                    scheduleReconnect(e)
+                    throw e
+                }
+                if (disposed.get()) {
+                    // dispose() ran while we were connecting: this client would outlive it.
+                    next.close()
                     return
                 }
-                client = next
+                clientRef.set(next)
                 publish(State.Handshaking(path))
 
                 val caps = try {
@@ -435,30 +572,51 @@ class ConnectionManager(private val application: Application) : Disposable {
                         CoreCapabilities.serializer(),
                     )
                 } catch (t: Throwable) {
-                    next.close()
-                    client = null
-                    scheduleReconnect(unwrap(t))
-                    return
+                    retire(next)
+                    throw t
                 }
 
                 if (!caps.versionCompatible) {
-                    next.close()
-                    client = null
+                    // Hard stop: no timer will knock on this Core again (the old code reconnected
+                    // forever here, because closing the client reported itself as a drop). The
+                    // halt goes first so nothing the close triggers can schedule a retry.
+                    haltAutoRetry()
+                    retire(next)
                     publish(State.VersionMismatch(path, caps.protocolVersion))
                     return
                 }
 
+                if (disposed.get()) {
+                    // Review suggestion 2: never publish Ready from a manager disposed mid-handshake.
+                    retire(next)
+                    return
+                }
+                cancelPendingRetry()
                 reconnectAttempt.set(0)
+                val previousPath = lastReadyPath
+                lastReadyPath = path
+                if (previousPath != null && previousPath != path) {
+                    // Review suggestion 7: a different socket path may be a different Core with a
+                    // different database, so sequence checkpoints from the old one mean nothing
+                    // there. Replay each tracked task from the start; holders' views and
+                    // SequencedText absorb re-delivered sequences idempotently.
+                    streams.all().forEach { it.forgetCheckpoint() }
+                    log("socket path changed ($previousPath -> $path): per-task checkpoints reset")
+                }
                 val restarted = lastInstanceId != null && lastInstanceId != caps.instanceId
                 lastInstanceId = caps.instanceId
                 // A refusal belongs to the instance that raised it and to the cursors it was
                 // computed against; a fresh handshake invalidates it rather than leaving a stale
                 // block on a Core that may answer the same request differently.
                 replayRefusalMessage = null
+                rearmRefusedStreams()
                 if (restarted) {
                     // Core came back under a new instance id. Core reconciles its own task
                     // rows to `interrupted`; this client keeps its checkpoints, replays, and
                     // only says out loud that the instance changed (AGENTS.md rule 3).
+                    // `instanceId` changes on EVERY restart of the same database, so it is not a
+                    // data identity; CoreCapabilities carries none (protocol gap). The socket path
+                    // is the proxy used above to decide when checkpoints are reset.
                     log("Core instance changed (restart detected): checkpoints retained, replay continues")
                 }
                 publish(State.Ready(path, caps))
@@ -467,20 +625,71 @@ class ConnectionManager(private val application: Application) : Disposable {
         }
     }
 
-    private fun scheduleReconnect(cause: Throwable?) {
+    /** Detach and close [stale] if it is still the current client. Never schedules a retry. */
+    private fun retire(stale: CoreClient?) {
+        if (stale == null) return
+        clientRef.compareAndSet(stale, null)
+        runCatching { stale.close() }
+    }
+
+    /**
+     * The read side of a client ended without us closing it. Only the CURRENT generation may
+     * trigger a reconnect: a retired client's late EOF must never close a healthy successor.
+     */
+    private fun onClientClosed(clientGeneration: Int, cause: Throwable?) {
         if (disposed.get()) return
-        client?.let { stale ->
-            client = null
-            runCatching { stale.close() }
+        if (generation.get() != clientGeneration) return
+        val dead = clientRef.get() ?: run {
+            // Dropped mid-handshake (before clientRef was set): the attempt itself fails and
+            // reports; a second schedule here is coalesced by scheduleReconnect anyway.
+            scheduleReconnect(cause ?: EOF)
+            return
         }
-        val attempt = reconnectAttempt.incrementAndGet()
-        val delay = backoffDelayMs(attempt)
-        publish(State.Unavailable(socketPath(), describe(cause), attempt, delay))
-        scheduler.schedule({
-            if (disposed.get()) return@schedule
-            connecting.set(false)
-            connectAsync("retry after ${delay}ms")
-        }, delay, TimeUnit.MILLISECONDS)
+        if (clientRef.compareAndSet(dead, null)) runCatching { dead.close() }
+        scheduleReconnect(cause ?: EOF)
+    }
+
+    private fun haltAutoRetry() {
+        autoRetryHalted = true
+        cancelPendingRetry()
+    }
+
+    private fun cancelPendingRetry() {
+        synchronized(retryLock) {
+            pendingRetry?.cancel(false)
+            pendingRetry = null
+        }
+    }
+
+    /**
+     * Publish Unavailable and schedule ONE retry. Coalesced: while a retry is already pending this
+     * is a no-op, so a probe failure and the matching socket close cannot double the schedule.
+     */
+    private fun scheduleReconnect(cause: Throwable?) {
+        if (disposed.get() || autoRetryHalted) return
+        synchronized(retryLock) {
+            if (pendingRetry != null) return
+            val attempt = reconnectAttempt.incrementAndGet()
+            val delay = backoffDelayMs(attempt)
+            publish(State.Unavailable(socketPath(), describe(cause), attempt, delay))
+            pendingRetry = try {
+                scheduler.schedule({
+                    synchronized(retryLock) { pendingRetry = null }
+                    if (!disposed.get() && !autoRetryHalted) {
+                        connectAsync("retry after ${delay}ms", force = false, fromRetry = true)
+                    }
+                }, delay, TimeUnit.MILLISECONDS)
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
+                null // shutting down
+            }
+        }
+    }
+
+    /** After a fresh handshake, streams paused by a per-task refusal get exactly one new poll. */
+    private fun rearmRefusedStreams() {
+        for (stream in streams.all()) {
+            if (stream.clearReplayRefusal()) schedulePoll(stream, 0L)
+        }
     }
 
     /** Exponential backoff with jitter, capped so a dead Core is polled, not hammered. */
@@ -495,18 +704,38 @@ class ConnectionManager(private val application: Application) : Disposable {
      * can never stack overlapping identical requests.
      */
     private fun pollAndReschedule(stream: EventStream) {
-        if (disposed.get() || !streams.containsKey(stream.taskId)) return
-        // A detected hole asks for the task's whole log; the window cap bounds the memory.
-        val after = if (stream.gapDetected) 0L else stream.lastSequence
+        if (disposed.get() || !streams.isLive(stream) || stream.replayRefusal != null) return
+        // A detected hole replays from just before the EARLIEST missing sequence (never the whole
+        // log); the merge accepts only the missing sequences plus anything newer, and the window
+        // cap bounds the memory.
+        val resync = stream.gapDetected
+        val after = if (resync) {
+            ((stream.firstMissingSequence() ?: 1L) - 1L).coerceAtLeast(0L)
+        } else {
+            stream.lastSequence
+        }
         replay(TaskSubscribeParams(taskId = stream.taskId, afterSequence = after))
             .whenComplete { events, error ->
                 if (error == null && events != null) {
                     stream.merge(events)
-                    if (after == 0L) stream.markResynced()
-                } else if (error != null && verboseLogging) {
+                    if (resync) {
+                        val unfilled = stream.markResynced()
+                        if (unfilled > 0) {
+                            log("task ${stream.taskId}: $unfilled sequence(s) absent from Core's log after a full resync")
+                        }
+                    }
+                } else if (error != null) {
+                    val refusal = oversizedRefusalOrNull(unwrap(error))
+                    if (refusal != null) {
+                        // Permanent for this request: stop this stream's polling and say so,
+                        // instead of re-sending the same refused request every interval (bug 5).
+                        stream.markReplayRefused(refusal)
+                        log("poll ${stream.taskId} stopped: ${truncate(refusal)}")
+                        return@whenComplete
+                    }
                     log("poll ${stream.taskId} deferred: ${describe(unwrap(error))}")
                 }
-                if (!disposed.get() && streams.containsKey(stream.taskId)) {
+                if (!disposed.get() && streams.isLive(stream)) {
                     schedulePoll(stream, settings().eventPollIntervalMs.toLong())
                 }
             }
@@ -514,7 +743,11 @@ class ConnectionManager(private val application: Application) : Disposable {
 
     private fun schedulePoll(stream: EventStream, delayMs: Long) {
         if (disposed.get()) return
-        scheduler.schedule({ pollAndReschedule(stream) }, delayMs, TimeUnit.MILLISECONDS)
+        try {
+            scheduler.schedule({ pollAndReschedule(stream) }, delayMs, TimeUnit.MILLISECONDS)
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // scheduler shut down by dispose()
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -532,7 +765,7 @@ class ConnectionManager(private val application: Application) : Disposable {
 
     /** Why a call cannot proceed right now, in the user's terms. */
     fun connectionProblem(): String? = when (val current = state) {
-        is State.Ready -> if (client?.isOpen == true) null else "the socket closed a moment ago; reconnecting"
+        is State.Ready -> if (clientRef.get()?.isOpen == true) null else "the socket closed a moment ago; reconnecting"
         is State.TransportUnsupported -> current.reason
         is State.Unavailable ->
             "Sandpane Core is not reachable at ${current.socketPath} (${current.reason}); " +
@@ -573,10 +806,17 @@ class ConnectionManager(private val application: Application) : Disposable {
     }
 
     private fun settings(): SandpaneSettings =
-        runCatching { application.getService(SandpaneSettings::class.java) }.getOrNull() ?: fallbackSettings
+        settingsOverride
+            ?: runCatching { application?.getService(SandpaneSettings::class.java) }.getOrNull()
+            ?: fallbackSettings
 
-    private fun unwrap(t: Throwable): Throwable =
-        if (t is ExecutionException && t.cause != null) t.cause!! else t
+    private fun unwrap(t: Throwable): Throwable {
+        var current = t
+        while ((current is ExecutionException || current is CompletionException) && current.cause != null) {
+            current = current.cause!!
+        }
+        return current
+    }
 
     /**
      * One sentence for a connection-level failure, from the SAME attribution seam the tool window
@@ -607,7 +847,10 @@ class ConnectionManager(private val application: Application) : Disposable {
 
         private val EOF = RuntimeException("socket reached EOF")
 
-        /** Opt-in and off by default: an IPC log line must never leak prompt content. */
+        /**
+         * Opt-in and off by default: an IPC log line must never leak prompt content. Toggled from
+         * Settings → Tools → Sandpane for the current IDE session only; never persisted.
+         */
         @Volatile
         var verboseLogging: Boolean = false
 

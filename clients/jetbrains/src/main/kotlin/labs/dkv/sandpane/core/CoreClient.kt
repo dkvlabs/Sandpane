@@ -32,7 +32,10 @@ import kotlin.io.path.Path
  *
  * Transport: `java.nio.channels.SocketChannel` bound to the platform's UNIX protocol
  * family via [UnixDomainSocketAddress] — `SocketChannel.open(UnixSocketAddress)` on JDK
- * 16+, which the pinned baseline runtime (JBR 17 for sinceBuild 242) provides. Never TCP
+ * 16+. The IDE runtime satisfies that: the cached IntelliJ IDEA 2024.2.4 (build 242) artifact
+ * this module compiles against ships JBR 21.0.4 (its `jbr/Contents/Home/release` says
+ * `JAVA_VERSION="21.0.4"`); this module's own bytecode target is the separate
+ * `javaToolchainVersion` pin in gradle.properties. Never TCP
  * (docs/specs/02 §2). Windows named pipes are NOT implemented by Core yet
  * (`sandpane-service` says so explicitly), so Windows resolves to [CoreTransportState.Unsupported]
  * instead of silently falling back to a socket the user cannot secure.
@@ -51,7 +54,12 @@ class CoreClient(
     private val requestTimeoutMs: Int = DEFAULT_REQUEST_TIMEOUT_MS,
     /** Unsolicited frames (reserved for a future Core push mode) and uncorrelated replies. */
     private val onUnsolicited: (String) -> Unit = { },
-    /** Fires exactly once when the read side ends: EOF, IOException, or [close]. */
+    /**
+     * Fires at most once, when the read side ends WITHOUT this client having been [close]d: EOF
+     * from Core, an IOException, or a framing violation. An intentional [close] is the caller's own
+     * decision and is not reported back — reporting it made the owner schedule a reconnect for a
+     * socket it had just retired on purpose (review bug 2).
+     */
     private val onClosed: (Throwable?) -> Unit = { },
 ) : AutoCloseable {
 
@@ -249,7 +257,9 @@ class CoreClient(
                 // closing a dead socket is not an error worth reporting twice
             }
             channel = null
-            notifyClosed(cause)
+            // `closed` is set by close() BEFORE it shuts the channel, so an intentional close is
+            // recognisable here and stays silent; only a peer-side or I/O end is reported.
+            if (!closed.get()) notifyClosed(cause)
         }
     }
 

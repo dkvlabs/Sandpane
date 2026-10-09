@@ -11,6 +11,8 @@ import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.model.ApplyResult
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.ui.PlainText
+import labs.dkv.sandpane.services.ApplyPlan
 import labs.dkv.sandpane.services.TaskMonitorService
 
 /**
@@ -23,7 +25,9 @@ import labs.dkv.sandpane.services.TaskMonitorService
  *  2. `hostDirty` refuses client-side as well: Core reports uncommitted host work, and
  *     touching a dirty tree is the exact case specs/04 rule 7 protects.
  *  3. `expectedBase` goes to Core; a divergence aborts THERE and is reported as such.
- *  4. This action writes no host file itself. It has no filesystem write path at all.
+ *  4. `selectedFiles` is exactly the reviewed paths the dialog listed ([ApplyPlan]); an empty
+ *     change set is refused before the dialog rather than sent.
+ *  5. This action writes no host file itself. It has no filesystem write path at all.
  */
 class ApplyTaskAction : AnAction() {
 
@@ -33,14 +37,16 @@ class ApplyTaskAction : AnAction() {
         val project = event.project
         val presentation = event.presentation
         if (project == null || DumbService.isDumb(project)) {
+            // Visible-but-disabled while indexing; hidden without a project. (The old order set
+            // isEnabledAndVisible last, which silently re-enabled the action during indexing.)
+            presentation.isVisible = project != null
             presentation.isEnabled = false
-            presentation.isEnabledAndVisible = project != null
             return
         }
         val problem = ConnectionManager.instance().connectionProblem()
         val pending = TaskMonitorService.instance(project).awaitingReviewTasks().isNotEmpty()
         presentation.isEnabled = problem == null && pending
-        presentation.description = problem ?: if (!pending) {
+        presentation.description = problem?.let(PlainText::inert) ?: if (!pending) {
             "No task is awaiting review"
         } else {
             "Apply the reviewed change set through Core"
@@ -79,24 +85,23 @@ class ApplyTaskAction : AnAction() {
             return
         }
 
-        if (reviewed.hostDirty) {
-            notify(
-                project,
-                "Sandpane: apply refused — host tree is dirty",
-                "Core reports uncommitted changes in the host working tree for task ${candidate.taskId}. " +
-                    "Commit or stash your own work before applying an agent's change set; Sandpane will " +
-                    "not overwrite it.",
-                NotificationType.ERROR,
-            )
-            return
+        val plan = when (val decision = ApplyPlan.decide(candidate.taskId, reviewed)) {
+            is ApplyPlan.Decision.Refused -> {
+                notify(project, "Sandpane: apply refused — nothing sent", decision.reason, NotificationType.ERROR)
+                return
+            }
+
+            is ApplyPlan.Decision.Ready -> decision
         }
 
-        if (!confirm(project, "Sandpane: Apply Task Changes", applyMessage(candidate, reviewed), "Apply via Core")) {
+        if (!confirm(project, "Sandpane: Apply Task Changes", applyMessage(candidate, reviewed, plan), "Apply via Core")) {
             notify(project, "Sandpane: nothing applied", "Cancelled.", NotificationType.INFORMATION)
             return
         }
 
-        tasks.apply(candidate.taskId, selectedFiles = null, expectedBase = reviewed.baseCommit)
+        // Exactly the paths the dialog listed (review bug 7) — never `null` after a confirmation
+        // that named files.
+        tasks.apply(plan.params)
             .whenComplete { result, error ->
                 if (error != null) {
                     // Attribution seam again: this action must not announce a client-side refusal
@@ -117,10 +122,18 @@ class ApplyTaskAction : AnAction() {
     private fun applyMessage(
         candidate: TaskMonitorService.TaskView,
         reviewed: ChangeSet,
+        plan: ApplyPlan.Decision.Ready,
     ): String = buildString {
         appendLine("Apply task ${candidate.taskId.take(8)} through Core?")
         appendLine()
-        appendLine("files: ${reviewed.changes.size}")
+        appendLine("files (${plan.paths.size}) — exactly these are sent as the selection:")
+        appendLine(ApplyPlan.describePaths(plan.paths))
+        if (plan.renamedWithoutSource.isNotEmpty()) {
+            appendLine(
+                "renamed (${plan.renamedWithoutSource.size}): Core reports only the new path; the original " +
+                    "path is not part of the protocol's change set, so it is not shown here.",
+            )
+        }
         appendLine("base commit: ${reviewed.baseCommit}")
         appendLine("host dirty: ${reviewed.hostDirty} (checked again by Core before it touches anything)")
         appendLine()

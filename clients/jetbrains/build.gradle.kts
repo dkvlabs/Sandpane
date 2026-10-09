@@ -29,8 +29,10 @@ repositories {
 }
 
 kotlin {
-    // 242 ships on JBR 17; 252 runs on a newer JBR. Targeting the oldest supported
-    // runtime keeps the class files loadable across the declared range.
+    // Bytecode target for this plugin's own classes. NOTE: the IDE baseline does NOT run on JBR 17 —
+    // the cached IntelliJ IDEA 2024.2.4 (build 242) artifact ships JBR 21.0.4 (its jbr `release`
+    // file says JAVA_VERSION="21.0.4"). This pin stays at 17 only until the separate dependency-
+    // upgrade step moves the toolchain; a 17 target loads on any newer runtime in the range.
     jvmToolchain(providers.gradleProperty("javaToolchainVersion").get().toInt())
 }
 

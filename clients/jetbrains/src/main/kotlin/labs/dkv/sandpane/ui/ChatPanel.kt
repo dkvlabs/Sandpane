@@ -23,7 +23,6 @@ import labs.dkv.sandpane.services.SbxService
 import labs.dkv.sandpane.services.TaskMonitorService
 import labs.dkv.sandpane.settings.SandpaneSettings
 import java.awt.BorderLayout
-import java.awt.Component
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.Font
@@ -31,19 +30,16 @@ import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.DefaultComboBoxModel
-import javax.swing.DefaultListCellRenderer
 import javax.swing.DefaultListModel
 import javax.swing.JButton
 import javax.swing.JComboBox
 import javax.swing.JComponent
-import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JSplitPane
 import javax.swing.JTextArea
 import javax.swing.ListSelectionModel
-import javax.swing.SwingConstants
 import javax.swing.Timer
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
@@ -59,7 +55,7 @@ import javax.swing.event.DocumentListener
  * Core socket reader thread (CoreClient.readLoop)
  *   -> EventStream.merge -> TaskMonitorService.onBatch              [background]
  *     -> ChatPanel view listener:
- *          message.delta      -> pendingDeltas.offer(...)           [lock-free queue, no Swing]
+ *          message.delta      -> pendingDeltas.offer(task, seq, text) [lock-free queue, no Swing]
  *          everything else     -> onEdt { ... }                    [invokeLater]
  *   -> javax.swing.Timer(streamFlushIntervalMs, default 50ms)       [fires ON the EDT]
  *     -> drainDeltas() -> DefaultListModel writes -> repaint        [the ONLY paint path]
@@ -79,6 +75,16 @@ import javax.swing.event.DocumentListener
  *    panel never fabricates a conversation to send to.
  *  - transcript rows recovered from `conversation.history` are Core's stored messages, rendered
  *    as plain text; a truncated page says so and gives the cursor that continues it.
+ *
+ * Text safety (security review S1): every label and renderer here that shows Core- or
+ * user-provided text has Swing HTML rendering disabled ([PlainText]); tooltips carrying such text
+ * are escaped. Nothing a Core string contains is ever interpreted as markup.
+ *
+ * Selection integrity (review bug 3): the chat picker, the displayed transcript and the Send target
+ * are the same conversation — selection survives a refresh by id, any selection change reloads (or
+ * clears) the transcript, and the target is printed next to Send. Live task activity is rendered
+ * into the transcript only when the task's conversation is the displayed one, or when Core has not
+ * (yet) told this client which conversation the task belongs to; those rows carry the task id.
  */
 class ChatPanel(
     private val project: Project,
@@ -100,8 +106,12 @@ class ChatPanel(
         }
     }
 
-    /** An editor context item the user agreed to send. */
-    data class AttachmentChip(val label: String, val target: String, val removable: Boolean)
+    /**
+     * An editor context item that WAS sent with the last message. Shown for the record only: the
+     * selection is quoted into the message body at send time, so there is nothing left to remove
+     * (review bug 10 — the old "Remove ×" button removed a chip from a message already sent).
+     */
+    data class AttachmentChip(val label: String, val target: String)
 
     private val settings = SandpaneSettings.instance()
     private val connection = ConnectionManager.instance()
@@ -151,16 +161,46 @@ class ChatPanel(
     }
 
     private val sendButton = JButton("Send")
-    private val removeAttachmentButton = JButton("Remove ×")
 
-    private val connectionLabel = JLabel("  not connected")
-    private val contextLabel = JLabel("  no editor context")
-    private val gateLabel = JLabel("  ")
-    private val banner = JLabel("", SwingConstants.LEFT)
+    private val connectionLabel = PlainText.label("  not connected")
+    private val contextLabel = PlainText.label("  no editor context")
+    private val gateLabel = PlainText.label("  ")
+    private val banner = PlainText.label("")
+
+    /** The conversation Send will post to, printed beside the button (review bug 3). */
+    private val targetLabel = PlainText.label(ConversationSelection.targetLine(null))
+
+    /**
+     * True while this panel repopulates a model itself: Swing fires selection/action events for
+     * programmatic changes too, and those must not be mistaken for the user picking something.
+     * Replaces the old `hasFocus()` gating, which ignored every non-focus change and so let the
+     * picker and the transcript drift apart. EDT-only.
+     */
+    private var suppressPickerEvents = false
+
+    /** Which conversation the transcript currently shows. EDT-only. */
+    private var displayedConversationId: String? = null
+
+    /** Bumped per enumeration / history load; a stale completion is dropped. EDT-only. */
+    private var enumerationGeneration = 0
+
+    /** The Core project whose conversations [conversationModel] currently holds. EDT-only. */
+    private var conversationsProjectId: String? = null
+    private var historyGeneration = 0
+
+    /** Tasks whose replay refusal was already announced in the transcript. EDT-only. */
+    private val announcedRefusals = HashMap<String, String>()
 
     /** taskId → row id for the growing agent message. EDT-owned only. */
     private val streamingRows = HashMap<String, String>()
-    private val pendingDeltas = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
+
+    /** taskId → the streaming text in durable-sequence order (review W1). EDT-owned only. */
+    private val streamingText = HashMap<String, SequencedText>()
+
+    /** One `message.delta`, with the durable sequence that orders it. */
+    private data class PendingDelta(val taskId: String, val sequence: Long, val text: String)
+
+    private val pendingDeltas = java.util.concurrent.ConcurrentLinkedQueue<PendingDelta>()
     private val flushTimer: Timer
 
     /** Set once [dispose] runs; guards [onEdt] because the platform offers no Disposable overload. */
@@ -183,9 +223,16 @@ class ChatPanel(
         add(buildComposer(), BorderLayout.SOUTH)
 
         messages.selectionMode = ListSelectionModel.SINGLE_SELECTION
-        messages.cellRenderer = RowRenderer()
+        messages.cellRenderer = PlainTextListRenderer(BorderFactory.createEmptyBorder(2, 4, 2, 4)) { value ->
+            val row = value as? ChatRow
+            if (row == null) (value?.toString() ?: "") to null
+            else row.summaryLine() to (row.meta ?: "select to read the full message")
+        }
         messages.addListSelectionListener { if (!messages.valueIsAdjusting) showSelectedRowDetails() }
-        attachments.cellRenderer = DefaultListCellRenderer()
+        attachments.cellRenderer = PlainTextListRenderer { value ->
+            val chip = value as? AttachmentChip
+            if (chip == null) (value?.toString() ?: "") to null else chip.label to chip.target
+        }
 
         flushTimer = Timer(settings.streamFlushIntervalMs) { drainDeltas() }
         flushTimer.isCoalesce = true
@@ -194,10 +241,10 @@ class ChatPanel(
         wireCore()
         // Project changes re-enumerate chats from Core; nothing is cached client-side as truth.
         projectPicker.addActionListener {
-            if (projectPicker.hasFocus()) onSelectedProjectChanged()
+            if (!suppressPickerEvents) onSelectedProjectChanged()
         }
         conversationPicker.addActionListener {
-            if (conversationPicker.hasFocus()) loadConversationHistory()
+            if (!suppressPickerEvents) onConversationSelectionChanged()
         }
         addSystemRow(
             "Sandpane scaffold (JB0/JB1). Projects and sandboxes are read from Core. Chats are " +
@@ -209,45 +256,80 @@ class ChatPanel(
 
     /**
      * `conversation.list` for the selected project, on a background thread, with the outcome
-     * rendered as text — never as a silently empty picker.
+     * rendered as text — never as a silently empty picker. The previously selected conversation is
+     * kept BY ID when Core still lists it, and the transcript is then reconciled with whatever ends
+     * up selected (review bug 3).
      */
     private fun onSelectedProjectChanged() {
-        sandboxModel.removeAllElements()
         val selected = projectModel.selectedItem as? SandpaneProject
+        repopulate {
+            sandboxModel.removeAllElements()
+            sbx.sandboxesFor(selected?.id).forEach { sandboxModel.addElement(it) }
+        }
+        val generation = ++enumerationGeneration
         if (selected == null) {
-            conversationModel.removeAllElements()
+            repopulate { conversationModel.removeAllElements() }
+            conversationsProjectId = null
             conversationState = "no project selected"
+            onConversationSelectionChanged()
             refreshGateUI()
             return
         }
-        sbx.sandboxesFor(selected.id).forEach { sandboxModel.addElement(it) }
-        conversationModel.removeAllElements()
         conversationState = "loading conversations from Core…"
         sbx.enumerateConversations(selected.id).whenComplete { enumeration, error ->
             onEdt {
-                if (error != null) {
-                    conversationState = ErrorAttribution.describe(CoreMethods.CONVERSATION_LIST, error)
-                } else {
-                    when (enumeration) {
-                        is SbxService.ConversationEnumeration.Available -> {
-                            enumeration.conversations.forEach { conversationModel.addElement(it) }
-                            conversationState = if (enumeration.conversations.isEmpty()) {
-                                "Core reports no open conversations for this project"
-                            } else {
-                                enumeration.explain()
-                            }
+                // A newer project selection / refresh superseded this answer: drop it.
+                if (generation != enumerationGeneration) return@onEdt
+                val listed: List<Conversation> = when {
+                    error != null -> {
+                        conversationState = ErrorAttribution.describe(CoreMethods.CONVERSATION_LIST, error)
+                        emptyList()
+                    }
+
+                    enumeration is SbxService.ConversationEnumeration.Available -> {
+                        conversationState = if (enumeration.conversations.isEmpty()) {
+                            "Core reports no open conversations for this project"
+                        } else {
+                            enumeration.explain()
                         }
+                        enumeration.conversations
+                    }
 
-                        SbxService.ConversationEnumeration.Unavailable ->
-                            conversationState = "this Core does not advertise conversation.list — " +
-                                "chats cannot be enumerated, and none is invented"
+                    enumeration is SbxService.ConversationEnumeration.Failed -> {
+                        conversationState = enumeration.explain()
+                        emptyList()
+                    }
 
-                        is SbxService.ConversationEnumeration.Failed ->
-                            conversationState = enumeration.explain()
+                    else -> {
+                        conversationState = "this Core does not advertise conversation.list — " +
+                            "chats cannot be enumerated, and none is invented"
+                        emptyList()
                     }
                 }
-                conversationPicker.toolTipText = conversationState
+                // The selection as it is NOW (the user may have picked another chat while this
+                // request was in flight), judged against the project the picker holds (review W2).
+                val outcome = ConversationSelection.reconcile(
+                    currentSelectedId = selectedConversationId(),
+                    modelProjectId = conversationsProjectId,
+                    answeredProjectId = selected.id,
+                    listed = listed,
+                )
+                repopulate {
+                    conversationModel.removeAllElements()
+                    listed.forEach { conversationModel.addElement(it) }
+                    // Explicit, by id — never DefaultComboBoxModel's implicit "first added" pick.
+                    conversationModel.selectedItem = outcome.choice
+                }
+                conversationsProjectId = selected.id
+                outcome.vanishedId?.let { gone ->
+                    addSystemRow(
+                        "The conversation previously selected (${gone.take(8)}) is no longer " +
+                            "listed by Core for this project; the selection changed and the transcript follows it.",
+                    )
+                }
+                conversationPicker.toolTipText = PlainText.tooltip(conversationState)
                 conversationPicker.isEnabled = conversationModel.size > 0
+                onConversationSelectionChanged()
                 refreshGateUI()
             }
         }
@@ -259,7 +341,7 @@ class ChatPanel(
                 } else {
                     hydration.describe()
                 }
-                gateLabel.toolTipText = text
+                gateLabel.toolTipText = PlainText.tooltip(text)
                 if (hydration is TaskMonitorService.Hydration.Loaded && hydration.tasks.isNotEmpty()) {
                     addSystemRow(text)
                 }
@@ -267,18 +349,62 @@ class ChatPanel(
         }
     }
 
+    /** Run a programmatic model change without it counting as a user selection. EDT-only. */
+    private inline fun repopulate(change: () -> Unit) {
+        val prior = suppressPickerEvents
+        suppressPickerEvents = true
+        try {
+            change()
+        } finally {
+            suppressPickerEvents = prior
+        }
+    }
+
     /**
-     * `conversation.history` for the selected conversation: one bounded page of Core's stored
-     * messages plus, when the page stopped early, a visible disclosure and the cursor that
-     * continues it. Rows are plain text; content is data and is never rendered as markup.
+     * The selected conversation changed — by the user or by a refresh. Brings the transcript and
+     * the Send-target line in line with it; a no-op when they already agree.
      */
-    private fun loadConversationHistory() {
-        val conversation = conversationModel.selectedItem as? Conversation ?: return
+    private fun onConversationSelectionChanged() {
+        val selected = conversationModel.selectedItem as? Conversation
+        targetLabel.text = ConversationSelection.targetLine(selected)
+        targetLabel.toolTipText = PlainText.tooltip(
+            selected?.let { "Send posts to Core conversation ${it.id} · agent ${it.agentId}" }
+                ?: "No conversation is selected; Send will refuse rather than invent one.",
+        )
+        if (!ConversationSelection.transcriptOutOfSync(selected?.id, displayedConversationId)) return
+        if (selected == null) {
+            clearTranscript()
+            displayedConversationId = null
+            historyGeneration++
+            addSystemRow("No conversation selected: the transcript is empty and Send is refused.")
+        } else {
+            loadConversationHistory(selected)
+        }
+        refreshGateUI()
+    }
+
+    private fun clearTranscript() {
         rowsModel.removeAllElements()
         rowsById.clear()
         streamingRows.clear()
+        streamingText.clear()
+        details.text = ""
+    }
+
+    /**
+     * `conversation.history` for [conversation]: one bounded page of Core's stored messages plus,
+     * when the page stopped early, a visible disclosure and the cursor that continues it. Rows are
+     * plain text; content is data and is never rendered as markup.
+     */
+    private fun loadConversationHistory(conversation: Conversation) {
+        clearTranscript()
+        displayedConversationId = conversation.id
+        val generation = ++historyGeneration
+        addSystemRow("loading transcript of ${ConversationSelection.displayName(conversation)} from Core…")
         connection.conversationHistory(conversation.id).whenComplete { page, error ->
             onEdt {
+                // The user (or a refresh) moved on to another conversation: drop this page.
+                if (generation != historyGeneration) return@onEdt
                 if (error != null) {
                     // NOT_FOUND on an archived or unknown conversation is Core's verdict and is
                     // shown as such — not turned into an empty transcript that reads as "no
@@ -320,61 +446,45 @@ class ChatPanel(
             .apply { targetComponent = this@ChatPanel }
 
         val pickers = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
-            add(JLabel("Project"))
+            add(PlainText.label("Project"))
             add(projectPicker.apply { preferredSize = Dimension(170, 26) })
-            add(JLabel("Chat"))
+            add(PlainText.label("Chat"))
             add(conversationPicker.apply { preferredSize = Dimension(160, 26) })
-            add(JLabel("Sandbox"))
+            add(PlainText.label("Sandbox"))
             add(sandboxPicker.apply { preferredSize = Dimension(180, 26) })
-            add(JLabel("Agent"))
+            add(PlainText.label("Agent"))
             add(agentPicker.apply { preferredSize = Dimension(150, 26) })
         }
 
-        sandboxPicker.renderer = object : DefaultListCellRenderer() {
-            override fun getListCellRendererComponent(
-                list: JList<*>?,
-                value: Any?,
-                index: Int,
-                isSelected: Boolean,
-                cellHasFocus: Boolean,
-            ): Component {
-                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
-                val sandbox = value as? SandboxSummary ?: return this
+        projectPicker.renderer = PlainTextListRenderer { value ->
+            val project = value as? SandpaneProject
+            if (project == null) "no project" to null
+            else project.name to "Core project ${project.id}"
+        }
+        agentPicker.renderer = PlainTextListRenderer { value -> (value?.toString() ?: "") to null }
+
+        sandboxPicker.renderer = PlainTextListRenderer { value ->
+            val sandbox = value as? SandboxSummary
+            if (sandbox == null) {
+                (value?.toString() ?: "") to null
+            } else {
                 val mode = sandbox.modeView()
-                text = buildString {
-                    append(sandbox.name)
-                    append(" ● ")
-                    append(sandbox.probedState ?: "state not probed")
-                    append(" · ")
-                    append(mode.badge)
-                }
                 // Two different claims, never merged into one: `probedState` is what SBX was last
                 // seen doing; `workspaceMode` is what Core RECORDED it was asked to bind. A null
                 // mode is Core's honest absence and renders as UNVERIFIED, never as safe
                 // (docs/specs/02 §7, specs/04 §3).
-                toolTipText = "state: last probed by Core; SBX owns sandbox state.\n" +
-                    "mode: ${mode.explanation}"
-                return this
+                "${sandbox.name} ● ${sandbox.probedState ?: "state not probed"} · ${mode.badge}" to
+                    "state: last probed by Core; SBX owns sandbox state.\nmode: ${mode.explanation}"
             }
         }
 
-        conversationPicker.renderer = object : DefaultListCellRenderer() {
-            override fun getListCellRendererComponent(
-                list: JList<*>?,
-                value: Any?,
-                index: Int,
-                isSelected: Boolean,
-                cellHasFocus: Boolean,
-            ): Component {
-                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
-                val conversation = value as? Conversation
-                text = conversation?.title?.takeIf { it.isNotBlank() }
-                    ?: conversation?.id?.take(8)
-                    ?: "no conversation"
-                toolTipText = conversation?.let {
-                    "Core conversation ${it.id} · agent ${it.agentId} · created ${it.createdAt}"
-                } ?: "conversation.list is not advertised by this Core"
-                return this
+        conversationPicker.renderer = PlainTextListRenderer { value ->
+            val conversation = value as? Conversation
+            if (conversation == null) {
+                "no conversation" to "conversation.list is not advertised by this Core, or it lists none"
+            } else {
+                ConversationSelection.displayName(conversation) to
+                    "Core conversation ${conversation.id} · agent ${conversation.agentId} · created ${conversation.createdAt}"
             }
         }
 
@@ -401,20 +511,14 @@ class ChatPanel(
 
     private fun buildComposer(): JComponent {
         val chips = JPanel(BorderLayout()).apply {
-            add(JLabel("Attachments"), BorderLayout.WEST)
+            // Record of what went out with the LAST message — not an editable attachment list.
+            add(PlainText.label("Sent with last message"), BorderLayout.NORTH)
             add(
                 JScrollPane(attachments.apply {
                     selectionMode = ListSelectionModel.SINGLE_SELECTION
                     preferredSize = Dimension(220, 56)
                 }).apply { horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER },
                 BorderLayout.CENTER,
-            )
-            add(
-                removeAttachmentButton.apply {
-                    addActionListener { removeSelectedAttachment() }
-                    toolTipText = "Drop the quoted selection from this message"
-                },
-                BorderLayout.SOUTH,
             )
         }
 
@@ -427,6 +531,7 @@ class ChatPanel(
         val sendColumn = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             add(Box.createVerticalGlue())
+            add(targetLabel)
             add(sendButton)
         }
 
@@ -465,21 +570,18 @@ class ChatPanel(
         removeSnapshotListener = sbx.addSnapshotListener { snapshot ->
             onEdt {
                 val previouslySelected = (projectModel.selectedItem as? SandpaneProject)?.id
-                projectModel.removeAllElements()
-                snapshot.projects.orEmpty().forEach { projectModel.addElement(it) }
-                sandboxModel.removeAllElements()
-                sbx.sandboxesFor((projectModel.selectedItem as? SandpaneProject)?.id)
-                    .forEach { sandboxModel.addElement(it) }
+                val projects = snapshot.projects.orEmpty()
+                repopulate {
+                    projectModel.removeAllElements()
+                    projects.forEach { projectModel.addElement(it) }
+                    // A refresh re-asks Core; it does not reuse a cached conversation list. The
+                    // selection is preserved by id when Core still reports that project.
+                    projectModel.selectedItem =
+                        projects.firstOrNull { it.id == previouslySelected } ?: projects.firstOrNull()
+                }
                 banner.text = snapshot.failure
                     ?.let { "Core problem: $it (${snapshot.describeAge()})" }
                     ?: "projects and sandboxes ${snapshot.describeAge()}"
-                // A refresh re-asks Core; it does not reuse a cached conversation list. The
-                // selection is preserved by id when Core still reports that project.
-                if (previouslySelected != null) {
-                    (0 until projectModel.size)
-                        .firstOrNull { projectModel.getElementAt(it).id == previouslySelected }
-                        ?.let { projectModel.setSelectedItem(projectModel.getElementAt(it)) }
-                }
                 onSelectedProjectChanged()
                 refreshGateUI()
             }
@@ -487,9 +589,10 @@ class ChatPanel(
 
         removeViewListener = tasks.addViewListener { taskId, view, rendered ->
             val delta = (rendered?.agentEvent as? AgentEvent.MessageDelta)?.text
-            if (delta != null) {
-                // Hand-off only: no Swing access on this thread.
-                pendingDeltas.offer(taskId to delta)
+            if (delta != null && rendered != null) {
+                // Hand-off only: no Swing access on this thread. The sequence travels with the
+                // text so a hole-filling delta lands at its position, not at the end.
+                pendingDeltas.offer(PendingDelta(taskId, rendered.taskEvent.sequence, delta))
                 // start() resets the countdown, so it is only called when the timer stopped.
                 if (!flushTimer.isRunning) flushTimer.start()
             } else {
@@ -538,35 +641,54 @@ class ChatPanel(
         val blocked = blocker != null
         composer.isEnabled = !blocked
         sendButton.isEnabled = !blocked && composer.text.isNotBlank()
-        sendButton.toolTipText = blocker ?: "Send this text plus the editor context to Core"
-        composer.toolTipText = blocker ?: "Type a message for the selected conversation"
+        sendButton.toolTipText = PlainText.tooltip(blocker ?: "Send this text plus the editor context to Core")
+        composer.toolTipText = PlainText.tooltip(blocker ?: "Type a message for the selected conversation")
         banner.text = blocker
             ?: "projects and sandboxes ${sbx.currentSnapshot().describeAge()}"
+    }
+
+    /**
+     * Does live activity for [taskId] belong in the transcript currently shown? Unknown
+     * attribution is shown (labelled with the task id) rather than hidden. EDT-only.
+     */
+    private fun belongsToDisplayedConversation(taskId: String, view: TaskMonitorService.TaskView?): Boolean {
+        val conversationId = (view ?: tasks.view(taskId))?.conversationId ?: return true
+        return conversationId == displayedConversationId
     }
 
     /** Runs on the EDT only (Swing Timer fires on the EDT). */
     private fun drainDeltas() {
         if (pendingDeltas.isEmpty()) {
             flushTimer.stop()
+            // Lost-wakeup guard (review bug 8): a producer that offered between the isEmpty()
+            // check and stop() saw the timer still running and did not start it. Re-check after
+            // stopping; whichever side runs last restarts the timer.
+            if (!pendingDeltas.isEmpty() && !panelDisposed) flushTimer.start()
             return
         }
-        val grouped = LinkedHashMap<String, StringBuilder>()
+        val changed = LinkedHashSet<String>()
         while (true) {
             val next = pendingDeltas.poll() ?: break
-            grouped.getOrPut(next.first) { StringBuilder() }.append(next.second)
+            // Another conversation's stream is Core-stored; it appears when that chat is opened.
+            if (!belongsToDisplayedConversation(next.taskId, null)) continue
+            if (streamingText.getOrPut(next.taskId) { SequencedText() }.put(next.sequence, next.text)) {
+                changed += next.taskId
+            }
         }
-        grouped.forEach { (taskId, text) -> appendDelta(taskId, text.toString()) }
+        changed.forEach { taskId -> renderStreamingRow(taskId) }
         trimRows()
     }
 
-    private fun appendDelta(taskId: String, text: String) {
+    /** Re-render one task's streaming row from its sequence-ordered text. EDT-only. */
+    private fun renderStreamingRow(taskId: String) {
+        val text = streamingText[taskId]?.toString().orEmpty()
         if (text.isEmpty()) return
         val rowId = streamingRows.getOrPut(taskId) { "agent-$taskId" }
         val existing = rowsById[rowId]
         val row = ChatRow(
             id = rowId,
             role = "agent",
-            text = (existing?.text ?: "") + text,
+            text = text,
             meta = "task ${taskId.take(8)} · streaming (${settings.streamFlushIntervalMs}ms flush)",
         )
         if (existing == null) rowsModel.addElement(row) else rowsModel.setElementAt(row, rowsModel.indexOf(existing))
@@ -575,6 +697,7 @@ class ChatPanel(
     }
 
     private fun applyTaskEvent(taskId: String, view: TaskMonitorService.TaskView, rendered: RenderedEvent?) {
+        if (!belongsToDisplayedConversation(taskId, view)) return
         val event = rendered?.agentEvent
         val line: String? = when (event) {
             is AgentEvent.ToolStarted -> "tool ${event.name} started (${event.id})"
@@ -596,7 +719,27 @@ class ChatPanel(
             val prefix = if (kind != null && CoreEventKinds.ALL.contains(kind)) "[$kind] " else ""
             addSystemRow(prefix + line)
         }
+        announceReplayRefusal(taskId, view.replayRefusal)
         updateRowStatus(taskId, view)
+    }
+
+    /**
+     * Review bug 5: Core refused this task's replay and polling for it stopped. Said once per
+     * refusal (and once when a reconnect re-arms it), never repeated per poll interval.
+     */
+    private fun announceReplayRefusal(taskId: String, refusal: String?) {
+        val announced = announcedRefusals[taskId]
+        if (refusal == announced) return
+        if (refusal != null) {
+            announcedRefusals[taskId] = refusal
+            addSystemRow(
+                "task ${taskId.take(8)}: updates stopped — $refusal The transcript for this task may be " +
+                    "incomplete until Sandpane reconnects to Core.",
+            )
+        } else if (announced != null) {
+            announcedRefusals.remove(taskId)
+            addSystemRow("task ${taskId.take(8)}: Core connection renewed; replay for this task is being retried once.")
+        }
     }
 
     private fun updateRowStatus(taskId: String, view: TaskMonitorService.TaskView) {
@@ -678,26 +821,17 @@ class ChatPanel(
     private fun addAttachmentChips(snapshot: SandpaneContextProvider.Snapshot) {
         attachmentsModel.removeAllElements()
         snapshot.activeFile?.let {
-            attachmentsModel.addElement(AttachmentChip("file ${it.substringAfterLast('/')}", it, removable = false))
+            attachmentsModel.addElement(AttachmentChip("file ${it.substringAfterLast('/')}", "attached as a file reference: $it"))
         }
         if (snapshot.hasSelection) {
             attachmentsModel.addElement(
                 AttachmentChip(
                     "selection ${snapshot.selectionStartLine}–${snapshot.selectionEndLine}",
-                    "quoted into the message body",
-                    removable = true,
+                    "quoted into the message body that was sent" +
+                        if (snapshot.truncated) " (truncated to the context budget)" else "",
                 ),
             )
         }
-    }
-
-    private fun removeSelectedAttachment() {
-        val selected = attachments.selectedValue ?: return
-        if (!selected.removable) {
-            banner.text = "The active file stays attached: it is the task's repository context."
-            return
-        }
-        attachmentsModel.removeElement(selected)
     }
 
     private fun onComposerChanged() {
@@ -710,7 +844,9 @@ class ChatPanel(
         while (rowsModel.size() > MAX_ROWS) {
             val dropped = rowsModel.remove(0)
             rowsById.remove(dropped.id)
-            streamingRows.entries.removeAll { it.value == dropped.id }
+            val droppedTasks = streamingRows.filterValues { it == dropped.id }.keys
+            droppedTasks.forEach { streamingText.remove(it) }
+            streamingRows.keys.removeAll(droppedTasks)
         }
     }
 
@@ -737,8 +873,11 @@ class ChatPanel(
      * of touching dead components.
      */
     private fun onEdt(action: () -> Unit) {
+        // A disposed panel runs NOTHING: late whenComplete handlers used to execute their Swing
+        // code inline on the completing (background) thread here (review bug 1).
+        if (panelDisposed) return
         val app = ApplicationManager.getApplication()
-        if (app == null || panelDisposed) action() else app.invokeLater { if (!panelDisposed) action() }
+        if (app == null) action() else app.invokeLater { if (!panelDisposed) action() }
     }
 
     /** Detaches every subscription. Core tasks are untouched by design. */
@@ -754,24 +893,8 @@ class ChatPanel(
         pendingDeltas.clear()
         rowsById.clear()
         streamingRows.clear()
-    }
-
-    /** Renders the one-line summary; the details pane holds the full text. */
-    private class RowRenderer : DefaultListCellRenderer() {
-        override fun getListCellRendererComponent(
-            list: JList<*>?,
-            value: Any?,
-            index: Int,
-            isSelected: Boolean,
-            cellHasFocus: Boolean,
-        ): Component {
-            super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
-            val row = value as? ChatRow ?: return this
-            text = row.summaryLine()
-            toolTipText = row.meta ?: "select to read the full message"
-            border = BorderFactory.createEmptyBorder(2, 4, 2, 4)
-            return this
-        }
+        streamingText.clear()
+        announcedRefusals.clear()
     }
 
     companion object {

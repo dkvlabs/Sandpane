@@ -120,7 +120,7 @@ class SandpaneContextProvider(private val project: Project) {
             }
 
             val raw = selection.orEmpty()
-            val clamped = if (raw.length > limit) raw.substring(0, limit) else raw
+            val clamped = clampChars(raw, limit)
             Snapshot(
                 activeFile = file?.path,
                 selectionText = clamped.takeIf { it.isNotEmpty() },
@@ -170,12 +170,14 @@ class SandpaneContextProvider(private val project: Project) {
         return clampToContentBudget(body)
     }
 
-    /** Never exceed Core's own `display_text` bound; truncation is visible, not silent. */
-    private fun clampToContentBudget(body: String): String {
-        val budget = SandpaneSettings.instance().maxContentBytes
-        if (body.length <= budget) return body
-        return body.take(budget - MARKER.length) + MARKER
-    }
+    /**
+     * Never exceed Core's own `display_text(&content, 64 * 1024)` bound; truncation is visible, not
+     * silent. Core counts Unicode SCALAR VALUES (`str::chars().count()` in
+     * `sandpane_core::validation::bounded`), so this counts code points too — not UTF-16 chars
+     * (which over-count astral characters) and not UTF-8 bytes (review bug 9).
+     */
+    private fun clampToContentBudget(body: String): String =
+        clampCodePoints(body, SandpaneSettings.instance().maxContentBytes)
 
     /** Bound the quoted selection so one action cannot upload a whole file on purpose or by accident. */
     private fun maxSelectionChars(): Int {
@@ -189,7 +191,31 @@ class SandpaneContextProvider(private val project: Project) {
     companion object {
         private const val SELECTION_CAP_CHARS = 8_000
         private const val MIN_SELECTION_CHARS = 512
-        private const val MARKER = "…[truncated]"
+        internal const val MARKER = "…[truncated]"
+
+        /**
+         * [body] cut so that it plus [marker] is at most [maxCodePoints] Unicode code points — the
+         * unit Core's `display_text` bound counts — on a code-point boundary, so a surrogate pair
+         * is never split. Unchanged when it already fits. Pure.
+         */
+        internal fun clampCodePoints(body: String, maxCodePoints: Int, marker: String = MARKER): String {
+            val total = body.codePointCount(0, body.length)
+            if (total <= maxCodePoints) return body
+            val markerPoints = marker.codePointCount(0, marker.length)
+            val withMarker = markerPoints <= maxCodePoints
+            val keep = if (withMarker) maxCodePoints - markerPoints else maxCodePoints
+            val end = body.offsetByCodePoints(0, keep)
+            val cut = body.substring(0, end)
+            return if (withMarker) cut + marker else cut
+        }
+
+        /** [text] cut to at most [limit] UTF-16 chars without splitting a surrogate pair. Pure. */
+        internal fun clampChars(text: String, limit: Int): String {
+            if (text.length <= limit) return text
+            var end = limit.coerceAtLeast(0)
+            if (end > 0 && Character.isHighSurrogate(text[end - 1])) end -= 1
+            return text.substring(0, end)
+        }
 
         fun instance(project: Project): SandpaneContextProvider =
             project.getService(SandpaneContextProvider::class.java)

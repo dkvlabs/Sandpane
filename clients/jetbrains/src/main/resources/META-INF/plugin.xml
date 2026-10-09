@@ -52,6 +52,11 @@
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
+    <!-- ProjectLevelVcsManager (VCS roots for context and review mapping) lives in the VCS module,
+         not in platform core. `com.intellij.modules.vcs` is declared by the pinned IC 2024.2.4
+         (lib/app.jar META-INF/IdeaPlugin.xml); IDEs without it will not load this plugin rather
+         than fail at runtime. Cross-IDE availability is still a JB4 verification item. -->
+    <depends>com.intellij.modules.vcs</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <!-- Tool Window: native Swing by default; JCEF is never a hard requirement. -->
