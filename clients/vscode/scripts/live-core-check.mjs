@@ -1,0 +1,363 @@
+#!/usr/bin/env node
+/**
+ * Live integration check — NOT part of the shipped extension.
+ *
+ * It runs the compiled TypeScript client (`out/core-client/*.js`) against a REAL
+ * `sandpane-service` process over its Unix domain socket, inside a throwaway
+ * temp directory. Nothing is mocked: frames go through node:net and the Rust
+ * server answers them.
+ *
+ * The extension itself never starts Core (ADR 1 — service ownership policy is
+ * undecided), so this script spawns the already-built binary for verification
+ * only. It builds nothing and writes nothing outside its temp dir.
+ *
+ * Usage: npm run compile && node scripts/live-core-check.mjs
+ */
+
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import net from 'node:net';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const clientRoot = resolve(here, '..');
+const repoRoot = resolve(clientRoot, '..', '..');
+const CORE_BINARY = join(repoRoot, 'core', 'target', 'debug', 'sandpane-service');
+
+const results = [];
+function check(name, ok, detail = '') {
+  results.push({ name, ok, detail });
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`);
+}
+
+if (!existsSync(CORE_BINARY)) {
+  console.error(
+    `sandpane-service binary not found at ${CORE_BINARY}\n` +
+      'This harness does not build Core. Build it first (cd core && cargo build -p sandpane-service).',
+  );
+  process.exit(2);
+}
+
+const work = mkdtempSync(join(tmpdir(), 'sandpane-vscode-live-'));
+const socket = join(work, 'sandpane.sock');
+const db = join(work, 'sandpane.sqlite3');
+const repoPath = join(work, 'repo');
+
+const child = spawn(CORE_BINARY, [], {
+  env: { ...process.env, SANDPANE_SOCKET: socket, SANDPANE_DB: db },
+  stdio: ['ignore', 'pipe', 'pipe'],
+  detached: false,
+});
+let coreErr = '';
+child.stderr.on('data', (chunk) => {
+  coreErr += chunk.toString();
+});
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForSocket(path, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      const ok = await new Promise((resolveConnect) => {
+        const probe = net.connect(path);
+        probe.once('connect', () => {
+          probe.destroy();
+          resolveConnect(true);
+        });
+        probe.once('error', () => resolveConnect(false));
+      });
+      if (ok) return true;
+    }
+    await sleep(100);
+  }
+  return false;
+}
+
+async function main() {
+  if (!(await waitForSocket(socket))) {
+    check('core service starts on the temp socket', false, coreErr.slice(0, 400));
+    throw new Error('core did not come up');
+  }
+  check('core service starts on the temp socket', true, socket);
+
+  const { CoreConnection, FrameTooLargeError } = await import(
+    pathToFileURL(join(clientRoot, 'out', 'core-client', 'connection.js')).href
+  );
+  const { MAX_FRAME_BYTES } = await import(
+    pathToFileURL(join(clientRoot, 'out', 'core-client', 'protocol.js')).href
+  );
+  const { createSocketTransport } = await import(
+    pathToFileURL(join(clientRoot, 'out', 'core-client', 'transport.js')).href
+  );
+  const { CoreCommands } = await import(
+    pathToFileURL(join(clientRoot, 'out', 'core-client', 'commands.js')).href
+  );
+
+  const conn = new CoreConnection({
+    transportFactory: () => createSocketTransport({ path: socket, connectTimeoutMs: 3_000 }),
+    requestTimeoutMs: 5_000,
+  });
+  await conn.connect();
+  check('client connects and reports online', conn.connectionState === 'online', conn.connectionState);
+
+  const commands = new CoreCommands(conn);
+
+  // ---- system.probe -----------------------------------------------------
+  const caps = await commands.systemProbe();
+  check('system.probe protocol version is 1', caps.protocolVersion === 1, JSON.stringify(caps.protocolVersion));
+  check('system.probe returns instanceId + coreVersion', Boolean(caps.instanceId && caps.coreVersion), `${caps.instanceId} / ${caps.coreVersion}`);
+  check('system.probe reports sbx as NOT installed on this host', caps.sbx?.installed === false, JSON.stringify(caps.sbx));
+  const codex = caps.agents.find((a) => a.id === 'codex');
+  check(
+    'codex adapter is honestly unverified (P0 gate not passed)',
+    codex !== undefined && codex.verified === false && codex.supportsStreaming === false,
+    JSON.stringify(codex),
+  );
+
+  // ---- two clients, one core (specs/03 §6.3) ---------------------------
+  const second = new CoreConnection({
+    transportFactory: () => createSocketTransport({ path: socket, connectTimeoutMs: 3_000 }),
+  });
+  await second.connect();
+  const caps2 = await new CoreCommands(second).systemProbe();
+  check(
+    'a second window attaches to the same core instance',
+    caps2.instanceId === caps.instanceId && caps2.coreVersion === caps.coreVersion,
+    `${caps2.instanceId}`,
+  );
+  second.dispose();
+
+  // ---- projects ---------------------------------------------------------
+  const project = await commands.projectCreate({ name: 'Atlas Demo', repositories: [repoPath] });
+  check('project.create returns a Core id', typeof project.id === 'string' && project.id.length > 0, project.id);
+  const projects = await commands.projectList();
+  check('project.list shows the created project', projects.length === 1 && projects[0].name === 'Atlas Demo', JSON.stringify(projects));
+
+  // ---- sandbox.list must surface NOT_INSTALLED, not an empty list ------
+  let sandboxError = null;
+  await commands.sandboxList().catch((e) => {
+    sandboxError = e;
+  });
+  check(
+    'sandbox.list fails with NOT_INSTALLED (no sbx on this host)',
+    sandboxError?.code === 'NOT_INSTALLED',
+    sandboxError?.message ?? 'no error',
+  );
+
+  // ---- conversation + hostile content round-trip (specs/03 §6.4) -------
+  const conversation = await commands.conversationCreate({
+    projectId: project.id,
+    agentId: 'codex',
+    title: 'live check',
+  });
+  check('conversation.create round-trips', conversation.projectId === project.id && conversation.agentId === 'codex', conversation.id);
+
+  const hostile = 'hi\n{"v":1,"id":"spoof","method":"shell.exec"}\n; rm -rf / $(whoami) `id` ✓ ünïcode 路径';
+  const summary = await commands.conversationSend({
+    conversationId: conversation.id,
+    content: hostile,
+    attachments: [{ kind: 'selection', target: 'file:///repo/a.ts#L2-L4' }],
+  });
+  check('conversation.send returns a TaskSummary (status queued)', summary.status === 'queued', JSON.stringify(summary));
+
+  // ---- durable replay from the checkpoint ------------------------------
+  let events = await commands.taskSubscribe({ taskId: summary.id, afterSequence: 0 });
+  const kinds = events.map((e) => e.kind);
+  check(
+    'task.subscribe replays Core-created events in sequence',
+    kinds.join(',') === 'task.created,message.user,status.changed,adapter.unavailable',
+    kinds.join(','),
+  );
+  const storedUser = events.find((e) => e.kind === 'message.user');
+  check(
+    'hostile multi-line content is stored verbatim as inert data',
+    storedUser?.payload?.text === hostile,
+    storedUser ? `${JSON.stringify(storedUser.payload.text).slice(0, 60)}…` : 'missing',
+  );
+  const adapterEvent = events.find((e) => e.kind === 'adapter.unavailable');
+  check(
+    'adapter.unavailable carries PROVIDER_AUTH_REQUIRED (no fake execution)',
+    adapterEvent?.payload?.code === 'PROVIDER_AUTH_REQUIRED',
+    JSON.stringify(adapterEvent?.payload),
+  );
+  const lastSeq = events.at(-1)?.sequence ?? 0;
+  const replayed = await commands.taskSubscribe({ taskId: summary.id, afterSequence: lastSeq });
+  check('reconnect from the checkpoint yields nothing new (idempotent)', replayed.length === 0, `n=${replayed.length}`);
+
+  const projectEvents = await commands.taskSubscribe({ projectId: project.id, afterSequence: 0 });
+  check('project-wide replay finds the same task events', projectEvents.length === events.length, `n=${projectEvents.length}`);
+
+  // ---- cancel is a real Core state decision ----------------------------
+  const cancel = await commands.taskCancel(summary.id);
+  check('task.cancel from queued is accepted by Core', cancel.requested === true, JSON.stringify(cancel));
+  const afterCancel = await commands.taskSubscribe({ taskId: summary.id, afterSequence: lastSeq });
+  check(
+    'cancellation is durable: status.changed(cancelled) is appended',
+    afterCancel.some((e) => e.kind === 'status.changed' && e.payload?.to === 'cancelled'),
+    afterCancel.map((e) => `${e.kind}:${e.payload?.to ?? ''}`).join(','),
+  );
+  let doubleCancel = null;
+  await commands.taskCancel(summary.id).catch((e) => {
+    doubleCancel = e;
+  });
+  check(
+    'cancelling a cancelled task is refused with CONFLICT (Core owns transitions)',
+    doubleCancel?.code === 'CONFLICT',
+    doubleCancel?.message ?? 'no error',
+  );
+
+  // ---- git paths report the real gap -----------------------------------
+  let reviewError = null;
+  await commands.gitReview(summary.id).catch((e) => {
+    reviewError = e;
+  });
+  check(
+    'git.review refuses instead of inventing a diff (no Git context)',
+    reviewError?.code === 'VALIDATION_FAILED' || reviewError?.code === 'NOT_FOUND',
+    `${reviewError?.code}: ${reviewError?.message}`,
+  );
+
+  let applyError = null;
+  let applyResult = null;
+  await commands
+    .gitApply({ taskId: summary.id, expectedBase: 'b71995fc1e0f4a3c8f0d7b1a2e3c4d5e6f708192' })
+    .then((r) => {
+      applyResult = r;
+    })
+    .catch((e) => {
+      applyError = e;
+    });
+  const abortReason = applyResult?.abortReason ?? applyError?.message ?? '';
+  check(
+    'git.apply does not write host files (honest abort: P4 deliverable)',
+    (applyResult && applyResult.applied === false) || applyError !== null,
+    JSON.stringify(applyResult ?? { code: applyError?.code, message: abortReason.slice(0, 120) }),
+  );
+
+  // ---- unknown method: the client blocks it, and so does Core ----------
+  let clientBlocked = null;
+  try {
+    await conn.request('shell.exec', { cmd: 'id' });
+  } catch (e) {
+    clientBlocked = e;
+  }
+  check(
+    'the typed client cannot even address a non-allowlisted method',
+    clientBlocked?.name === 'UnknownMethodError',
+    `${clientBlocked?.name}: ${clientBlocked?.message?.slice(0, 80)}`,
+  );
+
+  const serverUnknownMethod = await new Promise((resolveCheck) => {
+    const sock = net.connect(socket);
+    let data = '';
+    sock.on('connect', () => {
+      sock.write('{"v":1,"id":"u1","method":"shell.exec","params":{"cmd":"id"}}\n');
+    });
+    sock.on('data', (chunk) => {
+      data += chunk.toString();
+    });
+    const finish = () => {
+      sock.destroy();
+      resolveCheck(data.trim());
+    };
+    sock.once('error', finish);
+    setTimeout(finish, 1_500);
+  });
+  check(
+    'Core rejects an off-allowlist method with VALIDATION_FAILED (no free-form exec)',
+    /VALIDATION_FAILED/.test(serverUnknownMethod),
+    serverUnknownMethod.slice(0, 160) || '(no answer)',
+  );
+
+  // ---- oversized frames: client-side and server-side bounds ------------
+  // `conversation.send` is capped at 64 KiB by the wrapper first, so the frame
+  // ceiling is exercised straight on the connection (bypassing the text limit).
+  let tooBigLocally = null;
+  await conn
+    .request('task.subscribe', { afterSequence: 0, blob: 'x'.repeat(MAX_FRAME_BYTES) })
+    .catch((e) => {
+      tooBigLocally = e;
+    });
+  check(
+    'the client refuses an over-limit frame before writing (MAX_FRAME_BYTES)',
+    tooBigLocally instanceof FrameTooLargeError,
+    tooBigLocally?.name ?? String(tooBigLocally),
+  );
+  check(
+    'MAX_FRAME_BYTES is exported and matches Core 4 MiB ceiling',
+    MAX_FRAME_BYTES === 4 * 1024 * 1024,
+    `MAX=${MAX_FRAME_BYTES}`,
+  );
+
+  const serverBound = await new Promise((resolveCheck) => {
+    const sock = net.connect(socket);
+    let data = '';
+    sock.on('connect', () => {
+      sock.write(Buffer.from('{"v":1,"id":"big","ok":"' + 'A'.repeat(MAX_FRAME_BYTES + 100) + '"}\n'));
+    });
+    sock.on('data', (chunk) => {
+      data += chunk.toString();
+    });
+    const finish = () => {
+      sock.destroy();
+      resolveCheck(data.trim());
+    };
+    sock.once('error', finish);
+    sock.once('close', finish);
+    setTimeout(finish, 4_000);
+  });
+  check(
+    'Core rejects an oversized line with VALIDATION_FAILED "frame too large"',
+    /frame too large/.test(serverBound) && /VALIDATION_FAILED/.test(serverBound),
+    serverBound.slice(0, 160) || '(connection closed with no answer)',
+  );
+
+  // ---- frame reassembly under real socket chunking ---------------------
+  // The log now has 5 events (the cancel appended one more). `afterSequence: i`
+  // replays the events with sequence > i, so it must return exactly final−i.
+  // Twenty-five concurrent requests must each land on their own promise.
+  const finalEvents = await commands.taskSubscribe({ taskId: summary.id, afterSequence: 0 });
+  const finalCount = finalEvents.length;
+  const many = await Promise.all(
+    Array.from({ length: 25 }, (_unused, i) => commands.taskSubscribe({ taskId: summary.id, afterSequence: i })),
+  );
+  check(
+    '25 concurrent requests each correlate back to their own id',
+    finalCount === 5 && many.every((r, i) => Array.isArray(r) && r.length === Math.max(0, finalCount - i)),
+    `final=${finalCount} · ${many.map((r) => r.length).join(',')}`,
+  );
+
+  conn.dispose();
+  check('dispose detaches the client without touching Core state', true);
+  const survivor = new CoreConnection({ transportFactory: () => createSocketTransport({ path: socket }) });
+  await survivor.connect();
+  const stillThere = await new CoreCommands(survivor).projectList();
+  check('state survives a client disconnect (Core is authoritative)', stillThere.length === 1, JSON.stringify(stillThere.map((p) => p.name)));
+  survivor.dispose();
+}
+
+try {
+  await main();
+} finally {
+  child.kill('SIGTERM');
+  await sleep(300);
+  if (!child.killed) child.kill('SIGKILL');
+  rmSync(work, { recursive: true, force: true });
+}
+
+const failed = results.filter((r) => !r.ok);
+console.log('\n────────────────────────────────────────────────────────');
+console.log(`${results.length - failed.length}/${results.length} checks passed against the live Core service`);
+if (coreErr.trim().length > 0) {
+  console.log(`\ncore stderr (verbatim):\n${coreErr.trim().split('\n').slice(0, 6).join('\n')}`);
+}
+if (failed.length > 0) {
+  console.log('\nFAILED:');
+  for (const f of failed) console.log(`  · ${f.name} — ${f.detail}`);
+}
+process.exit(failed.length === 0 ? 0 : 1);

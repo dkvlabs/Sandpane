@@ -1,0 +1,174 @@
+{
+  "name": "sandpane",
+  "displayName": "Sandpane",
+  "description": "Sandpane Core attachment for VS Code: projects, Docker Sandboxes (sbx), coding-agent chats and Git-safe task review from a Copilot-style sidebar. Scaffold stage (P3) — see README.md for what is functional and what is an honest seam.",
+  "version": "0.0.1",
+  "publisher": "dkvlabs",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:sandpane.chat",
+    "onView:sandpane.tasks"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sandpane",
+          "title": "Sandpane",
+          "icon": "media/sandpane.svg"
+        }
+      ]
+    },
+    "views": {
+      "sandpane": [
+        {
+          "id": "sandpane.chat",
+          "name": "Projects & Chats",
+          "type": "webview",
+          "contextualTitle": "Sandpane"
+        },
+        {
+          "id": "sandpane.tasks",
+          "name": "Tasks",
+          "when": "sandpane.coreAvailable"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "sandpane.newProject",
+        "title": "Sandpane: New Project"
+      },
+      {
+        "command": "sandpane.newSandbox",
+        "title": "Sandpane: New Sandbox"
+      },
+      {
+        "command": "sandpane.startTask",
+        "title": "Sandpane: Start Task (Chat)"
+      },
+      {
+        "command": "sandpane.reviewChanges",
+        "title": "Sandpane: Review Task Changes"
+      },
+      {
+        "command": "sandpane.applyTask",
+        "title": "Sandpane: Apply Task Changes (Git)"
+      },
+      {
+        "command": "sandpane.refreshSandboxes",
+        "title": "Sandpane: Refresh Sandboxes"
+      },
+      {
+        "command": "sandpane.startService",
+        "title": "Sandpane: Start Core Service"
+      },
+      {
+        "command": "sandpane.stopService",
+        "title": "Sandpane: Stop Core Service"
+      },
+      {
+        "command": "sandpane.openCoreLogs",
+        "title": "Sandpane: Open Core Logs"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "sandpane.refreshSandboxes",
+          "when": "view == sandpane.chat",
+          "group": "navigation"
+        },
+        {
+          "command": "sandpane.startTask",
+          "when": "view == sandpane.chat",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Sandpane",
+      "description": "Client-side UI defaults. Sandpane Core owns all authoritative project/task/sandbox state (specs/02 §1); these values are never a second source of truth.",
+      "properties": {
+        "sandpane.sandboxDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "UI default shown in the sandbox wizard. Not sent to Core: protocol v1 has no settings RPC, and SBX directory policy stays server-side."
+        },
+        "sandpane.defaultCPUs": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "description": "UI default CPU allocation shown in the sandbox wizard. Not sent to Core (protocol v1 SandboxCreateSpec has no resource fields)."
+        },
+        "sandpane.defaultMemory": {
+          "type": "string",
+          "default": "4g",
+          "pattern": "^[0-9]+[kmgt]?b?$",
+          "patternErrorMessage": "Use a value like 512m, 4g or 20g.",
+          "description": "UI default memory allocation shown in the sandbox wizard. Not sent to Core (protocol v1 SandboxCreateSpec has no resource fields)."
+        },
+        "sandpane.defaultDiskSize": {
+          "type": "string",
+          "default": "20g",
+          "pattern": "^[0-9]+[kmgt]?b?$",
+          "patternErrorMessage": "Use a value like 5g or 20g.",
+          "description": "UI default disk allocation shown in the sandbox wizard. Not sent to Core (protocol v1 SandboxCreateSpec has no resource fields)."
+        },
+        "sandpane.maxParallelTasks": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Client-side display ceiling for the task list. The Core scheduler enforces the real global/per-project limits (specs/02 §4)."
+        },
+        "sandpane.autoRefreshSandboxes": {
+          "type": "boolean",
+          "default": false,
+          "description": "Poll sandbox.list on a timer. Off by default: each refresh makes Core probe the SBX CLI."
+        },
+        "sandpane.attachDiagnostics": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit consent to attach the active file's diagnostics to a task (specs/03 §4). Off means diagnostics are never sent."
+        },
+        "sandpane.serviceMode": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "manual"
+          ],
+          "default": "ask",
+          "description": "What to do when Core is unreachable. 'auto' is intentionally not offered: the service ownership/auto-start policy (ADR 1, specs/02 §10) is undecided, so the extension never launches a binary."
+        },
+        "sandpane.coreSocketPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override the Core Unix socket path. Empty uses SANDPANE_SOCKET, then the per-user default data directory (mirrors sandpane_service::default_socket_path)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.webview.json",
+    "compile": "tsc -p tsconfig.build.json && tsc -p tsconfig.webview.json",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test",
+    "check:live": "node scripts/live-core-check.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "@types/vscode": "^1.90.0",
+    "typescript": "~5.6.3",
+    "vitest": "^2.1.9"
+  }
+}
