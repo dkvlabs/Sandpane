@@ -499,4 +499,24 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0026 — Desktop protocol tolerance
+
+- **date:** 2026-10-09
+- **phase:** P5 (desktop), prerequisite for the protocol v1 additions
+- **commit:** `6fbbb4b` (fix(desktop): tolerate unknown protocol enum values without hiding them) + `78fb74a` (fix(desktop): one action gate for unknown statuses; inert display of paths)
+- **details:** Unknown values from a newer Core no longer fail whole calls. Each case stays visible and honest:
+  - **TaskStatus:** shown as "Unknown status (raw)". It is never treated as terminal or running. Review, apply, cancel and retry are disabled through a single `taskActionGate`. A send that comes back with an unknown status is reported as accepted.
+  - **ErrorCode:** Core's message is kept and the raw code is shown.
+  - **FileChange status:** the file is listed but not selectable, and "apply everything" is blocked.
+  - **WorkspaceMode:** shown as unverified/live-writable.
+  - **Malformed frames** still fail.
+  - **Drift tests** pin the TaskStatus, FileChange and workspace-mode lists to the Rust enums.
+  - **Unusual characters** in file paths are shown as visible escapes.
+  - **Counts:** a new "Unrecognised N" count.
+- **files:** `apps/desktop/**` (16 + 9 files)
+- **verification:** `make desktop-check` → 351 passed / 8 skipped, 31 Rust tests passed; vite build OK. Render-level wiring: UNVERIFIED (no component harness).
+- **review:** [audit/0026-desktop-protocol-tolerance-review.md](audit/0026-desktop-protocol-tolerance-review.md) — phase-reviewer ran **after** the first commit (process deviation recorded); PASS-WITH-WARNINGS → fixed in the follow-up; PASS
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
