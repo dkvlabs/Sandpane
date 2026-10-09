@@ -1,0 +1,3 @@
+Status: stopped
+Socket: $HOME/.sbx/run/d/sandboxd.sock (not connected)
+exit=0

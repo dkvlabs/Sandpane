@@ -1,0 +1,4 @@
+$ sbx create shell --name sandpane-p0-probe --quiet $SCRATCH/empty-ws
+error: global network policy has not been initialized
+  try: sbx policy init <allow-all|balanced|deny-all>
+exit=1

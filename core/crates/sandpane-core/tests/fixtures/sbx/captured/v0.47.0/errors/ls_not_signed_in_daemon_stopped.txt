@@ -1,0 +1,4 @@
+$ sbx ls
+error: not signed in to Docker
+  try: sbx login
+exit=(not recorded; daemon was stopped)

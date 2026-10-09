@@ -1,0 +1,53 @@
+Initialize the global network policy that applies to all sandboxes.
+
+This sets the initial global network policy and must be run before adding
+custom allow/deny rules or starting a sandbox for the first time. It is a
+one-time setup: once initialized, use "sbx policy reset" to start over.
+
+This is the initial global policy, not a per-sandbox default; you can change
+it later. Per-sandbox rules, including those added by kits such as the
+built-in agent kits, apply on top for individual sandboxes.
+
+Available policies:
+  allow-all   All outbound network traffic is allowed
+  balanced    Typical development traffic is allowed, such as AI services and package registries
+  deny-all    All outbound network traffic is blocked
+
+After initializing, use "sbx policy allow/deny/rm" to change the global policy.
+Use "sbx policy reset" to clear all policies and start over.
+
+With --cloud:
+Set the default network mode of the cloud policy.
+
+There is no one-time setup: init sets the default mode for the account, or for
+one sandbox with --sandbox, keeps the existing allow and deny rules, and can be
+run again. balanced is deny-all plus the balanced allow list added to the scope.
+Use "sbx --cloud policy reset" to clear the rules first.
+
+Usage:
+  sbx policy init <allow-all|balanced|deny-all> [flags]
+
+Examples:
+  # Initialize with the balanced policy — recommended
+  sbx policy init balanced
+
+  # Allow all traffic
+  sbx policy init allow-all
+
+  # Block everything, then allow specific sites
+  sbx policy init deny-all
+  sbx policy allow network api.example.com:443
+
+  # Set the account default to balanced
+  sbx --cloud policy init balanced
+
+  # Block everything for one sandbox, keeping its allow rules
+  sbx --cloud policy init deny-all --sandbox my-sandbox
+
+Flags:
+  -h, --help             help for init
+      --sandbox string   Target a single cloud sandbox's policy (cloud only)
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging

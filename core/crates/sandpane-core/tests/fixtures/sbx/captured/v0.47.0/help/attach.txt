@@ -1,0 +1,25 @@
+Attach an interactive terminal session to a cloud sandbox.
+
+SANDBOX is the cloud sandbox ID (sbx_*) or name from "sbx --cloud ls".
+
+Opens a PTY-backed exec session against the sandbox's agent process. The
+sandbox must already exist; a stopped one is started first. Use
+`sbx --cloud run` to create a sandbox and attach in one step.
+
+Only supported with --cloud. See https://docs.docker.com/ai/sandboxes/ for the cloud sandbox model.
+
+Usage:
+  sbx attach SANDBOX [flags]
+
+Examples:
+  # Attach to a sandbox by ID or name
+  sbx --cloud attach sbx_abc123
+  sbx --cloud attach claude/my-sandbox
+
+Flags:
+      --detach-keys string   Override the detach gesture that leaves the session running (Docker-style, e.g. "ctrl-\", "ctrl-x,ctrl-d"). Default: Ctrl-\. Use this when the default collides with an agent's keymap (cloud only).
+  -h, --help                 help for attach
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging

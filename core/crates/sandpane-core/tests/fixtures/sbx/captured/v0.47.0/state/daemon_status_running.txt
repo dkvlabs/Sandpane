@@ -1,0 +1,3 @@
+Status: running
+Socket: $HOME/.sbx/run/d/sandboxd.sock
+Logs: $HOME/Library/Application Support/com.docker.sandboxes/sandboxes/sandboxd/daemon.log

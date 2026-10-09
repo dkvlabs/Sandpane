@@ -1,0 +1,2 @@
+No sandboxes found.
+Launch one: sbx run claude

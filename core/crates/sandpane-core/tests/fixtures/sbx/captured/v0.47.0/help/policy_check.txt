@@ -1,0 +1,19 @@
+Check whether the current sandbox policy would authorize an access request.
+
+The check is read-only and evaluates the same daemon-side policy authorizer
+used by sandbox network enforcement.
+
+Usage:
+  sbx policy check COMMAND
+
+Available Commands:
+  network     Check network access to a host
+
+Flags:
+  -h, --help   help for check
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging
+
+Use "sbx policy check COMMAND --help" for more information about a command.

@@ -1,0 +1,13 @@
+Start the sandboxd daemon
+
+Usage:
+  sbx daemon start [flags]
+
+Flags:
+  -d, --detach          Run daemon in background
+  -h, --help            help for start
+      --policy string   Initialize the global network policy: "allow-all", "balanced", or "deny-all"
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging

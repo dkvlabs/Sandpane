@@ -1,0 +1,24 @@
+Show full metadata for a single template.
+
+NAME|ID can be either a template name (resolved to its ID via the server's
+?name= filter) or a template ID (tmpl_*).
+
+Cloud-only in v1: requires --cloud.
+
+Usage:
+  sbx template inspect NAME|ID [flags]
+
+Examples:
+  sbx --cloud template inspect my-template
+  sbx --cloud template inspect tmpl_abc123
+
+  # Output in JSON format
+  sbx --cloud template inspect my-template --json
+
+Flags:
+  -h, --help   help for inspect
+      --json   Output in JSON format
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging

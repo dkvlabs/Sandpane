@@ -1,0 +1,5 @@
+Starting sandboxd daemon...
+{
+  "sandboxes": []
+}
+exit=0

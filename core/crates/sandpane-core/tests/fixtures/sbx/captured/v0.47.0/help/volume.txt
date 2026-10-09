@@ -1,0 +1,26 @@
+Manage persistent volumes for cloud sandboxes.
+
+Volumes provide persistent storage that survives across sandbox runs.
+Data is saved as a snapshot when a sandbox exits, not continuously
+synced. If multiple sandboxes mount the same volume concurrently, the
+last sandbox to exit wins — its snapshot overwrites the others.
+
+Volumes are a cloud-only feature; every subcommand requires --cloud.
+
+Usage:
+  sbx volume COMMAND
+
+Available Commands:
+  create      Create a new persistent volume
+  inspect     Show details for a volume
+  ls          List persistent volumes
+  rm          Delete a persistent volume
+
+Flags:
+  -h, --help   help for volume
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging
+
+Use "sbx volume COMMAND --help" for more information about a command.

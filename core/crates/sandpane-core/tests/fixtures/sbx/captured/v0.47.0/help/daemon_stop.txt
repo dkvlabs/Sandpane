@@ -1,0 +1,11 @@
+Stop the sandboxd daemon
+
+Usage:
+  sbx daemon stop [flags]
+
+Flags:
+  -h, --help   help for stop
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging

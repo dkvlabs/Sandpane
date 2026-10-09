@@ -1,0 +1,25 @@
+Inspect or extend a cloud sandbox's TTL.
+
+With one argument, prints the current expiration and the maximum
+remaining time before the sandbox's hard 24h-from-creation ceiling.
+
+With two arguments — a duration prefixed with '+' followed by a sandbox
+ID or name — extends the TTL by that amount, subject to the server-enforced
+ceiling. The server cannot shorten an expiration, so DURATION must be
+positive. Units are Go's duration units (h, m, s, ms, us, ns), in either
+case (+2h, +2H, +1h30m).
+
+SANDBOX may be given by ID (sbx_*) or name, as shown by "sbx --cloud ls".
+
+Cloud-only: local sandboxes are not TTL-managed.
+
+Usage:
+  sbx ttl [+DURATION] SANDBOX
+
+Flags:
+  -h, --help   help for ttl
+      --json   Output as JSON
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging
