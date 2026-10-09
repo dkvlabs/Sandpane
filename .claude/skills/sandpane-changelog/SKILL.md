@@ -39,7 +39,7 @@ Record only what you can actually observe; every unknown value becomes `-`. Neve
 
 ## Quality bars
 
-- **verification** field: quote commands actually run in this step and their real outcomes — including failures and things that could NOT be verified (e.g. "Gradle build not run: no local toolchain"). Evidence before claims (superpowers `verification-before-completion`).
+- **verification** field: quote commands actually run in this step and their real outcomes — including failures and things that could NOT be verified (e.g. "Gradle build not run: no local toolchain"). Evidence before claims (`superpowers:verification-before-completion`).
 - **details** field: what was built, key decisions, and any deviation from `docs/specs/`. Spec deviations must also be flagged in the entry's details, not silently absorbed.
 - Every entry number has a matching audit file; every audit file lists findings AND dispositions (accepted/deferred counts as dispositioned when justified).
 - Cross-check after writing: entry `NNNN` exists in both files, commit hashes resolve (`git cat-file -e <hash>^{commit}`), relative links in both files resolve.

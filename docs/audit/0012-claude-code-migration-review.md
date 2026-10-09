@@ -40,7 +40,7 @@ The orchestrator ran an inline docs/tooling checklist pass, the lighter tier all
 
 | # | Disposition | Reason |
 |---|---|---|
-| 1 | fixed pre-commit | Tools are now `Read, Grep, Glob, Bash`. `permissionMode: plan` was deliberately not used: it can block the reviewers' test/build runs, and it is ignored when the parent session runs in acceptEdits or auto mode. Read-only is enforced by the tool allowlist (no Edit/Write). |
+| 1 | fixed pre-commit | Tools are now `Read, Grep, Glob, Bash`. `permissionMode: plan` was deliberately not used: it can block the reviewers' test/build runs, and it is ignored when the parent session runs in acceptEdits or auto mode. The allowlist removes Edit/Write, but `Bash` can still write files, so the harness does not enforce read-only. That rests on the agents' prompt instructions ("you never modify files"). |
 | 2 | fixed pre-commit | `auto-edit` → `permissionMode: acceptEdits` |
 | 3 | fixed pre-commit | `$ARGUMENTS` |
 | 4 | fixed pre-commit | Vendored copies removed. The plugin is enabled at project scope in `.claude/settings.json`; this was the user's choice in session. |
@@ -57,5 +57,6 @@ The orchestrator ran an inline docs/tooling checklist pass, the lighter tier all
 - `python3 -m json.tool .claude/settings.json` succeeded.
 - `git diff --cached --name-only | grep -E 'tmp/|DS_Store'` returned nothing.
 - Not verified: a fresh Claude Code session loading the reconfigured agents, which needs a session restart. No `make check` was run, because the commit touches no code paths.
+- Addendum (follow-up commit, same day): (a) the disposition #1 wording was corrected — the harness does not enforce read-only, because `Bash` can still write; (b) one bare `verification-before-completion` reference in `sandpane-changelog` was namespaced; (c) a root `CLAUDE.md` containing `@AGENTS.md` was added. Per https://code.claude.com/docs/en/memory.md, Claude Code ignores AGENTS.md whenever a CLAUDE.md exists, and some sessions never read it, so the import is the documented way to guarantee the contract loads. A follow-up sweep, `git grep -i -E 'superpowers|vendored|SUPERPOWERS_'`, found no other stale vendoring claims.
 
 **Docs/tooling checklist tier, orchestrator inline: 1 Critical and 4 Suggestions fixed pre-commit, 1 Nice-to-have documented. PASS.**

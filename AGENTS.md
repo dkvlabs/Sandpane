@@ -27,6 +27,7 @@ Flow per implementation (details in the skill):
 
 ```text
 AGENTS.md            ← this file (agent contract)
+CLAUDE.md            ← `@AGENTS.md` import so every Claude Code session loads this contract
 README.md            ← project overview and quickstart
 LICENSE              ← MIT (original Sandpane code; see docs/licensing-decision.md)
 docs/                ← specs/, design/, audit/, CHANGELOG.md, P0 records
