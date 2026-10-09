@@ -452,4 +452,26 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0024 — Fail closed on repositories with submodules
+
+- **date:** 2026-10-09
+- **phase:** P4 (Git safety) hardening
+- **commit:** `fb16670` (fix(core): fail closed on repositories with submodules (review integrity))
+- **details:** The automated commit security review of `bb5cc8f` found a problem in the git hardening. `--ignore-submodules=dirty` hid uncommitted submodule work from both the dirty gate and review.
+  - **Detection:** Core now reads gitlinks from the index only, through the hardened runner, and never enters a submodule work tree.
+  - **Refusal:** `is_dirty`, `change_list` and the apply preconditions refuse with the paths named.
+    - `git.review` returns `VALIDATION_FAILED`.
+    - `git.apply` aborts with an `abortReason`.
+  - **Unchanged:** the filter-trap protection and the protocol.
+- **files:** `core/crates/sandpane-core/src/git.rs`, `core/crates/sandpane-service/{src/lib.rs,tests/service_integration.rs}`
+- **verification:**
+  - clippy `-D warnings` clean;
+  - `cargo test`: 160 passed;
+  - mutation check: 4 tests fail when the refusal is disabled;
+  - schema drift in sync;
+  - VS Code live check: 56/56.
+- **review:** [audit/0024-core-submodule-fail-closed-review.md](audit/0024-core-submodule-fail-closed-review.md) — automated finding + orchestrator verification; PASS
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
