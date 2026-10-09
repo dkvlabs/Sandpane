@@ -22,7 +22,7 @@
      - W4: wording that overstated consent;
      - W5: `baseCommit` was not validated.
    - Suggestions: S1–S6.
-4. **A follow-up batch** fixed W1–W5, S2, S3, S4 and S6. S1 and S5 were deferred as low-severity. The engineer ran a mutation check: each new test fails with its fix removed.
+4. **A follow-up batch** fixed W1–W5 and re-review S2, S3, S4 and S6. Re-review S1 and S5 were deferred as low-severity. These labels are separate from the security review's S5, which is fixed above. The engineer ran a mutation check: each new test fails with its fix removed.
 
 ## Findings and disposition (discovery round)
 
@@ -40,7 +40,7 @@
 
 ### Follow-up review
 
-- S1 and S5 are deferred. Their contents were not carried into this record; they live in the review transcript and remain open.
+- Re-review S1 and S5 are deferred; they are not the security review's S5. Their contents were not carried into this record; they live in the review transcript and remain open.
 - Every other follow-up item is fixed.
 
 ## Residual risk

@@ -23,13 +23,14 @@ Required by `specs/07_ROADMAP_AND_TASKS.md` (P0) and `specs/08_TESTING_AND_RELEA
 | Claude Code (agent harness, dev tooling only) | `claude --version` → `2.1.288 (Claude Code)` (09.10.2026) | verified (host) — project config in `.claude/` (agents `skills:` preload, commands `argument-hint`) checked against code.claude.com docs, entry 0013 |
 | Superpowers plugin (dev tooling only) | `superpowers@claude-plugins-official` **6.4.1** (`5bf4e78`), project + user scope (`~/.claude/plugins/installed_plugins.json`, 09.10.2026). Upstream latest is **6.4.2** (`8ca22db`, only change: leaner `writing-plans`), but the official marketplace pins `sha 5bf4e78`, so `claude plugin update` reports "already at the latest version (6.4.1)" | verified (installed version); 6.4.2 not available via the official marketplace — re-run `claude plugin marketplace update claude-plugins-official && claude plugin update superpowers@claude-plugins-official --scope project` once the pin moves |
 
-> **P0 blocker attribution, corrected 09.10.2026 by live host probes.** The gate is *not* missing
-> Docker or a missing Codex install — both are present (Docker CLI 29.8.2, `codex-cli 0.155.1`).
-> It is precisely: (1) the `sbx` CLI is not installed, (2) the Docker daemon is not running, and
-> (3) adapter verification requires executing Codex **inside a real SBX**, which neither (1) nor (2)
-> permits. Until all three hold, `system.probe` must keep reporting `sbx.installed:false` and
-> `codex {verified:false, supportsStreaming:false, supportsCancel:false, supportsResume:false}` —
-> which is what the live harness (`clients/vscode/scripts/live-core-check.mjs`, 30/30) asserts.
+> **P0 blocker attribution (updated 09.10.2026, superseding the earlier note).** Since the earlier note,
+> the `sbx` CLI v0.47.0 has been installed, its daemon runs, and the user initialized the global network
+> policy. A provider-free `shell` sandbox completed a real create → exec → stop → rm round trip
+> (entry 0015). Docker CLI 29.8.2 and `codex-cli 0.155.1` are also present. The one remaining P0 blocker
+> is **running Codex (or any provider agent) inside a real SBX**, which needs a provider sign-in that only
+> the user can do. Until then, `system.probe` reports
+> `codex {verified:false, supportsStreaming:false, supportsCancel:false, supportsResume:false}`. The live
+> VS Code harness (`clients/vscode/scripts/live-core-check.mjs`, 56/56 on 09.10.2026) checks that.
 
 ## Dependency versions (upgrade pass U1–U4, 09.10.2026)
 

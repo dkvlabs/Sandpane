@@ -297,7 +297,7 @@ Rules:
     - `scope: machine` settings;
     - a socket owner/mode check;
     - a crypto nonce for the webview CSP.
-  - **Two review rounds:** W1–W5 and S2/S3/S4/S6 were fixed; S1 and S5 are deferred.
+  - **Two review rounds:** W1–W5 and re-review S2/S3/S4/S6 were fixed; re-review S1 and S5 are deferred.
 - **files:** `clients/vscode/**` (37 files)
 - **verification:**
   - `npm run typecheck` clean;
