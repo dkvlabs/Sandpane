@@ -195,4 +195,21 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0014 — Real sbx v0.47.0 capture (P0 progress)
+
+- **date:** 2026-10-09
+- **phase:** P0 (supported-interface feasibility)
+- **commit:** `c392530` (test(sbx): capture real sbx v0.47.0 help, state and error fixtures (P0))
+- **details:** `sbx` is now installed on the dev host (v0.47.0). These were captured and sanitized into `core/crates/sandpane-core/tests/fixtures/sbx/captured/v0.47.0/` with `fixture_status: captured`:
+  - every documented command and subcommand `--help` (66 files)
+  - version, daemon status (stopped, running, `--json`) and empty `ls`
+  - the real error format: `error: <msg>` / `  try: <hint>`, exit 1
+
+  Observed behavior: `sbx ls --json` auto-starts `sandboxd`. `sbx create` refuses until the global network policy is initialized (`sbx policy init …`). That is a persistent, user-owned choice, so the CRUD success paths remain UNVERIFIED. `docs/compatibility.md` was updated.
+- **files:** `core/crates/sandpane-core/tests/fixtures/sbx/captured/v0.47.0/**`, `docs/compatibility.md`
+- **verification:** `sbx version` → v0.47.0 0411f50; `sbx daemon status --json` → running; `sbx ls --json` → `{"sandboxes": []}` exit 0; `sbx create shell --name sandpane-p0-probe …` → policy-not-initialized error, exit 1, nothing created (`ls` stays empty); 0 invalid help captures; no username or secret leaks.
+- **review:** [audit/0014-sbx-v047-capture-review.md](audit/0014-sbx-v047-capture-review.md) — fixtures checklist: 1 fixed, 2 deferred with owners; PASS
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
