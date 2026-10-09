@@ -1,0 +1,3 @@
+$ sbx stop sandpane-p0-probe
+Sandbox 'sandpane-p0-probe' stopped; state preserved. Restart with: sbx run --name sandpane-p0-probe
+exit=0

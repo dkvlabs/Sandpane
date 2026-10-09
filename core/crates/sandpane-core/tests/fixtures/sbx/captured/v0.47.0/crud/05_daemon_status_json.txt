@@ -1,0 +1,7 @@
+$ sbx daemon status --json
+{
+  "status": "running",
+  "socket": "$HOME/.sbx/run/d/sandboxd.sock",
+  "logs": "$HOME/Library/Application Support/com.docker.sandboxes/sandboxes/sandboxd/daemon.log"
+}
+exit=0

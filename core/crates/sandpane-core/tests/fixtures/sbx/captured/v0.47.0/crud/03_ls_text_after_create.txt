@@ -1,0 +1,4 @@
+$ sbx ls
+SANDBOX             AGENT   STATUS    PORTS   WORKSPACE
+sandpane-p0-probe   shell   running           $SCRATCH/empty-ws
+exit=0

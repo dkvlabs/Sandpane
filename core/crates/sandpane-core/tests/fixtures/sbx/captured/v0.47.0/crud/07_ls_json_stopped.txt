@@ -1,0 +1,17 @@
+$ sbx ls --json
+{
+  "sandboxes": [
+    {
+      "name": "sandpane-p0-probe",
+      "id": "b5ebec73-e2ae-471a-811a-e011cfb1948e",
+      "agent": "shell",
+      "status": "stopped",
+      "last_used_at": "2026-10-09T17:31:31.918874Z",
+      "workspaces": [
+        "$SCRATCH/empty-ws"
+      ],
+      "created_at": "2026-10-09T17:31:28Z"
+    }
+  ]
+}
+exit=0

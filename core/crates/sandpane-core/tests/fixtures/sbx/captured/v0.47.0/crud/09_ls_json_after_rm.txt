@@ -1,0 +1,5 @@
+$ sbx ls --json
+{
+  "sandboxes": []
+}
+exit=0

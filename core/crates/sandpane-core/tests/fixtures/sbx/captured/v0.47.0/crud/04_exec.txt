@@ -1,0 +1,3 @@
+$ sbx exec sandpane-p0-probe echo sandpane-p0-ok
+sandpane-p0-ok
+exit=0

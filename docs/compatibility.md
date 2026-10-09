@@ -17,7 +17,7 @@ Required by `specs/07_ROADMAP_AND_TASKS.md` (P0) and `specs/08_TESTING_AND_RELEA
 | Core protocol | version **1** (integer `PROTOCOL_VERSION`); crate semver 0.1.0 — separate axes, do not conflate | verified (core suite) |
 | Docker CLI | `/usr/local/bin/docker`, `Docker version 29.8.2, build 7fc2dff` (re-probed 09.10.2026) | verified (CLI version) |
 | Docker daemon | `docker info` fails: `failed to connect to the docker API at unix:///Users/gabrielgeorgescu/.docker/run/docker.sock … daemon is not running` | **daemon DOWN on this host — no container can run here today** |
-| Docker SBX CLI (`sbx`) | `/opt/homebrew/bin/sbx`, `sbx version: v0.47.0 0411f50ee4700fe7bd37e6e7e3aced563e850ca9` (probed 09.10.2026). Daemon `sandboxd` was stopped; `sbx ls --json` auto-started it (observed side effect), after which `sbx ls --json` → `{"sandboxes": []}` exit 0. `sbx create shell …` → `error: global network policy has not been initialized / try: sbx policy init <allow-all\|balanced\|deny-all>` exit 1 | **CLI + daemon verified; sandbox CRUD still UNVERIFIED** — create needs the user to choose and run `sbx policy init` (persistent machine-wide setting, not chosen by an agent). Real help/state/error captures in `core/crates/sandpane-core/tests/fixtures/sbx/captured/v0.47.0/` (entry 0014) |
+| Docker SBX CLI (`sbx`) | `/opt/homebrew/bin/sbx`, `sbx version: v0.47.0 0411f50ee4700fe7bd37e6e7e3aced563e850ca9` (probed 09.10.2026). Daemon `sandboxd` was stopped; `sbx ls --json` auto-started it (observed side effect), after which `sbx ls --json` → `{"sandboxes": []}` exit 0. `sbx create shell …` → `error: global network policy has not been initialized / try: sbx policy init <allow-all\|balanced\|deny-all>` exit 1 | **CLI + daemon + sandbox CRUD verified (CLI level).** The user ran `sbx policy init balanced` (09.10.2026). A disposable `shell` sandbox then went through create → `ls --json` → exec → stop → rm --force → not-found, every step exit 0 except the expected final error, all captured in `captured/v0.47.0/crud/`. Real `ls --json` rows: `name, id, agent, status, last_used_at, workspaces[], created_at`. Sandpane's Core adapter against these outputs is verified separately in its own entry. Agents needing provider sign-in (codex, claude) are UNVERIFIED |
 | Codex CLI | `/Users/gabrielgeorgescu/.local/bin/codex`, `codex-cli 0.155.1`; `~/.codex/auth.json` + `config.toml` exist (presence metadata only — contents never read, never logged) | **P0 BLOCKER — never validated inside SBX, so the adapter stays `verified:false`** |
 | Claude Agent SDK | not validated | UNVERIFIED |
 | Claude Code (agent harness, dev tooling only) | `claude --version` → `2.1.288 (Claude Code)` (09.10.2026) | verified (host) — project config in `.claude/` (agents `skills:` preload, commands `argument-hint`) checked against code.claude.com docs, entry 0013 |
@@ -62,14 +62,14 @@ Client-side handling of every item is recorded in the respective scaffold README
 
 | Platform | CPU | OS version | Docker SBX version | Codex version | Claude version | VS Code version | IntelliJ baseline | Core protocol (v) | Tests | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| macOS | arm64 | 27.0.1 | v0.47.0 (CLI + daemon only) | - | - | - | - | 1 (core 0.1.0) | core unit/integration + daemon smoke | sandbox CRUD blocked on `sbx policy init` (user decision) |
+| macOS | arm64 | 27.0.1 | v0.47.0 (CLI, daemon, shell-sandbox CRUD) | - | - | - | - | 1 (core 0.1.0) | core unit/integration + daemon smoke | policy `balanced` (user); Codex-in-SBX not yet proven |
 | macOS | x86_64 | - | - | - | - | - | - | - | - | UNVERIFIED |
 | Windows 11 | x86_64 | - | - | - | - | - | - | - | - | UNVERIFIED |
 | Linux (TBD distro) | x86_64 | - | - | - | - | - | - | - | - | UNVERIFIED |
 
 ## SBX CLI fixtures
 
-Fixtures under `core/crates/sandpane-core/tests/fixtures/sbx/` (top level) are **illustrative hand-written samples**, clearly marked as such. **Real captures** from `sbx v0.47.0` live in `captured/v0.47.0/` (`fixture_status: captured`, see its `_meta.json`): every command's `--help`, version/daemon/empty-list state, and the real error format (`error: <msg>` + `  try: <hint>`, exit 1). Still missing (needs a created sandbox): non-empty `ls --json` rows and create/stop/rm success outputs — the illustrative `list.json` remains the only non-empty sample until then.
+Fixtures under `core/crates/sandpane-core/tests/fixtures/sbx/` (top level) are **illustrative hand-written samples**, clearly marked as such. **Real captures** from `sbx v0.47.0` live in `captured/v0.47.0/` (`fixture_status: captured`, see its `_meta.json`): every command's `--help`, version/daemon/empty-list state, and the real error format (`error: <msg>` + `  try: <hint>`, exit 1). `captured/v0.47.0/crud/` holds a real create/list/exec/stop/rm round trip, including non-empty `ls --json` rows (field `status`, not the illustrative `state`).
 
 ## Version gate policy
 

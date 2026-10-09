@@ -1,0 +1,4 @@
+$ sbx rm --force sandpane-p0-probe
+Deleting sandbox sandpane-p0-probe...
+Sandbox 'sandpane-p0-probe' removed
+exit=0

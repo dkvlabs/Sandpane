@@ -1,0 +1,4 @@
+$ sbx rm --force sandpane-p0-probe
+error: sandbox 'sandpane-p0-probe' not found
+  try: sbx ls
+exit=1

@@ -1,0 +1,2 @@
+$ sbx create shell --name sandpane-p0-probe --quiet $SCRATCH/empty-ws
+exit=0
