@@ -171,4 +171,28 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0013 — Claude Code agents/commands/skills refresh + superpowers version record
+
+- **date:** 2026-10-09
+- **phase:** infra (agent tooling)
+- **commit:** `78d317c` (chore(tooling): refresh Claude Code agents, commands and skills; record superpowers version)
+- **details:** Reviewed all 9 agents, 3 commands and 5 project skills.
+  - **Agents:** each now preloads its governing skill through the `skills:` frontmatter field. This fixes the read-only reviewers: their tool allowlist has no Skill tool, so they could not load the gates they cite.
+  - **`core-protocol`:** synced to the code — `NOT_FOUND` (in code, not yet in specs/02 §2), the 4 MiB frame cap, per-task `afterSequences` cursors, the oversized-replay refusal, bounded read methods, and `Method::ALL` with `make schema-drift`.
+  - **`core-engineer`:** error list now includes `NOT_FOUND`; its superpowers reference is namespaced.
+  - **Commands:** gained quoted `argument-hint` values.
+  - **`sandpane-changelog`:** lost the unsupported `priority` field.
+  - **Version:** entry 0012's switch from the vendored copies to the plugin was a silent downgrade, 6.4.2 → 6.4.1. The official marketplace pins `5bf4e78` (6.4.1), and upstream 6.4.2 only changes `writing-plans`. The user chose to stay on official 6.4.1. The version is recorded in `docs/compatibility.md`, and 0012 has a correction note.
+- **files:** `.claude/agents/*.md`, `.claude/commands/*.md`, `.claude/skills/{core-protocol,sandpane-changelog}/SKILL.md`, `docs/compatibility.md`, `docs/audit/0012-claude-code-migration-review.md` (correction)
+- **verification:**
+  - `claude plugin update superpowers@claude-plugins-official --scope project --json` → `up_to_date` 6.4.1.
+  - `installed_plugins.json` → user and project scopes both at 6.4.1 `5bf4e78`.
+  - `claude --version` → 2.1.288.
+  - The PyYAML frontmatter parse of 17 files passed, with no undocumented keys and all `skills:` targets present.
+  - The skill's protocol claims match the code constants.
+  - Not verified: skill preloading and command hints in a restarted session.
+- **review:** [audit/0013-claude-config-refresh-review.md](audit/0013-claude-config-refresh-review.md) — docs/tooling checklist tier, orchestrator inline. Result: 1 Critical fixed, 1 Critical dispositioned by user decision, 4 lesser findings fixed; PASS.
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
