@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { TaskProjection, TimelineEntry } from "../../lib/reducers";
-import { taskStatusView, windowEntries } from "../../lib/reducers";
+import { displayPath, taskStatusView, windowEntries } from "../../lib/reducers";
 import { Badge, Button, EmptyState, Mono, Panel, Warning } from "../ui/primitives";
 
 /**
@@ -55,9 +55,9 @@ export function ActivityTimeline({
 
       {projection.changedFiles.length > 0 && (
         <div className="timeline__files">
-          {projection.changedFiles.map((path) => (
-            <span key={path} className="pill">
-              <Mono>{path}</Mono>
+          {projection.changedFiles.map((path, index) => (
+            <span key={`${index}:${path}`} className="pill">
+              <Mono>{displayPath(path).text}</Mono>
             </span>
           ))}
         </div>
@@ -127,7 +127,7 @@ function TimelineRow({ entry }: { entry: TimelineEntry }) {
       return (
         <li className="timeline__row">
           <span className="timeline__text">
-            changed <Mono>{entry.path}</Mono>
+            changed <Mono>{displayPath(entry.path).text}</Mono>
           </span>
           <Seq entry={entry} />
         </li>

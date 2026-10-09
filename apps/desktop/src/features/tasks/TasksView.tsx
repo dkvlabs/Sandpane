@@ -10,8 +10,8 @@ import {
 } from "../../lib/hooks";
 import {
   countTasks,
-  describeTaskAction,
-  reviewBlockReason,
+  indexRowEventsRead,
+  taskActionGate,
   taskBucket,
   taskIsolationView,
   taskStatusView,
@@ -42,7 +42,7 @@ import { navigate, type Route } from "../../app/router";
 import { useProbeRefetch } from "../../components/ui/refresh";
 import type { TaskStatus } from "../../lib/protocol";
 
-type Filter = "all" | Exclude<TaskBucket, "unknown">;
+type Filter = "all" | TaskBucket;
 
 /** Same predicate as `countTasks`, so every tab count equals its rows. */
 function matchesFilter(filter: Filter, status: TaskStatus | "unknown"): boolean {
@@ -70,6 +70,7 @@ export function TasksView({ route }: { route: Route }) {
         <span className="statusbar__counts">
           Running {counts.running} · Queued {counts.queued} · Review needed {counts.needsReview} ·
           Failed {counts.failed} · Cancelled {counts.cancelled}
+          {counts.unrecognized > 0 && <> · Unrecognised {counts.unrecognized}</>}
         </span>
       }
     >
@@ -132,6 +133,10 @@ export function TasksView({ route }: { route: Route }) {
               { id: "completed", label: `Completed ${counts.completed}` },
               { id: "failed", label: `Failed ${counts.failed}` },
               { id: "cancelled", label: `Cancelled ${counts.cancelled}` },
+              // A status this build cannot read (or none reported yet) is its own
+              // bucket, so every row is reachable from a tab and the tabs add up
+              // to "All".
+              { id: "unknown", label: `Unrecognised ${counts.unrecognized}` },
             ]}
           />
         }
@@ -166,9 +171,9 @@ export function TasksView({ route }: { route: Route }) {
             <tbody>
               {shown.map((task) => {
                 const view = taskStatusView(task.status, task.unrecognizedStatus);
-                const actions = describeTaskAction(
-                  task.status === "unknown" ? undefined : task.status,
-                );
+                // The row carries both Core reads: its own status, and the event
+                // log's when the two differ. The same gate as the detail view.
+                const actions = taskActionGate(task, indexRowEventsRead(task));
                 return (
                   <tr key={task.taskId}>
                     <td>
@@ -195,8 +200,8 @@ export function TasksView({ route }: { route: Route }) {
                       </span>
                       {task.disagreement !== null && (
                         <Badge tone="attention" title={
-                          `Core's event log last said ${taskStatusView(task.disagreement.fromEvents).label} ` +
-                          `while its task row says ${taskStatusView(task.disagreement.fromTaskList, task.unrecognizedStatus).label}. ` +
+                          `Core's event log last said ${taskStatusView(task.disagreement.fromEvents, task.disagreement.fromEventsRaw).label} ` +
+                          `while its task row says ${taskStatusView(task.disagreement.fromTaskList, task.disagreement.fromTaskListRaw).label}. ` +
                           "The desktop reports both; it never decides which one is current."
                         }>
                           reads differ
@@ -212,7 +217,7 @@ export function TasksView({ route }: { route: Route }) {
                       </Button>
                       {!actions.canCancel && (
                         <span className="muted">
-                          {task.unrecognizedStatus !== null
+                          {actions.unrecognized
                             ? " actions disabled: status not recognised by this build "
                             : " cancel n/a "}
                         </span>
@@ -245,18 +250,10 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
   );
   const cancel = useCancelTask();
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const actions = describeTaskAction(
-    projection?.status === "unknown" ? undefined : projection?.status,
-  );
-  // An unrecognised status (Core's row or its event log) blocks review/apply,
-  // and must not be described as terminal: this build cannot tell what it is.
-  const blockedReason = reviewBlockReason(row, projection);
-  const cancelUnavailableCopy =
-    projection?.status === "unknown" || row?.unrecognizedStatus != null
-      ? "Core reported a status this Sandpane build does not recognise, so it cannot tell whether cancelling applies. Cancel is disabled here until the desktop is updated."
-      : projection === null || projection.status === null
-        ? "No status has been reported for this task in this window yet, so there is nothing to cancel from here."
-        : "This task is already in a terminal or review state; cancelling would change nothing.";
+  // ONE gate over both Core reads: an unrecognised status from Core's task row
+  // OR its event log disables cancel, review and apply together, and is never
+  // described as terminal — this build cannot tell what it is.
+  const actions = taskActionGate(row, projection);
 
   return (
     <div className="grid grid--workspace">
@@ -272,7 +269,9 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
             >
               Cancel task
             </Button>
-            {!actions.canCancel && <span className="muted">{cancelUnavailableCopy}</span>}
+            {actions.cancelUnavailableReason !== null && (
+              <span className="muted">{actions.cancelUnavailableReason}</span>
+            )}
           </div>
           <ConfirmDialog
             open={confirmOpen}
@@ -305,7 +304,7 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
           )}
         </Panel>
       </div>
-      <ReviewPanel taskId={taskId} isolation={isolation} blockedReason={blockedReason} />
+      <ReviewPanel taskId={taskId} isolation={isolation} blockedReason={actions.blockedReason} />
     </div>
   );
 }

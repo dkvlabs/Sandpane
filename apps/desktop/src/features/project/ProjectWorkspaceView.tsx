@@ -9,11 +9,10 @@ import {
   useTaskProjection,
 } from "../../lib/hooks";
 import {
-  describeTaskAction,
   foldSbxView,
   resolveSelection,
-  reviewBlockReason,
   sandboxModeView,
+  taskActionGate,
   taskIsolationView,
   taskStatusView,
 } from "../../lib/reducers";
@@ -102,9 +101,9 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
     !sandboxList.isLoading && sandboxList.error === null,
   );
   const projection = useTaskProjection(selectedTask);
-  const actions = describeTaskAction(
-    projection?.status === "unknown" ? undefined : projection?.status,
-  );
+  // ONE gate over both Core reads (the selected task's row AND its event log):
+  // an unrecognised status on either side disables review, apply AND cancel.
+  const actions = taskActionGate(selectedRow, projection);
 
   return (
     <AppShell
@@ -264,7 +263,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
           <ReviewPanel
             taskId={selectedTask}
             isolation={taskIsolation}
-            blockedReason={reviewBlockReason(selectedRow, projection)}
+            blockedReason={actions.blockedReason}
           />
           {selectedTask !== null && (
             <Panel title="Task actions">

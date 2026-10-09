@@ -395,7 +395,9 @@ describe("foldTaskIndex — Core's rows and the event replay, neither invented",
     expect(rows[0]?.status).toBe("awaiting_review");
     expect(rows[0]?.disagreement).toEqual({
       fromEvents: "running",
+      fromEventsRaw: null,
       fromTaskList: "awaiting_review",
+      fromTaskListRaw: null,
     });
     // No client-side transition was computed: both sides are Core's own values.
   });

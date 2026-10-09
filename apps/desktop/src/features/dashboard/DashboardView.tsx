@@ -9,6 +9,7 @@ import {
 } from "../../lib/hooks";
 import {
   countTasks,
+  displayPath,
   foldSbxView,
   taskStatusView,
   type TimelineEntry,
@@ -69,6 +70,7 @@ export function DashboardView({ route }: { route: Route }) {
         <span className="statusbar__counts">
           Running {counts.running} · Queued {counts.queued} · Review needed{" "}
           {counts.needsReview} · Failed {counts.failed}
+          {counts.unrecognized > 0 && <> · Unrecognised {counts.unrecognized}</>}
         </span>
       }
     >
@@ -303,7 +305,7 @@ function describeEntry(entry: TimelineEntry): string {
         ? `Running ${entry.name ?? entry.toolId}`
         : `${entry.name ?? entry.toolId} ${entry.ok ? "succeeded" : "failed"}`;
     case "file":
-      return `Changed ${entry.path}`;
+      return `Changed ${displayPath(entry.path).text}`;
     case "approval":
       return `Approval required: ${entry.description}`;
     case "unmodelled":

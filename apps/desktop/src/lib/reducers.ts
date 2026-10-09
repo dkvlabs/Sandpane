@@ -241,17 +241,20 @@ export function describeTaskAction(
  * "unrecognised".
  */
 export function reviewBlockReason(
-  row: { unrecognizedStatus: string | null } | null | undefined,
-  projection:
-    | { status: TaskStatus | "unknown" | null; unrecognizedStatus?: string | null }
-    | null
-    | undefined,
+  row: TaskRowRead | null | undefined,
+  projection: TaskEventsRead | null | undefined,
 ): string | null {
   if (row?.unrecognizedStatus != null) {
     return (
       `Core reports status "${displayRaw(row.unrecognizedStatus)}" for this task, which this ` +
       "Sandpane build does not recognise (it is older than Core). Review and apply are disabled " +
       "here until the desktop is updated; nothing has been applied."
+    );
+  }
+  if (row?.source === "task.list" && row.status === "unknown") {
+    return (
+      "Core's task row reports a status this Sandpane build does not recognise for this task. " +
+      "Review and apply are disabled here until the desktop is updated; nothing has been applied."
     );
   }
   if (projection?.status === "unknown") {
@@ -264,6 +267,78 @@ export function reviewBlockReason(
     );
   }
   return null;
+}
+
+/** Core's stored task row as the gates read it (a `TaskIndexEntry` fits). */
+export interface TaskRowRead {
+  unrecognizedStatus: string | null;
+  status?: TaskStatus | "unknown";
+  /**
+   * Where the row came from. Only a `task.list` row's `"unknown"` means "Core
+   * said something unrecognised": an event-only row folds a status that was
+   * never reported to `"unknown"` too, and that is "not reported".
+   */
+  source?: TaskIndexSource;
+}
+
+/** The status Core's durable event log last reported (a `TaskProjection` fits). */
+export interface TaskEventsRead {
+  status: TaskStatus | "unknown" | null;
+  unrecognizedStatus?: string | null;
+}
+
+/**
+ * Every task action the desktop offers, from ONE place over BOTH Core reads.
+ *
+ * Cancel, review, apply and retry depend on knowing the task's state. When
+ * EITHER read — Core's task row or its event log — reports a status this build
+ * does not recognise, all of them are disabled: the review block
+ * (`reviewBlockReason`) and the action flags come from the same check, so a
+ * view can never block review while still offering Cancel. When both reads are
+ * recognised the event log decides, as before; a known-vs-known difference is
+ * surfaced by `foldTaskIndex` (`disagreement`), never resolved here.
+ */
+export interface TaskActionGate {
+  /** True when either Core read reports a status this build cannot interpret. */
+  unrecognized: boolean;
+  canCancel: boolean;
+  canReview: boolean;
+  canRetry: boolean;
+  /** Non-null when review/apply must stay disabled (`reviewBlockReason`). */
+  blockedReason: string | null;
+  /** Why Cancel is disabled, safe to render; null when Cancel is offered. */
+  cancelUnavailableReason: string | null;
+}
+
+export function taskActionGate(
+  row: TaskRowRead | null | undefined,
+  projection: TaskEventsRead | null | undefined,
+): TaskActionGate {
+  const blockedReason = reviewBlockReason(row, projection);
+  if (blockedReason !== null) {
+    return {
+      unrecognized: true,
+      canCancel: false,
+      canReview: false,
+      canRetry: false,
+      blockedReason,
+      cancelUnavailableReason:
+        "Core reported a status this Sandpane build does not recognise, so it cannot tell " +
+        "whether cancelling applies. Cancel is disabled here until the desktop is updated.",
+    };
+  }
+  const status = projection?.status ?? null;
+  const actions = describeTaskAction(status);
+  return {
+    unrecognized: false,
+    ...actions,
+    blockedReason: null,
+    cancelUnavailableReason: actions.canCancel
+      ? null
+      : status === null
+        ? "No status has been reported for this task in this window yet, so there is nothing to cancel from here."
+        : "This task is already in a terminal or review state; cancelling would change nothing.",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +393,11 @@ export interface TaskCounts {
   awaitingInput: number;
   completed: number;
   interrupted: number;
+  /**
+   * The `"unknown"` bucket (`taskBucket`): a status this build does not
+   * recognise, or none reported yet. Every bucket together equals `total`.
+   */
+  unrecognized: number;
   total: number;
 }
 
@@ -333,6 +413,7 @@ export function countTasks(
     awaitingInput: 0,
     completed: 0,
     interrupted: 0,
+    unrecognized: 0,
     total: tasks.length,
   };
   for (const task of tasks) {
@@ -367,7 +448,9 @@ export function countTasks(
         counts.cancelled += 1;
         break;
       default:
-        // "unknown" and any future wire status: counted in total only.
+        // "unknown" and any future wire status: its own visible bucket, never
+        // folded into a known one.
+        counts.unrecognized += 1;
         break;
     }
   }
@@ -407,10 +490,17 @@ export interface TaskIndexEntry {
    * event-only row. Null otherwise.
    */
   unrecognizedStatus: string | null;
-  /** Set when Core's two reads report different statuses for the same task. */
+  /**
+   * Set when Core's two reads report different statuses for the same task —
+   * including two DIFFERENT unrecognised raw values, which are both `"unknown"`
+   * here. Each side keeps its raw string (null when recognised) so the UI can
+   * name exactly what each read said.
+   */
   disagreement: {
     fromEvents: TaskStatus | "unknown";
+    fromEventsRaw: string | null;
     fromTaskList: TaskStatus | "unknown";
+    fromTaskListRaw: string | null;
   } | null;
 }
 
@@ -462,12 +552,17 @@ export function foldTaskIndex(
       lastEventAt: projection.lastEventAt ?? existing.lastEventAt,
       // Core's stored row stays on screen; the event fold never overwrites it.
       // A difference between the two Core reads is reported below, not resolved
-      // by a client-side guess (AGENTS rule 3).
+      // by a client-side guess (AGENTS rule 3). An event log that has not
+      // reported a status yet (`null`) has nothing to disagree with.
       disagreement:
-        status !== existing.status
+        projection.status !== null &&
+        (projection.status !== existing.status ||
+          (projection.unrecognizedStatus ?? null) !== existing.unrecognizedStatus)
           ? {
-              fromEvents: status,
+              fromEvents: projection.status,
+              fromEventsRaw: projection.unrecognizedStatus ?? null,
               fromTaskList: existing.status,
+              fromTaskListRaw: existing.unrecognizedStatus,
             }
           : existing.disagreement,
     });
@@ -485,6 +580,26 @@ export function foldTaskIndex(
     if (byCore !== 0) return byCore;
     return a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0;
   });
+}
+
+/**
+ * The event-log read carried by a folded index row, for `taskActionGate` where
+ * only the row is at hand (the Tasks table). When the two Core reads differ the
+ * row keeps the event side in `disagreement`; an event-only row whose status
+ * was never reported (folded to `"unknown"` with no raw value) is "not
+ * reported", not "unrecognised".
+ */
+export function indexRowEventsRead(row: TaskIndexEntry): TaskEventsRead {
+  if (row.disagreement !== null) {
+    return {
+      status: row.disagreement.fromEvents,
+      unrecognizedStatus: row.disagreement.fromEventsRaw,
+    };
+  }
+  if (row.source === "events" && row.status === "unknown" && row.unrecognizedStatus === null) {
+    return { status: null, unrecognizedStatus: null };
+  }
+  return { status: row.status, unrecognizedStatus: row.unrecognizedStatus };
 }
 
 /** Parse a Core timestamp for ordering; unknown or unparsable sorts last. */
@@ -1404,13 +1519,20 @@ export interface ApplyPlan {
 
 export function planApply(changeSet: ChangeSet, selected: ReadonlySet<string>): ApplyPlan {
   const unknownChanges = changeSet.changes.filter((c) => c.status === "unknown");
-  const unrecognized = unknownChanges.map((c) => c.path);
+  // Apply is addressed BY PATH, so a path is unappliable as soon as ANY entry
+  // for it is unrecognised: selecting a recognised twin of that path would ask
+  // Core to apply the unrecognised change along with it.
+  const unrecognized = [...new Set(unknownChanges.map((c) => c.path))];
+  const unknownPaths = new Set(unrecognized);
   const known = new Set(
-    changeSet.changes.filter((c) => c.status !== "unknown").map((c) => c.path),
+    changeSet.changes
+      .filter((c) => c.status !== "unknown" && !unknownPaths.has(c.path))
+      .map((c) => c.path),
   );
-  const selectedFiles = changeSet.changes
-    .map((c) => c.path)
-    .filter((path) => known.has(path) && selected.has(path));
+  // Each path is sent once, in Core's order, even when Core listed it twice.
+  const selectedFiles = [...new Set(changeSet.changes.map((c) => c.path))].filter(
+    (path) => known.has(path) && selected.has(path),
+  );
   if (changeSet.changes.length === 0) {
     return { canApply: false, selectedFiles: undefined, unrecognized, blockedReason: null };
   }
@@ -1419,7 +1541,7 @@ export function planApply(changeSet: ChangeSet, selected: ReadonlySet<string>): 
   }
   if (unrecognized.length > 0) {
     const raws = unknownChanges
-      .map((c) => `${displayRaw(c.path)} (${displayRaw(c.unrecognizedStatus ?? "unknown")})`)
+      .map((c) => `${displayPath(c.path).text} (${displayRaw(c.unrecognizedStatus ?? "unknown")})`)
       .join(", ");
     return {
       canApply: false,
@@ -1517,25 +1639,79 @@ export interface ErrorCopy {
   provider?: string;
 }
 
-/** Longest hint shown; Core's hints are short commands. */
+/** Longest hint shown, in code points; Core's hints are short commands. */
 const MAX_HINT_CHARS = 120;
 
 /**
+ * Characters that render as nothing (or reorder their neighbours), so text
+ * containing them can look different from what it is: soft hyphen, Arabic
+ * letter mark, Mongolian vowel separator, zero-width and directional marks,
+ * bidi embeddings / overrides / isolates, word joiner and invisible math
+ * operators, BOM, interlinear annotation controls, and the tag block.
+ * A RegExp character-class body for use with the `u` flag.
+ */
+const INVISIBLE_CLASS =
+  "\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069" +
+  "\\ufeff\\ufff9-\\ufffb\\u{e0000}-\\u{e007f}";
+
+/** C0/C1 controls (CR/LF, the ESC of ANSI sequences) plus `INVISIBLE_CLASS`. */
+const HINT_STRIP = new RegExp(`[\\u0000-\\u001f\\u007f-\\u009f${INVISIBLE_CLASS}]`, "gu");
+
+/**
+ * What a file path must never show raw: everything in `HINT_STRIP`, spaces
+ * that are not U+0020 (a path could otherwise imitate another), line/paragraph
+ * separators, and lone surrogates.
+ */
+const PATH_ESCAPE = new RegExp(
+  `[\\u0000-\\u001f\\u007f-\\u009f${INVISIBLE_CLASS}` +
+    "\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ud800-\\udfff]",
+  "gu",
+);
+
+/** Cut to `max` code points (never inside a surrogate pair), marking the cut. */
+function capCodePoints(value: string, max: number): string {
+  const points = Array.from(value);
+  return points.length > max ? `${points.slice(0, max - 1).join("")}…` : value;
+}
+
+/**
  * Reduce an untrusted `details` string to a single printable line: control
- * characters (incl. CR/LF, ANSI escapes) removed, whitespace collapsed,
- * length capped. Returns undefined when nothing usable remains.
+ * characters (incl. CR/LF, ANSI escapes) and invisible / reordering characters
+ * removed, whitespace collapsed, length capped by code points. Returns
+ * undefined when nothing usable remains.
  */
 export function sanitizeHint(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  const cleaned = value
-    // C0/C1 control characters (CR/LF, the ESC of ANSI sequences) and
-    // zero-width / bidi-override marks that could make a shown command differ
-    // from the text a user would copy.
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const cleaned = value.replace(HINT_STRIP, " ").replace(/\s+/g, " ").trim();
   if (cleaned.length === 0) return undefined;
-  return cleaned.length > MAX_HINT_CHARS ? `${cleaned.slice(0, MAX_HINT_CHARS - 1)}…` : cleaned;
+  return capCodePoints(cleaned, MAX_HINT_CHARS);
+}
+
+/** Longest path shown, in code points of Core's raw path. */
+const MAX_PATH_CHARS = 1024;
+
+/**
+ * Display form of a file path Core reported. Unlike `sanitizeHint`, nothing is
+ * removed silently: each hidden, control or look-alike character is shown as a
+ * visible escape (`\u202E`, `\u{E0041}`) and `unusual` is set, so a path that
+ * a bidi override would make read as `gnp.exe` is shown for what it is. Display
+ * ONLY — the raw path is what selection and `git.apply` use.
+ */
+export function displayPath(path: string): { text: string; unusual: boolean } {
+  const points = Array.from(path);
+  const cut = points.length > MAX_PATH_CHARS;
+  const head = cut ? points.slice(0, MAX_PATH_CHARS).join("") : path;
+  let unusual = false;
+  const escaped = head.replace(PATH_ESCAPE, (ch) => {
+    unusual = true;
+    const code = ch.codePointAt(0) ?? 0;
+    const hex = code.toString(16).toUpperCase();
+    return code > 0xffff ? `\\u{${hex}}` : `\\u${hex.padStart(4, "0")}`;
+  });
+  return {
+    text: cut ? `${escaped}… (${points.length - MAX_PATH_CHARS} more characters)` : escaped,
+    unusual,
+  };
 }
 
 function coreHints(err: CoreRequestError): Pick<ErrorCopy, "hint" | "provider"> {

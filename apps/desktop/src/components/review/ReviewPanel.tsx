@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useApplyChanges, useTaskReview } from "../../lib/hooks";
 import {
+  displayPath,
   displayRaw,
   fileChangeLabel,
   planApply,
@@ -31,6 +32,11 @@ import { ErrorPanel } from "../../features/projects/ProjectsView";
  * listed with Core's raw status but cannot be selected, and its presence blocks
  * a whole-set apply (`planApply`). A task whose own status is unrecognised gets
  * `blockedReason`, which disables both review and apply.
+ *
+ * Paths are Core's raw strings and are only ever SHOWN through `displayPath`:
+ * hidden, control or reordering characters appear as visible escapes with an
+ * "unusual characters" mark, never silently cleaned — and never altered in
+ * what is selected or sent.
  */
 export function ReviewPanel({
   taskId,
@@ -156,20 +162,30 @@ function ReviewPanelBody({
             />
           ) : (
             <ul className="list list--files">
-              {changeSet.changes.map((change) => (
-                <li key={change.path} className="row">
+              {changeSet.changes.map((change, index) => {
+                // Apply is addressed by path: a recognised entry whose path also
+                // has an unrecognised entry cannot be applied either (planApply).
+                const twinUnknown =
+                  change.status !== "unknown" && plan.unrecognized.includes(change.path);
+                const unselectable = change.status === "unknown" || twinUnknown;
+                const shown = displayPath(change.path);
+                return (
+                // Core may list a path more than once; index keeps keys unique.
+                <li key={`${index}:${change.path}`} className="row">
                   <label
                     className="row__check"
                     title={
                       change.status === "unknown"
                         ? `Core reported status "${displayRaw(change.unrecognizedStatus ?? "unknown")}", which this build does not recognise; it cannot be applied from here.`
-                        : undefined
+                        : twinUnknown
+                          ? "Core also lists this path with a status this build does not recognise, so applying it would carry that change too; it cannot be applied from here."
+                          : undefined
                     }
                   >
                     <input
                       type="checkbox"
-                      disabled={change.status === "unknown"}
-                      checked={change.status !== "unknown" && selected.has(change.path)}
+                      disabled={unselectable}
+                      checked={!unselectable && selected.has(change.path)}
                       onChange={(event) => {
                         const next = new Set(selected);
                         if (event.target.checked) next.add(change.path);
@@ -177,8 +193,16 @@ function ReviewPanelBody({
                         setSelected(next);
                       }}
                     />
-                    <Mono>{change.path}</Mono>
+                    <Mono>{shown.text}</Mono>
                   </label>
+                  {shown.unusual && (
+                    <Badge
+                      tone="attention"
+                      title="This path contains hidden, control or look-alike characters. They are shown as \u escapes so the name cannot pass for a different file."
+                    >
+                      unusual characters
+                    </Badge>
+                  )}
                   <Badge
                     tone={
                       change.status === "deleted"
@@ -191,7 +215,8 @@ function ReviewPanelBody({
                     {fileChangeLabel(change.status, change.unrecognizedStatus)}
                   </Badge>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
 
@@ -251,7 +276,7 @@ function ReviewPanelBody({
                 <p>
                   {plan.selectedFiles === undefined
                     ? `All ${changeSet.changes.length} file(s) in the change set.`
-                    : `Selected: ${selectedFiles.join(", ")}`}
+                    : `Selected: ${selectedFiles.map((f) => displayPath(f).text).join(", ")}`}
                 </p>
                 {plan.unrecognized.length > 0 && (
                   <p>
@@ -275,8 +300,8 @@ function ReviewPanelBody({
               {apply.data.conflictedFiles.length > 0 && (
                 <p>
                   Conflicts:{" "}
-                  {apply.data.conflictedFiles.map((f) => (
-                    <Mono key={f}>{f}</Mono>
+                  {apply.data.conflictedFiles.map((f, index) => (
+                    <Mono key={`${index}:${f}`}>{displayPath(f).text}</Mono>
                   ))}
                 </p>
               )}

@@ -205,7 +205,12 @@ describe("an unknown TaskStatus is kept raw, never mapped to a known state", () 
       { id: "t1", conversationId: "c1", status: "unknown", unrecognizedStatus: FUTURE_STATUS },
     ]);
     expect(rows[0]?.status).toBe("unknown");
-    expect(rows[0]?.disagreement).toEqual({ fromEvents: "running", fromTaskList: "unknown" });
+    expect(rows[0]?.disagreement).toEqual({
+      fromEvents: "running",
+      fromEventsRaw: null,
+      fromTaskList: "unknown",
+      fromTaskListRaw: FUTURE_STATUS,
+    });
   });
 
   it("the event log keeps a raw status.changed value, and a later known status clears it", () => {
