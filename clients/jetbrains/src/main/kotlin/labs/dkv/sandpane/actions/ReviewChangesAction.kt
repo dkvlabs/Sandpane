@@ -92,7 +92,7 @@ class ReviewChangesAction : AnAction() {
         candidateCount: Int,
     ) {
         val diff = EditorDiffProvider.instance(project)
-        val repositoryRoot = ProjectLevelVcsManager.getInstance(project).allVcsRoots.firstOrNull()?.path?.path
+        val repositoryRoot = ProjectLevelVcsManager.getInstance(project).getAllVcsRoots().firstOrNull()?.path?.path
             ?: project.basePath
         val target = diff.resolve(changeSet, repositoryRoot)
         val summary = diff.summarize(target, null)

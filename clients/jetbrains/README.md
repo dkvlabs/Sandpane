@@ -4,35 +4,76 @@ IntelliJ Platform plugin scaffold (Kotlin, native Swing tool window, typed local
 client) implementing the JB0/JB1 surface of
 [`docs/specs/04_JETBRAINS_PLUGIN.md`](../../docs/specs/04_JETBRAINS_PLUGIN.md).
 
-> ## Verification status: COMPILES, PACKAGES AND UNIT-TESTS ON THIS HOST — never launched in an IDE
+> ## Verification status: COMPILES, UNIT-TESTS, PACKAGES AND PASSES PLUGIN VERIFIER ON THIS HOST — never launched in an IDE
 >
-> This section was corrected on 09.10.2026. An earlier revision of this README stated that nothing
-> in this module had ever been compiled or run and that no Kotlin compiler existed on this host.
-> That is no longer true, and leaving it written would have been a false statement about
-> verification (AGENTS.md rule 5).
+> Re-baselined on 09.10.2026 (task U4, "latest library for each implementation"). Earlier revisions
+> of this section described a 2024.2.4 / Gradle 8.10.2 / JDK 17 build with 97 tests; those numbers
+> are superseded by the ones below.
 >
-> **Proven on this host** (commands and counts in "Checks actually run" below):
-> `./gradlew test --offline` compiles `main` and `test` against the resolved IntelliJ Platform
-> **2024.2.4** artifact and runs **97 unit tests, 0 failures, 0 errors**; `./gradlew buildPlugin
-> --offline` produces the installable `build/distributions/sandpane-jetbrains-0.1.0-scaffold.zip`
-> (2 707 234 bytes, rewritten by the clean run at 17:19 local on 09.10.2026).
+> **Proven on this host** (exact commands and outputs in "Checks actually run" below):
+> `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
+> (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
+> executed offline) against **IntelliJ IDEA 2026.2.3 (IU-262.10968.63)**: **161 tests, 0 failures,
+> 0 errors, 0 skipped** across 20 test classes; `build/distributions/sandpane-jetbrains-0.1.0-scaffold.zip`
+> (1 163 019 bytes) is produced and `verifyPluginStructure` accepts it. `./gradlew verifyPlugin`
+> (IntelliJ Plugin Verifier 1.410) reports **`Compatible`** against IU-262.10968.63 with **no**
+> deprecated, experimental, internal or override-only API usages and no compatibility problems.
 > `ProtocolDriftGuardTest` re-reads `core/crates/sandpane-protocol/src/lib.rs`,
 > `core/crates/sandpane-service/src/lib.rs` and `schemas/*.json` on every run and fails the build on
 > a wire-name, method-order, numeric-bound or enum drift — and was demonstrated to go red when one
 > name was renamed on either side (see "Drift gate and its negative control").
 >
 > **Still NOT verified, and nothing here implies otherwise:** `runIde` has never started an IDE;
-> Plugin Verifier has never run; the packaged zip has never been installed or loaded in a real
-> JetBrains product; none of the version pins below is confirmed against current Plugin SDK docs;
-> no socket round trip against a live Core has ever been made; and every `sbx`/Codex-dependent
-> behaviour is unexercised — this host has **no `sbx` binary** (`command -v sbx` → absent) and the
-> **Docker daemon is unreachable** (`docker info` fails), which is the P0 gate docs/compatibility.md
-> records as not passed.
+> the packaged zip has never been installed or loaded in a real JetBrains product (Plugin Verifier
+> is static bytecode analysis, not a load test); only one IDE build (262) has been verified, so the
+> declared range is exactly `262`–`262.*`; no socket round trip against a live Core has ever been
+> made; and every `sbx`/Codex-dependent behaviour is unexercised — this host has **no `sbx` binary**
+> (`command -v sbx` → absent) and the **Docker daemon is unreachable** (`docker info` fails), which
+> is the P0 gate docs/compatibility.md records as not passed.
 
-**Host side effect, not a repo artifact:** running the builds populated Gradle caches under
-`~/.gradle` on this dev host (the 8.10.2 wrapper distribution plus ~8.6 GB of dependency/module
-caches, including the multi-GB IntelliJ Platform artifact). Nothing of that lives in the repository —
-`clients/jetbrains/.gitignore:3` ignores `build/`, so the only tracked outputs are sources.
+**Host side effect, not a repo artifact:** running the builds populated caches on this dev host:
+the Gradle 9.8.1 wrapper distribution under `~/.gradle/wrapper/dists/`, the IntelliJ IDEA 2026.2.3
+artifact (~1.4 GB download in `~/.gradle/caches/modules-2`, ~4.2 GB extracted under
+`~/.gradle/caches/9.8.1/transforms/`), Temurin JDK 21.0.12.1 downloaded by the foojay resolver into
+`~/.gradle/jdks/` during the first run of this upgrade (toolchain then still at 21 — see "Toolchain";
+Temurin 25.0.3 was already in `~/.gradle/jdks/` from an earlier auto-provision and was reused), and ~935 MB of bundled-plugin dependency data the Plugin Verifier unpacked into
+`~/.pluginVerifier/` on its first run. Nothing of that lives in the repository —
+`clients/jetbrains/.gitignore` ignores `build/`, `.gradle/`, `.intellijPlatform/` and `.kotlin/`.
+
+## Versions and toolchain (09.10.2026)
+
+Every version below was read from its publishing registry on 09.10.2026, not assumed.
+
+| Item | Old | New | Source checked |
+|---|---|---|---|
+| Gradle wrapper | 8.10.2 (no checksum pinned) | **9.8.1**, `distributionSha256Sum=dce76f55…dc01f` | `services.gradle.org/versions/current`; `gradle-wrapper.jar` sha256 `3b8a2577…8e98` matches the published wrapper checksum |
+| IntelliJ Platform Gradle Plugin | 2.1.0 | **2.19.0** | Gradle Plugin Portal `maven-metadata.xml` (`<release>2.19.0`) |
+| Kotlin (JVM + serialization compiler plugins) | 2.0.21 | **2.4.21** | Maven Central `kotlin-gradle-plugin` metadata — newest *stable*; `2.5.0-Beta1` is listed as `<release>` but is a pre-release and was deliberately not taken |
+| kotlinx-serialization-json | 1.7.3 | **1.11.0** | Maven Central metadata — newest *stable*; `1.12.0-RC` is a pre-release and was deliberately not taken |
+| Toolchain resolver | none | **foojay-resolver-convention 1.0.0** (settings plugin) | Gradle Plugin Portal metadata; usage per docs.gradle.org toolchains page |
+| Target IDE | IntelliJ IDEA Community (`IC`) 2024.2.4 via `create(IC, …)` | **IntelliJ IDEA 2026.2.3** (build 262.10968.63) via the unified `intellijIdea(...)` dependency — there is no separate Community artifact since 2025.3 | `data.services.jetbrains.com/products/releases?code=IIU&latest=true&type=release`; extracted `product-info.json` says `IntelliJ IDEA`, `2026.2.3`, `262.10968.63`, `productCode IU` |
+| `sinceBuild` / `untilBuild` | 242 / 252.* | **262 / 262.*** | the only build line compiled and verified here |
+| Java toolchain / bytecode | 17 | **25** (class-file major 69 in the plugin jar) | see below |
+| Plugin Verifier IDEs | `recommended()` (never run) | **`current()`** = the IDE the build compiles against | IntelliJ SDK docs `pluginVerification.ides` |
+
+**Toolchain: why 25 and not 21.** The upgrade request expected "262 → Java 21". The IDE itself says
+otherwise, from four independent sources: `product-info.json` → `"minRequiredJavaVersion": 25`;
+the bundled JBR `release` file → `JAVA_VERSION="25.0.4"`; platform classes are class-file major 69
+(e.g. `lib/intellij.platform.vcs.impl.jar`: 2 864/2 864 classes at 69); and IPGP's
+`verifyPluginProjectConfiguration`, with the toolchain at 21, printed `Java sourceCompatibility is
+set to '21', but IntelliJ Platform '2026.2.3' requires Java '25'`. The toolchain is therefore 25.
+No JDK 25 is installed system-wide on this host (17 / 23 / 26 / 27 are). Foojay provisioning was
+proven here with 21 (Temurin 21.0.12.1 downloaded during the first gate run); Temurin 25.0.3 was
+already in `~/.gradle/jdks` from an earlier Gradle auto-provision and was reused, and
+`./gradlew javaToolchains` lists it as `Auto-provisioned by Gradle`. On a host without it, the same
+resolver downloads it. No machine-specific JDK path is committed. The Gradle launcher itself
+runs on whatever `JAVA_HOME` is (here GraalVM CE 23; Gradle 9.8.1 needs ≥ 17).
+
+**until-build is kept on purpose.** `verifyPluginProjectConfiguration` recommends removing
+`until-build` for 243+ ("restricts plugin compatibility with future IDE versions"). That advice is
+not followed: an open-ended range would advertise compatibility with IDE builds nobody has run the
+verifier against (AGENTS.md rule 5). Widen the range only together with matching
+`pluginVerification.ides` entries.
 
 ---
 
@@ -40,44 +81,70 @@ caches, including the multi-GB IntelliJ Platform artifact). Nothing of that live
 
 | # | Task | Status here | Command / note |
 |---|---|---|---|
-| 1 | Pin exact IDE baseline, JDK, Kotlin, Gradle, plugin versions from current Plugin SDK docs | **UNVERIFIED pins** | `gradle.properties`: `platformType=IC`, `platformVersion=2024.2.4`, `javaToolchainVersion=17`, `kotlinVersion=2.0.21`, `intellijPlatformPluginVersion=2.1.0`, `kotlinxSerializationVersion=1.7.3` |
-| 2 | Declare `sinceBuild`/`untilBuild` range | **DECLARED, UNPROVEN** | `pluginSinceBuild=242`, `pluginUntilBuild=252.*`; supplied by `patchPluginXml` (no `<idea-version>` hardcoded in `plugin.xml`) |
-| 3 | Resolve Gradle distribution | **DONE** — the wrapper ran and its 8.10.2 distribution is unpacked under `~/.gradle/wrapper/dists/gradle-8.10.2-bin/` (marker `.ok` written 09.10.2026) | `./gradlew --version` → `Gradle 8.10.2`, Launcher JVM 23 (GraalVM CE 23+37), OS `Mac OS X aarch64` |
-| 4 | First real build | **RUN** — `compileKotlin`, `jar`, `instrumentedJar`, `composedJar`, `buildPlugin` all succeed offline against the cached platform artifact | `./gradlew buildPlugin --offline` → `build/distributions/sandpane-jetbrains-0.1.0-scaffold.zip`. NOTE: `./gradlew build` alone does **not** produce the zip in this project — `buildPlugin` is a separate task and is not wired into `assemble`. |
+| 1 | Pin exact IDE baseline, JDK, Kotlin, Gradle, plugin versions from current Plugin SDK docs | **DONE for one IDE line** — versions read from their registries and built/verified together (see "Versions and toolchain") | `gradle.properties`: `platformVersion=2026.2.3`, `javaToolchainVersion=25`, `kotlinxSerializationVersion=1.11.0`; `build.gradle.kts` `plugins {}`: Kotlin 2.4.21, IPGP 2.19.0; `settings.gradle.kts`: foojay 1.0.0; wrapper 9.8.1 |
+| 2 | Declare `sinceBuild`/`untilBuild` range | **DECLARED = VERIFIED RANGE** | `pluginSinceBuild=262`, `pluginUntilBuild=262.*`; supplied by `patchPluginXml` (no `<idea-version>` hardcoded in `plugin.xml`). Older builds (≤ 261) are not supported: they were not verified and need Java ≤ 21 bytecode. |
+| 3 | Resolve Gradle distribution | **DONE** — wrapper regenerated as 9.8.1 with `--gradle-distribution-sha256-sum`, distribution downloaded and used | `./gradlew --version` → `Gradle 9.8.1`, Launcher JVM 23 (GraalVM CE 23+37) |
+| 4 | First real build | **RUN** — `compileKotlin`, `instrumentCode`, `jar`, `instrumentedJar`, `composedJar`, `buildPlugin`, `verifyPluginStructure` succeed online and offline against IntelliJ IDEA 2026.2.3 | `build/distributions/sandpane-jetbrains-0.1.0-scaffold.zip`. NOTE: `./gradlew build` alone does **not** produce the zip in this project — `buildPlugin` is a separate task and is not wired into `assemble`. |
 | 5 | Sandbox IDE launch + tool window visible | **NOT RUN** | `./gradlew runIde` — never executed; no IDE has ever rendered this tool window |
-| 6 | Plugin Verifier (public API + binary compatibility across the range) | **CONFIGURED, NEVER RUN** | `./gradlew runPluginVerifier` (`pluginVerification.ides { recommended() }`) |
-| 7 | `runIde` matrix: IDEA Community **and** Ultimate, then PyCharm / WebStorm / PhpStorm | **NOT RUN** | specs/04 §1 — cross-IDE support is never assumed |
+| 6 | Plugin Verifier (public API + binary compatibility across the range) | **RUN — `Compatible`, 0 deprecated / experimental / internal usages** against IU-262.10968.63 (the whole declared range) | `./gradlew verifyPlugin` (`pluginVerification.ides { current() }`, verifier-cli 1.410); report in `build/reports/pluginVerifier/IU-262.10968.63/` |
+| 7 | `runIde` matrix: IntelliJ IDEA (unified since 2025.3), then PyCharm / WebStorm / PhpStorm | **NOT RUN** | specs/04 §1 — cross-IDE support is never assumed; the Plugin Verifier has only seen IntelliJ IDEA |
 | 8 | Product-modules dependency form | **OPEN QUESTION** | the brief's `intellij { modules("intellij.platform.core") }` is the 1.x surface; no 2.x equivalent was proven, so none is declared. See the `JB0 OPEN ITEM` block in `build.gradle.kts`. |
-| 9 | `kotlin.stdlib.default.dependency=false` combined with KGP 2.0.x | **COMPILES; RUNTIME UNVERIFIED** | `javaToolchainVersion=17` resolved to the auto-detected Azul Zulu JDK 17.0.20.1 (`./gradlew javaToolchains`), and the build succeeds. The produced zip nevertheless carries `kotlin-stdlib-2.0.20.jar`, i.e. a *different* Kotlin runtime than the pinned compiler 2.0.21 — only loading the plugin in an IDE shows whether that collides. |
-| 10 | kotlinx-serialization-json bundled vs platform-provided | **PACKAGED; COLLISION UNVERIFIED** | the zip ships `kotlinx-serialization-json-jvm-1.7.3.jar` + `kotlinx-serialization-core-jvm-1.7.3.jar` alongside the plugin jar. Unit tests pass with them; whether an IDE runtime already carrying serialization classes conflicts is untested. |
+| 9 | `kotlin.stdlib.default.dependency=false` combined with KGP 2.4.21 | **PACKAGING FIXED; RUNTIME UNVERIFIED** | with IPGP 2.19.0 the zip **no longer bundles any `kotlin-stdlib`** (the old zip carried `kotlin-stdlib-2.0.20` against a 2.0.21 compiler); the plugin uses the IDE's Kotlin runtime. Whether that runtime satisfies classes compiled by 2.4.21 is only proven by loading the plugin (item 5). |
+| 10 | kotlinx-serialization-json bundled vs platform-provided | **PACKAGED; COLLISION UNVERIFIED** | the zip ships `kotlinx-serialization-json-jvm-1.11.0.jar` + `kotlinx-serialization-core-jvm-1.11.0.jar` alongside the plugin jar. Unit tests pass with them and the Plugin Verifier raises no problem; whether an IDE runtime already carrying serialization classes conflicts at class-load time is untested. |
 | 11 | Tool-window descriptor attributes (`<toolWindow>` bean) | **UNVERIFIED** | see "Descriptor mapping notes" |
-| 12 | `CommonDataKeys.EDITOR` / `ContentFactory` deprecations on 252 | **UNVERIFIED** | Plugin Verifier output decides |
+| 12 | Deprecated / experimental API on the target | **CLEAN on 262** | Plugin Verifier: 0 deprecated, 0 experimental, 0 internal usages. Two source deprecations fixed during the upgrade (`allVcsRoots` → `getAllVcsRoots()`, `ReadAction.compute` → `ReadAction.computeBlocking`); compiler-generated interface stubs removed with `jvmDefault = NO_COMPATIBILITY` (see "Code changes for the 2026.2 platform"). |
 | 13 | Real icon assets (`svg` + `@2x`) | **NOT CREATED** | no placeholder image is fabricated; `plugin.xml` declares no icon |
 | 14 | Keyboard shortcuts | **DELIBERATELY ABSENT** | specs/04 §6 requires no conflict with common IDE actions; assigned after the JB4 audit |
 | 15 | Kotlin/IDE lint clean | **NOT RUN** | no `detekt`/`ktlint` run. `buildSearchableOptions` is **SKIPPED** by configuration, so the "no searchable options" signal from JetBrains during `buildPlugin` is not a pass. |
-| 16 | Test run | **RUN — 97 tests, 0 failures, 0 errors** | `./gradlew test --offline`; per-class counts in "Checks actually run" |
+| 16 | Test run | **RUN — 161 tests, 0 failures, 0 errors, 0 skipped** | `./gradlew test --rerun` (online and `--offline`), fresh `build/test-results` each time |
 
 ### Compile-verify list (specific APIs written by inspection)
 
-These are the calls most likely to need a correction on first *runtime*. All of them are now
-**type-checked**: `:compileKotlin` accepts every line below against `platformVersion=2024.2.4` with
-KGP 2.0.21 on the JDK 17 toolchain. What remains unproven is *behaviour* — none of these has ever
-executed inside a running IDE, which is what items 5–7 exist to establish:
+These are the calls most likely to need a correction on first *runtime*. All of them are
+**type-checked** (`:compileKotlin` against IntelliJ IDEA 2026.2.3 with KGP 2.4.21 on the JDK 25
+toolchain) and **binary-checked** (Plugin Verifier `Compatible` on IU-262.10968.63). What remains
+unproven is *behaviour* — none of these has ever executed inside a running IDE, which is what
+items 5–7 exist to establish:
 
 - `SocketChannel.open(UnixDomainSocketAddress)` / `StandardProtocolFamily.UNIX` probe (JDK 16+).
 - `CompletableFuture.orTimeout(...)`, `CompletableFuture.failedFuture(...)` (JDK 9+).
-- `ReadAction.compute<V, E> { }` in `SandpaneContextProvider.collect`.
-- `FileEditorManager.selectedTextEditor`, `ProjectLevelVcsManager.getVcsRootFor`, `allVcsRoots`.
+- `ReadAction.computeBlocking<V, E> { }` in `SandpaneContextProvider.collect` (was `compute`, deprecated on 262).
+- `FileEditorManager.selectedTextEditor`, `ProjectLevelVcsManager.getVcsRootFor`, `getAllVcsRoots()` (the `allVcsRoots` property is deprecated on 262).
 - `ContentFactory.getInstance().createContent(...)` + `Content.setDisposer(Disposable)`.
-- `ToolWindowFactory.createToolWindowContent(project, toolWindow)` (242 form) vs the 252 signature.
+- `ToolWindowFactory.createToolWindowContent(project, toolWindow)` + `shouldBeAvailable(project)`.
 - `NotificationGroupManager.getInstance().getNotificationGroup("Sandpane")`.
 - `Messages.showDialog(project, message, title, arrayOf(...), 1, null)` (used instead of a
   yes/no overload whose return type differs across versions).
 - `Application.invokeLater(Runnable, Disposable)`, `getService(Class)`.
 - `AnAction.getUpdateThread()` override (required on 2024.2+).
 - `kotlinx.serialization` `decodeFromJsonElement` / `encodeToJsonElement` experimental-API opt-ins.
-- `intellijPlatform { create(...) }`, `instrumentationTools()`, `pluginVerifier()`,
-  `testFramework(TestFrameworkType.Platform)`, `ideaVersion { sinceBuild/untilBuild }`.
+- `intellijPlatform { intellijIdea(...) }`, `pluginVerifier()`, `testFramework(TestFrameworkType.Platform)`,
+  `ideaVersion { sinceBuild/untilBuild }`, `pluginVerification { ides { current() } }` — all
+  executed by IPGP 2.19.0 (`instrumentationTools()` was removed from IPGP and is gone from the build).
+
+### Code changes for the 2026.2 platform
+
+Compiling against 2026.2.3 with Kotlin 2.4.21 produced **no `e:` errors**. What changed, all with
+public, non-deprecated, non-experimental replacements (checked with `javap -v` against the IDE jars):
+
+1. `ProjectLevelVcsManager.allVcsRoots` (Kotlin property; on 262 it is `@Deprecated` with
+   `ReplaceWith("getAllVcsRoots()")` and `@JvmName("getAllVcsRootsDoNotUse")`) → `getAllVcsRoots()`
+   in `services/SandpaneContextProvider.kt` and `actions/ReviewChangesAction.kt`.
+2. `ReadAction.compute(...)` (`@Deprecated`) → `ReadAction.computeBlocking(...)` (same signature and
+   blocking contract, not deprecated, no `@ApiStatus` marker) in `services/SandpaneContextProvider.kt`.
+3. `build.gradle.kts`: `jvmDefault = JvmDefaultMode.NO_COMPATIBILITY`. With Kotlin 2.2+'s default
+   `-jvm-default=enable`, `SandpaneToolWindowFactory` received compiler-generated stubs for every
+   default method of the platform's Kotlin `ToolWindowFactory` interface, and the first verifier run
+   reported them as **4 deprecated** (`isApplicable`, `isDoNotActivateOnStart`) and **6 experimental**
+   (`getAnchor`, `getIcon`, `manage`) API usages that the sources never make. With no-compatibility
+   mode the class contains only its two real overrides and the verifier reports none.
+
+Remaining compiler warnings (none are API deprecations): `java.lang.Object` used as a lock
+(`CoreClient.kt:66`, `EventStream.kt:50,57` — "not recommended, use kotlin.Any"), unnecessary safe
+calls now that platform types are non-null (`SandpaneContextProvider.kt:91,117,120`),
+`ChatPanel.kt:592` "condition is always true", and 3 in tests (`CoreCommandsTest.kt:97,552`,
+`ReplayCursorSemanticsTest.kt:97`). 10 `w:` lines in total on a clean compile; left as-is to keep the
+upgrade diff to what the platform required.
 
 ---
 
@@ -114,10 +181,10 @@ Unsupported is visibly unsupported — no mocked adapter, no fake success (AGENT
 
 ```text
 clients/jetbrains/
-├── settings.gradle.kts
-├── build.gradle.kts                      # org.jetbrains.intellij.platform 2.x (executes: compile, test, buildPlugin)
-├── gradle.properties                     # all JB0 pins + Kotlin flags
-├── gradlew / gradlew.bat / gradle/wrapper/   # generated by host Gradle 8.10.2; distribution unpacked and run
+├── settings.gradle.kts                   # plugin repositories + foojay toolchain resolver 1.0.0
+├── build.gradle.kts                      # IPGP 2.19.0 + Kotlin 2.4.21 (executes: compile, test, buildPlugin, verifyPlugin)
+├── gradle.properties                     # IDE / range / JDK / serialization pins + Kotlin flags
+├── gradlew / gradlew.bat / gradle/wrapper/   # Gradle 9.8.1 wrapper, distribution sha256 pinned
 ├── .gitignore                            # line 3 ignores build/
 ├── README.md
 └── src/
@@ -335,8 +402,9 @@ discovery revision this client is now synced to**):
   `SandpaneToolWindowFactory.FACTORY_ID`, with the visible tool-window `id="Sandpane"`.
   `<toolWindow>` has no documented `factoryId` attribute in the current descriptor bean, and an
   undocumented attribute risks a load error, so it was **not** invented. Confirm at JB0.
-- No `<depends>` beyond `com.intellij.modules.platform`; no optional JCEF dependency
-  (native Swing is the default and the fallback).
+- `<depends>`: `com.intellij.modules.platform` and `com.intellij.modules.vcs` (declared on
+  2026.2.3 by `lib/intellij.platform.vcs.impl.jar` → `intellij.platform.vcs.impl.xml`); no optional
+  JCEF dependency (native Swing is the default and the fallback).
 - Actions are nested inside the `labs.dkv.sandpane.Toolwindow` group (added to
   `EditorPopupMenu` and `ProjectViewPopupMenu`) instead of using `<reference>` to
   not-yet-registered ids, and the tool window toolbar builds them by id via `ActionManager`.
@@ -346,53 +414,43 @@ discovery revision this client is now synced to**):
 
 ## Checks actually run on this host
 
-Gradle/compile/test rows were run on 09.10.2026 in this session; the file-level rows are re-run
-counts from the same date.
+All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results` and
+`build/distributions` were deleted before each gate run so counts come from that run only.
 
 | Check | Tool / command | Result |
 |---|---|---|
-| Clean compile + package + tests from scratch | `./gradlew clean buildPlugin test --offline` | **BUILD SUCCESSFUL**, exit 0 — `compileKotlin`, `compileTestKotlin`, `jar`, `instrumentedJar`, `composedJar`, `buildPlugin`, `test` all executed |
-| Unit tests | `./gradlew test --offline` | **97 tests, 0 failures, 0 errors** — `CoreClientFramingTest` 29, `CoreCommandsTest` 28, `ErrorAttributionTest` 13, `ProtocolDriftGuardTest` 8, `ReplayCursorSemanticsTest` 7, `FolderMatchingTest` 12 |
-| Kotlin warning surface | `./gradlew compileKotlin compileTestKotlin --offline --rerun-tasks` | **0** `w:`/`e:` lines on a forced full recompile (`-Werror` stays off until JB0 records a verified build) |
-| Installable artifact | `./gradlew buildPlugin --offline` | `build/distributions/sandpane-jetbrains-0.1.0-scaffold.zip` (2 707 234 bytes); bundles the plugin jar + `kotlinx-serialization-{json,core}-jvm-1.7.3` + `kotlin-stdlib-2.0.20`. Never installed anywhere. |
-| Toolchain actually used | `./gradlew --version`, `./gradlew javaToolchains` | Gradle 8.10.2, Launcher JVM 23 (GraalVM CE), `javaToolchainVersion=17` satisfied by auto-detected Azul Zulu JDK 17.0.20.1; platform artifact `IC 2024.2.4` resolved from cache |
-| Drift gate can fail (negative control) | mutated Kotlin mirror, then a mutated **copy** of the Rust sources via `-PsandpaneRepoRoot` | red in both directions with a message naming the drifted wire string; green after restore — see "Drift gate and its negative control" |
+| Gate, online | `./gradlew test --rerun buildPlugin verifyPluginStructure --console=plain` | `BUILD SUCCESSFUL in 15s`, `19 actionable tasks: 12 executed, 7 up-to-date`; first-ever run (IDE download; intermediate config with toolchain 21 and no `jvmDefault` change) was `BUILD SUCCESSFUL in 4m 40s` |
+| Gate, offline from clean | `./gradlew clean --offline`, then `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache --console=plain` | `BUILD SUCCESSFUL in 17s`, `19 actionable tasks: 16 executed, 3 up-to-date`; `compileKotlin`, `compileTestKotlin`, `test`, `buildPlugin`, `verifyPluginStructure` executed |
+| Unit tests | JUnit XML in `build/test-results/test` | **161 tests, 0 failures, 0 errors, 0 skipped**, 20 result files (both runs) |
+| Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
+| Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
+| Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |
+| Kotlin warning surface | clean offline compile | **0** `e:`, **10** `w:` (listed under "Code changes for the 2026.2 platform") |
+| Installable artifact | `unzip -l build/distributions/sandpane-jetbrains-0.1.0-scaffold.zip` | 1 163 019 bytes (plugin jar 551 292 bytes): plugin jar, `-searchableOptions.jar`, `kotlinx-serialization-{core,json}-jvm-1.11.0`; **no** `kotlin-stdlib`. Never installed anywhere. |
+| Toolchain actually used | `./gradlew --version`, `./gradlew javaToolchains` | Gradle 9.8.1, Launcher JVM 23 (GraalVM CE); toolchain 25 = `Eclipse Temurin JDK 25 (25.0.3+9-LTS)`, `Detected by: Auto-provisioned by Gradle` |
+| Wrapper integrity | `shasum -a 256 gradle/wrapper/gradle-wrapper.jar` | `3b8a2577…8e98` = the published `gradle-9.8.1-wrapper.jar.sha256` |
+| Drift gate can fail (negative control) | mutated Kotlin mirror, then a mutated **copy** of the Rust sources via `-PsandpaneRepoRoot` | red in both directions with a message naming the drifted wire string; green after restore — see "Drift gate and its negative control" (recorded before U4; the gate ran green again in the suite above) |
 | Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 14 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
-| `plugin.xml` well-formed + registrations dumped | `python3` `xml.etree` | parsed; id/name/vendor/depends/toolWindow/services/configurable/notificationGroup/4 actions all present |
-| Every class `plugin.xml` names exists in the sources | grep over all `labs.dkv.*` strings | 19 distinct strings: **12 name a type and all 12 resolve**, 0 missing; the other 7 are 4 action ids, 1 group id and 2 package prefixes (re-checked 09.10.2026) |
 | Subprocess misuse (`ProcessBuilder`, `Runtime.exec`, `sh -c`, `bash -lc`) | grep over `src/main/kotlin` | **none** — no subprocess surface exists in this module |
-| Internal/private API references (`com.intellij.internal`, JetBrains AI, `setAccessible`, `Unsafe`, reflection) | grep | none |
+| Internal/private API references (`com.intellij.internal`, JetBrains AI, `setAccessible`, `Unsafe`, reflection) | grep, plus Plugin Verifier | none |
 | TCP / network surface | grep | none — every `TCP` hit is prose stating it is never used |
-| Leftover `TODO()` / `???` / `FIXME` | grep | none |
-| Source inventory | `find src -name '*.kt' \| wc -l` | 28 files (22 main, 6 test) |
-| Gradle wrapper | `gradle --offline wrapper` | generated for real (8.10.2, jar sha256 `2db75c40…8046`), and its distribution has now been unpacked and used by the runs above |
+| Source inventory | `find src -name '*.kt' \| wc -l` | 46 files (28 main, 18 test) |
 
 ## NOT verified
 
 - **`runIde` has never been launched.** No IDE has ever shown the tool window, the chat panel, the
   sandbox picker, the diffs, or any of these actions. Every UI behaviour in this module is
   written-against-documentation, not observed.
-- **Plugin Verifier has never run** (`runPluginVerifier`), so public-API and binary compatibility
-  across `242`–`252.*` is unproven, as is every deprecation question in JB0 items 11–12.
+- **Plugin Verifier has run against one IDE only** (IU-262.10968.63). It is static: it proves the
+  bytecode links against that IDE's public API, not that the plugin loads or behaves. Any other
+  build, or any other IDE product (PyCharm, WebStorm, …), is unverified.
 - **The packaged zip has never been installed or loaded** in any JetBrains product. Packaging is
   not proof of loadability: `<toolWindow>` wiring, `plugin.xml` class resolution, service
   instantiation, the bundled Kotlin runtime, and kotlinx-serialization coexistence with the IDE's
   own classes are all untested at runtime (JB0 items 8–12).
-- **Version pins are unconfirmed against current Plugin SDK docs** — `platformType=IC`,
-  `platformVersion=2024.2.4`, `kotlinVersion=2.0.21`, `intellijPlatformPluginVersion=2.1.0`,
-  `kotlinxSerializationVersion=1.7.3`, `pluginSinceBuild=242`/`pluginUntilBuild=252.*`. They
-  compile together here; nobody has checked them against the recommended matrix.
-- **`verifyPluginProjectConfiguration` reports a real misconfiguration that this host cannot fix.**
-  The build prints: `The Java configuration specifies sourceCompatibility='17' but IntelliJ
-  Platform '2024.2.4' requires sourceCompatibility='21'` (alongside the note that
-  `.intellijPlatform` must be VCS-excluded — it is, at `.gitignore:32`). `gradle.properties` pins
-  `javaToolchainVersion=17` and this host has JDK 17 / 23 / 26 / 27 but **no JDK 21**, and the build
-  runs `--offline`, so toolchain auto-provisioning is not available. Consequence stated plainly:
-  the zip is expected to be **rejected or degraded on 2024.2.4** until the toolchain moves to 21 or
-  the baseline drops to a 17-era platform — a decision that needs an IDE to verify against (JB0
-  exit criteria), so it is recorded here rather than changed blind. The same run also reports
-  `kotlin.stdlib.default.dependency=false` while the packaged zip carries
-  `kotlin-stdlib-2.0.20` against a pinned 2.0.21 compiler (JB0 items 9–10).
+- **Kotlin 2.4.21 compiler vs the IDE's bundled Kotlin runtime** — the zip no longer bundles a
+  stdlib, so the plugin runs on whatever Kotlin runtime 2026.2.3 ships. Compatible on paper (the
+  verifier found no missing classes), unproven at runtime (item 9).
 - **No socket round trip against a live Core** has ever been made — no `system.probe`, no real
   frame, no reconnect/replay. The framing tests are byte-level and in-JVM; the guard refusals and
   cursor shapes are proven against a *recording* transport, not against Core's answers.
@@ -403,13 +461,11 @@ counts from the same date.
 - **`ConnectionManager`, `ChatPanel`, `TaskMonitorService`, `SbxService` and the actions have no
   test that instantiates them** — they need an IDE `Project`/application service. The pure seams
   they delegate to (`CoreCommands`, `CoreGuards`, `ReplayCursors`, `FolderMatching`,
-  `WorkspaceModeView`, `NdjsonFramer`, `ErrorAttribution`) are what the 97 tests cover, so wiring
+  `WorkspaceModeView`, `NdjsonFramer`, `ErrorAttribution`) are what the 161 tests cover, so wiring
   bugs inside those classes remain possible.
 - **Older/newer Core compatibility** (testing this client against an older and a newer Core within
   the compatibility policy) has not been done; advertisement gating is tested against fabricated
   capability lists only.
-- `docs/compatibility.md` still records "Gradle / Kotlin — not installed locally" for this client.
-  That line is now stale on this host: the Gradle wrapper ran, the Kotlin compiler ran (via
-  `kotlin-compiler-embeddable` resolved into `~/.gradle`), and tests executed. The standalone
-  `kotlinc` CLI is still absent, which is irrelevant to this build. That file is the orchestrator's
-  to update — recorded here rather than changed silently.
+- `docs/compatibility.md` still records "Gradle / Kotlin — not installed locally" for this client
+  and none of the versions above. That file is the orchestrator's to update — recorded here rather
+  than changed from inside this module.

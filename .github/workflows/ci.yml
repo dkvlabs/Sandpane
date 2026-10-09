@@ -157,7 +157,7 @@ jobs:
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 25  # IntelliJ IDEA 2026.2 (build 262) requires Java 25 (product-info minRequiredJavaVersion)
       - name: Wrapper is checked in
         run: test -x clients/jetbrains/gradlew
       # Validate the checked-in gradle-wrapper.jar before executing it.

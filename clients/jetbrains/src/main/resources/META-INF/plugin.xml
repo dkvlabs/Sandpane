@@ -10,8 +10,9 @@
     the current descriptor bean — adding an undocumented attribute risks a load error, so
     it is NOT invented here. JB0: confirm the bean attributes against the pinned baseline.
   * `<idea-version>` is intentionally absent: patchPluginXml (build.gradle.kts
-    intellijPlatform.pluginConfiguration.ideaVersion) supplies sinceBuild=242 /
-    untilBuild=252.*. Until a build is actually run, no unverified range is hardcoded.
+    intellijPlatform.pluginConfiguration.ideaVersion) supplies sinceBuild=262 /
+    untilBuild=262.* from gradle.properties — the one build line this plugin is compiled and
+    Plugin-Verifier-checked against (IntelliJ IDEA 2026.2.3).
   * No icon is declared: an icon must be a real bundled asset, and no placeholder image is
     fabricated in this scaffold. JB0 adds tools/sandpane.svg (+@2x) and the `icon` attributes.
   * No keyboard shortcuts are declared yet: specs/04 §6 requires that Sandpane keybindings
@@ -53,9 +54,11 @@
 
     <depends>com.intellij.modules.platform</depends>
     <!-- ProjectLevelVcsManager (VCS roots for context and review mapping) lives in the VCS module,
-         not in platform core. `com.intellij.modules.vcs` is declared by the pinned IC 2024.2.4
-         (lib/app.jar META-INF/IdeaPlugin.xml); IDEs without it will not load this plugin rather
-         than fail at runtime. Cross-IDE availability is still a JB4 verification item. -->
+         not in platform core. `com.intellij.modules.vcs` is declared by the pinned IntelliJ IDEA
+         2026.2.3 (lib/intellij.platform.vcs.impl.jar intellij.platform.vcs.impl.xml, and
+         lib/intellij.idea.ultimate.customization.jar META-INF/plugin.xml); IDEs without it will
+         not load this plugin rather than fail at runtime. Cross-IDE availability is still a JB4
+         verification item. -->
     <depends>com.intellij.modules.vcs</depends>
 
     <extensions defaultExtensionNs="com.intellij">

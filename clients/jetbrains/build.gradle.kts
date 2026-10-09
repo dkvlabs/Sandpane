@@ -1,21 +1,18 @@
 // Sandpane JetBrains plugin — Gradle build (IntelliJ Platform Gradle Plugin 2.x).
 //
-// ┌────────────────────────────────────────────────────────────────────────────┐
-// │ STATUS: NEVER EXECUTED. Written by inspection only.                        │
-// │ The authoring host has Gradle 8.10.2 + JDK 23 but NO IntelliJ Platform     │
-// │ artifacts and NO Kotlin compiler were resolved, so none of the DSL below is │
-// │ proven. Every `version`/`type` literal is a JB0 pin to verify against the  │
-// │ current Plugin SDK docs (docs/specs/04 §1, §4 JB0). See README.md.         │
-// └────────────────────────────────────────────────────────────────────────────┘
+// Executed on the authoring host (results in README.md "Checks actually run"): Gradle 9.8.1,
+// IntelliJ Platform Gradle Plugin 2.19.0, Kotlin 2.4.21, target IntelliJ IDEA 2026.2.3 (262),
+// JDK 25 toolchain (auto-provisioned into ~/.gradle/jdks via the foojay resolver, settings.gradle.kts,
+// when no local JDK 25 exists).
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 
 plugins {
     java
-    id("org.jetbrains.kotlin.jvm") version "2.0.21"
+    id("org.jetbrains.kotlin.jvm") version "2.4.21"
     // Wire types in labs/dkv/sandpane/model/Models.kt are kotlinx.serialization
     // @Serializable classes; this compiler plugin is what makes them encode/decode.
-    id("org.jetbrains.kotlin.plugin.serialization") version "2.0.21"
-    id("org.jetbrains.intellij.platform") version "2.1.0"
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.4.21"
+    id("org.jetbrains.intellij.platform") version "2.19.0"
 }
 
 group = providers.gradleProperty("pluginGroup").get()
@@ -29,10 +26,9 @@ repositories {
 }
 
 kotlin {
-    // Bytecode target for this plugin's own classes. NOTE: the IDE baseline does NOT run on JBR 17 —
-    // the cached IntelliJ IDEA 2024.2.4 (build 242) artifact ships JBR 21.0.4 (its jbr `release`
-    // file says JAVA_VERSION="21.0.4"). This pin stays at 17 only until the separate dependency-
-    // upgrade step moves the toolchain; a 17 target loads on any newer runtime in the range.
+    // Toolchain + bytecode target for this plugin's classes: IntelliJ IDEA 2026.2.3 (262) requires
+    // Java 25 (see gradle.properties for the evidence). If no local JDK 25 exists, Gradle
+    // provisions one via the foojay resolver.
     jvmToolchain(providers.gradleProperty("javaToolchainVersion").get().toInt())
 }
 
@@ -40,10 +36,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:${providers.gradleProperty("kotlinxSerializationVersion").get()}")
 
     intellijPlatform {
-        create(
-            providers.gradleProperty("platformType"),
-            providers.gradleProperty("platformVersion"),
-        )
+        // Unified IntelliJ IDEA distribution (no separate Community artifact since 2025.3).
+        intellijIdea(providers.gradleProperty("platformVersion"))
 
         // JB0 OPEN ITEM (do not delete this note): specs brief asks for the
         // product-modules style `intellij { modules("intellij.platform.core") }`.
@@ -58,7 +52,8 @@ dependencies {
         //   intellijPlatform { bundledPlugin("com.intellij.java") }   // pending JB0
 
         testFramework(TestFrameworkType.Platform)
-        instrumentationTools()
+        // `instrumentationTools()` was removed from IPGP 2.x; `javaCompiler()` is now applied by
+        // default for code instrumentation.
         pluginVerifier()
     }
 
@@ -78,11 +73,12 @@ intellijPlatform {
         }
     }
 
-    // JB0/JB4: run against older and newer Core within the compatibility policy.
-    // `recommended()` needs a Team City/CD configuration; keep it explicit until then.
+    // Plugin Verifier: `current()` = the exact IDE this build compiles against (IntelliJ IDEA
+    // 2026.2.3), i.e. the whole declared since/until range (262 / 262.*). Widening the range must
+    // add the matching IDEs here (e.g. `create(...)`/`select {}`), never just edit the numbers.
     pluginVerification {
         ides {
-            recommended()
+            current()
         }
     }
 }
@@ -105,6 +101,13 @@ tasks {
     withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
         compilerOptions {
             allWarningsAsErrors = false
+            // Kotlin 2.2+ defaults to `-jvm-default=enable`, which emits compatibility stubs in
+            // this plugin's classes for every default method of a platform Kotlin interface they
+            // implement (e.g. ToolWindowFactory.getAnchor/getIcon/manage/isApplicable). Plugin
+            // Verifier then reports those generated stubs as deprecated/experimental API usage
+            // the sources never make. No other Kotlin module links against this plugin, so the
+            // binary-compatibility stubs buy nothing: generate plain JVM default methods only.
+            jvmDefault = org.jetbrains.kotlin.gradle.dsl.JvmDefaultMode.NO_COMPATIBILITY
         }
     }
 }

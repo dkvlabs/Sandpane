@@ -88,7 +88,7 @@ class SandpaneContextProvider(private val project: Project) {
 
     /** Public VCS API only; returns empty when no VCS is mapped, never a guessed `.git` walk. */
     fun vcsRootPaths(): List<String> = try {
-        ProjectLevelVcsManager.getInstance(project).allVcsRoots.mapNotNull { it.path?.path?.takeIf { p -> p.isNotBlank() } }
+        ProjectLevelVcsManager.getInstance(project).getAllVcsRoots().mapNotNull { it.path?.path?.takeIf { p -> p.isNotBlank() } }
     } catch (e: Exception) {
         // VCS not initialized yet (e.g. very early startup): report none rather than guess.
         emptyList()
@@ -107,7 +107,9 @@ class SandpaneContextProvider(private val project: Project) {
      */
     fun collect(editor: Editor? = null): Snapshot {
         val limit = maxSelectionChars()
-        return ReadAction.compute<Snapshot, RuntimeException> {
+        // `ReadAction.compute` is @Deprecated on 262; `computeBlocking` is its public, non-deprecated
+        // replacement with the same contract (blocking read action on the calling thread).
+        return ReadAction.computeBlocking<Snapshot, RuntimeException> {
             val target = editor ?: FileEditorManager.getInstance(project).selectedTextEditor
             val file = target?.let { currentFileFor(it.document) } ?: currentFile()
             val selection = target?.selectionModel?.selectedText
