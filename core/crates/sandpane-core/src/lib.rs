@@ -1,0 +1,18 @@
+//! Sandpane Core domain logic.
+//!
+//! Safety model (docs/specs/06): every external string passes [`validation`]
+//! before it can reach a subprocess argument vector; subprocesses are spawned
+//! with fixed executables + argument arrays only — never through a shell.
+
+pub mod db;
+pub mod events;
+pub mod git;
+pub mod sbx;
+pub mod scheduler;
+pub mod task;
+pub mod validation;
+
+pub use db::{Database, DbError};
+pub use events::EventLog;
+pub use task::{TaskStateError, TaskStateMachine};
+pub use validation::{ValidationError, Validator};

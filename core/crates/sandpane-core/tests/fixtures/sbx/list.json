@@ -1,0 +1,7 @@
+{
+  "_comment": "ILLUSTRATIVE hand-written fixture — NOT captured from a real sbx CLI. Replace during P0 with a sanitized, version-labelled capture and flip _meta.json fixture_status to 'captured'. See docs/compatibility.md.",
+  "sandboxes": [
+    { "name": "atlas-auth", "state": "running" },
+    { "name": "nova-search", "state": "stopped" }
+  ]
+}

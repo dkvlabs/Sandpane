@@ -1,0 +1,7 @@
+{
+  "fixture_status": "illustrative",
+  "sbx_version": null,
+  "captured_on": null,
+  "captured_on_os": null,
+  "notes": "Hand-written samples used to test parsing/argument construction offline. P0 task: capture sanitized fixtures from a real sbx CLI, record exact version + OS + date here, and update docs/compatibility.md."
+}

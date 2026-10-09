@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/change-set.schema.json",
+  "title": "SandpaneChangeSet",
+  "description": "git.review result: the ACTUAL change set versus the task's recorded base revision, including untracked files (specs/06 §6, specs/08 T15). Never a mocked-up diff.",
+  "type": "object",
+  "required": ["taskId", "baseCommit", "hostDirty", "changes"],
+  "additionalProperties": false,
+  "properties": {
+    "taskId": { "type": "string" },
+    "baseCommit": { "type": "string", "description": "Recorded base revision the task started from." },
+    "hostDirty": { "type": "boolean", "description": "True when the host working tree has uncommitted changes at review time." },
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["added", "modified", "deleted", "renamed", "untracked"]
+          }
+        }
+      }
+    }
+  }
+}

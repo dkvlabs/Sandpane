@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/task-event.schema.json",
+  "title": "SandpaneTaskEvent",
+  "description": "Durable, replayable task log entry (specs/02 §3 task_events). Sequence is unique per task and strictly increasing; clients reconnect with afterSequence.",
+  "type": "object",
+  "required": ["taskId", "sequence", "kind", "payload", "timestamp"],
+  "additionalProperties": false,
+  "properties": {
+    "taskId": { "type": "string" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "kind": {
+      "type": "string",
+      "description": "Event kind. Core-emitted kinds include: task.created, status.changed, message.user, adapter.unavailable, scheduler.deferred. Agent-normalized kinds follow agent-event.schema.json type values."
+    },
+    "payload": { "description": "Kind-specific payload; for normalized agent events matches agent-event.schema.json." },
+    "timestamp": { "type": "string", "format": "date-time", "description": "RFC3339 UTC, assigned by Core (stable replays)." }
+  }
+}

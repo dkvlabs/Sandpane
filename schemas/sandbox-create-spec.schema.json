@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/sandbox-create-spec.schema.json",
+  "title": "SandpaneSandboxCreateSpec",
+  "description": "sandbox.create params. Every field is validated in Core before it can reach an SBX CLI argument vector; names follow a strict shell-safe pattern (specs/06 §4).",
+  "type": "object",
+  "required": ["name", "projectId", "workspaceMode"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9]|-(?!-))*[a-z0-9]$|^[a-z0-9]$",
+      "maxLength": 63,
+      "description": "Lowercase alphanumeric + single hyphens, alphanumeric ends, no '--' (option-smuggling guard)."
+    },
+    "projectId": { "type": "string", "minLength": 1 },
+    "workspaceMode": {
+      "type": "string",
+      "enum": ["direct_mount", "sbx_clone", "host_worktree", "mountless"],
+      "description": "direct_mount is live-writable and must be labeled as such in every UI (specs/02 §7)."
+    },
+    "repoPath": {
+      "type": ["string", "null"],
+      "description": "Absolute host path of the repository to bind; canonicalized + containment-checked by Core."
+    }
+  }
+}

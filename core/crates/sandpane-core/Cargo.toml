@@ -1,0 +1,18 @@
+[package]
+name = "sandpane-core"
+description = "Sandpane Core domain logic: validation, task lifecycle, SQLite persistence, event log, scheduler, SBX CLI adapter, Git workspace safety"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sandpane-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

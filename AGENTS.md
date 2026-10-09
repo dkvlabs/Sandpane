@@ -77,3 +77,18 @@ Project skills (`.qwen/skills/`): `sandpane-changelog` (logging system — manda
 - Commits: Conventional Commits (`feat(core):`, `docs(audit):`, …). Every implementation commit is followed by its `docs(audit)` logging commit.
 - Protocol changes touch `schemas/` + generated/hand-synced client types together; note drift-check status in the changelog entry.
 - Record verified versions in `docs/compatibility.md` whenever you prove something against a real tool.
+
+## Code Review
+
+Project-specific rules reviewers MUST enforce. Report a violation only when you can quote the exact rule below and cite the exact changed line that breaks it (name this section as the source). No style preferences.
+
+1. **No shell interpolation.** Any subprocess (`std::process::Command`, Node `child_process`, Kotlin `ProcessBuilder`) must use an argument vector/list. A changed line that builds a command string for a shell, or interpolates an external value into one, is Critical. `sh -c`, `bash -lc`, string-concatenated `git`/`sbx` invocations → Critical.
+2. **Validate before argument.** Any external value (sandbox name, path, ref, port, agent id) that reaches a CLI argument vector must pass `sandpane_core::validation` (or the client equivalent) first. An unvalidated external value flowing into an arg → Critical.
+3. **Task state transitions in Core only.** A client/UI file that computes or asserts a task lifecycle transition instead of reading Core state → Warning (Critical if it fabricates a `running`/`resumed` state after restart).
+4. **Durable-before-notify.** A change that notifies subscribers of a task event before it is appended durably (`task_events`) → Critical.
+5. **Honest capability/verification claims.** `verified: true`, `supportsResume: true`, a green status, or a passing check with no evidence path → Critical. Tests that mock the unit under test, or fixtures labeled as captured when they are illustrative → Critical.
+6. **No secrets in logs/events/exports.** A changed line that writes a token/key/secret value (not presence metadata) to a log, event payload, or export → Critical.
+7. **Git apply safety.** A change that writes host-repo files outside an explicit, base-checked, confirmed Git operation (merge/cherry-pick/patch) → Critical. Overwriting uncommitted host work → Critical.
+8. **Protocol/schema together.** A change to `sandpane-protocol` types or `schemas/*.json` that updates one without the other, or breaks frame compatibility without a version bump → Warning (Critical if it silently desyncs a shipped client).
+9. **Bounded IPC frames.** A read path that buffers unbounded input without the `MAX_FRAME_BYTES` cap → Warning.
+10. **Licensing gate.** Bundling a third-party binary (e.g. `sbx`), or claiming Docker affiliation/endorsement → Critical.

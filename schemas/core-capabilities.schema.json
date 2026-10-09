@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/core-capabilities.schema.json",
+  "title": "SandpaneCoreCapabilities",
+  "description": "system.probe result: protocol version + capability discovery. Capabilities come from known tested commands, documented minimum versions, and actual runtime verification — never optimistic guesses (specs/08 §3).",
+  "type": "object",
+  "required": ["protocolVersion", "coreVersion", "instanceId", "agents", "platform"],
+  "additionalProperties": false,
+  "properties": {
+    "protocolVersion": { "type": "integer", "const": 1 },
+    "coreVersion": { "type": "string" },
+    "instanceId": { "type": "string", "description": "Unique per running Core instance; changes across restarts so clients can detect them." },
+    "sbx": {
+      "type": ["object", "null"],
+      "required": ["installed"],
+      "additionalProperties": false,
+      "properties": {
+        "installed": { "type": "boolean" },
+        "binaryPath": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] },
+        "daemonRunning": { "type": ["boolean", "null"] }
+      }
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "verified", "supportsStreaming", "supportsCancel", "supportsResume"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "verified": { "type": "boolean", "description": "True ONLY after the adapter passed its in-SBX feasibility gate (P0)." },
+          "supportsStreaming": { "type": "boolean" },
+          "supportsCancel": { "type": "boolean" },
+          "supportsResume": { "type": "boolean", "description": "Native-session resume advertised ONLY after restart tests pass." }
+        }
+      }
+    },
+    "platform": { "type": "string" }
+  }
+}

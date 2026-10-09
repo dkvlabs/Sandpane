@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/rpc-request.schema.json",
+  "title": "SandpaneCoreRpcRequest",
+  "description": "Client → Core request frame (newline-delimited JSON over Unix socket / named pipe). Protocol version negotiated via system.probe.",
+  "type": "object",
+  "required": ["v", "id", "method"],
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "description": "Protocol version the client speaks. Current: 1.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "id": {
+      "description": "Client-chosen correlation id, echoed verbatim in the response.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "method": {
+      "description": "Allowlisted dotted method name. There is deliberately no free-form execution method.",
+      "type": "string",
+      "enum": [
+        "system.probe",
+        "project.create",
+        "project.list",
+        "sandbox.list",
+        "sandbox.create",
+        "conversation.create",
+        "conversation.send",
+        "task.cancel",
+        "task.subscribe",
+        "git.review",
+        "git.apply"
+      ]
+    },
+    "params": {
+      "description": "Method-specific payload object ({} when empty). Validated per method; unknown/invalid shapes → VALIDATION_FAILED.",
+      "type": "object"
+    }
+  }
+}

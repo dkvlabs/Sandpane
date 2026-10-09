@@ -1,0 +1,26 @@
+[package]
+name = "sandpane-service"
+description = "Persistent per-user Sandpane Core service: local IPC server (Unix socket / NDJSON), single-instance handshake, request dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sandpane-service"
+path = "src/main.rs"
+
+[lib]
+name = "sandpane_service"
+path = "src/lib.rs"
+
+[dependencies]
+sandpane-core = { workspace = true }
+sandpane-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

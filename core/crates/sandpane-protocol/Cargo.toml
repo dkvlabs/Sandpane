@@ -1,0 +1,13 @@
+[package]
+name = "sandpane-protocol"
+description = "Versioned RPC protocol types for the Sandpane Core service (Sandpane-owned; not a Docker/Codex/Claude wire format)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

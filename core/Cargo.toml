@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sandpane-protocol",
+    "crates/sandpane-core",
+    "crates/sandpane-service",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://example.invalid/sandpane"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+sandpane-protocol = { path = "crates/sandpane-protocol" }
+sandpane-core = { path = "crates/sandpane-core" }
+
+[profile.release]
+lto = "thin"

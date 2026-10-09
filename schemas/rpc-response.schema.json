@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/rpc-response.schema.json",
+  "title": "SandpaneCoreRpcResponse",
+  "description": "Core → client response frame. Exactly one of ok/err is present (flattened tagged outcome).",
+  "type": "object",
+  "required": ["v", "id"],
+  "oneOf": [
+    { "required": ["ok"], "not": { "required": ["err"] } },
+    { "required": ["err"], "not": { "required": ["ok"] } }
+  ],
+  "properties": {
+    "v": { "type": "integer", "minimum": 1 },
+    "id": { "type": "string", "description": "Correlates the request; empty string when the request frame itself was unparseable." },
+    "ok": { "description": "Method-specific result payload." },
+    "err": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "NOT_INSTALLED",
+            "DAEMON_DOWN",
+            "UNSUPPORTED_SBX_VERSION",
+            "PROVIDER_AUTH_REQUIRED",
+            "CONFLICT",
+            "TASK_INTERRUPTED",
+            "PERMISSION_DENIED",
+            "VALIDATION_FAILED",
+            "NOT_FOUND",
+            "INTERNAL"
+          ]
+        },
+        "message": { "type": "string" },
+        "details": { "description": "Optional structured details. Never secrets, never full prompt content." }
+      }
+    }
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/agent-event.schema.json",
+  "title": "SandpaneAgentEvent",
+  "description": "Normalized agent event union (specs/02 §4). A Sandpane-owned format: adapters normalize only what they can verify from provider events and mark anything else as unsupported.event — never guess.",
+  "oneOf": [
+    {
+      "properties": { "type": { "const": "message.delta" }, "text": { "type": "string" } },
+      "required": ["type", "text"],
+      "additionalProperties": false
+    },
+    {
+      "properties": { "type": { "const": "tool.started" }, "name": { "type": "string" }, "id": { "type": "string" } },
+      "required": ["type", "name", "id"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "type": { "const": "tool.finished" },
+        "id": { "type": "string" },
+        "ok": { "type": "boolean" },
+        "summary": { "type": ["string", "null"] }
+      },
+      "required": ["type", "id", "ok"],
+      "additionalProperties": false
+    },
+    {
+      "properties": { "type": { "const": "file.changed" }, "path": { "type": "string" } },
+      "required": ["type", "path"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "type": { "const": "approval.required" },
+        "requestId": { "type": "string" },
+        "description": { "type": "string" }
+      },
+      "required": ["type", "requestId", "description"],
+      "additionalProperties": false
+    },
+    {
+      "properties": { "type": { "const": "task.completed" }, "ok": { "type": "boolean" } },
+      "required": ["type", "ok"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "type": { "const": "error" },
+        "code": {
+          "type": "string",
+          "enum": [
+            "NOT_INSTALLED", "DAEMON_DOWN", "UNSUPPORTED_SBX_VERSION", "PROVIDER_AUTH_REQUIRED",
+            "CONFLICT", "TASK_INTERRUPTED", "PERMISSION_DENIED", "VALIDATION_FAILED", "NOT_FOUND", "INTERNAL"
+          ]
+        },
+        "message": { "type": "string" }
+      },
+      "required": ["type", "code", "message"],
+      "additionalProperties": false
+    },
+    {
+      "properties": { "type": { "const": "unsupported.event" }, "providerType": { "type": "string" } },
+      "required": ["type", "providerType"],
+      "additionalProperties": false
+    }
+  ]
+}
