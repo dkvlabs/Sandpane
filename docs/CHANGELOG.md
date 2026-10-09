@@ -399,4 +399,29 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0022 — Core dependency upgrade (U1)
+
+- **date:** 2026-10-09
+- **phase:** P1/P2 (Core) maintenance
+- **commit:** `013ecfd` (build(core): upgrade rusqlite to 0.40.2 and pin latest dependency floors (U1))
+- **details:**
+  - **rusqlite 0.32.1 → 0.40.2:**
+    - bundled SQLite 3.53.2;
+    - includes the 0.40.1 fixes for SAVEPOINT-name injection and `from_rc` UB;
+    - default features are off, plus `cache`, so the wasm-only path leaves the lockfile.
+  - **Floors raised to the latest releases:** serde, serde_json, thiserror, uuid, libc, tempfile.
+  - **`rust-version`** 1.85 → 1.89.
+  - **No source changes:** each rusqlite runtime-breaking change was checked against its call sites.
+  - Versions are recorded in `docs/compatibility.md`.
+- **files:** `core/{Cargo.toml,Cargo.lock,crates/sandpane-core/Cargo.toml,crates/sandpane-service/Cargo.toml}`, `docs/compatibility.md`
+- **verification:**
+  - clippy `-D warnings` is clean;
+  - `cargo test` passes 154 tests;
+  - schema drift is in sync;
+  - there are no duplicate crates across all targets.
+  - MSRV build and `cargo audit` locally: UNVERIFIED.
+- **review:** [audit/0022-core-deps-upgrade-review.md](audit/0022-core-deps-upgrade-review.md) — checklist; PASS
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
