@@ -1624,11 +1624,15 @@ fn git_context(inner: &ServerInner, task_id: &str) -> Result<(String, String), S
 fn git_review(inner: &ServerInner, task_id: String) -> Result<serde_json::Value, SvcError> {
     let (repo_path, base_commit) = git_context(inner, &task_id)?;
     let repo = Path::new(&repo_path);
-    let dirty = inner.git.is_dirty(repo).map_err(internal)?;
+    // A repository with submodules is REFUSED (VALIDATION_FAILED, naming the
+    // submodule paths): Core never enters submodule work trees, and the
+    // ChangeSet has no "incomplete" field, so returning a list would silently
+    // under-report the agent's changes and the host's dirty state.
+    let dirty = inner.git.is_dirty(repo).map_err(review_git_error)?;
     let changes = inner
         .git
         .change_list(repo, &base_commit)
-        .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+        .map_err(review_git_error)?;
     let change_set = ChangeSet {
         task_id,
         base_commit,
@@ -1648,6 +1652,16 @@ fn git_review(inner: &ServerInner, task_id: String) -> Result<serde_json::Value,
             .collect(),
     };
     serde_json::to_value(change_set).map_err(internal)
+}
+
+/// `git.review` error mapping: a submodule refusal is a structured
+/// VALIDATION_FAILED (the repository shape is unsupported, not a Core
+/// fault); everything else stays INTERNAL.
+fn review_git_error(e: scoregit::GitError) -> SvcError {
+    match e {
+        scoregit::GitError::SubmodulesPresent(_) => (ErrorCode::ValidationFailed, e.to_string()),
+        other => (ErrorCode::Internal, other.to_string()),
+    }
 }
 
 fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value, SvcError> {

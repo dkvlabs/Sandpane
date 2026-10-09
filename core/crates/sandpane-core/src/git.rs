@@ -24,7 +24,13 @@
 //!   executes nothing;
 //! - `status`/`diff` pass `--ignore-submodules=dirty`: a submodule's own
 //!   config/attributes (invisible to the superproject's enumeration) are never
-//!   loaded, while gitlink commit changes stay visible;
+//!   loaded, while gitlink commit changes stay visible. Because that also hides
+//!   uncommitted work INSIDE a submodule, the dirty gate
+//!   ([`GitRunner::is_dirty`], hence [`preconditions_for_apply`]) and the
+//!   review change list ([`GitRunner::change_list`]) first scan the INDEX for
+//!   gitlinks (`ls-files --stage -z -- :(top)`, mode 160000, index only — never
+//!   a submodule work tree) and REFUSE with [`GitError::SubmodulesPresent`]
+//!   naming the paths when any exist (fail closed, never a false "clean");
 //! - `diff` passes `--no-ext-diff --no-textconv`; revisions end with
 //!   `--end-of-options`, pathspecs with `--`;
 //! - runs through [`crate::process::run_bounded`] (timeout, output caps).
@@ -41,6 +47,20 @@
 //! eol-normalized files are compared in raw/stored form — a review may list a
 //! file as modified that attribute-aware git would not, never the reverse;
 //! worktree checkout does not smudge.
+//!
+//! Submodule trade-off (review of bb5cc8f): Sandpane cannot verify submodule
+//! work trees safely, so ANY repository whose index holds a gitlink — dirty or
+//! clean, including a task worktree created from such a repo — is refused by
+//! the dirty gate, every apply precondition, and `git.review` (the protocol's
+//! `ChangeSet` has no "incomplete" marker; adding one is the follow-up that
+//! would let review return a flagged partial list instead of refusing). This
+//! is fail-closed: submodule users lose review/apply, never get a false clean.
+//! What the gitlink scan does NOT catch: an untracked nested repository (no
+//! gitlink) is still listed by status/`ls-files --others` as an untracked
+//! directory (dirty gate trips; review shows `dir/`, not its contents). The
+//! scan lists every tracked file, so it runs with a raised stdout cap
+//! ([`SUBMODULE_SCAN_MAX_STDOUT`], ≈700k files); a larger index fails closed
+//! (truncated output is refused) and blocks review/apply for that repo.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -62,6 +82,42 @@ pub enum GitError {
     DirtyHostState(String),
     #[error("base revision diverged: expected {expected}, found {found}")]
     BaseDiverged { expected: String, found: String },
+    /// The index contains gitlinks (submodules). The hardened status/diff
+    /// never enter a submodule work tree (`--ignore-submodules=dirty`), so
+    /// uncommitted work inside one is invisible: Core refuses rather than
+    /// report "clean" or a partial change list (review of bb5cc8f).
+    #[error("{}", submodule_refusal(.0))]
+    SubmodulesPresent(Vec<String>),
+}
+
+/// At most this many submodule paths are named in a refusal message (keeps a
+/// pathological repo from producing an oversized error frame).
+pub const SUBMODULE_PATHS_IN_MESSAGE: usize = 20;
+
+/// stdout cap for the index-wide gitlink scan. `ls-files --stage` lists EVERY
+/// tracked file (~90 bytes each), so the 4 MiB `QUERY` cap would refuse clean
+/// repositories above ~45k files; 64 MiB covers roughly 700k. Larger indexes
+/// fail closed (the scan refuses truncated output).
+pub const SUBMODULE_SCAN_MAX_STDOUT: usize = 64 * 1024 * 1024;
+
+fn submodule_refusal(paths: &[String]) -> String {
+    let shown: Vec<String> = paths
+        .iter()
+        .take(SUBMODULE_PATHS_IN_MESSAGE)
+        .map(|p| format!("{p:?}"))
+        .collect();
+    let more = paths.len().saturating_sub(SUBMODULE_PATHS_IN_MESSAGE);
+    let extra = if more > 0 {
+        format!(" (and {more} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "repository contains submodule(s) {}{extra}; Sandpane cannot verify submodule work \
+         trees safely (it never enters them), so it refuses rather than risk overwriting \
+         uncommitted work or reporting an incomplete change list",
+        shown.join(", ")
+    )
 }
 
 /// Config overrides applied to EVERY git invocation (before the subcommand).
@@ -150,6 +206,16 @@ impl GitRunner {
     /// builder (absolute, UTF-8, no control characters) and may legitimately
     /// contain spaces or shell-looking characters (review S-b).
     pub fn run(&self, cwd: &Path, args: &[String]) -> Result<String, GitError> {
+        self.run_with_limits(cwd, args, &self.limits)
+    }
+
+    /// [`Self::run`] under explicit output/time limits (same hardening).
+    fn run_with_limits(
+        &self,
+        cwd: &Path,
+        args: &[String],
+        limits: &RunLimits,
+    ) -> Result<String, GitError> {
         let non_paths: Vec<String> = args
             .iter()
             .filter(|a| !Path::new(a.as_str()).is_absolute())
@@ -157,7 +223,7 @@ impl GitRunner {
             .collect();
         Validator::assert_no_shell_metachars(&non_paths).map_err(GitError::Validation)?;
         let repo = self.repo_overrides(cwd)?;
-        self.exec(cwd, &repo.config, Some(repo.empty_tree), args)
+        self.exec(cwd, &repo.config, Some(repo.empty_tree), args, limits)
     }
 
     fn exec(
@@ -166,6 +232,7 @@ impl GitRunner {
         extra: &[String],
         attr_source: Option<&str>,
         args: &[String],
+        limits: &RunLimits,
     ) -> Result<String, GitError> {
         let cmd = self.hardened_command(
             cwd,
@@ -174,7 +241,7 @@ impl GitRunner {
             args,
             std::env::vars_os().map(|(k, _)| k),
         );
-        let out = run_bounded(cmd, &self.limits).map_err(|e| GitError::Exec(e.to_string()))?;
+        let out = run_bounded(cmd, limits).map_err(|e| GitError::Exec(e.to_string()))?;
         let sub = args.first().map(String::as_str).unwrap_or("?");
         if !out.status.success() {
             return Err(GitError::Exec(format!(
@@ -187,7 +254,7 @@ impl GitRunner {
             // Never act on a partial change list / partial status.
             return Err(GitError::Exec(format!(
                 "git {sub} output exceeded {} bytes; refusing truncated output",
-                self.limits.max_stdout
+                limits.max_stdout
             )));
         }
         Ok(out.stdout_lossy())
@@ -242,9 +309,35 @@ impl GitRunner {
         Ok(PathBuf::from(line))
     }
 
+    /// Every gitlink (mode 160000, any stage) in the INDEX, repo-wide. Reads
+    /// only the index through the hardened runner — never a submodule's work
+    /// tree, config, or attributes. The index is authoritative: a gitlink
+    /// present only in HEAD is a staged deletion, which status reports.
+    pub fn submodule_paths(&self, repo: &Path) -> Result<Vec<String>, GitError> {
+        let limits = RunLimits {
+            max_stdout: SUBMODULE_SCAN_MAX_STDOUT.max(self.limits.max_stdout),
+            ..self.limits
+        };
+        let out = self.run_with_limits(repo, &GitArgs::ls_files_stage(), &limits)?;
+        gitlink_paths_from_ls_files_stage(&out)
+    }
+
+    /// Fail closed on submodules (see [`GitError::SubmodulesPresent`]).
+    pub fn refuse_submodules(&self, repo: &Path) -> Result<(), GitError> {
+        let paths = self.submodule_paths(repo)?;
+        if paths.is_empty() {
+            Ok(())
+        } else {
+            Err(GitError::SubmodulesPresent(paths))
+        }
+    }
+
     /// Porcelain status → true when the working tree has ANY uncommitted
-    /// change (staged, unstaged, or untracked).
+    /// change (staged, unstaged, or untracked). Refuses
+    /// ([`GitError::SubmodulesPresent`]) when the repository has submodules:
+    /// their work trees are not inspected, so "clean" could not be vouched for.
     pub fn is_dirty(&self, repo: &Path) -> Result<bool, GitError> {
+        self.refuse_submodules(repo)?;
         let out = self.run(repo, &GitArgs::status_porcelain())?;
         Ok(!out.trim().is_empty())
     }
@@ -254,9 +347,12 @@ impl GitRunner {
     /// missed; specs/08 T15). The diff compares `base` against the WORKING
     /// TREE, so committed, staged, and unstaged modifications all appear.
     /// Renames are reported as `renamed` at their NEW path (T15 requires the
-    /// full set: new/deleted/renamed/untracked).
+    /// full set: new/deleted/renamed/untracked). Refuses
+    /// ([`GitError::SubmodulesPresent`]) when the repository has submodules —
+    /// never a silently partial list.
     pub fn change_list(&self, repo: &Path, base_commit: &str) -> Result<Vec<RawChange>, GitError> {
         Validator::git_ref(base_commit)?;
+        self.refuse_submodules(repo)?;
         let tracked = self.run(repo, &GitArgs::diff_name_status(base_commit))?;
         let mut changes = Vec::new();
         for line in tracked.lines() {
@@ -366,6 +462,32 @@ pub fn filter_overrides_from_names(nul_separated: &str) -> Result<Vec<String>, G
     Ok(out)
 }
 
+/// Parse `git ls-files --stage -z` (`<mode> SP <oid> SP <stage> TAB <path>`
+/// NUL-terminated) into the deduplicated gitlink (mode `160000`) paths, in
+/// index order. A malformed entry fails CLOSED.
+pub fn gitlink_paths_from_ls_files_stage(out: &str) -> Result<Vec<String>, GitError> {
+    let mut paths: Vec<String> = Vec::new();
+    for entry in out.split('\0').filter(|e| !e.is_empty()) {
+        let Some((meta, path)) = entry.split_once('\t') else {
+            return Err(GitError::Exec(format!(
+                "unexpected ls-files --stage entry {entry:?}"
+            )));
+        };
+        let mut fields = meta.split(' ');
+        let (Some(mode), Some(_oid), Some(_stage), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(GitError::Exec(format!(
+                "unexpected ls-files --stage entry {entry:?}"
+            )));
+        };
+        if mode == "160000" && !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+        }
+    }
+    Ok(paths)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawChange {
     pub path: String,
@@ -391,7 +513,9 @@ impl GitArgs {
 
     /// `--ignore-submodules=dirty`: never enter a submodule's work tree
     /// (its config/attributes are invisible to Core's hardening, W-2);
-    /// gitlink commit changes are still reported.
+    /// gitlink commit changes are still reported. Submodule-internal dirt is
+    /// therefore invisible here — callers go through [`GitRunner::is_dirty`],
+    /// which refuses submodule repositories first.
     pub fn status_porcelain() -> Vec<String> {
         vec![
             "status".into(),
@@ -416,6 +540,19 @@ impl GitArgs {
             "--end-of-options".into(),
             base.into(),
             "--".into(),
+        ]
+    }
+
+    /// Index listing used ONLY for the gitlink (submodule) scan. Reads the
+    /// index, never a work tree; `:(top)` makes it repo-wide from any cwd.
+    pub fn ls_files_stage() -> Vec<String> {
+        vec![
+            "ls-files".into(),
+            "--stage".into(),
+            "-z".into(),
+            "--full-name".into(),
+            "--".into(),
+            ":(top)".into(),
         ]
     }
 
@@ -525,6 +662,49 @@ mod tests {
             GitArgs::ls_files_others(),
             vec!["ls-files", "--others", "--exclude-standard", "--"]
         );
+        // Index-only scan (never enters a submodule work tree), repo-wide
+        // regardless of cwd via the `:(top)` pathspec.
+        assert_eq!(
+            GitArgs::ls_files_stage(),
+            vec!["ls-files", "--stage", "-z", "--full-name", "--", ":(top)"]
+        );
+    }
+
+    #[test]
+    fn gitlink_paths_are_parsed_from_ls_files_stage() {
+        let sha = "a".repeat(40);
+        let out = format!(
+            "100644 {sha} 0\tfile.txt\0\
+             160000 {sha} 0\tvendor/lib\0\
+             120000 {sha} 0\tlink\0\
+             160000 {sha} 1\tconflicted\0\
+             160000 {sha} 2\tconflicted\0\
+             160000 {sha} 0\twith\ttab and space\0"
+        );
+        assert_eq!(
+            gitlink_paths_from_ls_files_stage(&out).unwrap(),
+            vec!["vendor/lib", "conflicted", "with\ttab and space"]
+        );
+        assert!(gitlink_paths_from_ls_files_stage("").unwrap().is_empty());
+        // A malformed entry fails CLOSED (never silently "no submodules").
+        assert!(gitlink_paths_from_ls_files_stage("garbage\0").is_err());
+    }
+
+    #[test]
+    fn submodule_refusal_message_names_paths_escaped_and_capped() {
+        let e = GitError::SubmodulesPresent(vec!["sub".into(), "bad\nname".into()]);
+        let msg = e.to_string();
+        assert!(msg.contains("\"sub\""), "{msg}");
+        assert!(msg.contains("bad\\nname"), "control chars escaped: {msg}");
+        assert!(!msg.contains("bad\nname"), "{msg}");
+        assert!(msg.contains("cannot verify submodule work trees"), "{msg}");
+        assert!(msg.contains("uncommitted"), "{msg}");
+
+        let many: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+        let msg = GitError::SubmodulesPresent(many).to_string();
+        assert!(msg.contains("\"m19\""), "{msg}");
+        assert!(!msg.contains("\"m20\""), "list capped: {msg}");
+        assert!(msg.contains("80 more"), "{msg}");
     }
 
     #[test]
@@ -1021,9 +1201,130 @@ mod tests {
         std::fs::remove_file(traps.join("clean-fired")).unwrap();
 
         let runner = GitRunner::default();
-        let _ = runner.is_dirty(&top).unwrap();
-        let _ = runner.change_list(&top, &base).unwrap();
+        // The hardened status/diff vectors themselves still never enter the
+        // submodule (run directly: the public gates now refuse submodule
+        // repos before reaching status/diff, which would make this vacuous).
+        let _ = runner.run(&top, &GitArgs::status_porcelain()).unwrap();
+        let _ = runner.run(&top, &GitArgs::diff_name_status(&base)).unwrap();
+        // And the public gates refuse (fail closed) — also without the filter.
+        assert!(matches!(
+            runner.is_dirty(&top),
+            Err(GitError::SubmodulesPresent(_))
+        ));
+        assert!(matches!(
+            runner.change_list(&top, &base),
+            Err(GitError::SubmodulesPresent(_))
+        ));
         assert_eq!(fired(&traps), Vec::<String>::new(), "submodule filter ran");
+    }
+
+    /// Builds `<dir>/top` with a committed submodule at `sub` (cloned from
+    /// `<dir>/sub-origin`); returns (top, base commit).
+    fn repo_with_submodule(dir: &Path) -> (PathBuf, String) {
+        let origin = dir.join("sub-origin");
+        let top = dir.join("top");
+        for d in [&origin, &top] {
+            std::fs::create_dir(d).unwrap();
+        }
+        init_repo(&origin);
+        init_repo(&top);
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &origin.display().to_string(),
+                "sub",
+            ])
+            .current_dir(&top)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "submodule add: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git_plain(&top, &["commit", "-qm", "add submodule"]);
+        let base = GitRunner::default().rev_parse_head(&top).unwrap();
+        (top, base)
+    }
+
+    /// Review finding (bb5cc8f): `--ignore-submodules=dirty` hides
+    /// uncommitted work inside a submodule, so the dirty gate reported clean.
+    /// Fail closed: any gitlink in the index refuses the dirty gate, the apply
+    /// preconditions, and the change list — naming the submodule.
+    #[test]
+    fn submodule_with_uncommitted_work_refuses_dirty_gate_apply_and_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let (top, base) = repo_with_submodule(dir.path());
+        let checkout = top.join("sub");
+        std::fs::write(checkout.join("file.txt"), "uncommitted submodule work\n").unwrap();
+        std::fs::write(checkout.join("scratch.txt"), "untracked in submodule\n").unwrap();
+
+        // Control: plain git sees the submodule as modified...
+        let plain = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&top)
+            .output()
+            .unwrap();
+        let plain = String::from_utf8_lossy(&plain.stdout).into_owned();
+        assert!(plain.contains("sub"), "control: plain status {plain:?}");
+        // ...while the hardened status vector is blind to it (the hazard).
+        let runner = GitRunner::default();
+        let hardened = runner.run(&top, &GitArgs::status_porcelain()).unwrap();
+        assert!(hardened.trim().is_empty(), "hardened status {hardened:?}");
+
+        let refused = |r: Result<(), GitError>| match r {
+            Err(GitError::SubmodulesPresent(paths)) => {
+                assert_eq!(paths, vec!["sub".to_string()]);
+            }
+            other => panic!("expected SubmodulesPresent, got {other:?}"),
+        };
+        refused(runner.is_dirty(&top).map(|_| ()));
+        refused(runner.change_list(&top, &base).map(|_| ()));
+        refused(preconditions_for_apply(&runner, &top, &base));
+        let msg = runner.is_dirty(&top).unwrap_err().to_string();
+        assert!(msg.contains("\"sub\""), "{msg}");
+
+        // A cwd below the top level cannot hide the submodule.
+        let docs = top.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        refused(runner.is_dirty(&docs).map(|_| ()));
+
+        // User work in the submodule is untouched.
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("file.txt")).unwrap(),
+            "uncommitted submodule work\n"
+        );
+        assert!(checkout.join("scratch.txt").exists());
+    }
+
+    /// Even a CLEAN submodule refuses: Core cannot inspect submodule work
+    /// trees safely, so it never vouches for one.
+    #[test]
+    fn clean_submodule_still_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (top, base) = repo_with_submodule(dir.path());
+        let runner = GitRunner::default();
+        assert!(matches!(
+            preconditions_for_apply(&runner, &top, &base),
+            Err(GitError::SubmodulesPresent(_))
+        ));
+    }
+
+    #[test]
+    fn plain_repo_has_no_submodules() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let runner = GitRunner::default();
+        assert!(runner.submodule_paths(dir.path()).unwrap().is_empty());
+        // An untracked `.gitmodules` alone is not a gitlink (and is reported
+        // as ordinary untracked dirt, never hidden).
+        std::fs::write(dir.path().join(".gitmodules"), "[submodule \"x\"]\n").unwrap();
+        assert!(runner.submodule_paths(dir.path()).unwrap().is_empty());
+        assert!(runner.is_dirty(dir.path()).unwrap());
     }
 
     /// GIT_ATTR_SOURCE=<empty tree> neutralizes WORKTREE `.gitattributes`

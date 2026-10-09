@@ -1015,6 +1015,113 @@ fn git_review_and_apply_gates_on_real_repo() {
     );
 }
 
+/// Review finding (bb5cc8f): the hardened status/diff pass
+/// `--ignore-submodules=dirty`, so uncommitted work INSIDE a submodule is
+/// invisible. `git.review` must not return a silently partial change list
+/// (the protocol has no "incomplete" field) and `git.apply` must abort.
+#[test]
+fn git_review_and_apply_refuse_repo_with_submodule() {
+    let mut s = start_server(no_sbx());
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("lib-origin");
+    let repo = dir.path().join("host");
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    for d in [&origin, &repo] {
+        std::fs::create_dir(d).unwrap();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "sandpane@test.invalid"]);
+        git(d, &["config", "user.name", "Sandpane Test"]);
+        std::fs::write(d.join("app.txt"), "base\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+    }
+    git(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &origin.display().to_string(),
+            "vendor/lib",
+        ],
+    );
+    git(&repo, &["commit", "-qm", "add submodule"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    // Uncommitted user work inside the submodule work tree.
+    std::fs::write(repo.join("vendor/lib/app.txt"), "uncommitted\n").unwrap();
+
+    let project = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Nova Demo", "repositories": [repo.display().to_string()]}),
+    );
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let repo_id: String = {
+        let db = s.inner.db.lock().unwrap();
+        db.conn()
+            .query_row(
+                "SELECT id FROM repositories WHERE project_id = ?1",
+                rusqlite::params![project_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let conv = s.ok(
+        "2",
+        "conversation.create",
+        serde_json::json!({"projectId": project_id, "agentId": "codex"}),
+    );
+    {
+        let db = s.inner.db.lock().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO tasks (id, conversation_id, repo_id, base_commit, status, created_at, updated_at)
+                 VALUES ('task-sub-1',?1,?2,?3,'queued','t','t')",
+                rusqlite::params![conv["id"].as_str().unwrap(), repo_id, base],
+            )
+            .unwrap();
+    }
+
+    let err = s.err(
+        "3",
+        "git.review",
+        serde_json::json!({"taskId": "task-sub-1"}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED", "got: {err}");
+    let msg = err["message"].as_str().unwrap();
+    assert!(msg.contains("vendor/lib"), "names the submodule: {msg}");
+    assert!(msg.contains("cannot verify"), "{msg}");
+
+    let apply = s.ok(
+        "4",
+        "git.apply",
+        serde_json::json!({"taskId": "task-sub-1", "expectedBase": base}),
+    );
+    assert_eq!(apply["applied"], false);
+    let reason = apply["abortReason"].as_str().unwrap();
+    assert!(reason.contains("vendor/lib"), "got: {reason}");
+    assert!(reason.contains("submodule"), "got: {reason}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("vendor/lib/app.txt")).unwrap(),
+        "uncommitted\n",
+        "submodule work must survive"
+    );
+}
+
 #[test]
 fn oversized_frame_is_refused_without_hanging() {
     let s = start_server(no_sbx());
