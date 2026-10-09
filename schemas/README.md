@@ -17,9 +17,13 @@ formats — never Docker SBX / Codex / Claude wire formats.
 ## Sync status
 
 **Hand-synced** with the Rust types at scaffold stage — the Rust crate is the
-source of truth. A generated-binding + drift-check pipeline (schemas →
-TypeScript/Kotlin codegen, CI diff gate) is a P1/P7 deliverable
-(docs/specs/07 P1 "Stable schema + generated bindings + drift check",
-docs/specs/08 §6 "schema/codegen drift"). Until it lands, any protocol change
-must update the Rust types AND these files in the same commit, and say so in
-the changelog entry.
+source of truth. The **value-set drift gate landed** with the CI entry
+(docs/CHANGELOG.md 0005): `make schema-drift` → `scripts/schema_drift.py`
+compares the exact method/error-code/event-type/status/mode/version sets
+between this directory and `core/crates/sandpane-protocol` and fails on any
+mismatch. The **generated bindings** half (schemas → TypeScript/Kotlin codegen)
+remains a P1/P7 deliverable (docs/specs/07 P1 "Stable schema + generated
+bindings + drift check", docs/specs/08 §6 "schema/codegen drift"). Until
+codegen lands, any protocol change must update the Rust types AND these files
+in the same commit — the drift gate now enforces it — and say so in the
+changelog entry.

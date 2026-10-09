@@ -7,11 +7,11 @@
 CARGO ?= cargo
 NPM ?= npm
 
-.PHONY: check core-check core-fmt core-clippy core-test vscode-check desktop-check jetbrains-check schema-lint clean
+.PHONY: check core-check core-fmt core-clippy core-test vscode-check desktop-check jetbrains-check schema-lint schema-drift clean
 
 ## Everything currently verifiable on this host.
-check: core-check
-	@echo "make check: OK (core). vscode/desktop/jetbrains targets exist but are not yet part of 'check' until their phases land — run them explicitly."
+check: core-check schema-lint schema-drift
+	@echo "make check: OK (core + schemas). vscode/desktop/jetbrains targets exist but are not yet part of 'check' until their phases land — run them explicitly."
 
 core-check: core-fmt core-clippy core-test
 
@@ -36,10 +36,16 @@ jetbrains-check:
 	@test -d clients/jetbrains || { echo "clients/jetbrains: phase not landed"; exit 1; }
 	cd clients/jetbrains && ./gradlew build --console=plain
 
-## JSON syntax check for the protocol schemas (drift-check pipeline is P1/P7).
+## JSON syntax check for the protocol schemas.
 schema-lint:
 	@for f in schemas/*.schema.json; do python3 -m json.tool "$$f" >/dev/null || exit 1; done
 	@echo "schemas: JSON syntax OK"
+
+## Value-set drift gate (the enforceable half of specs/08 §6 "schema/codegen
+## drift"): Rust protocol crate is source of truth; schemas/ must match its
+## exact wire value sets. Generated TS/Kotlin bindings remain P1/P7.
+schema-drift:
+	python3 scripts/schema_drift.py
 
 clean:
 	cd core && $(CARGO) clean

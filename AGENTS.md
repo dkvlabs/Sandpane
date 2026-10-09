@@ -48,6 +48,7 @@ apps/desktop/        ← Tauri 2 desktop app (React + Rust shell)
 | VS Code typecheck/test | `cd clients/vscode && npm run typecheck && npm test` |
 | Desktop typecheck/test | `cd apps/desktop && npm run typecheck && npm test` |
 | JetBrains | `cd clients/jetbrains && ./gradlew build` (requires local Gradle/JDK; not verifiable on every host — record honestly) |
+| Schema syntax + protocol drift gate | `make schema-lint && make schema-drift` (both in `make check`) |
 | Everything | `make check` |
 
 ## Non-negotiable engineering rules (from docs/specs)

@@ -1,0 +1,159 @@
+# Sandpane PR CI — docs/specs/08 §6 "Pull request CI".
+#
+# Honest status (docs/CHANGELOG.md entry 0005): scaffolded alongside the Rust
+# core; this workflow file has NEVER been executed on GitHub Actions — origin
+# (github.com:dkvlabs/Sandpane) currently has no pushed branches, so the first
+# push of `main` will run it untested. Client jobs light up through the
+# `detect` job's file-existence outputs.
+#
+# NOT covered by this workflow (specs/08 §6, tracked by later phases):
+# - webview CSP / static analysis (P3)
+# - TS lint step (add when client phases land their lint config)
+# - Kotlin SDK tests + Plugin Verifier against targeted IDE range (P6)
+# - native Tauri Rust builds (packaging phase)
+# - SBX fixture contract tests as a named suite + optional real-SBX
+#   integration on compatible CI hosts (P0 gate — `sbx` absent on this host)
+# - "review requirement for destructive command adapter modifications" —
+#   that is branch protection, not expressible in this file.
+# Licensing gates (docs/licensing-decision.md) block publication, not CI.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Which phases have landed (files exist). Job-level `if` may only use
+  # needs/always/success/failure/cancelled per GitHub's context availability
+  # table, so hashFiles-based phase detection lives in a step, not a guard.
+  detect:
+    name: Detect landed phases
+    runs-on: ubuntu-latest
+    outputs:
+      vscode: ${{ steps.phases.outputs.vscode }}
+      desktop: ${{ steps.phases.outputs.desktop }}
+      jetbrains: ${{ steps.phases.outputs.jetbrains }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: phases
+        run: |
+          {
+            echo "vscode=$([ -f clients/vscode/package.json ] && echo true || echo false)"
+            echo "desktop=$([ -f apps/desktop/package.json ] && echo true || echo false)"
+            echo "jetbrains=$([ -f clients/jetbrains/gradlew ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
+  # Rust formatting/clippy/tests (specs/08 §6). Unix-socket integration tests
+  # run on both OS families the Core targets today (docs/compatibility.md).
+  # The ubuntu leg has never run yet — first push will be its first proof.
+  core:
+    name: Core (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --all-targets
+
+  # Dependency audit (specs/08 §6). Non-blocking while the advisory backlog has
+  # not been triaged; a finding must become blocking before the P7 beta exit
+  # gate (recorded in docs/CHANGELOG.md 0005).
+  deps-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+        working-directory: core
+
+  # Value-set drift gate between schemas/ and the Rust protocol crate
+  # (the enforceable half of specs/08 §6 "schema/codegen drift";
+  # generated TS/Kotlin bindings remain P1/P7 — see schemas/README.md).
+  schemas:
+    name: Schemas + drift gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: make schema-lint
+      - run: make schema-drift
+
+  # VS Code extension: typecheck + Vitest. Lint step pending the client
+  # phase's lint config (see header). Skipped until the phase lands.
+  vscode:
+    name: VS Code extension
+    needs: detect
+    if: ${{ needs.detect.outputs.vscode == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+        working-directory: clients/vscode
+      - run: npm run typecheck
+        working-directory: clients/vscode
+      - run: npm test
+        working-directory: clients/vscode
+
+  desktop:
+    name: Desktop (web frontend)
+    needs: detect
+    if: ${{ needs.detect.outputs.desktop == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+        working-directory: apps/desktop
+      - run: npm run typecheck
+        working-directory: apps/desktop
+      - run: npm test
+        working-directory: apps/desktop
+
+  # Kotlin: compile once + gradle wrapper presence (specs/08 §6; SDK tests and
+  # Plugin Verifier are P6 packaging work).
+  jetbrains:
+    name: JetBrains plugin
+    needs: detect
+    if: ${{ needs.detect.outputs.jetbrains == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Wrapper is checked in
+        run: test -x clients/jetbrains/gradlew
+      - name: Compile
+        run: ./gradlew compileKotlin --console=plain
+        working-directory: clients/jetbrains
