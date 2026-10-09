@@ -367,4 +367,36 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0021 — Desktop dependency upgrade (U3)
+
+- **date:** 2026-10-09
+- **phase:** P5 (desktop) maintenance
+- **commit:** `8b45a9c` (build(desktop): upgrade to React 19.3, Vite 8.3, Vitest 5, TypeScript 7, Tauri 2.12 (U3))
+- **details:**
+  - **npm packages:**
+    - React 19.3.0;
+    - Vite 8.3.4 with plugin-react 6.1.2 (Oxc);
+    - Vitest 5.0.3;
+    - TypeScript 7.0.2;
+    - React Query 5.104.1;
+    - @tauri-apps/api 2.12.2 and @tauri-apps/cli 2.12.1;
+    - @types/node 24.19.1, matching the Node 24 runtime.
+  - **Rust crates:**
+    - tauri 2.12.2;
+    - tauri-build 2.7.1;
+    - serde 1.0.229, serde_json 1.0.151, libc 0.2.190;
+    - `rust-version` raised to 1.90, which is tauri's MSRV.
+  - **Lockfile:** regenerated. Every entry resolves from registry.npmjs.org.
+  - **Source change:** `TextInput` uses React 19 ref-as-a-prop. No config changes were needed (checked against each migration guide).
+  - **Docs:** versions recorded in `docs/compatibility.md`.
+- **files:** `apps/desktop/{package.json,package-lock.json,src-tauri/Cargo.toml,src/components/ui/primitives.tsx}`, `docs/compatibility.md`
+- **verification:**
+  - `make desktop-check`: 273 passed / 8 skipped TS tests, 31 Rust tests passed.
+  - `vite build` OK.
+  - `npm audit`: 0 vulnerabilities.
+  - Native `tauri build`: UNVERIFIED.
+- **review:** [audit/0021-desktop-deps-upgrade-review.md](audit/0021-desktop-deps-upgrade-review.md) — checklist; PASS
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
