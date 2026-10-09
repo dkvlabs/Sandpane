@@ -424,4 +424,32 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0023 — VS Code dependency upgrade (U2)
+
+- **date:** 2026-10-09
+- **phase:** P3/P4 (VS Code) maintenance
+- **commit:** `7a0a5b8` (build(vscode): upgrade to TypeScript 7 and Vitest 5; pin @types/vscode to the engine (U2))
+- **details:**
+  - **TypeScript 7.0.2:**
+    - `module` is now `node20`.
+    - The webview build uses `esnext` with legacy module detection; its output is byte-identical.
+    - `esModuleInterop` is forced on, so five files gain `__importStar`.
+  - **Vitest 5.0.3 / Vite 8.3.4:**
+    - Config moved to `vitest.config.mts`.
+    - The fake-DOM helper now compiles with the real `tsc`, using an argument vector.
+  - **`@types/vscode`:** pinned exactly to 1.90.0. It had floated to 1.140.0, above `engines.vscode`.
+  - **`@types/node`:** 22.20.5. Vitest 5 refuses 20.x; this gap is recorded.
+  - **Docs:** the README toolchain table and INSTALL host requirements (Node 22.12+ or 24) are updated, and `docs/compatibility.md` records the versions.
+- **files:** `clients/vscode/**` (12 files), `docs/compatibility.md`
+- **verification:**
+  - typecheck clean;
+  - 280/280 tests pass;
+  - the `.vsix` packages (30 files);
+  - the live Core check passes 56/56 against the upgraded Core;
+  - `npm audit` reports 0 vulnerabilities.
+  - No Extension Development Host run: UNVERIFIED.
+- **review:** [audit/0023-vscode-deps-upgrade-review.md](audit/0023-vscode-deps-upgrade-review.md) — checklist; PASS (1 warning fixed in-commit)
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
