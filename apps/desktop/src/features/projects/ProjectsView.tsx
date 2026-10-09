@@ -1,0 +1,224 @@
+import { useState } from "react";
+import {
+  useCoreLink,
+  useCreateProject,
+  useProjects,
+} from "../../lib/hooks";
+import { describeCoreError } from "../../lib/reducers";
+import {
+  validateProjectName,
+  validateRepositoryPaths,
+} from "../../lib/wizard";
+import { AppShell, ViewHeader } from "../../components/layout/AppShell";
+import { ConnectionBanner, ConnectionChip } from "../../components/layout/ConnectionState";
+import { ProjectSidebar } from "../../components/project/ProjectSidebar";
+import {
+  Button,
+  EmptyState,
+  Field,
+  Mono,
+  Panel,
+  Skeleton,
+  TextInput,
+  Warning,
+} from "../../components/ui/primitives";
+import { IconRefresh } from "../../components/layout/icons";
+import { href, navigate, type Route } from "../../app/router";
+import { CoreRequestError } from "../../lib/core-client";
+import { useProbeRefetch } from "../../components/ui/refresh";
+
+export function ProjectsView({ route }: { route: Route }) {
+  const link = useCoreLink();
+  const refetch = useProbeRefetch();
+  const { projects, isLoading, error } = useProjects();
+  const create = useCreateProject();
+  const [name, setName] = useState("");
+  const [repos, setRepos] = useState("");
+  const attached = link.kind === "attached";
+
+  const repoList = repos
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const nameError = create.isPending ? null : validateProjectName(name);
+  const repoError = create.isPending ? null : validateRepositoryPaths(repoList);
+  const canSubmit =
+    attached && nameError === null && repoError === null && name.length > 0;
+
+  return (
+    <AppShell
+      route={route}
+      sidebar={<ProjectSidebar projects={projects} />}
+      statusLeading={<ConnectionChip link={link} onRetry={refetch} />}
+      statusTrailing={
+        <span className="statusbar__counts">
+          {attached
+            ? `${projects.length} project(s) in Core`
+            : "project count unavailable while Core is offline"}
+        </span>
+      }
+    >
+      <ViewHeader
+        title="Projects"
+        subtitle="Grouped repositories, chats and task history. State lives in the shared Core SQLite store — the desktop keeps no competing database."
+        actions={
+          <Button onClick={refetch}>
+            <IconRefresh /> Refresh
+          </Button>
+        }
+      />
+      <ConnectionBanner link={link} onRetry={refetch} />
+
+      <div className="grid grid--two">
+        <Panel
+          title="Core projects"
+          description="project.list, archived projects excluded by Core."
+        >
+          {!attached ? (
+            <EmptyState
+              variant="offline"
+              heading="Project list requires Core"
+              body="Start the persistent Core and retry. Sample data from the design mockups is deliberately not rendered here."
+              action={
+                <Button onClick={refetch}>
+                  <IconRefresh /> Retry attach
+                </Button>
+              }
+            />
+          ) : isLoading ? (
+            <Skeleton rows={4} />
+          ) : error !== null ? (
+            <ErrorPanel error={error} />
+          ) : projects.length === 0 ? (
+            <EmptyState
+              heading="No projects yet"
+              body="Create the first project on the right; repository paths can be added now or later."
+            />
+          ) : (
+            <ul className="list">
+              {projects.map((project) => (
+                <li key={project.id}>
+                  <div className="row row--action">
+                    <a
+                      className="row__main"
+                      href={href("project-workspace", { projectId: project.id })}
+                    >
+                      <span className="row__title">{project.name}</span>
+                      <span className="row__meta">
+                        <Mono>{project.id.slice(0, 8)}</Mono> · created{" "}
+                        {project.createdAt}
+                      </span>
+                    </a>
+                    <Button onClick={() => navigate("project-workspace", { projectId: project.id })}>
+                      Open
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Panel>
+
+        <Panel
+          title="Create project"
+          description="Core validates the name (120 chars, no control characters) and requires absolute repository paths."
+        >
+          {!attached ? (
+            <Warning tone="danger" title="Disabled while Core is unreachable">
+              Creating a project needs a live Core connection; otherwise the UI would show a
+              success it cannot verify.
+            </Warning>
+          ) : (
+            <form
+              className="stack"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (!canSubmit) return;
+                create.mutate({ name, repositories: repoList });
+              }}
+            >
+              <Field
+                label="Project name"
+                error={name.length === 0 ? undefined : (nameError ?? undefined)}
+                hint="Any Unicode text; control characters are rejected by Core."
+              >
+                {(id) => (
+                  <TextInput
+                    id={id}
+                    value={name}
+                    invalid={nameError !== null && name.length > 0}
+                    onChange={(event) => setName(event.target.value)}
+                    placeholder="Project name"
+                  />
+                )}
+              </Field>
+              <Field
+                label="Repository paths (one per line, optional)"
+                error={repoError ?? undefined}
+                hint="Absolute paths only. The native folder picker is a DT1 item, so paths are typed here."
+              >
+                {(id) => (
+                  <textarea
+                    id={id}
+                    className="input input--multiline"
+                    rows={3}
+                    spellCheck={false}
+                    value={repos}
+                    onChange={(event) => setRepos(event.target.value)}
+                    placeholder="/absolute/path/to/repo"
+                  />
+                )}
+              </Field>
+              {create.isError && <ErrorPanel error={create.error} />}
+              {create.isSuccess && (
+                <Warning tone="success" title="Project created in Core">
+                  <Mono>{create.data.id.slice(0, 8)}</Mono> · {create.data.name}. Chats and tasks
+                  for it are available in the workspace.
+                </Warning>
+              )}
+              <div className="row-actions">
+                <Button variant="primary" type="submit" disabled={!canSubmit}>
+                  Create project
+                </Button>
+                <Button
+                  variant="ghost"
+                  type="button"
+                  onClick={() => {
+                    setName("");
+                    setRepos("");
+                    create.reset();
+                  }}
+                >
+                  Clear
+                </Button>
+              </div>
+            </form>
+          )}
+        </Panel>
+      </div>
+
+      <Panel title="Repositories and context">
+        <p className="muted">
+          Protocol v1 exposes <Mono>project.create</Mono> with repository paths but no{" "}
+          <Mono>repository.list</Mono>, so bound repositories cannot be re-enumerated from Core
+          yet. Rather than show a guess, this view states the limitation: repo grouping, context
+          profiles and per-repo task identity arrive with a Core read method (DT1).
+        </p>
+      </Panel>
+    </AppShell>
+  );
+}
+
+export function ErrorPanel({ error }: { error: CoreRequestError }) {
+  const copy = describeCoreError(error);
+  return (
+    <Warning tone={copy.tone} title={copy.title}>
+      <p>
+        <strong>Reason:</strong> {copy.reason}
+      </p>
+      <p>
+        <strong>What you can do:</strong> {copy.action}
+      </p>
+    </Warning>
+  );
+}

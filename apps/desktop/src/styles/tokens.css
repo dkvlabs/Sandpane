@@ -1,0 +1,127 @@
+/*
+ * Sandpane Desktop design tokens — "Obsidian Atmosphere".
+ *
+ * Transcribed from docs/design/SANDPANE_DESKTOP_DESIGN_SPEC_AND_FINAL_PROMPT.md
+ * §4 (the design mockups themselves are SAMPLE DATA and carry no authority over
+ * behaviour). Semantic variables only, dark by default, light via the same
+ * token names, plus system auto-detection with a persisted user override.
+ */
+
+:root {
+  /* Palette — dark (default) */
+  --canvas: #0a0e13;
+  --rail: #0c1117;
+  --surface-1: #111820;
+  --surface-2: #16212a;
+  --surface-3: #1d2a34;
+  --line: #26343f;
+  --text-strong: #ebf2f5;
+  --text-muted: #95a4af;
+  --text-subtle: #6f8291;
+  --accent: #8ddace;
+  --accent-ink: #09211f;
+  --accent-quiet: #163731;
+  --success: #9bd5af;
+  --attention: #e6ba7c;
+  --danger: #ef978f;
+  --info: #91b8e6;
+
+  /* Elevation: tone + 1px lines, not heavy shadows (spec §4.4) */
+  --elevation-1: 0 1px 0 rgb(255 255 255 / 3%);
+  --elevation-2: 0 6px 18px rgb(0 0 0 / 28%);
+
+  /* Shape + rhythm */
+  --radius-control: 8px;
+  --radius-card: 12px;
+  --radius-dialog: 16px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Typography: system stack only, no remote font (spec §4.3) */
+  --font-ui:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --size-body: 13.5px;
+  --size-chat: 14.5px;
+  --lh-prose: 1.6;
+
+  /* Layout widths (spec §3 sizing guidance) */
+  --rail-width: 60px;
+  --rail-width-collapsed: 56px;
+  --sidebar-width: 244px;
+  --inspector-width: 320px;
+  --chat-max: 820px;
+
+  /* Motion durations (spec §5) */
+  --dur-hover: 120ms;
+  --dur-enter: 190ms;
+  --dur-dialog: 160ms;
+
+  /* One static radial pool of light, used only on wide views */
+  --atmosphere: radial-gradient(
+    1100px 520px at 88% -10%,
+    color-mix(in srgb, var(--accent) 9%, transparent),
+    transparent 62%
+  );
+}
+
+html[data-theme="light"] {
+  /* Warm pale greys, dark slate text, calmer teal accent (spec §4.5) */
+  --canvas: #f4f2ee;
+  --rail: #ebe8e2;
+  --surface-1: #fbfaf7;
+  --surface-2: #f2efe9;
+  --surface-3: #e8e4dc;
+  --line: #cfc9bf;
+  --text-strong: #26313a;
+  --text-muted: #5c6874;
+  --text-subtle: #7d8894;
+  --accent: #2c7a6c;
+  --accent-ink: #f5fffb;
+  --accent-quiet: #dceee9;
+  --success: #2f7a52;
+  --attention: #9a6b1f;
+  --danger: #a8453c;
+  --info: #33628f;
+  --elevation-1: 0 1px 0 rgb(0 0 0 / 4%);
+  --elevation-2: 0 6px 18px rgb(20 20 20 / 12%);
+  --atmosphere: radial-gradient(
+    1100px 520px at 88% -10%,
+    color-mix(in srgb, var(--accent) 12%, transparent),
+    transparent 62%
+  );
+}
+
+@media (prefers-color-scheme: light) {
+  html:not([data-theme]) {
+    --canvas: #f4f2ee;
+    --rail: #ebe8e2;
+    --surface-1: #fbfaf7;
+    --surface-2: #f2efe9;
+    --surface-3: #e8e4dc;
+    --line: #cfc9bf;
+    --text-strong: #26313a;
+    --text-muted: #5c6874;
+    --text-subtle: #7d8894;
+    --accent: #2c7a6c;
+    --accent-ink: #f5fffb;
+    --accent-quiet: #dceee9;
+    --success: #2f7a52;
+    --attention: #9a6b1f;
+    --danger: #a8453c;
+    --info: #33628f;
+  }
+}
+
+html[data-density="compact"] {
+  --space-4: 12px;
+  --space-6: 16px;
+  --space-8: 22px;
+  --size-body: 12.8px;
+  --size-chat: 13.6px;
+}

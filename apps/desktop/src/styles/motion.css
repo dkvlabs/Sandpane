@@ -1,0 +1,67 @@
+/*
+ * Motion — short, purposeful, and switched off by preference.
+ *
+ * The spec's hard floor: no animated backgrounds, no looping pulses, no scroll
+ * animation, no render loops. Entrances are one-shot; status changes are
+ * immediate. `prefers-reduced-motion` and the app's own override both collapse
+ * every transition to none.
+ */
+
+@media (prefers-reduced-motion: no-preference) {
+  html[data-reduced-motion="auto"] .workspace__scroll > * {
+    animation: sp-enter var(--dur-enter) ease both;
+  }
+
+  html[data-reduced-motion="auto"] .dialog {
+    animation: sp-pop var(--dur-dialog) ease both;
+  }
+
+  html[data-reduced-motion="auto"] .btn,
+  html[data-reduced-motion="auto"] .rail__item,
+  html[data-reduced-motion="auto"] .row--selectable {
+    transition:
+      background-color var(--dur-hover) ease,
+      border-color var(--dur-hover) ease,
+      color var(--dur-hover) ease;
+  }
+}
+
+html[data-reduced-motion="force"] *,
+html[data-reduced-motion="force"] *::before,
+html[data-reduced-motion="force"] *::after {
+  animation-duration: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0ms !important;
+    transition-duration: 0ms !important;
+  }
+}
+
+@keyframes sp-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes sp-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

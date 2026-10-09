@@ -1,0 +1,28 @@
+[package]
+name = "sandpane-desktop"
+version = "0.0.0"
+description = "Sandpane Desktop — Tauri 2 shell with a narrow Core IPC proxy"
+authors = ["DKV Labs"]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+# Deliberately NOT a member of the `core/` Cargo workspace: this crate keeps its
+# own lockfile and dependency graph, yet depends on `sandpane-protocol` by path so
+# the method allowlist it enforces cannot drift from Core's own `Method::parse`.
+# (Path dependencies resolve the referenced crate inside ITS workspace, which is
+# what makes `version.workspace = true` there still work.)
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sandpane-protocol = { path = "../../core/crates/sandpane-protocol" }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
