@@ -32,9 +32,13 @@ vscode-check:
 	@test -d clients/vscode || { echo "clients/vscode: phase not landed"; exit 1; }
 	cd clients/vscode && $(NPM) run typecheck && $(NPM) test
 
+## Webview gates + the Tauri Rust shell. The shell is NOT in the core/ workspace,
+## so core-check never compiled it (it was broken unnoticed once); it runs
+## --offline against its own lockfile, like the JetBrains build.
 desktop-check:
 	@test -d apps/desktop || { echo "apps/desktop: phase not landed"; exit 1; }
 	cd apps/desktop && $(NPM) run typecheck && $(NPM) test
+	cd apps/desktop/src-tauri && $(CARGO) fmt --check && $(CARGO) check --offline && $(CARGO) clippy --offline --all-targets -- -D warnings && $(CARGO) test --offline
 
 jetbrains-check:
 	@test -d clients/jetbrains || { echo "clients/jetbrains: phase not landed"; exit 1; }

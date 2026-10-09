@@ -11,7 +11,9 @@ import {
 import {
   describeTaskAction,
   foldSbxView,
+  resolveSelection,
   sandboxModeView,
+  taskIsolationView,
   taskStatusView,
 } from "../../lib/reducers";
 import type { WorkspaceMode } from "../../lib/protocol";
@@ -44,7 +46,8 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
   const link = useCoreLink();
   const refetch = useProbeRefetch();
   const { projects } = useProjects();
-  const { sandboxes } = useSandboxes();
+  const sandboxList = useSandboxes();
+  const sandboxes = sandboxList.sandboxes;
   const preferences = useUiPreferences().preferences;
   const index = useTaskIndex(projectId === "" ? null : projectId);
   const taskIndex = index.rows;
@@ -63,14 +66,25 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
       : taskIndex.filter((t) => t.conversationId === conversationId);
   }, [taskIndex, conversationId]);
 
-  const selectedTask = focusedTask ?? tasksForProject[0]?.taskId ?? null;
-  // Live-writable disclosure must come from Core's recorded binding, never from
-  // a local default. With no focused sandbox there is no mount to claim, so the
-  // honest answer is "nothing bound"; with one whose mode Core did not return,
-  // `sandboxModeView` says UNVERIFIED and treats it as writable.
-  const focusedRow = sandboxes.find((s) => s.name === focusedSandbox) ?? null;
+  // A remembered focus is honoured only while it is still in the current list
+  // (a conversation filter or a refresh can remove it); never act on a task or
+  // sandbox the view no longer shows.
+  const selectedTask = resolveSelection(
+    focusedTask,
+    tasksForProject.map((t) => t.taskId),
+    "first",
+  );
+  const selectedRow = tasksForProject.find((t) => t.taskId === selectedTask) ?? null;
+  const activeSandbox = resolveSelection(
+    focusedSandbox,
+    sandboxes.map((s) => s.name),
+    "none",
+  );
+  // The workspace panel describes the FOCUSED sandbox (Core's recorded binding,
+  // never a local default). With none focused there is no mount to claim.
+  const focusedRow = sandboxes.find((s) => s.name === activeSandbox) ?? null;
   const isolation =
-    focusedRow === undefined || focusedRow === null
+    focusedRow === null
       ? {
           label: "No sandbox bound here",
           liveWritable: false,
@@ -79,6 +93,13 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
             "No sandbox is focused, so this workspace claims no mount: nothing is being written to your tree through Core from this view.",
         }
       : sandboxModeView(focusedRow.workspaceMode);
+  // Review's live-writable disclosure comes from the SELECTED TASK's own
+  // sandbox, not the focused one: they can differ, and unknown is UNVERIFIED.
+  const taskIsolation = taskIsolationView(
+    selectedRow,
+    sandboxes,
+    !sandboxList.isLoading && sandboxList.error === null,
+  );
   const projection = useTaskProjection(selectedTask);
   const actions = describeTaskAction(
     projection?.status === "unknown" ? undefined : projection?.status,
@@ -91,7 +112,9 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
       statusLeading={<ConnectionChip link={link} onRetry={refetch} />}
       statusTrailing={
         <span className="statusbar__counts">
-          {tasksForProject.length} task(s) visible · switching projects never stops a task
+          {tasksForProject.length} task(s) visible
+          {index.unattributed > 0 ? ` · ${index.unattributed} replayed task(s) not provably in this project` : ""}
+          {" "}· switching projects never stops a task
         </span>
       }
     >
@@ -162,7 +185,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
             state: s.probedState,
             mode: s.workspaceMode,
           }))}
-          focused={focusedSandbox}
+          focused={activeSandbox}
           onFocus={setFocusedSandbox}
         />
         <Panel title="Isolation for this workspace">
@@ -174,9 +197,9 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
           </div>
           <p className="muted">{isolation.blurb}</p>
           <p className="muted">
-            {focusedSandbox === null
+            {activeSandbox === null
               ? "No sandbox focused yet, so this workspace states the safest thing it can: nothing is bound until one is chosen."
-              : `Read from Core's binding record for ${focusedSandbox} (sandbox.list). Binding a new sandbox needs a method protocol v1 does not expose — sandbox.create writes bindings only.`}
+              : `Read from Core's binding record for ${activeSandbox} (sandbox.list). Binding a new sandbox needs a method protocol v1 does not expose — sandbox.create writes bindings only.`}
           </p>
         </Panel>
       </div>
@@ -233,7 +256,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
           )}
         </div>
         <div>
-          <ReviewPanel taskId={selectedTask} liveWritable={isolation.liveWritable} />
+          <ReviewPanel taskId={selectedTask} isolation={taskIsolation} />
           {selectedTask !== null && (
             <Panel title="Task actions">
               <div className="row-actions">

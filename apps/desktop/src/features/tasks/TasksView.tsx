@@ -3,11 +3,20 @@ import {
   useCancelTask,
   useCoreLink,
   useProjects,
+  useSandboxes,
   useStoreStatus,
   useTaskIndex,
   useTaskProjection,
 } from "../../lib/hooks";
-import { countTasks, describeTaskAction, taskStatusView } from "../../lib/reducers";
+import {
+  countTasks,
+  describeTaskAction,
+  taskBucket,
+  taskIsolationView,
+  taskStatusView,
+  type TaskBucket,
+  type TaskIndexEntry,
+} from "../../lib/reducers";
 import { AppShell, ViewHeader } from "../../components/layout/AppShell";
 import {
   ConnectionBanner,
@@ -32,16 +41,12 @@ import { navigate, type Route } from "../../app/router";
 import { useProbeRefetch } from "../../components/ui/refresh";
 import type { TaskStatus } from "../../lib/protocol";
 
-type Filter = "all" | "running" | "waiting" | "queued" | "completed" | "failed";
+type Filter = "all" | Exclude<TaskBucket, "unknown">;
 
-const FILTER_MATCH: Record<Filter, (status: TaskStatus | "unknown") => boolean> = {
-  all: () => true,
-  running: (s) => s === "preparing" || s === "running" || s === "verifying",
-  waiting: (s) => s === "awaiting_review" || s === "awaiting_input",
-  queued: (s) => s === "queued" || s === "created",
-  completed: (s) => s === "completed",
-  failed: (s) => s === "failed" || s === "rejected" || s === "interrupted" || s === "cancelled",
-};
+/** Same predicate as `countTasks`, so every tab count equals its rows. */
+function matchesFilter(filter: Filter, status: TaskStatus | "unknown"): boolean {
+  return filter === "all" || taskBucket(status) === filter;
+}
 
 export function TasksView({ route }: { route: Route }) {
   const link = useCoreLink();
@@ -52,7 +57,7 @@ export function TasksView({ route }: { route: Route }) {
   const tasks = index.rows;
   const [filter, setFilter] = useState<Filter>("all");
   const counts = useMemo(() => countTasks(tasks), [tasks]);
-  const shown = tasks.filter((t) => FILTER_MATCH[filter](t.status));
+  const shown = tasks.filter((t) => matchesFilter(filter, t.status));
   const detailTaskId = route.name === "task-detail" ? route.params.taskId ?? null : null;
 
   return (
@@ -63,7 +68,7 @@ export function TasksView({ route }: { route: Route }) {
       statusTrailing={
         <span className="statusbar__counts">
           Running {counts.running} · Queued {counts.queued} · Review needed {counts.needsReview} ·
-          Failed {counts.failed}
+          Failed {counts.failed} · Cancelled {counts.cancelled}
         </span>
       }
     >
@@ -96,7 +101,14 @@ export function TasksView({ route }: { route: Route }) {
         </Warning>
       )}
 
-      {detailTaskId !== null && <TaskDetail taskId={detailTaskId} />}
+      {detailTaskId !== null && (
+        // Keyed: the confirm dialog and cancel result belong to one task.
+        <TaskDetail
+          key={detailTaskId}
+          taskId={detailTaskId}
+          row={tasks.find((t) => t.taskId === detailTaskId) ?? null}
+        />
+      )}
 
       <FeatureGateNotice
         gate={index.gate}
@@ -118,6 +130,7 @@ export function TasksView({ route }: { route: Route }) {
               { id: "queued", label: `Queued ${counts.queued}` },
               { id: "completed", label: `Completed ${counts.completed}` },
               { id: "failed", label: `Failed ${counts.failed}` },
+              { id: "cancelled", label: `Cancelled ${counts.cancelled}` },
             ]}
           />
         }
@@ -217,8 +230,14 @@ export function TasksView({ route }: { route: Route }) {
   );
 }
 
-function TaskDetail({ taskId }: { taskId: string }) {
+function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | null }) {
   const projection = useTaskProjection(taskId);
+  const sandboxList = useSandboxes();
+  const isolation = taskIsolationView(
+    row,
+    sandboxList.sandboxes,
+    !sandboxList.isLoading && sandboxList.error === null,
+  );
   const cancel = useCancelTask();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const actions = describeTaskAction(
@@ -276,7 +295,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
           )}
         </Panel>
       </div>
-      <ReviewPanel taskId={taskId} liveWritable={false} />
+      <ReviewPanel taskId={taskId} isolation={isolation} />
     </div>
   );
 }

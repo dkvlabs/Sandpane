@@ -61,6 +61,12 @@ export interface CoreTransport {
 
 export type ClientErrorCode =
   | "TIMEOUT"
+  /** The native proxy found no Core listening on the per-user socket. */
+  | "CORE_UNREACHABLE"
+  /** The socket path is not a private socket owned by this user; nothing was sent. */
+  | "SOCKET_UNTRUSTED"
+  /** Core refused the connection itself (e.g. peer is another OS user) before handling it. */
+  | "CORE_REFUSED_CONNECTION"
   | "TRANSPORT_CLOSED"
   | "TRANSPORT_UNAVAILABLE"
   | "FRAME_TOO_LARGE"
@@ -93,6 +99,129 @@ export class CoreRequestError extends Error {
   get isCoreError(): boolean {
     return this.source === "core";
   }
+
+  /**
+   * True when a state-changing request reached Core but its answer was lost, so
+   * Core may already have applied it. The UI must say "re-read state" instead
+   * of offering a blind retry (a second `conversation.send` would queue a second
+   * task; a second `git.apply` would re-run a one-time confirmation).
+   */
+  get mayHaveBeenApplied(): boolean {
+    const details = this.details;
+    return (
+      typeof details === "object" &&
+      details !== null &&
+      (details as Record<string, unknown>).mayHaveBeenApplied === true
+    );
+  }
+}
+
+/**
+ * Default RPC deadline. It must stay LONGER than the native proxy's own budget
+ * (`PROXY_DEADLINE_MS` in src-tauri/src/ipc_client.rs, 12 000 ms): the proxy
+ * then always reports its verdict — sent or not, answered or not — before the
+ * webview gives up. `tests/protocol-drift.test.ts` enforces the ordering.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * Per-method deadlines for calls Core may legitimately run long: `sandbox.create`
+ * can pull an image for up to 300 s and `sandbox.list` can take up to 30 s.
+ * Each stays above the proxy's own budget for that method
+ * (`proxy_deadline_ms` in ipc_client.rs: 320 s / 40 s), per-method drift-tested.
+ */
+export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
+  "sandbox.create": 330_000,
+  "sandbox.list": 45_000,
+};
+
+/** The webview deadline for one method with the default options. */
+export function requestTimeoutFor(method: Method): number {
+  return METHOD_TIMEOUT_MS[method] ?? DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
+/**
+ * Methods with no server-side effect. Mirrors `replay_safe` in
+ * src-tauri/src/ipc_client.rs exactly (drift-tested). For every OTHER method a
+ * lost answer is reported as "may have been applied — re-read state".
+ */
+export const REPLAY_SAFE_METHODS: ReadonlySet<Method> = new Set<Method>([
+  "system.probe",
+  "project.list",
+  "sandbox.list",
+  "task.list",
+  "conversation.list",
+  "conversation.history",
+  "task.subscribe",
+  "git.review",
+]);
+
+export function isReplaySafe(method: Method): boolean {
+  return REPLAY_SAFE_METHODS.has(method);
+}
+
+/** Copy appended to a lost answer for a state-changing method. */
+export const MAY_HAVE_BEEN_APPLIED_COPY =
+  "The request was already handed to Core, so it may have been applied — re-read state before retrying.";
+
+/**
+ * A rejection from the native proxy (`core_request_frame`). Tauri rejects an
+ * `invoke` with the serialized `ProxyError` OBJECT, not an `Error`, so this is
+ * decoded explicitly rather than stringified to "[object Object]".
+ */
+export class ProxyTransportError extends Error {
+  constructor(
+    readonly proxyCode: string,
+    message: string,
+    readonly mayHaveBeenApplied: boolean,
+  ) {
+    super(message);
+    this.name = "ProxyTransportError";
+  }
+}
+
+export function decodeProxyRejection(err: unknown): ProxyTransportError {
+  if (err instanceof ProxyTransportError) return err;
+  if (typeof err === "object" && err !== null && !(err instanceof Error)) {
+    const rec = err as Record<string, unknown>;
+    if (typeof rec.code === "string" && typeof rec.message === "string") {
+      return new ProxyTransportError(
+        rec.code,
+        rec.message,
+        rec.mayHaveBeenApplied === true,
+      );
+    }
+  }
+  if (err instanceof Error) return new ProxyTransportError("TRANSPORT", err.message, false);
+  return new ProxyTransportError("TRANSPORT", String(err), false);
+}
+
+/** Map a proxy code onto the client error plane; unknown codes stay a transport failure. */
+const PROXY_CODE_MAP: Record<string, ClientErrorCode> = {
+  TIMEOUT: "TIMEOUT",
+  CORE_UNREACHABLE: "CORE_UNREACHABLE",
+  CONNECTION_CLOSED: "TRANSPORT_CLOSED",
+  CORE_REFUSED_CONNECTION: "CORE_REFUSED_CONNECTION",
+  SOCKET_UNTRUSTED: "SOCKET_UNTRUSTED",
+  FRAME_TOO_LARGE: "FRAME_TOO_LARGE",
+  MALFORMED_FRAME: "MALFORMED_FRAME",
+  RESPONSE_ID_MISMATCH: "MALFORMED_FRAME",
+  METHOD_NOT_ALLOWED: "METHOD_NOT_ALLOWED",
+  PROTOCOL_VERSION: "VERSION_MISMATCH",
+  VALIDATION_FAILED: "INVALID_PARAMS",
+};
+
+function proxyFailure(method: Method, err: unknown): CoreRequestError {
+  const proxy = decodeProxyRejection(err);
+  const code = PROXY_CODE_MAP[proxy.proxyCode] ?? "TRANSPORT_UNAVAILABLE";
+  return new CoreRequestError(
+    "client",
+    code,
+    code === "TRANSPORT_UNAVAILABLE"
+      ? `the desktop could not exchange ${method} with Core (${proxy.proxyCode}): ${proxy.message}`
+      : proxy.message,
+    { proxyCode: proxy.proxyCode, mayHaveBeenApplied: proxy.mayHaveBeenApplied },
+  );
 }
 
 export function coreErrorCode(err: unknown): ErrorCode | null {
@@ -102,8 +231,10 @@ export function coreErrorCode(err: unknown): ErrorCode | null {
 }
 
 export interface CoreClientOptions {
-  /** RPC deadline. Defaults to 15s — long enough for a probed `sandbox.list`. */
+  /** Default RPC deadline. Defaults to `DEFAULT_REQUEST_TIMEOUT_MS` (above the proxy budget). */
   requestTimeoutMs?: number;
+  /** Per-method deadlines; defaults to `METHOD_TIMEOUT_MS`. */
+  methodTimeoutsMs?: Readonly<Partial<Record<Method, number>>>;
   /** Override the id factory in tests for deterministic ids. */
   nextId?: () => string;
   /** Override the clock in tests. */
@@ -133,6 +264,7 @@ export class CoreClient {
   /** Count of response frames whose `id` matched nothing pending. */
   private orphanResponses = 0;
   private readonly requestTimeoutMs: number;
+  private readonly methodTimeoutsMs: Readonly<Partial<Record<Method, number>>>;
   private readonly nextId: () => string;
   private readonly now: () => number;
 
@@ -140,7 +272,8 @@ export class CoreClient {
     private readonly transport: CoreTransport,
     options: CoreClientOptions = {},
   ) {
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.methodTimeoutsMs = options.methodTimeoutsMs ?? METHOD_TIMEOUT_MS;
     this.now = options.now ?? (() => Date.now());
     this.nextId =
       options.nextId ??
@@ -150,6 +283,11 @@ export class CoreClient {
       });
     this.lineUnsub = transport.onLine((line) => this.handleLine(line));
     this.closeUnsub = transport.onClose((reason) => this.handleClose(reason));
+  }
+
+  /** The deadline this client applies to `method`. */
+  timeoutFor(method: Method): number {
+    return this.methodTimeoutsMs[method] ?? this.requestTimeoutMs;
   }
 
   get transportKind(): string {
@@ -201,29 +339,18 @@ export class CoreClient {
     }
 
     const response = await new Promise<RpcResponseFrame>((resolve, reject) => {
+      const timeoutMs = this.timeoutFor(method);
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(
-          new CoreRequestError(
-            "client",
-            "TIMEOUT",
-            `${method} did not answer within ${this.requestTimeoutMs} ms`,
-          ),
-        );
-      }, this.requestTimeoutMs);
+        reject(timeoutError(method, timeoutMs));
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, method });
       void Promise.resolve(this.transport.write(encoded)).catch((err: unknown) => {
         const p = this.pending.get(id);
         if (!p) return;
         this.pending.delete(id);
         if (p.timer) clearTimeout(p.timer);
-        p.reject(
-          new CoreRequestError(
-            "client",
-            "TRANSPORT_UNAVAILABLE",
-            `the desktop could not write to Core: ${String(err)}`,
-          ),
-        );
+        p.reject(proxyFailure(method, err));
       });
     });
 
@@ -445,6 +572,22 @@ export class CoreClient {
     // Subscriptions keep their checkpoints and simply fail their next pass;
     // the caller decides whether to reattach.
   }
+}
+
+/**
+ * The client-side deadline error. For a state-changing method the frame was
+ * already handed to the transport, so the copy must not suggest a plain retry.
+ */
+export function timeoutError(method: Method, timeoutMs: number): CoreRequestError {
+  const applied = !isReplaySafe(method);
+  return new CoreRequestError(
+    "client",
+    "TIMEOUT",
+    applied
+      ? `${method} did not answer within ${timeoutMs} ms. ${MAY_HAVE_BEEN_APPLIED_COPY}`
+      : `${method} did not answer within ${timeoutMs} ms`,
+    { mayHaveBeenApplied: applied },
+  );
 }
 
 /** Parse a Core response envelope. Kept here so `framing.ts` stays dependency-light. */

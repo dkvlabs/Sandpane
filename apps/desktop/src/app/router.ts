@@ -92,7 +92,14 @@ export function parseHash(rawHash: string): Route {
       const want = pattern.segments[i] ?? "";
       const got = segments[i] ?? "";
       if (isParam(want)) {
-        params[want.slice(1)] = decodeURIComponent(got);
+        const decoded = safeDecode(got);
+        // A malformed escape (`%E0%A4%A`) is not a value: the hash matches no
+        // route rather than throwing during render (a white screen).
+        if (decoded === null) {
+          ok = false;
+          break;
+        }
+        params[want.slice(1)] = decoded;
       } else if (want !== got) {
         ok = false;
         break;
@@ -118,6 +125,14 @@ export function parseHash(rawHash: string): Route {
   };
 }
 
+function safeDecode(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
+
 function isParam(segment: string): boolean {
   return segment.startsWith(":");
 }
@@ -135,6 +150,24 @@ export function href(
       : segment,
   );
   return parts.length === 0 ? "#/" : `#/${parts.join("/")}`;
+}
+
+/**
+ * The React key for a route's view: views that keep per-entity state are keyed
+ * by that entity, so switching project resets the workspace while switching
+ * between a project's conversations does not (the chat panel scopes its own
+ * per-conversation state).
+ */
+export function routeViewKey(route: Route): string {
+  switch (route.name) {
+    case "project-workspace":
+    case "conversation":
+      return `project:${route.params.projectId ?? ""}`;
+    case "sandbox-detail":
+      return `sandbox:${route.params.sandboxName ?? ""}`;
+    default:
+      return route.name;
+  }
 }
 
 export function useRoute(): Route {

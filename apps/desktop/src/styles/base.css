@@ -82,15 +82,22 @@ code {
 
 /* ------------------------------------------------------------------ shell */
 
+/* Two columns unless a view actually renders a sidebar; a class, not `:has()`,
+   so the layout does not depend on selector support in the platform webview. */
 .shell {
   display: grid;
-  grid-template-columns: var(--rail-width) var(--sidebar-width) minmax(0, 1fr);
+  grid-template-columns: var(--rail-width) minmax(0, 1fr);
   height: 100vh;
   background: var(--canvas);
 }
 
-.shell:has(> .sidebar) {
+.shell--with-sidebar {
   grid-template-columns: var(--rail-width) var(--sidebar-width) minmax(0, 1fr);
+}
+
+/* The rail width lives on the GRID, so collapsing must set it on .shell. */
+.shell--rail-collapsed {
+  --rail-width: var(--rail-width-collapsed);
 }
 
 .rail {
@@ -175,8 +182,10 @@ code {
   justify-content: center;
 }
 
-.rail--collapsed {
-  --rail-width: var(--rail-width-collapsed);
+.rail--collapsed .rail__brand {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
 }
 
 .sidebar {
@@ -1230,6 +1239,34 @@ button.chip {
   gap: var(--space-2);
 }
 
+/* ------------------------------------------------------- render failure */
+
+.fatal {
+  max-width: 640px;
+  margin: 15vh auto 0;
+  padding: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  color: var(--text-strong);
+}
+
+.fatal__title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.fatal__detail {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface-1);
+}
+
 /* ---------------------------------------------------------- responsive */
 
 @media (max-width: 1100px) {
@@ -1239,8 +1276,18 @@ button.chip {
 }
 
 @media (max-width: 980px) {
-  .shell {
+  .shell,
+  .shell--with-sidebar {
+    --rail-width: var(--rail-width-collapsed);
     grid-template-columns: var(--rail-width) minmax(0, 1fr);
+  }
+  /* Narrow: icons only; every link keeps its aria-label and title. */
+  .rail__label,
+  .rail__word {
+    display: none;
+  }
+  .rail__item {
+    justify-content: center;
   }
   .shell > .sidebar {
     display: none;

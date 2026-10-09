@@ -2518,6 +2518,7 @@ dependencies = [
 name = "sandpane-desktop"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "sandpane-protocol",
  "serde",
  "serde_json",

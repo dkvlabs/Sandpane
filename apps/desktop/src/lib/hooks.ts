@@ -8,11 +8,13 @@
  * UI remembers, and it only ever asks Core for events after it.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useMemo, useRef, useSyncExternalStore } from "react";
 import {
+  useInfiniteQuery,
   useMutation,
   useQuery,
   useQueryClient,
+  type InfiniteData,
   type QueryClient,
 } from "@tanstack/react-query";
 
@@ -44,6 +46,7 @@ import {
   foldTaskIndex,
   foldTranscript,
   featureGate,
+  scopeProjectionsToProject,
   type CoreLinkState,
   type TaskIndexEntry,
   type FeatureGate,
@@ -266,31 +269,74 @@ export function useTaskIndex(projectId: string | null = null): {
   rows: TaskIndexEntry[];
   gate: FeatureGate;
   error: CoreRequestError | null;
+  /**
+   * Projections replayed in this window that could not be attributed to the
+   * project (no `task.list` row, no known conversation). Always 0 unscoped.
+   */
+  unattributed: number;
   refresh: () => Promise<unknown>;
 } {
   const projections = useTaskProjections();
   const { tasks, gate, error } = useCoreTasks(projectId);
+  // Only a project-scoped index needs the conversation list; the unscoped one
+  // must not issue a global `conversation.list` it never reads.
+  const coreChats = useCoreConversations(projectId, projectId !== null);
+  const session = useSessionConversations();
   const deps = useDeps();
-  const rows = useMemo(() => {
-    const map = new Map(projections.map((p) => [p.taskId, p]));
+  const conversationsAuthoritative =
+    coreChats.gate.state === "supported" &&
+    coreChats.error === null &&
+    !coreChats.isLoading &&
+    coreChats.loaded;
+  const { rows, unattributed } = useMemo(() => {
     // Only hand Core's rows to the fold when the method was actually advertised
     // and answered; otherwise the index stays the event-derived one.
     const coreRows = gate.state === "supported" ? tasks : [];
-    return foldTaskIndex(map, coreRows);
-  }, [projections, tasks, gate.state]);
+    let scoped: readonly TaskProjection[] = projections;
+    let excluded = 0;
+    if (projectId !== null) {
+      // The replay stream is window-wide; a project view shows only what Core's
+      // project-scoped reads prove belongs to this project.
+      const conversationIds = new Set<string>();
+      for (const c of coreChats.conversations) if (c.projectId === projectId) conversationIds.add(c.id);
+      for (const c of session) if (c.projectId === projectId) conversationIds.add(c.id);
+      const result = scopeProjectionsToProject(projections, {
+        taskIds: new Set(coreRows.map((t) => t.id)),
+        conversationIds,
+        conversationsAuthoritative,
+      });
+      scoped = result.inScope;
+      excluded = result.unattributed;
+    }
+    const map = new Map(scoped.map((p) => [p.taskId, p]));
+    return { rows: foldTaskIndex(map, coreRows), unattributed: excluded };
+  }, [
+    projections,
+    tasks,
+    gate.state,
+    projectId,
+    coreChats.conversations,
+    session,
+    conversationsAuthoritative,
+  ]);
   return {
     rows,
     gate,
     error,
+    unattributed,
     refresh: () =>
       deps.queryClient.invalidateQueries({ queryKey: queryKeys.coreTasks(projectId) }),
   };
 }
 
+/**
+ * The replay stream's status. `getStatus` returns a stable reference until the
+ * status structurally changes, and `setStatus` notifies, so a degraded or
+ * refused stream re-renders the banner even when no event arrived.
+ */
 export function useStoreStatus() {
   const deps = useDeps();
-  useSyncExternalStore(deps.store.subscribe, deps.store.getSnapshot);
-  return deps.store.getStatus();
+  return useSyncExternalStore(deps.store.subscribe, deps.store.getStatus);
 }
 
 /** Conversations created in this window (in-memory; survives no reload by design). */
@@ -302,10 +348,15 @@ export function useSessionConversations(): readonly Conversation[] {
  * `conversation.list` — every non-archived conversation Core holds for a
  * project, which is what lets the cockpit show chats this window never created.
  */
-export function useCoreConversations(projectId: string | null): {
+export function useCoreConversations(
+  projectId: string | null,
+  wanted = true,
+): {
   conversations: Conversation[];
   gate: FeatureGate;
   isLoading: boolean;
+  /** True once Core actually answered (not pending, not a placeholder). */
+  loaded: boolean;
   error: CoreRequestError | null;
   refetch: () => void;
 } {
@@ -315,15 +366,37 @@ export function useCoreConversations(projectId: string | null): {
     queryKey: queryKeys.conversations(projectId),
     queryFn: () =>
       deps.client.listConversations({ ...(projectId === null ? {} : { projectId }) }),
-    enabled: deps.transportAvailable && gate.state === "supported",
+    enabled: wanted && deps.transportAvailable && gate.state === "supported",
     staleTime: 5_000,
   });
   return {
     conversations: query.data ?? [],
     gate,
+    loaded: query.isSuccess,
     isLoading: query.isPending && gate.state === "supported" && deps.transportAvailable,
     error: query.error ? asCoreRequestError(query.error) : null,
     refetch: () => void query.refetch(),
+  };
+}
+
+/**
+ * React Query options for paged `conversation.history`, exported so the paging
+ * contract is testable against a plain `QueryClient` without a DOM.
+ *
+ * Keyed per conversation, so a page can never land in another conversation's
+ * transcript (the old local-state version appended a late page to whichever
+ * chat was open). The next page exists only while Core's newest page says it
+ * was `truncated`; its cursor is Core's own `nextSequence`.
+ */
+export function conversationHistoryQueryOptions(client: CoreClient, conversationId: string) {
+  return {
+    queryKey: queryKeys.history(conversationId),
+    queryFn: ({ pageParam }: { pageParam: number }) =>
+      client.getConversationHistory({ conversationId, afterSequence: pageParam }),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage: ConversationHistoryResult): number | undefined =>
+      lastPage.truncated ? lastPage.nextSequence : undefined,
+    staleTime: 5_000,
   };
 }
 
@@ -333,61 +406,45 @@ export function useCoreConversations(projectId: string | null): {
  * Pages accumulate one bounded read at a time (each asks Core for
  * `nextSequence` onward) and every page keeps Core's own `truncated`
  * disclosure, so the transcript can always say "this is what N bounded pages
- * returned", never "this is the whole conversation".
+ * returned", never "this is the whole conversation". A send invalidates the
+ * query (see `useSendMessage`), so the transcript re-reads what Core stored.
  */
 export function useConversationHistory(conversationId: string | null): {
   transcript: TranscriptView;
   gate: FeatureGate;
   isLoading: boolean;
+  isLoadingMore: boolean;
   error: CoreRequestError | null;
   loadMore: () => void;
 } {
   const deps = useDeps();
   const gate = useCoreFeatureGate("conversation.history", "conversation.history");
   const enabled = deps.transportAvailable && conversationId !== null && gate.state === "supported";
-  const [pages, setPages] = useState<ConversationHistoryResult[]>([]);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<CoreRequestError | null>(null);
-  const client = deps.client;
-
-  const load = useCallback(
-    async (after: number) => {
-      if (conversationId === null) return;
-      setPending(true);
-      setError(null);
-      try {
-        const page = await client.getConversationHistory({
-          conversationId,
-          afterSequence: after,
-        });
-        setPages((current) => [...current, page]);
-      } catch (err) {
-        setError(asCoreRequestError(err));
-      } finally {
-        setPending(false);
-      }
-    },
-    [client, conversationId],
-  );
-
-  // First page when a conversation is opened; a clean slate when it changes, so
-  // one chat's transcript is never shown under another chat's header.
-  const loadedFor = useRef<string | null>(null);
-  useEffect(() => {
-    if (!enabled || conversationId === null) return;
-    if (loadedFor.current === conversationId) return;
-    loadedFor.current = conversationId;
-    setPages([]);
-    void load(0);
-  }, [conversationId, enabled, load]);
-
-  const transcript = useMemo(() => foldTranscript(pages), [pages]);
+  const query = useInfiniteQuery<
+    ConversationHistoryResult,
+    Error,
+    InfiniteData<ConversationHistoryResult, number>,
+    readonly string[],
+    number
+  >({
+    ...conversationHistoryQueryOptions(deps.client, conversationId ?? ""),
+    enabled,
+  });
+  const pages = query.data?.pages;
+  const transcript = useMemo(() => foldTranscript(pages ?? []), [pages]);
+  const { fetchNextPage, isFetchingNextPage, hasNextPage } = query;
+  const loadMore = useCallback(() => {
+    // One page at a time: never stack a second read on an in-flight one.
+    if (isFetchingNextPage || !hasNextPage) return;
+    void fetchNextPage({ cancelRefetch: false });
+  }, [fetchNextPage, isFetchingNextPage, hasNextPage]);
   return {
     transcript,
     gate,
-    isLoading: pending || (enabled && pages.length === 0 && error === null),
-    error,
-    loadMore: () => void load(transcript.cursor),
+    isLoading: enabled && query.isPending,
+    isLoadingMore: isFetchingNextPage,
+    error: query.error ? asCoreRequestError(query.error) : null,
+    loadMore,
   };
 }
 
@@ -449,24 +506,31 @@ export function useCreateConversation() {
   });
 }
 
-export function useSendMessage(conversationId: string | null) {
+/**
+ * `conversation.send`. The conversation id travels WITH the variables, so the
+ * caller can attribute a success or failure to the chat it was sent from even
+ * if the user switched tabs while it was in flight.
+ */
+export function useSendMessage() {
   const deps = useDeps();
-  return useMutation<TaskSummary, CoreRequestError, string>({
-    mutationFn: async (content) => {
-      if (conversationId === null) {
-        throw new CoreRequestError(
-          "client",
-          "METHOD_NOT_ALLOWED",
-          "open a conversation before sending a message",
-        );
-      }
-      return decodeTaskSummary(
+  const qc = useQueryClient();
+  return useMutation<
+    TaskSummary,
+    CoreRequestError,
+    { conversationId: string; content: string }
+  >({
+    mutationFn: async ({ conversationId, content }) =>
+      decodeTaskSummary(
         await deps.client.sendMessage({
           conversationId,
           content,
           attachments: [],
         }),
-      );
+      ),
+    onSettled: (_data, _error, variables) => {
+      // Settled, not just success: a lost answer may still have been stored.
+      void qc.invalidateQueries({ queryKey: queryKeys.history(variables.conversationId) });
+      void qc.invalidateQueries({ queryKey: ["core", "task-list"] });
     },
   });
 }

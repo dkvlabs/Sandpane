@@ -10,11 +10,14 @@
 
 import { CoreClient, TaskSubscription } from "./core-client";
 import {
+  compareProjectionsByActivity,
   emptyProjection,
   foldTaskEvents,
   markReplayGap,
+  taskStatusView,
   type TaskProjection,
 } from "./reducers";
+import { EVENT_BATCH_MS_MAX, EVENT_BATCH_MS_MIN } from "../stores/ui";
 import type { TaskEvent } from "./protocol";
 
 export interface TaskEventStoreOptions {
@@ -41,14 +44,14 @@ export class TaskEventStore {
   private subscription: TaskSubscription | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private status: StoreStatus = { kind: "idle" };
-  private readonly batchMs: number;
+  private batchMs: number;
   private readonly pollIntervalMs: number | undefined;
 
   constructor(
     private readonly client: CoreClient,
     options: TaskEventStoreOptions = {},
   ) {
-    this.batchMs = options.batchMs ?? 80;
+    this.batchMs = clampBatchMs(options.batchMs ?? 80);
     this.pollIntervalMs = options.pollIntervalMs;
   }
 
@@ -99,8 +102,19 @@ export class TaskEventStore {
     this.subscription?.resume();
   }
 
-  getStatus(): StoreStatus {
-    return this.status;
+  /**
+   * Stable reference until the status structurally changes, so it can be a
+   * `useSyncExternalStore` snapshot (arrow: passed unbound to React).
+   */
+  getStatus = (): StoreStatus => this.status;
+
+  /** The coalescing window, driven live by the UI preference (clamped 16–500 ms). */
+  get batchWindowMs(): number {
+    return this.batchMs;
+  }
+
+  setBatchMs(ms: number): void {
+    this.batchMs = clampBatchMs(ms);
   }
 
   /** Sequence checkpoint per task, for status copy and reconnect assertions. */
@@ -136,16 +150,20 @@ export class TaskEventStore {
   applyEvents(events: readonly TaskEvent[]): void {
     if (events.length === 0) return;
     let changed = false;
+    let needsAttention = false;
     for (const event of events) {
       const current =
         this.projections.get(event.taskId) ?? emptyProjection(event.taskId);
       if (event.sequence <= current.lastSequence) continue;
-      this.projections.set(event.taskId, foldTaskEvents(current, [event]));
+      const next = foldTaskEvents(current, [event]);
+      this.projections.set(event.taskId, next);
       changed = true;
+      if (isAttentionEvent(current, next)) needsAttention = true;
     }
     if (changed) {
       this.rebuildSnapshot();
-      this.notifySoon();
+      if (needsAttention) this.flushNow();
+      else this.notifySoon();
     }
   }
 
@@ -157,14 +175,14 @@ export class TaskEventStore {
   }
 
   private rebuildSnapshot(): void {
-    this.snapshot = [...this.projections.values()].sort((a, b) =>
-      b.lastSequence - a.lastSequence,
-    );
+    // Per-task sequences are not comparable across tasks; order by activity.
+    this.snapshot = [...this.projections.values()].sort(compareProjectionsByActivity);
   }
 
   /**
-   * Coalesced notify, with an immediate flush when a batch carried a terminal
-   * or attention state (the user must not wait 80 ms to learn a task failed).
+   * Coalesced notify. `applyEvents` bypasses it with `flushNow` when a batch
+   * carried a terminal or attention state (the user must not wait for the
+   * window to learn a task failed or needs review/input/approval).
    */
   private notifySoon(): void {
     if (this.flushTimer) return;
@@ -178,12 +196,53 @@ export class TaskEventStore {
     for (const listener of [...this.listeners]) listener();
   }
 
+  private flushNow(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.flush();
+  }
+
+  /** Replace the status only on a structural change, and notify when it does. */
   private setStatus(next: StoreStatus): void {
+    if (sameStatus(this.status, next)) return;
     this.status = next;
+    this.notifySoon();
   }
 
   /** Test/diagnostic view of a single task projection. */
   peek(taskId: string): TaskProjection | undefined {
     return this.projections.get(taskId);
   }
+}
+
+function clampBatchMs(ms: number): number {
+  if (!Number.isFinite(ms)) return 80;
+  return Math.min(EVENT_BATCH_MS_MAX, Math.max(EVENT_BATCH_MS_MIN, Math.round(ms)));
+}
+
+function sameStatus(a: StoreStatus, b: StoreStatus): boolean {
+  if (a.kind !== b.kind) return false;
+  switch (a.kind) {
+    case "degraded":
+      return b.kind === "degraded" && a.reason === b.reason && a.attempt === b.attempt;
+    case "refused":
+      return b.kind === "refused" && a.reason === b.reason;
+    default:
+      return true;
+  }
+}
+
+/**
+ * A fold that the user must see at once: the task reached a terminal status or
+ * one that waits on them, or Core asked for an approval.
+ */
+function isAttentionEvent(before: TaskProjection, after: TaskProjection): boolean {
+  if (after.pendingApprovals.length > before.pendingApprovals.length) return true;
+  if (after.status === before.status || after.status === null || after.status === "unknown") {
+    return false;
+  }
+  const view = taskStatusView(after.status);
+  return view.terminal || view.needsReview || after.status === "awaiting_input";
 }

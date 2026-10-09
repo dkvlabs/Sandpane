@@ -146,3 +146,23 @@ export function schemaRequired(name: string): string[] {
 export function rustFieldExists(declaration: string): boolean {
   return protocolRustSource().includes(declaration);
 }
+
+/** The desktop's own Rust proxy (src-tauri), read from disk like the Core crates. */
+export const DESKTOP_PROXY_RUST = "apps/desktop/src-tauri/src/ipc_client.rs";
+
+export function desktopProxyRustSource(): string {
+  return read(DESKTOP_PROXY_RUST);
+}
+
+/** Resolve a `Method` variant name (e.g. `SystemProbe`) to its wire name. */
+export function rustMethodWireName(variant: string): string {
+  const source = protocolRustSource();
+  const start = source.indexOf("pub enum Method {");
+  const body = source.slice(start, source.indexOf("}", start));
+  const ordered = [...body.matchAll(/#\[serde\(rename = "[^"]+"\)\]\s*\n\s*([A-Z][A-Za-z0-9]*),/g)].map(
+    (m) => m[1] as string,
+  );
+  const index = ordered.indexOf(variant);
+  if (index < 0) throw new Error(`Method has no variant ${variant}`);
+  return rustMethodRenames()[index] as string;
+}

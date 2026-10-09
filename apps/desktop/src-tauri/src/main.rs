@@ -17,12 +17,11 @@
 
 mod ipc_client;
 
-use ipc_client::{core_request_frame, core_socket_status, CoreProxy};
+use ipc_client::{core_request_frame, core_socket_status};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 fn main() {
     tauri::Builder::default()
-        .manage(CoreProxy::default())
         .invoke_handler(tauri::generate_handler![
             core_request_frame,
             core_socket_status

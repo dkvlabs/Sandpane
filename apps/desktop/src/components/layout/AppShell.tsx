@@ -17,6 +17,7 @@ import {
   IconTasks,
   IconTemplates,
 } from "./icons";
+import { useUiPreferences } from "../../app/context";
 
 const ICONS: Record<NavSection, () => ReactNode> = {
   dashboard: IconHome,
@@ -60,6 +61,10 @@ function IconRail({
                 href={sectionHref(section)}
                 className={`rail__item${active ? " rail__item--active" : ""}`}
                 aria-current={active ? "page" : undefined}
+                // The accessible name never depends on the label being drawn:
+                // collapsed (preference) or narrow (CSS) rails hide it.
+                aria-label={NAV_LABELS[section]}
+                title={NAV_LABELS[section]}
               >
                 <Icon />
                 {!collapsed && <span className="rail__label">{NAV_LABELS[section]}</span>}
@@ -85,9 +90,17 @@ export function AppShell({
   statusTrailing: ReactNode;
   children: ReactNode;
 }) {
+  const collapsed = useUiPreferences().preferences.sidebarCollapsed;
+  const className = [
+    "shell",
+    sidebar !== undefined ? "shell--with-sidebar" : "",
+    collapsed ? "shell--rail-collapsed" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   return (
-    <div className="shell">
-      <IconRail route={route} collapsed={false} />
+    <div className={className}>
+      <IconRail route={route} collapsed={collapsed} />
       {sidebar !== undefined && <aside className="sidebar">{sidebar}</aside>}
       <main className="workspace" id="main" tabIndex={-1}>
         <div className="workspace__scroll">{children}</div>

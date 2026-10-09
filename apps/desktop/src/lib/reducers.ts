@@ -17,6 +17,7 @@ import type {
   FileChangeStatus,
   MessageRecord,
   Project,
+  SandboxSummary,
   TaskEvent,
   TaskStatus,
   TaskSummary,
@@ -201,7 +202,47 @@ export function describeTaskAction(
 // Dashboard / status-bar aggregation
 // ---------------------------------------------------------------------------
 
+/**
+ * One bucket per status, shared by the Tasks filter tabs AND `countTasks`, so a
+ * tab label can never disagree with the rows it filters. `cancelled` is its own
+ * bucket: a user-requested stop is not a failure.
+ */
+export type TaskBucket =
+  | "running"
+  | "waiting"
+  | "queued"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "unknown";
+
+export function taskBucket(status: TaskStatus | "unknown"): TaskBucket {
+  switch (status) {
+    case "preparing":
+    case "running":
+    case "verifying":
+      return "running";
+    case "awaiting_review":
+    case "awaiting_input":
+      return "waiting";
+    case "queued":
+    case "created":
+      return "queued";
+    case "completed":
+      return "completed";
+    case "failed":
+    case "rejected":
+    case "interrupted":
+      return "failed";
+    case "cancelled":
+      return "cancelled";
+    default:
+      return "unknown";
+  }
+}
+
 export interface TaskCounts {
+  cancelled: number;
   running: number;
   queued: number;
   needsReview: number;
@@ -216,6 +257,7 @@ export function countTasks(
   tasks: readonly { status: TaskStatus | "unknown" }[],
 ): TaskCounts {
   const counts: TaskCounts = {
+    cancelled: 0,
     running: 0,
     queued: 0,
     needsReview: 0,
@@ -254,6 +296,7 @@ export function countTasks(
         counts.completed += 1;
         break;
       case "cancelled":
+        counts.cancelled += 1;
         break;
       default:
         // "unknown" and any future wire status: counted in total only.
@@ -284,6 +327,8 @@ export interface TaskIndexEntry {
   conversationId: string | null;
   status: TaskStatus | "unknown";
   lastSequence: number;
+  /** Core timestamp of the newest event folded for this task; null when none. */
+  lastEventAt: string | null;
   source: TaskIndexSource;
   sandboxName: string | null;
   taskBranch: string | null;
@@ -304,6 +349,7 @@ export function foldTaskIndex(
       conversationId: task.conversationId,
       status: task.status,
       lastSequence: projections.get(task.id)?.lastSequence ?? 0,
+      lastEventAt: projections.get(task.id)?.lastEventAt ?? null,
       source: "task.list",
       sandboxName: task.sandboxName ?? null,
       taskBranch: task.taskBranch ?? null,
@@ -321,6 +367,7 @@ export function foldTaskIndex(
         conversationId: projection.conversationId,
         status,
         lastSequence: projection.lastSequence,
+        lastEventAt: projection.lastEventAt,
         source: "events",
         sandboxName: null,
         taskBranch: null,
@@ -333,6 +380,7 @@ export function foldTaskIndex(
       ...existing,
       conversationId: existing.conversationId ?? projection.conversationId,
       lastSequence: Math.max(existing.lastSequence, projection.lastSequence),
+      lastEventAt: projection.lastEventAt ?? existing.lastEventAt,
       // Core's stored row stays on screen; the event fold never overwrites it.
       // A difference between the two Core reads is reported below, not resolved
       // by a client-side guess (AGENTS rule 3).
@@ -346,7 +394,106 @@ export function foldTaskIndex(
     });
   }
 
-  return [...rows.values()].sort((a, b) => b.lastSequence - a.lastSequence);
+  // Sequences are PER TASK, so comparing them across tasks means nothing.
+  // Order by the newest Core event timestamp; rows with no event yet follow in
+  // reverse `task.list` order (Core lists `created_at ASC`, so newest first);
+  // the task id breaks any remaining tie so the order is stable.
+  const coreRank = new Map(coreTasks.map((task, index) => [task.id, index + 1]));
+  return [...rows.values()].sort((a, b) => {
+    const byActivity = eventTime(b.lastEventAt) - eventTime(a.lastEventAt);
+    if (byActivity !== 0 && !Number.isNaN(byActivity)) return byActivity;
+    const byCore = (coreRank.get(b.taskId) ?? 0) - (coreRank.get(a.taskId) ?? 0);
+    if (byCore !== 0) return byCore;
+    return a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0;
+  });
+}
+
+/** Parse a Core timestamp for ordering; unknown or unparsable sorts last. */
+export function eventTime(timestamp: string | null): number {
+  if (timestamp === null) return Number.NEGATIVE_INFINITY;
+  const parsed = Date.parse(timestamp);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+}
+
+/** Most recently active first (Core event time), then task id — never by sequence. */
+export function compareProjectionsByActivity(a: TaskProjection, b: TaskProjection): number {
+  const byActivity = eventTime(b.lastEventAt) - eventTime(a.lastEventAt);
+  if (byActivity !== 0 && !Number.isNaN(byActivity)) return byActivity;
+  return a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0;
+}
+
+/**
+ * Restrict the window-wide event projections to ONE project.
+ *
+ * Task events carry no project id, so membership is proven only by Core's own
+ * project-scoped reads: the task appears in this project's `task.list`, or its
+ * `task.created` conversation is one of this project's conversations. A
+ * projection with no conversation and no `task.list` row cannot be attributed;
+ * it is excluded and COUNTED so the view can say so rather than guess.
+ */
+export function scopeProjectionsToProject(
+  projections: readonly TaskProjection[],
+  scope: {
+    taskIds: ReadonlySet<string>;
+    conversationIds: ReadonlySet<string>;
+    /**
+     * True only when `conversationIds` is Core's complete answer for the project
+     * (`conversation.list` advertised and loaded). Otherwise a conversation
+     * outside the set may still be this project's (created in another client),
+     * so such a task is counted as unattributed instead of silently dropped.
+     */
+    conversationsAuthoritative: boolean;
+  },
+): { inScope: TaskProjection[]; unattributed: number } {
+  const inScope: TaskProjection[] = [];
+  let unattributed = 0;
+  for (const projection of projections) {
+    if (scope.taskIds.has(projection.taskId)) {
+      inScope.push(projection);
+    } else if (projection.conversationId === null) {
+      unattributed += 1;
+    } else if (scope.conversationIds.has(projection.conversationId)) {
+      inScope.push(projection);
+    } else if (!scope.conversationsAuthoritative) {
+      unattributed += 1;
+    }
+  }
+  return { inScope, unattributed };
+}
+
+/** Per-conversation composer drafts (UI-only state): set one, drop it when empty. */
+export function withDraft(
+  drafts: Readonly<Record<string, string>>,
+  conversationId: string,
+  text: string,
+): Readonly<Record<string, string>> {
+  const next = { ...drafts };
+  if (text.length === 0) delete next[conversationId];
+  else next[conversationId] = text;
+  return next;
+}
+
+/** After a send succeeded: clear that chat's draft only if it is still the sent text. */
+export function clearSentDraft(
+  drafts: Readonly<Record<string, string>>,
+  conversationId: string,
+  sent: string,
+): Readonly<Record<string, string>> {
+  return drafts[conversationId] === sent ? withDraft(drafts, conversationId, "") : drafts;
+}
+
+/**
+ * A remembered selection is only valid while it is still in the list it was
+ * picked from (a different project, a filtered conversation, a deleted
+ * sandbox); otherwise fall back.
+ */
+export function resolveSelection(
+  remembered: string | null,
+  candidates: readonly string[],
+  fallback: "first" | "none",
+): string | null {
+  if (remembered !== null && candidates.includes(remembered)) return remembered;
+  return fallback === "first" ? (candidates[0] ?? null) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +544,8 @@ export interface TaskProjection {
   taskId: string;
   /** Highest sequence folded in; the reconnect checkpoint. */
   lastSequence: number;
+  /** Core timestamp of that newest event (for cross-task ordering only). */
+  lastEventAt: string | null;
   /** Current status as reported by Core (never computed by the UI). */
   status: TaskStatus | "unknown" | null;
   /** Bound by the `task.created` event payload; null until Core says so. */
@@ -415,6 +564,7 @@ export function emptyProjection(taskId: string): TaskProjection {
   return {
     taskId,
     lastSequence: 0,
+    lastEventAt: null,
     status: null,
     conversationId: null,
     entries: [],
@@ -462,6 +612,7 @@ function withSequence(
     ...projection,
     ...patch,
     lastSequence: event.sequence,
+    lastEventAt: event.timestamp,
     entries: entry ? [...projection.entries, entry] : projection.entries,
   };
 }
@@ -558,6 +709,7 @@ function applyPayloadEvent(p: TaskProjection, event: TaskEvent): TaskProjection 
         return {
           ...p,
           lastSequence: sequence,
+          lastEventAt: timestamp,
           entries: p.entries.map((e) =>
             e === existing ? { ...e, ok, summary } : e,
           ),
@@ -723,9 +875,11 @@ export function foldTranscript(
     for (const message of page.messages) {
       bySequence.set(message.sequence, message);
     }
-    if (page.truncated) truncated = true;
     if (page.nextSequence > cursor) cursor = page.nextSequence;
   }
+  // Only the NEWEST page decides: once "Load more" fetched the rest, an earlier
+  // page's `truncated` must not keep the "not complete" banner up forever.
+  truncated = pages[pages.length - 1]?.truncated ?? false;
   const entries = [...bySequence.values()]
     .sort((a, b) => a.sequence - b.sequence)
     .map((message, index) => ({ ...message, order: index + 1 }));
@@ -1021,6 +1175,49 @@ export function sandboxModeView(mode: WorkspaceMode | null | undefined): Sandbox
 }
 
 /**
+ * The live-writable disclosure for ONE task, derived from that task's own
+ * sandbox binding — never from whichever sandbox a view happens to focus.
+ *
+ * Every missing link resolves to UNVERIFIED (treated as live-writable, the
+ * unsafe reading): no task row, a row with no `sandboxName` (event-only rows,
+ * or Core did not report one), a name `sandbox.list` does not return, or a row
+ * whose recorded mode is absent. Only a mode Core actually recorded for the
+ * task's sandbox may claim isolation.
+ */
+export function taskIsolationView(
+  task: Pick<TaskIndexEntry, "sandboxName"> | null | undefined,
+  sandboxes: readonly Pick<SandboxSummary, "name" | "workspaceMode">[],
+  /** False while `sandbox.list` is loading or failed: absence then proves nothing. */
+  sandboxListAvailable = true,
+): SandboxModeView & { reason: string } {
+  const unverified = (reason: string) => ({ ...UNVERIFIED_SANDBOX_MODE_VIEW, reason });
+  if (task === null || task === undefined) {
+    return unverified("This task is not in Core's task list here, so its sandbox is unknown.");
+  }
+  if (task.sandboxName === null) {
+    return unverified("Core did not report which sandbox this task runs in.");
+  }
+  const row = sandboxes.find((s) => s.name === task.sandboxName);
+  if (row === undefined && !sandboxListAvailable) {
+    return unverified(
+      `Core's sandbox list is unavailable right now (loading or failed), so the workspace mode of ${task.sandboxName} cannot be read.`,
+    );
+  }
+  if (row === undefined) {
+    return unverified(
+      `Sandbox ${task.sandboxName} is not in Core's sandbox list, so its workspace mode cannot be read.`,
+    );
+  }
+  const view = sandboxModeView(row.workspaceMode);
+  return {
+    ...view,
+    reason: view.verified
+      ? `Core recorded ${view.label} for this task's sandbox ${row.name}.`
+      : `Core returned no recorded workspace mode for this task's sandbox ${row.name}.`,
+  };
+}
+
+/**
  * Whether the running Core offers a method. `null` link means "not probed yet",
  * which is NOT "unsupported": the UI must show a pending state rather than
  * claiming a gap it has not observed (AGENTS rule 5).
@@ -1119,6 +1316,47 @@ export interface ErrorCopy {
   reason: string;
   action: string;
   tone: StatusTone;
+  /**
+   * A command Core suggested (`details.hint`, e.g. `sbx login`), sanitized to
+   * one short line. Shown as text for the user to run THEMSELVES — the desktop
+   * never executes it.
+   */
+  hint?: string;
+  /** `details.provider` when Core named one (e.g. `docker`), sanitized. */
+  provider?: string;
+}
+
+/** Longest hint shown; Core's hints are short commands. */
+const MAX_HINT_CHARS = 120;
+
+/**
+ * Reduce an untrusted `details` string to a single printable line: control
+ * characters (incl. CR/LF, ANSI escapes) removed, whitespace collapsed,
+ * length capped. Returns undefined when nothing usable remains.
+ */
+export function sanitizeHint(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const cleaned = value
+    // C0/C1 control characters (CR/LF, the ESC of ANSI sequences) and
+    // zero-width / bidi-override marks that could make a shown command differ
+    // from the text a user would copy.
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned.length === 0) return undefined;
+  return cleaned.length > MAX_HINT_CHARS ? `${cleaned.slice(0, MAX_HINT_CHARS - 1)}…` : cleaned;
+}
+
+function coreHints(err: CoreRequestError): Pick<ErrorCopy, "hint" | "provider"> {
+  const details = err.details;
+  if (typeof details !== "object" || details === null) return {};
+  const rec = details as Record<string, unknown>;
+  const hint = sanitizeHint(rec.hint);
+  const provider = sanitizeHint(rec.provider);
+  return {
+    ...(hint === undefined ? {} : { hint }),
+    ...(provider === undefined ? {} : { provider }),
+  };
 }
 
 const CORE_ERROR_COPY: Record<ErrorCode, Omit<ErrorCopy, "reason">> = {
@@ -1190,11 +1428,47 @@ export function describeCoreError(err: CoreRequestError): ErrorCopy {
         reason: err.message,
         action: "Re-check Core and retry; report this code if it repeats.",
         tone: "danger",
+        ...coreHints(err),
       };
     }
-    return { ...mapped, reason: err.message };
+    return { ...mapped, reason: err.message, ...coreHints(err) };
+  }
+  // A state-changing request whose answer was lost: the outcome is unknown, so
+  // the copy is about re-reading state — never "retry", which could apply twice.
+  if (err.mayHaveBeenApplied) {
+    return {
+      title: "Outcome unknown — this may have been applied",
+      reason: err.message,
+      action:
+        "Re-read state first (refresh this view or re-open the task). Only retry if Core shows the change did not happen; a blind retry can apply it twice.",
+      tone: "attention",
+    };
   }
   switch (err.code) {
+    case "CORE_UNREACHABLE":
+      return {
+        title: "Core is not running",
+        reason: err.message,
+        action:
+          "Start sandpane-service (the desktop never launches its own Core), then retry.",
+        tone: "danger",
+      };
+    case "CORE_REFUSED_CONNECTION":
+      return {
+        title: "Core refused this connection",
+        reason: err.message,
+        action:
+          "Core turned the connection away before handling the request, so nothing was applied. Check that sandpane-service runs as your own user, then retry.",
+        tone: "danger",
+      };
+    case "SOCKET_UNTRUSTED":
+      return {
+        title: "Refused an untrusted Core socket",
+        reason: err.message,
+        action:
+          "The socket path is not a private socket owned by you, so no request was sent. Check the path in Settings and who created it; restart sandpane-service as yourself.",
+        tone: "danger",
+      };
     case "INVALID_PARAMS":
       return {
         title: "Blocked by the desktop before it reached Core",

@@ -1,7 +1,8 @@
 import { useEffect } from "react";
-import { useRoute, type Route } from "./app/router";
+import { routeViewKey, useRoute, type Route } from "./app/router";
 import { CoreProvider, useUiPreferences } from "./app/context";
-import { applyUiTheme } from "./stores/ui";
+import { applyUiTheme, watchSystemTheme } from "./stores/ui";
+import { ErrorBoundary } from "./components/layout/ErrorBoundary";
 import { AppShell, ViewHeader } from "./components/layout/AppShell";
 import { ConnectionChip } from "./components/layout/ConnectionState";
 import { Button, EmptyState, Mono, Panel } from "./components/ui/primitives";
@@ -28,14 +29,20 @@ export function App({ deps }: { deps: AppDeps }) {
 
 function ThemedShell() {
   const { preferences } = useUiPreferences();
+  const route = useRoute();
   useEffect(() => {
     applyUiTheme(preferences);
+    // "system" must follow the OS live, not only at startup.
+    return watchSystemTheme(preferences, () => applyUiTheme(preferences));
   }, [preferences]);
-  return <Routes />;
+  return (
+    <ErrorBoundary resetKey={route.hash}>
+      <Routes route={route} />
+    </ErrorBoundary>
+  );
 }
 
-function Routes() {
-  const route = useRoute();
+function Routes({ route }: { route: Route }) {
   if (route.unmatched) return <UnknownRouteView route={route} />;
   switch (route.name) {
     case "dashboard":
@@ -44,7 +51,10 @@ function Routes() {
       return <ProjectsView route={route} />;
     case "project-workspace":
     case "conversation":
-      return <ProjectWorkspaceView route={route} />;
+      // Keyed by project: focus, drafts and chat form state belong to ONE
+      // project and must not leak into the next one (both routes render the
+      // same component, so React would otherwise reuse its state).
+      return <ProjectWorkspaceView key={routeViewKey(route)} route={route} />;
     case "chats":
       return <ChatsView route={route} />;
     case "tasks":
@@ -54,7 +64,7 @@ function Routes() {
     case "sandbox-new":
       return <SandboxesView route={route} />;
     case "sandbox-detail":
-      return <SandboxDetailView route={route} />;
+      return <SandboxDetailView key={routeViewKey(route)} route={route} />;
     case "agents":
       return <AgentsView route={route} />;
     case "templates":

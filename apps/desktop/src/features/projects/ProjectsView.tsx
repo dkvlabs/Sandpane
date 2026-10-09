@@ -247,6 +247,13 @@ export function ErrorPanel({ error }: { error: CoreRequestError }) {
       <p>
         <strong>What you can do:</strong> {copy.action}
       </p>
+      {copy.hint !== undefined && (
+        <p>
+          <strong>Core suggests:</strong> <Mono>{copy.hint}</Mono>
+          {copy.provider !== undefined ? ` (${copy.provider})` : ""}; run it yourself in a
+          terminal — Sandpane never runs it for you.
+        </p>
+      )}
     </Warning>
   );
 }

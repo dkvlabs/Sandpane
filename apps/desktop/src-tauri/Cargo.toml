@@ -24,6 +24,11 @@ serde_json = "1"
 # been compiled. See docs/audit/ and apps/desktop/README.md "Verification".
 sandpane-protocol = { path = "../../../core/crates/sandpane-protocol" }
 
+# `getuid()` for the socket-ownership check before every connect (W4). Already in
+# the lockfile at the version Tauri resolves; added as a direct dependency only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -50,8 +50,11 @@
   --size-chat: 14.5px;
   --lh-prose: 1.6;
 
-  /* Layout widths (spec §3 sizing guidance) */
-  --rail-width: 60px;
+  /* Layout widths (spec §3 sizing guidance). The DEFAULT is the spec's 56 px
+     icon-only rail (labels in tooltips + aria-label, via .shell--rail-collapsed).
+     The opt-in expanded form shows labels and is wide enough that the longest
+     ("Tasks & Review") is never truncated. */
+  --rail-width: 184px;
   --rail-width-collapsed: 56px;
   --sidebar-width: 244px;
   --inspector-width: 320px;
@@ -80,7 +83,7 @@ html[data-theme="light"] {
   --line: #cfc9bf;
   --text-strong: #26313a;
   --text-muted: #5c6874;
-  --text-subtle: #7d8894;
+  --text-subtle: #626e7a; /* 4.66:1 on --canvas #f4f2ee, 4.99:1 on --surface-1 (WCAG AA) */
   --accent: #2c7a6c;
   --accent-ink: #f5fffb;
   --accent-quiet: #dceee9;
@@ -107,7 +110,7 @@ html[data-theme="light"] {
     --line: #cfc9bf;
     --text-strong: #26313a;
     --text-muted: #5c6874;
-    --text-subtle: #7d8894;
+    --text-subtle: #626e7a; /* 4.66:1 on --canvas #f4f2ee, 4.99:1 on --surface-1 (WCAG AA) */
     --accent: #2c7a6c;
     --accent-ink: #f5fffb;
     --accent-quiet: #dceee9;

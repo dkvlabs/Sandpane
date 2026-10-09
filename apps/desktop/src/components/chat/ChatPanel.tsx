@@ -7,7 +7,7 @@ import {
   useSessionConversations,
   useSendMessage,
 } from "../../lib/hooks";
-import { foldAgentView } from "../../lib/reducers";
+import { clearSentDraft, foldAgentView, withDraft } from "../../lib/reducers";
 import type { Conversation } from "../../lib/protocol";
 import { ConversationTranscript } from "./ConversationTranscript";
 import { FeatureChip } from "../ui/feature-gate";
@@ -56,12 +56,14 @@ export function ChatPanel({
     return out;
   }, [coreChats.conversations, session, projectId]);
   const createConversation = useCreateConversation();
-  const send = useSendMessage(selectedConversationId);
+  const send = useSendMessage();
 
   const agents = capabilities?.agents ?? [];
   const [agentId, setAgentId] = useState<string>("");
   const [title, setTitle] = useState("");
-  const [draft, setDraft] = useState("");
+  // One draft per conversation: switching tabs never carries text into
+  // another chat, and switching back restores what was typed there.
+  const [drafts, setDrafts] = useState<Readonly<Record<string, string>>>({});
 
   if (link.kind !== "attached") {
     return (
@@ -76,6 +78,11 @@ export function ChatPanel({
   const effectiveAgent = agentId || agents[0]?.id || "";
   const selected: Conversation | null =
     conversations.find((c) => c.id === selectedConversationId) ?? null;
+  const draft = selected === null ? "" : (drafts[selected.id] ?? "");
+  // The single send mutation outlives tab switches; its result is shown only
+  // under the conversation it was actually sent from.
+  const sendIsForSelected =
+    selected !== null && send.variables?.conversationId === selected.id;
 
   return (
     <Panel
@@ -189,9 +196,16 @@ export function ChatPanel({
           onSubmit={(event) => {
             event.preventDefault();
             if (draft.trim().length === 0 || send.isPending) return;
-            send.mutate(draft, {
-              onSuccess: () => setDraft(""),
-            });
+            const conversationId = selected.id;
+            const content = draft;
+            send.mutate(
+              { conversationId, content },
+              {
+                // Clear the draft of the chat that was SENT, and only if it
+                // still holds the sent text (the user may have kept typing).
+                onSuccess: () => setDrafts((current) => clearSentDraft(current, conversationId, content)),
+              },
+            );
           }}
         >
           <label className="field">
@@ -201,19 +215,27 @@ export function ChatPanel({
               rows={3}
               value={draft}
               placeholder="Content is data, never a command — Core validates and stores it."
-              onChange={(event) => setDraft(event.target.value)}
+              onChange={(event) => {
+                const conversationId = selected.id;
+                const text = event.target.value;
+                setDrafts((current) => withDraft(current, conversationId, text));
+              }}
             />
           </label>
           <div className="row-actions">
-            <Button variant="primary" type="submit" disabled={draft.trim().length === 0}>
+            <Button
+              variant="primary"
+              type="submit"
+              disabled={draft.trim().length === 0 || send.isPending}
+            >
               Send
             </Button>
             <span className="muted">
               Creates a task in Core (conversation.send). Closing this tab never cancels it.
             </span>
           </div>
-          {send.isError && <ErrorPanel error={send.error} />}
-          {send.isSuccess && (
+          {sendIsForSelected && send.isError && <ErrorPanel error={send.error} />}
+          {sendIsForSelected && send.isSuccess && (
             <Warning tone="info" title="Task accepted by Core">
               <Mono>{send.data.id.slice(0, 8)}</Mono> · status <Mono>{send.data.status}</Mono>. The
               timeline below is the only place progress is reported, from durable events.

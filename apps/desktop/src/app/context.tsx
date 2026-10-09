@@ -24,7 +24,8 @@ export function buildDeps(
   options: { transportReason?: string | null } = {},
 ): AppDeps {
   const client = new CoreClient(transport);
-  const store = new TaskEventStore(client);
+  // The coalescing window is a UI preference; `CoreProvider` keeps it live.
+  const store = new TaskEventStore(client, { batchMs: uiPreferences.get().eventBatchMs });
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },
   });
@@ -56,6 +57,12 @@ export function CoreProvider({
     return () => {
       deps.store.stop();
     };
+  }, [deps]);
+
+  useEffect(() => {
+    // Settings → "Streaming coalescing window" applies without a restart.
+    deps.store.setBatchMs(uiPreferences.get().eventBatchMs);
+    return subscribeUi(() => deps.store.setBatchMs(uiPreferences.get().eventBatchMs));
   }, [deps]);
 
   return (

@@ -25,10 +25,13 @@ export interface UiState {
   lastProjectId: string | null;
   /** Bounds the rendered timeline; the rest stays in Core. */
   maxVisibleEvents: number;
-  /** Streaming notification coalescing window (ms). */
+  /** Streaming notification coalescing window (ms); drives `TaskEventStore`. */
   eventBatchMs: number;
-  /** Privacy/behaviour toggles that are genuinely local to the UI. */
-  confirmDestructiveActions: boolean;
+  /**
+   * Stored preference only (no notification command yet). There is deliberately
+   * NO toggle for destructive-action confirmation: confirmation is mandatory
+   * (docs/specs/05 §5), so it is not a preference.
+   */
   nativeNotifications: boolean;
 }
 
@@ -36,12 +39,13 @@ const DEFAULTS: UiState = {
   theme: "system",
   density: "comfortable",
   reducedMotionOverride: false,
-  sidebarCollapsed: false,
+  // Design spec §3: an icon-only rail (56 px) with tooltips by default;
+  // labelled navigation is the opt-in expanded form.
+  sidebarCollapsed: true,
   inspectorOpen: false,
   lastProjectId: null,
   maxVisibleEvents: 200,
   eventBatchMs: 80,
-  confirmDestructiveActions: true,
   nativeNotifications: false,
 };
 
@@ -66,7 +70,9 @@ export const uiPreferences = {
     return state;
   },
   set(patch: Partial<UiState>): void {
-    state = { ...state, ...patch };
+    // The same bounds as a persisted payload: an out-of-range number typed in
+    // Settings never reaches the event store or the timeline.
+    state = { ...state, ...sanitize({ ...state, ...patch }) };
     persist();
     for (const listener of [...listeners]) listener();
   },
@@ -85,7 +91,12 @@ export function subscribeUi(listener: () => void): () => void {
 export function loadUiPreferences(): void {
   const storage = safeStorage();
   if (!storage) return;
-  const raw = storage.getItem(STORAGE_KEY);
+  let raw: string | null;
+  try {
+    raw = storage.getItem(STORAGE_KEY);
+  } catch {
+    return;
+  }
   if (!raw) return;
   try {
     const parsed = JSON.parse(raw) as Partial<UiState>;
@@ -96,7 +107,8 @@ export function loadUiPreferences(): void {
   }
 }
 
-function sanitize(parsed: Partial<UiState>): Partial<UiState> {
+/** Exported for tests: what survives from a persisted or patched payload. */
+export function sanitize(parsed: Partial<UiState>): Partial<UiState> {
   const out: Partial<UiState> = {};
   if (parsed.theme === "system" || parsed.theme === "dark" || parsed.theme === "light") {
     out.theme = parsed.theme;
@@ -108,7 +120,6 @@ function sanitize(parsed: Partial<UiState>): Partial<UiState> {
     "reducedMotionOverride",
     "sidebarCollapsed",
     "inspectorOpen",
-    "confirmDestructiveActions",
     "nativeNotifications",
   ];
   for (const key of booleans) {
@@ -116,12 +127,14 @@ function sanitize(parsed: Partial<UiState>): Partial<UiState> {
       (out as Record<string, unknown>)[key] = parsed[key];
     }
   }
-  if (typeof parsed.lastProjectId === "string") out.lastProjectId = parsed.lastProjectId;
-  if (typeof parsed.maxVisibleEvents === "number") {
+  if (typeof parsed.lastProjectId === "string" || parsed.lastProjectId === null) {
+    out.lastProjectId = parsed.lastProjectId;
+  }
+  if (typeof parsed.maxVisibleEvents === "number" && Number.isFinite(parsed.maxVisibleEvents)) {
     out.maxVisibleEvents = clamp(parsed.maxVisibleEvents, 25, 1000);
   }
-  if (typeof parsed.eventBatchMs === "number") {
-    out.eventBatchMs = clamp(parsed.eventBatchMs, 16, 500);
+  if (typeof parsed.eventBatchMs === "number" && Number.isFinite(parsed.eventBatchMs)) {
+    out.eventBatchMs = clamp(parsed.eventBatchMs, EVENT_BATCH_MS_MIN, EVENT_BATCH_MS_MAX);
   }
   return out;
 }
@@ -133,8 +146,17 @@ function clamp(value: number, min: number, max: number): number {
 function persist(): void {
   const storage = safeStorage();
   if (!storage) return;
-  storage.setItem(STORAGE_KEY, JSON.stringify(state));
+  try {
+    storage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // Quota exceeded or storage blocked: the preference still applies for this
+    // session; failing to persist a UI preference must never break the app.
+  }
 }
+
+/** Bounds for the coalescing window, shared with `TaskEventStore.setBatchMs`. */
+export const EVENT_BATCH_MS_MIN = 16;
+export const EVENT_BATCH_MS_MAX = 500;
 
 /** Applies theme/density/motion to the document element (design spec §4.5, §10). */
 export function applyUiTheme(next: UiState): void {
@@ -149,4 +171,17 @@ export function applyUiTheme(next: UiState): void {
   root.dataset.theme = resolved;
   root.dataset.density = next.density;
   root.dataset.reducedMotion = next.reducedMotionOverride ? "force" : "auto";
+}
+
+/**
+ * While the theme is "system", re-apply on OS light/dark changes. Returns the
+ * unsubscribe; a no-op for an explicit theme or where `matchMedia` is absent.
+ */
+export function watchSystemTheme(next: UiState, onChange: () => void): () => void {
+  if (next.theme !== "system" || typeof window === "undefined" || !window.matchMedia) {
+    return () => {};
+  }
+  const query = window.matchMedia("(prefers-color-scheme: light)");
+  query.addEventListener("change", onChange);
+  return () => query.removeEventListener("change", onChange);
 }

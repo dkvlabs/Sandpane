@@ -12,7 +12,7 @@
  * the unit tests against an in-memory duplex.
  */
 
-import type { CoreTransport } from "../lib/core-client";
+import { decodeProxyRejection, type CoreTransport } from "../lib/core-client";
 
 type Invoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 
@@ -34,6 +34,11 @@ export class TauriTransport implements CoreTransport {
         const line = reply.endsWith("\n") ? reply.slice(0, -1) : reply;
         if (line.length === 0) return;
         for (const handler of [...this.lineHandlers]) handler(line);
+      },
+      // The proxy rejects with its serialized `ProxyError` object
+      // ({code, message, mayHaveBeenApplied}); keep it structured.
+      (err: unknown) => {
+        throw decodeProxyRejection(err);
       },
     );
   }

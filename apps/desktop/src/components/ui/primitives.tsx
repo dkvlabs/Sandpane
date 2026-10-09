@@ -9,12 +9,14 @@ import {
   forwardRef,
   useEffect,
   useId,
+  useRef,
   useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
 } from "react";
 import type { StatusTone } from "../../lib/reducers";
+import { FOCUSABLE_SELECTOR, confirmEnabled, nextTrapIndex } from "../../lib/focus";
 
 export function Badge({
   tone = "neutral",
@@ -224,6 +226,14 @@ export function Tabs({
  * Destructive confirmation (docs/specs/05 §5, §6 scenario 7). The caller must
  * state the real consequence and require a typed-in or clicked acknowledgement;
  * the dialog never defaults to "yes".
+ *
+ * Behaviour that must hold across parent re-renders (the task poll re-renders
+ * parents every second with a fresh `onCancel`):
+ * - the typed phrase resets only when the dialog OPENS, never mid-typing;
+ * - initial focus goes to the phrase input, else Cancel — never the danger button;
+ * - Tab/Shift+Tab are trapped inside the dialog; Escape cancels;
+ * - focus returns to the element that opened it when it closes;
+ * - the title id is unique per instance (`useId`), so two dialogs never collide.
  */
 export function ConfirmDialog({
   open,
@@ -243,31 +253,60 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  const titleId = useId();
   const [typedPhrase, setTypedPhrase] = useState("");
-  const phraseSatisfied = requirePhrase === undefined || typedPhrase === requirePhrase;
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const onCancelRef = useRef(onCancel);
+  useEffect(() => {
+    onCancelRef.current = onCancel;
+  });
+  const phraseSatisfied = confirmEnabled(requirePhrase, typedPhrase);
+
+  // Reset ONLY on the closed → open transition.
+  useEffect(() => {
+    if (open) setTypedPhrase("");
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
-    setTypedPhrase("");
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    const initial = dialog?.querySelector<HTMLElement>("[data-autofocus]");
+    initial?.focus();
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCancel();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCancelRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || dialog === null) return;
+      const focusables = [...dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)];
+      const active = document.activeElement;
+      const current = focusables.findIndex((element) => element === active);
+      const next = nextTrapIndex(focusables.length, current, event.shiftKey);
+      event.preventDefault();
+      if (next !== null) focusables[next]?.focus();
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onCancel]);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (opener?.isConnected) opener.focus();
+    };
+  }, [open]);
 
   if (!open) return null;
 
   return (
     <div className="dialog-backdrop" onClick={onCancel}>
       <div
+        ref={dialogRef}
         className="dialog"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="confirm-title"
+        aria-labelledby={titleId}
         onClick={(event) => event.stopPropagation()}
       >
-        <h2 id="confirm-title" className="dialog__title">
+        <h2 id={titleId} className="dialog__title">
           {title}
         </h2>
         <div className="dialog__body">{consequence}</div>
@@ -277,15 +316,20 @@ export function ConfirmDialog({
               Type <Mono>{requirePhrase}</Mono> to enable this action.
             </span>
             <TextInput
-              autoFocus
+              data-autofocus
               spellCheck={false}
+              autoComplete="off"
               value={typedPhrase}
               onChange={(event) => setTypedPhrase(event.target.value)}
             />
           </label>
         )}
         <div className="dialog__actions">
-          <Button variant="ghost" onClick={onCancel}>
+          <Button
+            variant="ghost"
+            onClick={onCancel}
+            {...(requirePhrase === undefined ? { "data-autofocus": true } : {})}
+          >
             Cancel
           </Button>
           <Button variant="danger" disabled={!phraseSatisfied} onClick={onConfirm}>

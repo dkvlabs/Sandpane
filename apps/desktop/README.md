@@ -11,34 +11,39 @@ second sandbox backend.
 Status: **P5 / DT0–DT1 scaffold**, re-synced to the additive protocol-v1 revision
 (`task.list`, `conversation.list`, `conversation.history`, `CoreCapabilities.methods`,
 `Project.repositories`, `SandboxSummary.workspaceMode`, `TaskSubscribeParams.afterSequences`).
-The shell, the wire client and the full information architecture are real and tested, and the
-Tauri Rust shell now **compiles and lints clean on this host** (see
+The shell, the wire client and the full information architecture are real and tested. The Tauri
+Rust shell compiles, lints and unit-tests clean on this host **as of the review-fix pass below**;
+an earlier revision of this README claimed that while the crate did not compile (see
 [Verification](#verification)).
 
 ---
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, npm 11.21.0, Rust 1.99.0 / Homebrew)
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — review-fix pass, 2026-10-09
+
+Run fresh after the A1–A12 / W4–W6 / S9 fixes. Every row below is a command that was actually run,
+with its actual result:
 
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **10 files, 227 tests passed**, 1 file (8 live tests) auto-skipped without a socket |
-| `SANDPANE_SOCKET=… npm test` | OK — **11 files, 235 tests passed** (227 unit + 8 against the real Core binary) |
-| `npm run build` (`tsc --noEmit && vite build`) | OK — `dist/` emitted (327.01 kB JS, 20.04 kB CSS) |
-| `cargo check --manifest-path src-tauri/Cargo.toml` | OK — `Finished dev profile` |
-| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | OK — no warnings |
-| `cargo test --manifest-path src-tauri/Cargo.toml` | OK — **7 passed; 0 failed** (frame proxy unit tests) |
+| `npm test` (`vitest run`) | OK — **12 files, 273 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm run build` (`tsc --noEmit && vite build`) | OK — `dist/` emitted (main chunk 338.83 kB JS, 20.65 kB CSS at the time of this run; sizes move with every change) |
+| `cd src-tauri && cargo check --offline` | OK — `Finished dev profile` |
+| `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
+| `cd src-tauri && cargo test --offline` | OK — **31 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied) |
+| `make desktop-check` (repo root) | OK — runs all of the above except `npm run build`; now includes `cargo fmt --check`, `check`, `clippy`, `test` for `src-tauri` |
 
-**Baseline movement:** the desktop suite went from **144 → 227** tests. The added coverage is
-`tests/guards.test.ts` (27), `tests/replay-cursors.test.ts` (11),
-`tests/protocol-drift.test.ts` (23) and the new additive-field cases inside
-`tests/protocol.test.ts` (20 → 29) and `tests/reducers.test.ts` (28 → 41).
+**Correction of an earlier claim.** A previous revision of this table reported `cargo check` OK
+and "7 passed" for `src-tauri`. That was false at the time: since commit `fbc45e2` the crate failed
+to compile (`E0308`, `replay_safe(request.method)` passed a `String` where a `Method` was required),
+and `make check` never compiled `src-tauri` because it is not in the `core/` workspace. The crate
+now compiles, and `make desktop-check` builds and tests it, so the same regression fails the gate.
 
-### Live Core run (the client, not a hand-rolled script)
+### Live Core run (earlier evidence — NOT re-run in the review-fix pass)
 
-The prebuilt `core/target/debug/sandpane-service` (built 15:09, never rebuilt or edited here)
+This section records an earlier run and was not repeated after the fixes above. The prebuilt `core/target/debug/sandpane-service` (built 15:09, never rebuilt or edited here)
 was started read-only against a disposable socket and database, and `tests/live-core.test.ts`
 ran the app's own `CoreClient` against it:
 
@@ -73,10 +78,19 @@ What that run measured (not asserted from prose):
 
 ### Not verified here, and therefore not claimed
 
-- `npm run tauri dev` / `npm run tauri build` — the crate now **compiles, lints and unit-tests
-  clean**, but the native window has never been launched on this host: no WebKit runtime check,
-  no round trip through `core_request_frame` over Tauri IPC, no build/sign/notarize run. The Rust
-  socket proxy is therefore *compiled and unit-tested*, not *end-to-end exercised*.
+- `npm run tauri dev` / `npm run tauri build` — the crate **compiles, lints and unit-tests clean**,
+  and its socket exchange is tested against a fake Core listener on a real Unix socket, but the
+  native window has never been launched on this host: no WebKit runtime check, no round trip
+  through `core_request_frame` over Tauri IPC, no build/sign/notarize run. In particular the
+  narrowed capability (`allow-core-request-frame` only, no `core:*` permissions) is validated by
+  `tauri-build` at compile time but has **not** been exercised at runtime.
+- The `SOCKET_UNTRUSTED` check (lstat: socket, owned by this uid, no group/other bits) has a
+  residual race between the `lstat` and `connect`; a peer-credential check on the connected
+  socket is the full fix and is not implemented here.
+- Socket path on Linux: the desktop now resolves `$XDG_STATE_HOME/sandpane/sandpane.sock`, the
+  same as the VS Code client. The committed Core service used `$XDG_STATE_HOME/sandpane.sock`
+  when `XDG_STATE_HOME` is set; aligning Core is a separate change, not verified from this app.
+  Until it lands, set `SANDPANE_SOCKET` explicitly on Linux. macOS paths already agree.
 - The `refused` replay path (Core's oversized-replay latch) is covered by unit tests against a
   test double modelled on Core's measured refusal text; it has not been triggered against a Core
   holding ~4 MiB of events.
@@ -161,13 +175,40 @@ React view  →  CoreClient (src/lib/core-client.ts)      ← framing, id correl
   (read-only metadata). It re-validates every method against `sandpane_protocol::Method` — it
   holds **no method list of its own**, so the allowlist cannot drift from Core — enforces
   `MAX_FRAME_BYTES`, has no `std::process::Command`, no shell, no arbitrary path or URL handler,
-  and never spawns Core.
+  and never spawns Core. Specifically:
+  - `core_request_frame` is `async` and runs the socket exchange on a blocking worker
+    (`spawn_blocking`) over **one connection per request**, so the main thread never waits on
+    Core and no request queues behind another on a lock.
+  - A frame must be exactly one line (CR/LF only as the single trailing newline), and the bytes
+    written are the bytes validated — never a re-serialization. The answer must carry the
+    request's own `id`; anything else is dropped (`RESPONSE_ID_MISMATCH`).
+  - One per-method deadline covers connect, write, read and the single retry (after a 150 ms
+    pause) a read-only method may get after a FAST failure (socket missing/refused, write broke,
+    Core closed before answering); a timeout is never retried. Budgets: `sandbox.create` 320 s,
+    `sandbox.list` 40 s, everything else 12 s — each below the webview's own deadline for the
+    same method (330 s / 45 s / 15 s), drift-tested per method, so the webview always hears the
+    proxy's verdict.
+  - A lost answer to a state-changing method — including a write that broke part-way, since
+    Core handles a final unterminated line at EOF — comes back with `mayHaveBeenApplied: true`,
+    and the UI says "may have been applied — re-read state" instead of offering a blind retry.
+    Core's own connection-level refusal (empty-id `err` frame, e.g. peer-uid mismatch) is
+    reported as `CORE_REFUSED_CONNECTION`, not applied.
+  - When Core attaches `details.hint` / `details.provider` to an error, the error panel shows
+    one sanitized line ("Core suggests: `sbx login`; run it yourself") — Sandpane never runs it.
+  - Before connecting it `lstat`s the socket and refuses (`SOCKET_UNTRUSTED`) anything that is not
+    a socket owned by the current user with no group/other permission bits.
+  - `capabilities/default.json` grants the main window only `allow-core-request-frame` (app
+    commands are ACL-gated through `tauri_build::AppManifest`); no `core:*` plugin permission is
+    granted. `core_socket_status` is registered but not granted, since no view calls it yet.
 - **State ownership stays in Core.** Task rows come from `task.list` and durable
   `task.subscribe` replay; both are Core's own values, displayed verbatim and labelled with
   which read produced them. When Core's two reads disagree the row shows both — the client
   computes no lifecycle transitions and never renders `running`/`resumed` it did not receive
-  (AGENTS rule 3). React Query owns reads/writes; the event stream lives in `TaskEventStore`
-  with ~80 ms coalescing; `src/stores/ui.ts` holds presentation-only preferences.
+  (AGENTS rule 3). React Query owns reads/writes (including paged `conversation.history`, as
+  an infinite query keyed per conversation); the event stream lives in `TaskEventStore` with a
+  coalescing window driven live by the Settings preference (16–500 ms, default 80 ms) and an
+  immediate flush for terminal/attention events; `src/stores/ui.ts` holds presentation-only
+  preferences. Destructive-action confirmation is mandatory and is not a preference.
 - **Core has no push frame yet**, so liveness is a replaying `task.subscribe` poll with
   **per-task cursors** (`afterSequences`), exponential backoff on failure, gap reporting, and a
   `resume()` path that re-uses the held cursors — which is how a UI restart or a reconnect
@@ -193,7 +234,7 @@ one that happens, and the drop count is exposed rather than hidden.
 | `#/projects` | Projects | `project.list` (incl. `repositories`), `project.create` |
 | `#/projects/:id`, `#/projects/:id/conversations/:cid` | ProjectWorkspace | `conversation.list` (Core's chats, not just this window's), `conversation.history`, sandbox picker + chat + activity timeline + review |
 | `#/chats` | Chats | `conversation.list` when advertised (cross-client chats reopen here); falls back to this window's list and says so |
-| `#/tasks`, `#/tasks/:id` | Tasks & Review | `task.list` + event replay, `task.cancel`, `git.review`, `git.apply` |
+| `#/tasks`, `#/tasks/:id` | Tasks & Review | `task.list` + event replay, `task.cancel`, `git.review`, `git.apply`; the review's live-writable disclosure comes from the task's own sandbox (`sandboxName` → `sandbox.list` mode), unknown = UNVERIFIED |
 | `#/sandboxes`, `#/sandboxes/new` | Sandboxes + wizard | `sandbox.list` (incl. `workspaceMode`), `sandbox.create` (start/stop/delete: no method yet) |
 | `#/agents` | Agents | `system.probe` `agents[]` |
 | `#/templates` | Templates | read-only unsupported state (no template RPC) |
@@ -246,6 +287,7 @@ apps/desktop/
 │   │   ├── reducers.ts           pure display/state logic (statuses, link, SBX, review)
 │   │   ├── event-store.ts        streamed projections, batched notifications
 │   │   ├── wizard.ts             sandbox wizard state machine + validation
+│   │   ├── focus.ts              pure dialog focus-trap / confirm rules
 │   │   └── hooks.ts              React Query wrappers + useSyncExternalStore hooks
 │   ├── transport/                tauri.ts (invoke proxy), unavailable.ts (explicit no-Core)
 │   ├── stores/ui.ts              UI-only preferences, persisted locally
@@ -258,16 +300,16 @@ apps/desktop/
 │   ├── icons/                    generated placeholder icons (required by generate_context!)
 │   └── src/{main.rs,ipc_client.rs}
 └── tests/                        framing, reducers, connection, wizard, core-client, guards,
-                                  replay cursors, protocol drift, live Core (opt-in)
+                                  replay cursors, protocol drift, proxy contract,
+                                  review-fix regressions (A5–A12), live Core (opt-in)
 ```
 
 `src-tauri/Cargo.toml` depends on `sandpane-protocol` by path (`../../../core/crates/…`) so the
 allowlist the proxy enforces cannot drift from Core's `Method::parse`, while keeping its own
 lockfile. That path was previously `../../core/…`, which resolved to the non-existent
 `apps/core/crates/sandpane-protocol`; dependency resolution failed and the crate had never been
-compiled. Fixing it surfaced three real defects that a non-compiling crate had been hiding — a
-missing `std::io::Read` import (so the bounded read could not compile), unused imports, and a
-missing icon asset — all now fixed and covered by `cargo clippy -D warnings` and 7 Rust tests.
+compiled. The crate is now compiled, linted and tested by `make desktop-check` (31 Rust tests), so
+a non-compiling shell can no longer hide behind a green `make check`.
 
 ---
 

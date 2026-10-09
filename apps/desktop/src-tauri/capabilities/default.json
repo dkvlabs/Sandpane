@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: Core frame proxy only. No shell, no filesystem, no HTTP, no opener, no notifications yet — the app's own Rust commands are the only native surface it can reach.",
+  "description": "Main window: the Core frame proxy command and nothing else. No core:* plugin permissions (no window/webview/event/path/menu/tray/image/resources APIs), no shell, filesystem, HTTP, opener or notifications. core_socket_status is registered but not granted until a view invokes it.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["allow-core-request-frame"]
 }

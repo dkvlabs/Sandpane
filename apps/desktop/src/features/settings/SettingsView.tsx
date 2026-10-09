@@ -25,6 +25,7 @@ import { IconRefresh } from "../../components/layout/icons";
 import type { Route } from "../../app/router";
 import { useProbeRefetch, RefreshButton } from "../../components/ui/refresh";
 import { useDeps, useUiPreferences } from "../../app/context";
+import { uiPreferences } from "../../stores/ui";
 
 /**
  * Settings.
@@ -244,10 +245,15 @@ export function SettingsView({ route }: { route: Route }) {
                 min={25}
                 max={1000}
                 step={25}
-                value={preferences.maxVisibleEvents}
-                onChange={(event) =>
-                  set({ maxVisibleEvents: Number(event.target.value) || 200 })
-                }
+                // Committed on blur, then clamped by the store (25–1000), so a
+                // half-typed number is never clamped mid-edit.
+                key={`events-${preferences.maxVisibleEvents}`}
+                defaultValue={preferences.maxVisibleEvents}
+                onBlur={(event) => {
+                  set({ maxVisibleEvents: Number(event.currentTarget.value) || 200 });
+                  // Show the value actually applied (clamping may leave the key unchanged).
+                  event.currentTarget.value = String(uiPreferences.get().maxVisibleEvents);
+                }}
               />
             )}
           </Field>
@@ -263,8 +269,13 @@ export function SettingsView({ route }: { route: Route }) {
                 min={16}
                 max={500}
                 step={4}
-                value={preferences.eventBatchMs}
-                onChange={(event) => set({ eventBatchMs: Number(event.target.value) || 80 })}
+                // Live: the event store re-reads this window on commit (blur).
+                key={`batch-${preferences.eventBatchMs}`}
+                defaultValue={preferences.eventBatchMs}
+                onBlur={(event) => {
+                  set({ eventBatchMs: Number(event.currentTarget.value) || 80 });
+                  event.currentTarget.value = String(uiPreferences.get().eventBatchMs);
+                }}
               />
             )}
           </Field>
@@ -285,19 +296,13 @@ export function SettingsView({ route }: { route: Route }) {
             checked={preferences.sidebarCollapsed}
             onChange={(event) => set({ sidebarCollapsed: event.target.checked })}
           />
-          <span>Collapse the icon rail to icons only</span>
+          <span>Icon-only navigation rail (tooltips on hover); untick to show labels</span>
         </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={preferences.confirmDestructiveActions}
-            onChange={(event) => set({ confirmDestructiveActions: event.target.checked })}
-          />
-          <span>
-            Confirm destructive actions (delete sandbox, discard changes, expose a port). Turning
-            this off weakens a safety boundary, so it is off-switchable but never off by default.
-          </span>
-        </label>
+        <p className="muted">
+          Destructive actions (delete sandbox, discard changes, apply to your repository, expose a
+          port) always ask for confirmation and state their consequence. That is a safety boundary,
+          not a preference, so there is no setting to turn it off.
+        </p>
         <label className="check">
           <input
             type="checkbox"
@@ -363,7 +368,7 @@ const APPEARANCE_DEFAULTS = {
   theme: "system",
   density: "comfortable",
   reducedMotionOverride: false,
-  sidebarCollapsed: false,
+  sidebarCollapsed: true,
   inspectorOpen: false,
   maxVisibleEvents: 200,
   eventBatchMs: 80,

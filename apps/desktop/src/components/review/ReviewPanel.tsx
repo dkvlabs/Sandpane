@@ -1,6 +1,10 @@
 import { useState } from "react";
 import { useApplyChanges, useTaskReview } from "../../lib/hooks";
-import { fileChangeLabel, reviewSummary } from "../../lib/reducers";
+import {
+  fileChangeLabel,
+  reviewSummary,
+  type SandboxModeView,
+} from "../../lib/reducers";
 import {
   Badge,
   Button,
@@ -23,17 +27,15 @@ import { ErrorPanel } from "../../features/projects/ProjectsView";
  */
 export function ReviewPanel({
   taskId,
-  liveWritable,
+  isolation,
 }: {
   taskId: string | null;
-  liveWritable: boolean;
+  /**
+   * The disclosure for THIS task's own sandbox (`taskIsolationView`), never a
+   * focused sandbox's. Unknown is UNVERIFIED and treated as live-writable.
+   */
+  isolation: SandboxModeView & { reason: string };
 }) {
-  const [requested, setRequested] = useState(false);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const { changeSet, isLoading, error, refetch } = useTaskReview(taskId, requested);
-  const apply = useApplyChanges();
-
   if (taskId === null) {
     return (
       <EmptyState
@@ -42,6 +44,24 @@ export function ReviewPanel({
       />
     );
   }
+  // Keyed by task: selection, the "review requested" flag, the confirm dialog
+  // and the last apply result belong to ONE task and must never carry over
+  // (a stale "Applied" or another task's selected files would be a lie).
+  return <ReviewPanelBody key={taskId} taskId={taskId} isolation={isolation} />;
+}
+
+function ReviewPanelBody({
+  taskId,
+  isolation,
+}: {
+  taskId: string;
+  isolation: SandboxModeView & { reason: string };
+}) {
+  const [requested, setRequested] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const { changeSet, isLoading, error, refetch } = useTaskReview(taskId, requested);
+  const apply = useApplyChanges();
 
   const summary = reviewSummary(changeSet, apply.data ?? null);
   const selectedFiles = [...selected];
@@ -61,12 +81,18 @@ export function ReviewPanel({
         </>
       }
     >
-      {liveWritable && (
-        <Warning tone="attention" title="Direct-mounted task">
-          Files may already be modified on the host: this workspace is writable immediately, so
-          there is no isolated copy to fall back to.
-        </Warning>
-      )}
+      {isolation.liveWritable &&
+        (isolation.verified ? (
+          <Warning tone="attention" title="Direct-mounted task">
+            Files may already be modified on the host: this workspace is writable immediately, so
+            there is no isolated copy to fall back to. {isolation.reason}
+          </Warning>
+        ) : (
+          <Warning tone="attention" title="Workspace mode UNVERIFIED — treated as live-writable">
+            {isolation.reason} Until Core reports this task's binding, assume files may already be
+            modified on the host.
+          </Warning>
+        ))}
 
       {isLoading && <p className="muted">Reading the change set from Core…</p>}
       {error !== null && <ErrorPanel error={error} />}
