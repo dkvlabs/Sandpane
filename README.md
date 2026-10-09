@@ -4,7 +4,7 @@
 
 Sandpane is an open-source, local-first **AI development workspace and Docker Sandboxes (`sbx`) manager** by DKV Labs. Create isolated environments, open several projects, run multiple coding-agent chats at once, watch real execution, run tests, review actual Git diffs, and merge approved changes — from VS Code, JetBrains IDEs, or a standalone desktop app, all connected to one persistent per-user Core service.
 
-> **Status:** implementation scaffold phase. The specifications in [`docs/specs/`](docs/specs/README.md) are authoritative; progress and evidence are logged in [`docs/CHANGELOG.md`](docs/CHANGELOG.md) with auto-review records in [`docs/audit/`](docs/audit/README.md). Public release of SBX-integrated artifacts is gated on [`docs/licensing-decision.md`](docs/licensing-decision.md).
+> **Status:** implementation scaffold phase complete — Rust Core (72 tests), VS Code / desktop / JetBrains client scaffolds, schemas + drift gate, and PR CI are landed (evidence: entries 0001–0009 in [`docs/CHANGELOG.md`](docs/CHANGELOG.md), review records in [`docs/audit/`](docs/audit/README.md)). Real sandbox and agent execution remain gated: `sbx` CLI and the Codex-in-SBX feasibility check are open P0 blockers ([`docs/compatibility.md`](docs/compatibility.md)), and public release of SBX-integrated artifacts is gated on [`docs/licensing-decision.md`](docs/licensing-decision.md). Unsupported = visibly unsupported.
 
 > **Independence notice:** Sandpane is an independent open-source developer tool published by DKV Labs. It is not affiliated with or endorsed by Docker, Inc. Docker Sandboxes is installed, licensed, and authenticated separately by the user. Sandpane never bundles `sbx` binaries.
 
@@ -33,9 +33,11 @@ Prerequisites: Rust stable (rustfmt + clippy), Node 20+, and — for real sandbo
 
 ```bash
 make core-check          # cargo fmt --check + clippy -D warnings + cargo test in core/
-make vscode-check        # typecheck + unit tests for clients/vscode
-make desktop-check       # typecheck + unit tests for apps/desktop
-make check               # everything verifiable on this host
+make vscode-check        # typecheck + unit tests for clients/vscode (npm install first)
+make desktop-check       # typecheck + unit tests for apps/desktop (npm install first)
+make schema-lint         # JSON syntax for schemas/
+make schema-drift        # value-set drift gate: schemas/ ⇄ Rust protocol crate
+make check               # everything verifiable on this host (jetbrains excluded — JB0 gate)
 ```
 
 JetBrains plugin: `cd clients/jetbrains && ./gradlew build` (requires Gradle + a supported JDK; run the Plugin Verifier before any release).

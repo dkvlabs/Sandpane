@@ -9,9 +9,10 @@ NPM ?= npm
 
 .PHONY: check core-check core-fmt core-clippy core-test vscode-check desktop-check jetbrains-check schema-lint schema-drift clean
 
-## Everything currently verifiable on this host.
-check: core-check schema-lint schema-drift
-	@echo "make check: OK (core + schemas). vscode/desktop/jetbrains targets exist but are not yet part of 'check' until their phases land — run them explicitly."
+## Everything currently verifiable on this host. Client checks need their
+## npm dependencies installed first (cd <dir> && npm install).
+check: core-check schema-lint schema-drift vscode-check desktop-check
+	@echo "make check: OK (core + schemas + vscode + desktop). jetbrains-check is excluded: nothing Kotlin has been compiled on this host yet (JB0 gate, docs/compatibility.md) — run it explicitly on a networked machine."
 
 core-check: core-fmt core-clippy core-test
 
