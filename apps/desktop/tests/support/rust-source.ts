@@ -166,3 +166,57 @@ export function rustMethodWireName(variant: string): string {
   if (index < 0) throw new Error(`Method has no variant ${variant}`);
   return rustMethodRenames()[index] as string;
 }
+
+/**
+ * Wire names of a `#[serde(rename_all = "snake_case")]` unit enum in the
+ * protocol crate, in declared order (`TaskStatus`, `FileChangeStatus`,
+ * `WorkspaceMode`).
+ *
+ * Fails loudly — never returns an empty list — when the enum is missing, when
+ * its attribute block does not carry `rename_all = "snake_case"` (the PascalCase
+ * → snake_case conversion below would then be wrong), or when no variant
+ * parses. Doc comments and attributes are skipped; a per-variant
+ * `#[serde(rename = "...")]` wins over the conversion.
+ */
+export function rustSnakeCaseEnumVariants(name: string): string[] {
+  const source = protocolRustSource();
+  const marker = `pub enum ${name} {`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`${PROTOCOL_RUST} has no "${marker}"`);
+  // The attribute block: the lines directly above the enum, up to the previous
+  // blank line or item.
+  const before = source.slice(0, start).split("\n");
+  const attrs: string[] = [];
+  for (let i = before.length - 2; i >= 0; i -= 1) {
+    const line = (before[i] ?? "").trim();
+    if (!(line.startsWith("#[") || line.startsWith("///"))) break;
+    attrs.push(line);
+  }
+  if (!attrs.some((line) => line.includes('#[serde(rename_all = "snake_case")]'))) {
+    throw new Error(`pub enum ${name} is not #[serde(rename_all = "snake_case")]`);
+  }
+  const end = source.indexOf("\n}", start);
+  if (end < 0) throw new Error(`pub enum ${name} has no closing brace`);
+  const body = source.slice(start + marker.length, end).split("\n");
+  const names: string[] = [];
+  let pendingRename: string | null = null;
+  for (const rawLine of body) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("//")) continue;
+    const rename = /^#\[serde\(rename = "([^"]+)"\)\]$/.exec(line);
+    if (rename) {
+      pendingRename = rename[1] as string;
+      continue;
+    }
+    if (line.startsWith("#[")) continue;
+    const variant = /^([A-Z][A-Za-z0-9]*),?$/.exec(line);
+    if (!variant) {
+      throw new Error(`pub enum ${name} has a non-unit variant this parser does not read: ${line}`);
+    }
+    const ident = variant[1] as string;
+    names.push(pendingRename ?? ident.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase());
+    pendingRename = null;
+  }
+  if (names.length === 0) throw new Error(`no variants parsed from pub enum ${name}`);
+  return names;
+}

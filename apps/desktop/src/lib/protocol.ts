@@ -264,6 +264,14 @@ export interface SandboxSummary {
    * UNVERIFIED and treat it as live-writable — never blank-as-safe.
    */
   workspaceMode: WorkspaceMode | null;
+  /**
+   * CLIENT-SIDE ONLY (never on the wire): the raw `workspaceMode` string when
+   * Core sent a mode this desktop build does not recognise — a newer Core added
+   * one. `workspaceMode` is then `null`, so every view lands on the UNVERIFIED,
+   * live-writable reading (rule 4) and never on an isolation claim; this field
+   * exists only so the UI can say what Core actually sent.
+   */
+  unrecognizedWorkspaceMode?: string;
 }
 
 export type WorkspaceMode =
@@ -434,7 +442,16 @@ export const TASK_STATUSES: readonly TaskStatus[] = [
 export interface TaskSummary {
   id: string;
   conversationId: string;
-  status: TaskStatus;
+  /**
+   * Core's stored status. `"unknown"` is a CLIENT-SIDE decode result, never a
+   * wire value: Core sent a status this desktop build does not recognise (a
+   * newer Core added one). It is never mapped onto a known state — not terminal,
+   * not running, not reviewable — and the raw string is kept in
+   * `unrecognizedStatus` so the UI can show exactly what Core said.
+   */
+  status: TaskStatus | "unknown";
+  /** CLIENT-SIDE ONLY: Core's raw status string when `status` is `"unknown"`. */
+  unrecognizedStatus?: string;
   sandboxName?: string | null;
   taskBranch?: string | null;
   baseCommit?: string | null;
@@ -455,9 +472,26 @@ export type FileChangeStatus =
   | "renamed"
   | "untracked";
 
+/** `sandpane_protocol::FileChangeStatus`, in declared order (drift-tested). */
+export const FILE_CHANGE_STATUSES: readonly FileChangeStatus[] = [
+  "added",
+  "modified",
+  "deleted",
+  "renamed",
+  "untracked",
+];
+
 export interface FileChange {
   path: string;
-  status: FileChangeStatus;
+  /**
+   * `"unknown"` is a CLIENT-SIDE decode result, never a wire value: Core sent a
+   * file status this build does not recognise. Such a file is listed (with
+   * `unrecognizedStatus`) but is never selectable for apply, and its presence
+   * blocks a whole-set apply that would carry it along implicitly.
+   */
+  status: FileChangeStatus | "unknown";
+  /** CLIENT-SIDE ONLY: Core's raw status string when `status` is `"unknown"`. */
+  unrecognizedStatus?: string;
 }
 
 export interface GitApplyParams {

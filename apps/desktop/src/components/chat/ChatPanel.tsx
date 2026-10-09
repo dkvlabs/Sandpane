@@ -7,7 +7,7 @@ import {
   useSessionConversations,
   useSendMessage,
 } from "../../lib/hooks";
-import { clearSentDraft, foldAgentView, withDraft } from "../../lib/reducers";
+import { clearSentDraft, foldAgentView, taskStatusView, withDraft } from "../../lib/reducers";
 import type { Conversation } from "../../lib/protocol";
 import { ConversationTranscript } from "./ConversationTranscript";
 import { FeatureChip } from "../ui/feature-gate";
@@ -237,8 +237,9 @@ export function ChatPanel({
           {sendIsForSelected && send.isError && <ErrorPanel error={send.error} />}
           {sendIsForSelected && send.isSuccess && (
             <Warning tone="info" title="Task accepted by Core">
-              <Mono>{send.data.id.slice(0, 8)}</Mono> · status <Mono>{send.data.status}</Mono>. The
-              timeline below is the only place progress is reported, from durable events.
+              <Mono>{send.data.id.slice(0, 8)}</Mono> · status{" "}
+              <Mono>{taskStatusView(send.data.status, send.data.unrecognizedStatus).label}</Mono>.
+              The timeline below is the only place progress is reported, from durable events.
             </Warning>
           )}
         </form>

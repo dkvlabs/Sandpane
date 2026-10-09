@@ -6,7 +6,7 @@
  * explicit `unknown`/`unprobed` shape instead of a guess.
  */
 
-import { MAX_HISTORY_BYTES, MAX_LIST_LIMIT } from "./protocol";
+import { MAX_HISTORY_BYTES, MAX_LIST_LIMIT, TASK_STATUSES } from "./protocol";
 import type {
   AgentCapability,
   ApplyResult,
@@ -23,6 +23,7 @@ import type {
   TaskSummary,
   WorkspaceMode,
 } from "./protocol";
+import { UNRECOGNIZED_CORE_CODE } from "./core-client";
 import type { ProbeOutcome, CoreRequestError } from "./core-client";
 
 // ---------------------------------------------------------------------------
@@ -160,12 +161,43 @@ const UNKNOWN_STATUS_VIEW: Omit<StatusView, "status"> = {
   note: "Core reported a status this desktop build does not recognise.",
 };
 
+/**
+ * Membership in the known set — NOT `value in STATUS_VIEWS`, which would accept
+ * prototype keys such as `"constructor"` as a task status.
+ */
 export function isTaskStatus(value: unknown): value is TaskStatus {
-  return typeof value === "string" && value in STATUS_VIEWS;
+  return typeof value === "string" && (TASK_STATUSES as readonly string[]).includes(value);
 }
 
-export function taskStatusView(status: unknown): StatusView {
+/**
+ * Display text for a raw wire value this build does not recognise: one
+ * printable line (control characters stripped, length capped), so a hostile or
+ * garbled value cannot restyle or spoof the surrounding copy.
+ */
+export function displayRaw(raw: string): string {
+  return sanitizeHint(raw) ?? "(unprintable)";
+}
+
+/**
+ * The view for a status. `unrecognized` is Core's raw status string when the
+ * decoder could not map it (`TaskSummary.unrecognizedStatus`): the badge then
+ * says exactly what Core sent and why this build cannot interpret it. It is
+ * never terminal, never running and never reviewable.
+ */
+export function taskStatusView(status: unknown, unrecognized?: string | null): StatusView {
   if (isTaskStatus(status)) return { status, ...STATUS_VIEWS[status] };
+  if (typeof unrecognized === "string") {
+    return {
+      status: "unknown",
+      ...UNKNOWN_STATUS_VIEW,
+      label: `Unknown status (${displayRaw(unrecognized)}) — this Sandpane build is older than Core`,
+      tone: "attention",
+      note:
+        `Core reported "${displayRaw(unrecognized)}", a task status this desktop build does not ` +
+        "know. It is not treated as running, finished or reviewable; update Sandpane Desktop to " +
+        "act on this task here.",
+    };
+  }
   return { status: "unknown", ...UNKNOWN_STATUS_VIEW };
 }
 
@@ -196,6 +228,42 @@ export function describeTaskAction(
     canRetry:
       status === "failed" || status === "cancelled" || status === "interrupted",
   };
+}
+
+/**
+ * Why review/apply must stay disabled for a task, or null when nothing blocks.
+ *
+ * A status this build does not recognise — from Core's task row
+ * (`unrecognizedStatus`) or from a `status.changed` event the fold could not
+ * read (`projection.status === "unknown"`) — means the desktop cannot tell
+ * whether reviewing or applying is meaningful, so it does neither. A projection
+ * with NO status yet (`null`) is not a block: that is "not reported", not
+ * "unrecognised".
+ */
+export function reviewBlockReason(
+  row: { unrecognizedStatus: string | null } | null | undefined,
+  projection:
+    | { status: TaskStatus | "unknown" | null; unrecognizedStatus?: string | null }
+    | null
+    | undefined,
+): string | null {
+  if (row?.unrecognizedStatus != null) {
+    return (
+      `Core reports status "${displayRaw(row.unrecognizedStatus)}" for this task, which this ` +
+      "Sandpane build does not recognise (it is older than Core). Review and apply are disabled " +
+      "here until the desktop is updated; nothing has been applied."
+    );
+  }
+  if (projection?.status === "unknown") {
+    const raw = projection.unrecognizedStatus;
+    return (
+      (typeof raw === "string"
+        ? `Core's event log reports status "${displayRaw(raw)}" for this task, which this Sandpane build does not recognise (it is older than Core). `
+        : "Core's event log reported a status this Sandpane build does not recognise for this task. ") +
+      "Review and apply are disabled here until the desktop is updated; nothing has been applied."
+    );
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -333,8 +401,17 @@ export interface TaskIndexEntry {
   sandboxName: string | null;
   taskBranch: string | null;
   baseCommit: string | null;
+  /**
+   * Core's raw status when this build does not recognise it (`status` is then
+   * `"unknown"`): from the `task.list` row, or from the event log for an
+   * event-only row. Null otherwise.
+   */
+  unrecognizedStatus: string | null;
   /** Set when Core's two reads report different statuses for the same task. */
-  disagreement: { fromEvents: TaskStatus | "unknown"; fromTaskList: TaskStatus } | null;
+  disagreement: {
+    fromEvents: TaskStatus | "unknown";
+    fromTaskList: TaskStatus | "unknown";
+  } | null;
 }
 
 export function foldTaskIndex(
@@ -354,6 +431,7 @@ export function foldTaskIndex(
       sandboxName: task.sandboxName ?? null,
       taskBranch: task.taskBranch ?? null,
       baseCommit: task.baseCommit ?? null,
+      unrecognizedStatus: task.status === "unknown" ? task.unrecognizedStatus ?? null : null,
       disagreement: null,
     });
   }
@@ -372,6 +450,7 @@ export function foldTaskIndex(
         sandboxName: null,
         taskBranch: null,
         baseCommit: null,
+        unrecognizedStatus: projection.unrecognizedStatus,
         disagreement: null,
       });
       continue;
@@ -388,7 +467,7 @@ export function foldTaskIndex(
         status !== existing.status
           ? {
               fromEvents: status,
-              fromTaskList: existing.status as TaskStatus,
+              fromTaskList: existing.status,
             }
           : existing.disagreement,
     });
@@ -524,6 +603,8 @@ export type TimelineEntry =
       sequence: number;
       timestamp: string;
       status: TaskStatus | "unknown";
+      /** Core's raw `to` when this build does not recognise it. */
+      raw?: string;
     }
   | {
       kind: "error";
@@ -548,6 +629,11 @@ export interface TaskProjection {
   lastEventAt: string | null;
   /** Current status as reported by Core (never computed by the UI). */
   status: TaskStatus | "unknown" | null;
+  /**
+   * Core's raw `status.changed.to` when this build does not recognise it
+   * (`status` is then `"unknown"`); cleared by the next recognised status.
+   */
+  unrecognizedStatus: string | null;
   /** Bound by the `task.created` event payload; null until Core says so. */
   conversationId: string | null;
   entries: TimelineEntry[];
@@ -566,6 +652,7 @@ export function emptyProjection(taskId: string): TaskProjection {
     lastSequence: 0,
     lastEventAt: null,
     status: null,
+    unrecognizedStatus: null,
     conversationId: null,
     entries: [],
     changedFiles: [],
@@ -636,11 +723,21 @@ function applyEvent(p: TaskProjection, event: TaskEvent): TaskProjection {
           ? (payload as Record<string, unknown>).to
           : payload;
       const status = isTaskStatus(raw) ? raw : "unknown";
+      // A non-empty string this build does not know is a status a newer Core
+      // added: kept raw, never mapped. A malformed `to` stays plain "unknown".
+      const unrecognized =
+        status === "unknown" && typeof raw === "string" && raw.length > 0 ? raw : null;
       return withSequence(
         p,
         event,
-        { status },
-        { kind: "status", sequence, timestamp, status },
+        { status, unrecognizedStatus: unrecognized },
+        {
+          kind: "status",
+          sequence,
+          timestamp,
+          status,
+          ...(unrecognized === null ? {} : { raw: unrecognized }),
+        },
       );
     }
     case "message.user": {
@@ -1161,8 +1258,26 @@ export const UNVERIFIED_SANDBOX_MODE_VIEW: SandboxModeView = {
     "direct-mounted host tree is writable immediately and silence would promise otherwise.",
 };
 
-export function sandboxModeView(mode: WorkspaceMode | null | undefined): SandboxModeView {
-  if (mode === undefined || mode === null) return UNVERIFIED_SANDBOX_MODE_VIEW;
+/**
+ * `unrecognized` is Core's raw mode string when this build could not read it
+ * (`SandboxSummary.unrecognizedWorkspaceMode`). It gets the SAME unverified,
+ * live-writable view as an absent mode — never an isolation claim — with copy
+ * that names what Core actually recorded instead of saying it recorded nothing.
+ */
+export function sandboxModeView(
+  mode: WorkspaceMode | null | undefined,
+  unrecognized?: string | null,
+): SandboxModeView {
+  if (mode === undefined || mode === null) {
+    if (typeof unrecognized !== "string") return UNVERIFIED_SANDBOX_MODE_VIEW;
+    return {
+      ...UNVERIFIED_SANDBOX_MODE_VIEW,
+      blurb:
+        `Core recorded workspace mode "${displayRaw(unrecognized)}", which this Sandpane build ` +
+        "does not recognise (it is older than Core), so it cannot prove the mount is isolated. " +
+        "It is shown as live-writable — the unsafe reading — until the desktop is updated.",
+    };
+  }
   const view = workspaceModeView(mode);
   return {
     label: view.label,
@@ -1186,7 +1301,10 @@ export function sandboxModeView(mode: WorkspaceMode | null | undefined): Sandbox
  */
 export function taskIsolationView(
   task: Pick<TaskIndexEntry, "sandboxName"> | null | undefined,
-  sandboxes: readonly Pick<SandboxSummary, "name" | "workspaceMode">[],
+  sandboxes: readonly Pick<
+    SandboxSummary,
+    "name" | "workspaceMode" | "unrecognizedWorkspaceMode"
+  >[],
   /** False while `sandbox.list` is loading or failed: absence then proves nothing. */
   sandboxListAvailable = true,
 ): SandboxModeView & { reason: string } {
@@ -1208,12 +1326,14 @@ export function taskIsolationView(
       `Sandbox ${task.sandboxName} is not in Core's sandbox list, so its workspace mode cannot be read.`,
     );
   }
-  const view = sandboxModeView(row.workspaceMode);
+  const view = sandboxModeView(row.workspaceMode, row.unrecognizedWorkspaceMode);
   return {
     ...view,
     reason: view.verified
       ? `Core recorded ${view.label} for this task's sandbox ${row.name}.`
-      : `Core returned no recorded workspace mode for this task's sandbox ${row.name}.`,
+      : typeof row.unrecognizedWorkspaceMode === "string"
+        ? `Core recorded workspace mode "${displayRaw(row.unrecognizedWorkspaceMode)}" for this task's sandbox ${row.name}, which this Sandpane build does not recognise.`
+        : `Core returned no recorded workspace mode for this task's sandbox ${row.name}.`,
   };
 }
 
@@ -1243,7 +1363,10 @@ export function featureGate(
   return { state: "unsupported", note: unsupportedNote };
 }
 
-export function fileChangeLabel(status: FileChangeStatus): string {
+export function fileChangeLabel(
+  status: FileChangeStatus | "unknown",
+  unrecognized?: string | null,
+): string {
   switch (status) {
     case "added":
       return "Added";
@@ -1255,7 +1378,60 @@ export function fileChangeLabel(status: FileChangeStatus): string {
       return "Renamed";
     case "untracked":
       return "Untracked";
+    default:
+      return typeof unrecognized === "string"
+        ? `Unknown status (${displayRaw(unrecognized)})`
+        : "Unknown status";
   }
+}
+
+/**
+ * What an apply would actually send, given the user's selection.
+ *
+ * A file whose status this build does not recognise is never sent: it is
+ * dropped from an explicit selection, and while one is in the change set a
+ * whole-set apply (no `selectedFiles`, which Core reads as "everything") is
+ * blocked, because it would carry that file along implicitly.
+ */
+export interface ApplyPlan {
+  canApply: boolean;
+  /** `undefined` = whole change set (only when every file is recognised). */
+  selectedFiles: string[] | undefined;
+  /** Paths whose status this build cannot read. */
+  unrecognized: string[];
+  blockedReason: string | null;
+}
+
+export function planApply(changeSet: ChangeSet, selected: ReadonlySet<string>): ApplyPlan {
+  const unknownChanges = changeSet.changes.filter((c) => c.status === "unknown");
+  const unrecognized = unknownChanges.map((c) => c.path);
+  const known = new Set(
+    changeSet.changes.filter((c) => c.status !== "unknown").map((c) => c.path),
+  );
+  const selectedFiles = changeSet.changes
+    .map((c) => c.path)
+    .filter((path) => known.has(path) && selected.has(path));
+  if (changeSet.changes.length === 0) {
+    return { canApply: false, selectedFiles: undefined, unrecognized, blockedReason: null };
+  }
+  if (selectedFiles.length > 0) {
+    return { canApply: true, selectedFiles, unrecognized, blockedReason: null };
+  }
+  if (unrecognized.length > 0) {
+    const raws = unknownChanges
+      .map((c) => `${displayRaw(c.path)} (${displayRaw(c.unrecognizedStatus ?? "unknown")})`)
+      .join(", ");
+    return {
+      canApply: false,
+      selectedFiles: undefined,
+      unrecognized,
+      blockedReason:
+        `${unrecognized.length} file(s) have a status this Sandpane build does not recognise: ` +
+        `${raws}. Applying the whole change set would include them, so select the recognised ` +
+        "files to apply explicitly.",
+    };
+  }
+  return { canApply: true, selectedFiles: undefined, unrecognized, blockedReason: null };
 }
 
 /**
@@ -1266,6 +1442,12 @@ export function fileChangeLabel(status: FileChangeStatus): string {
 export function reviewSummary(
   changeSet: ChangeSet | null,
   apply: ApplyResult | null,
+  /**
+   * How many files the apply actually SENT (`selectedFiles.length`); omitted
+   * for a whole-set apply. Never the full change-set length when a selection
+   * or an unrecognised file narrowed what went to Core.
+   */
+  sentFileCount?: number,
 ): { headline: string; detail: string; tone: StatusTone } {
   if (changeSet === null) {
     return {
@@ -1276,9 +1458,13 @@ export function reviewSummary(
     };
   }
   if (apply?.applied) {
+    // A whole-set apply is only ever sent when every file is recognised
+    // (`planApply`), so the recognised count is what Core was asked to apply.
+    const applied =
+      sentFileCount ?? changeSet.changes.filter((c) => c.status !== "unknown").length;
     return {
       headline: "Applied",
-      detail: `Core applied ${changeSet.changes.length} file(s) from ${shortHash(
+      detail: `Core applied ${applied} file(s) from ${shortHash(
         changeSet.baseCommit,
       )}.`,
       tone: "success",
@@ -1294,9 +1480,14 @@ export function reviewSummary(
       tone: "neutral",
     };
   }
+  const unrecognized = changeSet.changes.filter((c) => c.status === "unknown").length;
+  const unrecognizedNote =
+    unrecognized > 0
+      ? ` ${unrecognized} file(s) have a status this build does not recognise and cannot be applied from here.`
+      : "";
   return {
     headline: `${changeSet.changes.length} file(s) changed`,
-    detail: `Base ${shortHash(changeSet.baseCommit)}. Not applied to your working tree.${dirtyWarning}${
+    detail: `Base ${shortHash(changeSet.baseCommit)}. Not applied to your working tree.${dirtyWarning}${unrecognizedNote}${
       apply?.abortReason ? ` Last apply aborted: ${apply.abortReason}.` : ""
     }`,
     tone: changeSet.hostDirty ? "attention" : "info",
@@ -1418,8 +1609,28 @@ const CORE_ERROR_COPY: Record<ErrorCode, Omit<ErrorCopy, "reason">> = {
 };
 
 export function describeCoreError(err: CoreRequestError): ErrorCopy {
+  if (err.isCoreError && err.code === UNRECOGNIZED_CORE_CODE) {
+    // Core answered with a code this build does not know: show Core's verdict
+    // as itself — the raw code and Core's own message — without guessing what
+    // it means or offering reassurance.
+    const details = err.details;
+    const raw =
+      typeof details === "object" && details !== null
+        ? (details as Record<string, unknown>).unrecognizedCode
+        : undefined;
+    return {
+      title: `Core reported ${typeof raw === "string" ? displayRaw(raw) : "an error code"}, which this Sandpane build does not recognise`,
+      reason: err.message,
+      action:
+        "This desktop build is older than Core. Read Core's message above; update Sandpane Desktop for specific guidance, and re-read state before retrying.",
+      tone: "danger",
+      ...coreHints(err),
+    };
+  }
   if (err.isCoreError) {
-    const mapped = CORE_ERROR_COPY[err.code as ErrorCode];
+    const mapped = Object.prototype.hasOwnProperty.call(CORE_ERROR_COPY, err.code)
+      ? CORE_ERROR_COPY[err.code as ErrorCode]
+      : undefined;
     // A code this build does not have copy for is reported as itself; the UI
     // never invents reassurance for a verdict it cannot explain.
     if (mapped === undefined) {

@@ -164,15 +164,15 @@ function SandboxList({
                     sandbox with a probed state but no mode is never shown safe. */}
                 <Badge
                   tone={
-                    sandboxModeView(sandbox.workspaceMode).verified
-                      ? sandboxModeView(sandbox.workspaceMode).liveWritable
+                    sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).verified
+                      ? sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).liveWritable
                         ? "danger"
                         : "neutral"
                       : "attention"
                   }
-                  title={sandboxModeView(sandbox.workspaceMode).blurb}
+                  title={sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).blurb}
                 >
-                  {sandboxModeView(sandbox.workspaceMode).label}
+                  {sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).label}
                 </Badge>
               </span>
             </li>
@@ -286,7 +286,7 @@ export function SandboxDetailView({ route }: { route: Route }) {
   const name = route.params.sandboxName ?? "";
   const sandbox = sandboxes.find((s) => s.name === name) ?? null;
   // Read from Core's binding record for this name — never a guessed default.
-  const mode = sandboxModeView(sandbox?.workspaceMode);
+  const mode = sandboxModeView(sandbox?.workspaceMode, sandbox?.unrecognizedWorkspaceMode);
 
   return (
     <AppShell

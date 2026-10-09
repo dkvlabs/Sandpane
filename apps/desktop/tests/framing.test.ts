@@ -166,9 +166,19 @@ describe("parseResponseFrame", () => {
     expect(() => parseResponseFrame('{"v":1,"ok":1}')).toThrow(MalformedFrameError);
   });
 
-  it("rejects an unknown error code instead of coercing it", () => {
+  it("keeps an unknown error code as Core's verdict, never coerced to a known one", () => {
+    // A newer Core may add a code. It is neither coerced onto a known code nor
+    // turned into a client MALFORMED_FRAME: the raw code and Core's message are
+    // kept (see tests/protocol-tolerance.test.ts).
+    const frame = parseResponseFrame('{"v":1,"id":"x","err":{"code":"WEIRD","message":"m"}}');
+    expect(frame).toEqual({
+      v: 1,
+      id: "x",
+      err: { code: "UNRECOGNIZED_CORE_CODE", message: "m", details: { unrecognizedCode: "WEIRD" } },
+    });
+    // A code of the wrong TYPE is still a malformed frame.
     expect(() =>
-      parseResponseFrame('{"v":1,"id":"x","err":{"code":"WEIRD","message":"m"}}'),
+      parseResponseFrame('{"v":1,"id":"x","err":{"code":7,"message":"m"}}'),
     ).toThrow(MalformedFrameError);
   });
 });

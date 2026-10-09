@@ -11,6 +11,7 @@ import {
 import {
   countTasks,
   describeTaskAction,
+  reviewBlockReason,
   taskBucket,
   taskIsolationView,
   taskStatusView,
@@ -164,7 +165,7 @@ export function TasksView({ route }: { route: Route }) {
             </thead>
             <tbody>
               {shown.map((task) => {
-                const view = taskStatusView(task.status);
+                const view = taskStatusView(task.status, task.unrecognizedStatus);
                 const actions = describeTaskAction(
                   task.status === "unknown" ? undefined : task.status,
                 );
@@ -195,7 +196,7 @@ export function TasksView({ route }: { route: Route }) {
                       {task.disagreement !== null && (
                         <Badge tone="attention" title={
                           `Core's event log last said ${taskStatusView(task.disagreement.fromEvents).label} ` +
-                          `while its task row says ${taskStatusView(task.disagreement.fromTaskList).label}. ` +
+                          `while its task row says ${taskStatusView(task.disagreement.fromTaskList, task.unrecognizedStatus).label}. ` +
                           "The desktop reports both; it never decides which one is current."
                         }>
                           reads differ
@@ -210,7 +211,11 @@ export function TasksView({ route }: { route: Route }) {
                         Open
                       </Button>
                       {!actions.canCancel && (
-                        <span className="muted"> cancel n/a </span>
+                        <span className="muted">
+                          {task.unrecognizedStatus !== null
+                            ? " actions disabled: status not recognised by this build "
+                            : " cancel n/a "}
+                        </span>
                       )}
                     </td>
                   </tr>
@@ -243,6 +248,15 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
   const actions = describeTaskAction(
     projection?.status === "unknown" ? undefined : projection?.status,
   );
+  // An unrecognised status (Core's row or its event log) blocks review/apply,
+  // and must not be described as terminal: this build cannot tell what it is.
+  const blockedReason = reviewBlockReason(row, projection);
+  const cancelUnavailableCopy =
+    projection?.status === "unknown" || row?.unrecognizedStatus != null
+      ? "Core reported a status this Sandpane build does not recognise, so it cannot tell whether cancelling applies. Cancel is disabled here until the desktop is updated."
+      : projection === null || projection.status === null
+        ? "No status has been reported for this task in this window yet, so there is nothing to cancel from here."
+        : "This task is already in a terminal or review state; cancelling would change nothing.";
 
   return (
     <div className="grid grid--workspace">
@@ -258,11 +272,7 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
             >
               Cancel task
             </Button>
-            {!actions.canCancel && (
-              <span className="muted">
-                This task is already in a terminal or review state; cancelling would change nothing.
-              </span>
-            )}
+            {!actions.canCancel && <span className="muted">{cancelUnavailableCopy}</span>}
           </div>
           <ConfirmDialog
             open={confirmOpen}
@@ -295,7 +305,7 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
           )}
         </Panel>
       </div>
-      <ReviewPanel taskId={taskId} isolation={isolation} />
+      <ReviewPanel taskId={taskId} isolation={isolation} blockedReason={blockedReason} />
     </div>
   );
 }

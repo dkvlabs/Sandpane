@@ -34,12 +34,9 @@ import {
 } from "./conversation-store";
 import {
   decodeApplyResult,
-  decodeChangeSet,
   decodeConversation,
   decodeProject,
   decodeProjects,
-  decodeSandboxSummaries,
-  decodeTaskSummary,
 } from "./decode";
 import {
   foldCoreLink,
@@ -188,7 +185,7 @@ export function useSandboxes(): {
   const deps = useDeps();
   const query = useQuery<SandboxSummary[]>({
     queryKey: queryKeys.sandboxes,
-    queryFn: async () => decodeSandboxSummaries(await deps.client.listSandboxes()),
+    queryFn: () => deps.client.listSandboxSummaries(),
     enabled: deps.transportAvailable,
     staleTime: 5_000,
   });
@@ -519,14 +516,14 @@ export function useSendMessage() {
     CoreRequestError,
     { conversationId: string; content: string }
   >({
-    mutationFn: async ({ conversationId, content }) =>
-      decodeTaskSummary(
-        await deps.client.sendMessage({
-          conversationId,
-          content,
-          attachments: [],
-        }),
-      ),
+    // Decoded by the client: a status this build does not recognise is still
+    // an ACCEPTED send (Core applied it), never reported as a failure.
+    mutationFn: ({ conversationId, content }) =>
+      deps.client.sendConversationMessage({
+        conversationId,
+        content,
+        attachments: [],
+      }),
     onSettled: (_data, _error, variables) => {
       // Settled, not just success: a lost answer may still have been stored.
       void qc.invalidateQueries({ queryKey: queryKeys.history(variables.conversationId) });
@@ -546,7 +543,7 @@ export function useTaskReview(taskId: string | null, enabled: boolean) {
   const deps = useDeps();
   const query = useQuery<ChangeSet>({
     queryKey: ["core", "git", "review", taskId ?? ""],
-    queryFn: async () => decodeChangeSet(await deps.client.reviewTask(taskId ?? "")),
+    queryFn: () => deps.client.reviewChangeSet(taskId ?? ""),
     enabled: enabled && taskId !== null && deps.transportAvailable,
     staleTime: 10_000,
   });

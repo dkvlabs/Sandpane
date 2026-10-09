@@ -21,10 +21,13 @@ import {
   type ConversationHistoryParams,
   type ConversationHistoryResult,
   type ConversationListParams,
+  type ChangeSet,
+  type ConversationSendParams,
   type CoreCapabilities,
   type ErrorCode,
   type Method,
-  type RpcResponseFrame,
+  type RpcOkFrame,
+  type SandboxSummary,
   type TaskEvent,
   type TaskListParams,
   type TaskSubscribeParams,
@@ -32,11 +35,14 @@ import {
 } from "./protocol";
 import { FrameTooLargeError, MalformedFrameError, encodeFrame } from "./framing";
 import {
+  decodeChangeSet,
   decodeConversationHistory,
   decodeConversations,
   decodeCoreCapabilities,
+  decodeSandboxSummaries,
   decodeTaskEvents,
   decodeTaskSummaries,
+  decodeTaskSummary,
 } from "./decode";
 import {
   CoreValidationError,
@@ -81,6 +87,30 @@ export type ClientErrorCode =
 export type ErrorSource = "core" | "client";
 
 /**
+ * Display code for a Core `err` frame whose `code` this desktop build does not
+ * recognise (a newer Core added one). It is NOT a protocol `ErrorCode` and is
+ * never written to the wire: the error stays `source: "core"`, Core's own
+ * message is kept verbatim, and the raw code travels in
+ * `details.unrecognizedCode`. Replacing it with a client `MALFORMED_FRAME`
+ * would hide Core's real verdict; reusing `INTERNAL` would claim one Core
+ * never made.
+ */
+export const UNRECOGNIZED_CORE_CODE = "UNRECOGNIZED_CORE_CODE" as const;
+export type UnrecognizedCoreCode = typeof UNRECOGNIZED_CORE_CODE;
+
+/** A Core `err` payload as this client parsed it (code may be unrecognised). */
+export interface ParsedErrPayload {
+  code: ErrorCode | UnrecognizedCoreCode;
+  message: string;
+  details?: unknown;
+}
+
+/** A response envelope after `parseResponseFrame`. */
+export type ParsedResponseFrame =
+  | RpcOkFrame
+  | { v: number; id: string; ok?: never; err: ParsedErrPayload };
+
+/**
  * One error type for both failure planes: `source: "core"` carries a structured
  * protocol `ErrorCode`, `source: "client"` a transport/framing failure. UI copy
  * must show which plane failed — "Core is not running" is not "SBX is missing".
@@ -88,7 +118,7 @@ export type ErrorSource = "core" | "client";
 export class CoreRequestError extends Error {
   constructor(
     readonly source: ErrorSource,
-    readonly code: ErrorCode | ClientErrorCode,
+    readonly code: ErrorCode | ClientErrorCode | UnrecognizedCoreCode,
     message: string,
     readonly details?: unknown,
   ) {
@@ -224,8 +254,9 @@ function proxyFailure(method: Method, err: unknown): CoreRequestError {
   );
 }
 
+/** The protocol `ErrorCode` of a Core verdict; `null` for client or unrecognised codes. */
 export function coreErrorCode(err: unknown): ErrorCode | null {
-  return err instanceof CoreRequestError && err.isCoreError
+  return err instanceof CoreRequestError && err.isCoreError && isErrorCode(err.code)
     ? (err.code as ErrorCode)
     : null;
 }
@@ -248,7 +279,7 @@ export type ProbeOutcome =
 
 /** Correlates a pending request with its eventual response frame. */
 interface Pending {
-  resolve: (frame: RpcResponseFrame) => void;
+  resolve: (frame: ParsedResponseFrame) => void;
   reject: (err: CoreRequestError) => void;
   timer: ReturnType<typeof setTimeout> | null;
   method: Method;
@@ -338,7 +369,7 @@ export class CoreClient {
       throw err;
     }
 
-    const response = await new Promise<RpcResponseFrame>((resolve, reject) => {
+    const response = await new Promise<ParsedResponseFrame>((resolve, reject) => {
       const timeoutMs = this.timeoutFor(method);
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -410,6 +441,26 @@ export class CoreClient {
 
   sendMessage(params: unknown) {
     return this.request("conversation.send", params);
+  }
+
+  /**
+   * `conversation.send`, decoded. Core has APPLIED the send once it answers
+   * `ok`, so the returned `TaskSummary` must decode even when its status is one
+   * this build does not recognise — failing here would report an accepted task
+   * as failed and invite a duplicate send.
+   */
+  async sendConversationMessage(params: ConversationSendParams): Promise<TaskSummary> {
+    return decodeTaskSummary(await this.request("conversation.send", params));
+  }
+
+  /** `sandbox.list`, decoded (an unrecognised workspace mode reads as UNVERIFIED). */
+  async listSandboxSummaries(): Promise<SandboxSummary[]> {
+    return decodeSandboxSummaries(await this.request("sandbox.list", {}));
+  }
+
+  /** `git.review`, decoded (an unrecognised file status is listed, never applied). */
+  async reviewChangeSet(taskId: string): Promise<ChangeSet> {
+    return decodeChangeSet(await this.request("git.review", { taskId }));
   }
 
   cancelTask(taskId: string) {
@@ -521,7 +572,7 @@ export class CoreClient {
   }
 
   private handleLine(line: string): void {
-    let frame: RpcResponseFrame;
+    let frame: ParsedResponseFrame;
     try {
       frame = parseResponseFrame(line);
     } catch (err) {
@@ -590,8 +641,15 @@ export function timeoutError(method: Method, timeoutMs: number): CoreRequestErro
   );
 }
 
-/** Parse a Core response envelope. Kept here so `framing.ts` stays dependency-light. */
-export function parseResponseFrame(line: string): RpcResponseFrame {
+/**
+ * Parse a Core response envelope. Kept here so `framing.ts` stays dependency-light.
+ *
+ * An `err` frame with a well-formed but UNRECOGNISED code (a newer Core) is
+ * kept as Core's verdict under `UNRECOGNIZED_CORE_CODE` — message verbatim, raw
+ * code in `details.unrecognizedCode` — instead of failing as a malformed frame.
+ * A non-string or empty code, or a non-string message, is still malformed.
+ */
+export function parseResponseFrame(line: string): ParsedResponseFrame {
   let value: unknown;
   try {
     value = JSON.parse(line);
@@ -619,22 +677,43 @@ export function parseResponseFrame(line: string): RpcResponseFrame {
     throw new MalformedFrameError("err payload must be an object");
   }
   const e = errValue as Record<string, unknown>;
-  if (
-    typeof e.code !== "string" ||
-    typeof e.message !== "string" ||
-    !isErrorCode(e.code)
-  ) {
-    throw new MalformedFrameError("err payload needs a known code and string message");
+  if (typeof e.code !== "string" || e.code.length === 0 || typeof e.message !== "string") {
+    throw new MalformedFrameError("err payload needs a non-empty string code and string message");
+  }
+  if (isErrorCode(e.code)) {
+    return {
+      v: rec.v,
+      id: rec.id,
+      err: {
+        code: e.code as ErrorCode,
+        message: e.message,
+        ...(e.details === undefined ? {} : { details: e.details }),
+      },
+    };
   }
   return {
     v: rec.v,
     id: rec.id,
     err: {
-      code: e.code as ErrorCode,
+      code: UNRECOGNIZED_CORE_CODE,
       message: e.message,
-      ...(e.details === undefined ? {} : { details: e.details }),
+      details: unrecognizedCodeDetails(e.code, e.details),
     },
   };
+}
+
+/**
+ * Keep Core's own `details` next to the raw code. An object is spread (so
+ * `hint`/`provider` stay where `describeCoreError` reads them) with
+ * `unrecognizedCode` added; any other present value is nested as `coreDetails`.
+ */
+function unrecognizedCodeDetails(code: string, details: unknown): Record<string, unknown> {
+  if (typeof details === "object" && details !== null && !Array.isArray(details)) {
+    return { ...(details as Record<string, unknown>), unrecognizedCode: code };
+  }
+  return details === undefined
+    ? { unrecognizedCode: code }
+    : { unrecognizedCode: code, coreDetails: details };
 }
 
 function extractFrameId(line: string): string | null {

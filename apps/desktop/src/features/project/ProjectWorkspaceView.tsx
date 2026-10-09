@@ -12,6 +12,7 @@ import {
   describeTaskAction,
   foldSbxView,
   resolveSelection,
+  reviewBlockReason,
   sandboxModeView,
   taskIsolationView,
   taskStatusView,
@@ -92,7 +93,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
           blurb:
             "No sandbox is focused, so this workspace claims no mount: nothing is being written to your tree through Core from this view.",
         }
-      : sandboxModeView(focusedRow.workspaceMode);
+      : sandboxModeView(focusedRow.workspaceMode, focusedRow.unrecognizedWorkspaceMode);
   // Review's live-writable disclosure comes from the SELECTED TASK's own
   // sandbox, not the focused one: they can differ, and unknown is UNVERIFIED.
   const taskIsolation = taskIsolationView(
@@ -184,6 +185,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
             bound: s.boundProjectId === projectId,
             state: s.probedState,
             mode: s.workspaceMode,
+            unrecognizedMode: s.unrecognizedWorkspaceMode ?? null,
           }))}
           focused={activeSandbox}
           onFocus={setFocusedSandbox}
@@ -229,8 +231,11 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
                         <Mono>{task.taskId.slice(0, 8)}</Mono>
                       </span>
                       <span className="row__meta">
-                        <Badge tone={taskStatusView(task.status).tone}>
-                          {taskStatusView(task.status).label}
+                        <Badge
+                          tone={taskStatusView(task.status, task.unrecognizedStatus).tone}
+                          title={taskStatusView(task.status, task.unrecognizedStatus).note}
+                        >
+                          {taskStatusView(task.status, task.unrecognizedStatus).label}
                         </Badge>
                         {task.conversationId === null
                           ? " · conversation unknown"
@@ -256,7 +261,11 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
           )}
         </div>
         <div>
-          <ReviewPanel taskId={selectedTask} isolation={taskIsolation} />
+          <ReviewPanel
+            taskId={selectedTask}
+            isolation={taskIsolation}
+            blockedReason={reviewBlockReason(selectedRow, projection)}
+          />
           {selectedTask !== null && (
             <Panel title="Task actions">
               <div className="row-actions">
@@ -316,6 +325,7 @@ function SandboxPicker({
     bound: boolean;
     state: string | null;
     mode: WorkspaceMode | null;
+    unrecognizedMode: string | null;
   }[];
   focused: string | null;
   onFocus: (name: string) => void;
@@ -345,8 +355,11 @@ function SandboxPicker({
               </span>
               <span className="row__meta">
                 {sandbox.state ?? "state not probed"} ·{" "}
-                <Badge tone={sandboxModeView(sandbox.mode).verified ? (sandboxModeView(sandbox.mode).liveWritable ? "danger" : "neutral") : "attention"}>
-                  {sandboxModeView(sandbox.mode).label}
+                <Badge
+                  tone={sandboxModeView(sandbox.mode, sandbox.unrecognizedMode).verified ? (sandboxModeView(sandbox.mode, sandbox.unrecognizedMode).liveWritable ? "danger" : "neutral") : "attention"}
+                  title={sandboxModeView(sandbox.mode, sandbox.unrecognizedMode).blurb}
+                >
+                  {sandboxModeView(sandbox.mode, sandbox.unrecognizedMode).label}
                 </Badge>
                 <Button variant="ghost" onClick={() => onFocus(sandbox.name)}>
                   Focus

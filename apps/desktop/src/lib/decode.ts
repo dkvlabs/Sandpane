@@ -5,12 +5,20 @@
  * every view goes through these guards instead of casting. A payload that does
  * not match the documented shape raises `MalformedFrameError` — the client never
  * substitutes invented defaults for missing Core data.
+ *
+ * Forward compatibility (additive Core enums): a STRING enum value this build
+ * does not recognise — a new task status, file-change status or workspace mode
+ * from a newer Core — does not fail the whole call. It decodes to the explicit
+ * `"unknown"` variant (or `null` for a workspace mode, the unverified reading)
+ * with the raw value kept beside it, and is never mapped onto a known state.
+ * A value of the wrong TYPE, or a missing required field, is still malformed.
  */
 
 import {
   AGENT_EVENT_TYPES,
   CORE_EVENT_KINDS,
   ERROR_CODES,
+  FILE_CHANGE_STATUSES,
   TASK_STATUSES,
   WORKSPACE_MODES,
   type AgentEvent,
@@ -22,6 +30,7 @@ import {
   type CoreCapabilities,
   type ErrorCode,
   type FileChange,
+  type FileChangeStatus,
   type MessageRecord,
   type Project,
   type SandboxSummary,
@@ -91,17 +100,23 @@ function arr(rec: Rec, key: string, what: string): unknown[] {
   return v;
 }
 
-function pickEnum<T extends string>(
-  rec: Rec,
-  key: string,
+/**
+ * A string enum field that tolerates values added by a newer Core.
+ *
+ * Returns the known value, or `{ value: "unknown", raw }` for a non-empty
+ * string this build does not recognise. A non-string, missing or empty value is
+ * still a malformed frame: tolerance covers additive VALUES, not broken shapes.
+ */
+function tolerantEnum<T extends string>(
+  value: unknown,
   what: string,
   allowed: readonly T[],
-): T {
-  const v = str(rec, key, what);
-  if (!(allowed as readonly string[]).includes(v)) {
-    throw new MalformedFrameError(`${what}.${key} has unknown value "${v}"`);
+): { value: T } | { value: "unknown"; raw: string } {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new MalformedFrameError(`${what} must be a non-empty string`);
   }
-  return v as T;
+  if ((allowed as readonly string[]).includes(value)) return { value: value as T };
+  return { value: "unknown", raw: value };
 }
 
 /**
@@ -135,6 +150,11 @@ export function decodeErrorCode(value: unknown): ErrorCode {
   return value as ErrorCode;
 }
 
+/**
+ * STRICT check: is `value` a status this build knows? Payload decoders use the
+ * tolerant path (`decodeTaskSummary`) instead, so an additive status from a
+ * newer Core never fails a whole `task.list` / `conversation.send`.
+ */
 export function decodeTaskStatus(value: unknown): TaskStatus {
   if (
     typeof value !== "string" ||
@@ -145,6 +165,7 @@ export function decodeTaskStatus(value: unknown): TaskStatus {
   return value as TaskStatus;
 }
 
+/** STRICT check; `decodeSandboxSummaries` uses the tolerant path. */
 export function decodeWorkspaceMode(value: unknown): WorkspaceMode {
   if (
     typeof value !== "string" ||
@@ -224,16 +245,22 @@ export function decodeSandboxSummaries(value: unknown): SandboxSummary[] {
     const s = asRecord(item, "SandboxSummary");
     // `workspaceMode` is additive and optional: absent/null means Core has no
     // readable binding row, which the UI must render as UNVERIFIED (and treat as
-    // live-writable), never as safe. A PRESENT value must be one of Core's four
-    // modes — an unreadable string is a malformed frame, not a guess.
+    // live-writable), never as safe. A PRESENT string this build does not know
+    // (a mode a newer Core added) decodes to the SAME unverified reading —
+    // `null` — with the raw value kept so the UI can name it; it is never
+    // guessed into one of the four known modes, and never into an isolated one.
+    // A present value of the wrong type is still a malformed frame.
     const rawMode = s.workspaceMode;
-    const workspaceMode =
-      rawMode === undefined || rawMode === null ? null : decodeWorkspaceMode(rawMode);
+    const mode =
+      rawMode === undefined || rawMode === null
+        ? null
+        : tolerantEnum(rawMode, "SandboxSummary.workspaceMode", WORKSPACE_MODES);
     return {
       name: str(s, "name", "SandboxSummary"),
       probedState: optStr(s, "probedState", "SandboxSummary"),
       boundProjectId: optStr(s, "boundProjectId", "SandboxSummary"),
-      workspaceMode,
+      workspaceMode: mode === null || mode.value === "unknown" ? null : mode.value,
+      ...(mode !== null && "raw" in mode ? { unrecognizedWorkspaceMode: mode.raw } : {}),
     };
   });
 }
@@ -299,10 +326,14 @@ export function decodeConversation(value: unknown): Conversation {
 
 export function decodeTaskSummary(value: unknown): TaskSummary {
   const t = asRecord(value, "TaskSummary");
+  // An additive status from a newer Core keeps its raw value and is NEVER
+  // mapped onto a known state; see `TaskSummary.status`.
+  const status = tolerantEnum(t.status, "TaskSummary.status", TASK_STATUSES);
   return {
     id: str(t, "id", "TaskSummary"),
     conversationId: str(t, "conversationId", "TaskSummary"),
-    status: decodeTaskStatus(t.status),
+    status: status.value,
+    ...("raw" in status ? { unrecognizedStatus: status.raw } : {}),
     sandboxName: optStr(t, "sandboxName", "TaskSummary"),
     taskBranch: optStr(t, "taskBranch", "TaskSummary"),
     baseCommit: optStr(t, "baseCommit", "TaskSummary"),
@@ -333,15 +364,18 @@ export function decodeChangeSet(value: unknown): ChangeSet {
   const c = asRecord(value, "ChangeSet");
   const changes: FileChange[] = arr(c, "changes", "ChangeSet").map((item) => {
     const f = asRecord(item, "FileChange");
+    const path = str(f, "path", "FileChange");
+    // One unrecognised status must not hide the rest of the review; that file
+    // stays listed with its raw status and is never selectable for apply.
+    const status = tolerantEnum<FileChangeStatus>(
+      f.status,
+      "FileChange.status",
+      FILE_CHANGE_STATUSES,
+    );
     return {
-      path: str(f, "path", "FileChange"),
-      status: pickEnum(f, "status", "FileChange", [
-        "added",
-        "modified",
-        "deleted",
-        "renamed",
-        "untracked",
-      ] as const),
+      path,
+      status: status.value,
+      ...("raw" in status ? { unrecognizedStatus: status.raw } : {}),
     };
   });
   return {

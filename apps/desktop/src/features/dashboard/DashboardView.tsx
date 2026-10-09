@@ -295,7 +295,7 @@ function ActivityRow({ entry, taskId }: { entry: TimelineEntry; taskId: string }
 function describeEntry(entry: TimelineEntry): string {
   switch (entry.kind) {
     case "status":
-      return taskStatusView(entry.status).label;
+      return taskStatusView(entry.status, entry.raw).label;
     case "error":
       return entry.code ? `${entry.code}: ${entry.message}` : entry.message;
     case "tool":

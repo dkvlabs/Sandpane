@@ -31,15 +31,17 @@ export function ActivityTimeline({
     <div className="timeline">
       <div className="timeline__head">
         <span className="timeline__title">Agent activity</span>
-        <Badge tone={taskStatusView(projection.status).tone}>
-          {taskStatusView(projection.status).label}
+        <Badge tone={taskStatusView(projection.status, projection.unrecognizedStatus).tone}>
+          {taskStatusView(projection.status, projection.unrecognizedStatus).label}
         </Badge>
         <span className="timeline__meta">
           sequence {projection.lastSequence} · {projection.entries.length} event(s)
         </span>
       </div>
 
-      <p className="timeline__note">{taskStatusView(projection.status).note}</p>
+      <p className="timeline__note">
+        {taskStatusView(projection.status, projection.unrecognizedStatus).note}
+      </p>
 
       {projection.replayGap !== null && (
         <Warning
@@ -106,7 +108,7 @@ function TimelineRow({ entry }: { entry: TimelineEntry }) {
         </li>
       );
     case "status": {
-      const view = taskStatusView(entry.status);
+      const view = taskStatusView(entry.status, entry.raw);
       return (
         <li className="timeline__row timeline__row--status">
           <Badge tone={view.tone}>{view.label}</Badge>
@@ -198,7 +200,7 @@ function ToolDisclosure({
 
 export function TaskHeader({ projection }: { projection: TaskProjection | null }) {
   if (projection === null) return null;
-  const view = taskStatusView(projection.status);
+  const view = taskStatusView(projection.status, projection.unrecognizedStatus);
   return (
     <Panel title={<Mono>{projection.taskId}</Mono>} tone={view.tone}>
       <div className="badges">

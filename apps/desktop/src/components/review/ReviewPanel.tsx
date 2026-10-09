@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { useApplyChanges, useTaskReview } from "../../lib/hooks";
 import {
+  displayRaw,
   fileChangeLabel,
+  planApply,
   reviewSummary,
   type SandboxModeView,
 } from "../../lib/reducers";
@@ -24,10 +26,16 @@ import { ErrorPanel } from "../../features/projects/ProjectsView";
  * text method yet, so the panel says so instead of rendering invented hunks,
  * and apply is always an explicit, confirmed Git operation against a recorded
  * base commit.
+ *
+ * Forward compatibility: a file whose status this build does not recognise is
+ * listed with Core's raw status but cannot be selected, and its presence blocks
+ * a whole-set apply (`planApply`). A task whose own status is unrecognised gets
+ * `blockedReason`, which disables both review and apply.
  */
 export function ReviewPanel({
   taskId,
   isolation,
+  blockedReason = null,
 }: {
   taskId: string | null;
   /**
@@ -35,6 +43,8 @@ export function ReviewPanel({
    * focused sandbox's. Unknown is UNVERIFIED and treated as live-writable.
    */
   isolation: SandboxModeView & { reason: string };
+  /** Non-null when review/apply must stay disabled (`reviewBlockReason`). */
+  blockedReason?: string | null;
 }) {
   if (taskId === null) {
     return (
@@ -47,24 +57,41 @@ export function ReviewPanel({
   // Keyed by task: selection, the "review requested" flag, the confirm dialog
   // and the last apply result belong to ONE task and must never carry over
   // (a stale "Applied" or another task's selected files would be a lie).
-  return <ReviewPanelBody key={taskId} taskId={taskId} isolation={isolation} />;
+  return (
+    <ReviewPanelBody
+      key={taskId}
+      taskId={taskId}
+      isolation={isolation}
+      blockedReason={blockedReason}
+    />
+  );
 }
 
 function ReviewPanelBody({
   taskId,
   isolation,
+  blockedReason,
 }: {
   taskId: string;
   isolation: SandboxModeView & { reason: string };
+  blockedReason: string | null;
 }) {
   const [requested, setRequested] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const { changeSet, isLoading, error, refetch } = useTaskReview(taskId, requested);
+  const blocked = blockedReason !== null;
+  const { changeSet, isLoading, error, refetch } = useTaskReview(taskId, requested && !blocked);
   const apply = useApplyChanges();
 
-  const summary = reviewSummary(changeSet, apply.data ?? null);
-  const selectedFiles = [...selected];
+  const summary = reviewSummary(
+    changeSet,
+    apply.data ?? null,
+    apply.variables?.selectedFiles?.length ?? undefined,
+  );
+  // What would actually be sent: unrecognised files are never included, and a
+  // whole-set apply is refused while one is in the set.
+  const plan = changeSet === null ? null : planApply(changeSet, selected);
+  const selectedFiles = plan?.selectedFiles ?? [];
 
   return (
     <Panel
@@ -72,10 +99,10 @@ function ReviewPanelBody({
       description={`Task ${taskId.slice(0, 8)} · git.review reads the ACTUAL change set versus the recorded base commit.`}
       actions={
         <>
-          <Button onClick={() => setRequested(true)} disabled={isLoading}>
+          <Button onClick={() => setRequested(true)} disabled={isLoading || blocked}>
             Review changes
           </Button>
-          {changeSet !== null && <Button variant="ghost" onClick={refetch}>
+          {changeSet !== null && !blocked && <Button variant="ghost" onClick={refetch}>
             Re-read
           </Button>}
         </>
@@ -94,10 +121,16 @@ function ReviewPanelBody({
           </Warning>
         ))}
 
-      {isLoading && <p className="muted">Reading the change set from Core…</p>}
+      {blocked && (
+        <Warning tone="attention" title="Review and apply are disabled for this task">
+          {blockedReason}
+        </Warning>
+      )}
+
+      {isLoading && !blocked && <p className="muted">Reading the change set from Core…</p>}
       {error !== null && <ErrorPanel error={error} />}
 
-      {changeSet !== null && (
+      {changeSet !== null && plan !== null && !blocked && (
         <>
           <div className="review__summary">
             <Badge tone={summary.tone}>{summary.headline}</Badge>
@@ -125,10 +158,18 @@ function ReviewPanelBody({
             <ul className="list list--files">
               {changeSet.changes.map((change) => (
                 <li key={change.path} className="row">
-                  <label className="row__check">
+                  <label
+                    className="row__check"
+                    title={
+                      change.status === "unknown"
+                        ? `Core reported status "${displayRaw(change.unrecognizedStatus ?? "unknown")}", which this build does not recognise; it cannot be applied from here.`
+                        : undefined
+                    }
+                  >
                     <input
                       type="checkbox"
-                      checked={selected.has(change.path)}
+                      disabled={change.status === "unknown"}
+                      checked={change.status !== "unknown" && selected.has(change.path)}
                       onChange={(event) => {
                         const next = new Set(selected);
                         if (event.target.checked) next.add(change.path);
@@ -138,8 +179,16 @@ function ReviewPanelBody({
                     />
                     <Mono>{change.path}</Mono>
                   </label>
-                  <Badge tone={change.status === "deleted" ? "danger" : "neutral"}>
-                    {fileChangeLabel(change.status)}
+                  <Badge
+                    tone={
+                      change.status === "deleted"
+                        ? "danger"
+                        : change.status === "unknown"
+                          ? "attention"
+                          : "neutral"
+                    }
+                  >
+                    {fileChangeLabel(change.status, change.unrecognizedStatus)}
                   </Badge>
                 </li>
               ))}
@@ -155,15 +204,17 @@ function ReviewPanelBody({
           <div className="row-actions">
             <Button
               variant="primary"
-              disabled={changeSet.changes.length === 0 || apply.isPending}
+              disabled={!plan.canApply || apply.isPending}
               onClick={() => setConfirmOpen(true)}
             >
               Apply selected changes
             </Button>
             <span className="muted">
-              {selectedFiles.length === 0
-                ? "Nothing selected — Core would apply the whole change set."
-                : `${selectedFiles.length} file(s) selected.`}
+              {plan.blockedReason !== null
+                ? plan.blockedReason
+                : plan.selectedFiles === undefined
+                  ? "Nothing selected — Core would apply the whole change set."
+                  : `${plan.selectedFiles.length} file(s) selected.`}
             </span>
           </div>
 
@@ -175,10 +226,13 @@ function ReviewPanelBody({
             onCancel={() => setConfirmOpen(false)}
             onConfirm={() => {
               setConfirmOpen(false);
+              // Re-derived at confirm time from the same plan the dialog shows;
+              // never a whole-set apply while an unrecognised file is present.
+              if (!plan.canApply) return;
               apply.mutate({
                 taskId,
                 expectedBase: changeSet.baseCommit,
-                ...(selectedFiles.length > 0 ? { selectedFiles } : {}),
+                ...(plan.selectedFiles !== undefined ? { selectedFiles: plan.selectedFiles } : {}),
               });
             }}
             consequence={
@@ -195,10 +249,16 @@ function ReviewPanelBody({
                   </p>
                 )}
                 <p>
-                  {selectedFiles.length === 0
+                  {plan.selectedFiles === undefined
                     ? `All ${changeSet.changes.length} file(s) in the change set.`
                     : `Selected: ${selectedFiles.join(", ")}`}
                 </p>
+                {plan.unrecognized.length > 0 && (
+                  <p>
+                    Not included: {plan.unrecognized.length} file(s) whose status this build does
+                    not recognise.
+                  </p>
+                )}
               </>
             }
           />

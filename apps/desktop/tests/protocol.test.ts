@@ -184,10 +184,18 @@ describe("payload decoders", () => {
     expect(summary.sandboxName).toBeNull();
   });
 
-  it("rejects an unknown task status instead of mapping it", () => {
-    expect(() => decodeTaskSummary({ id: "t", conversationId: "c", status: "paused" })).toThrow(
+  it("keeps an unknown task status raw instead of mapping it", () => {
+    // Never mapped to a known state (no fictitious pause); kept as "unknown" with
+    // Core's raw value so the whole call does not fail on an additive status.
+    expect(decodeTaskSummary({ id: "t", conversationId: "c", status: "paused" })).toMatchObject({
+      status: "unknown",
+      unrecognizedStatus: "paused",
+    });
+    expect(() => decodeTaskSummary({ id: "t", conversationId: "c", status: 3 })).toThrow(
       MalformedFrameError,
     );
+    // The STRICT validators still refuse unknown values.
+    expect(() => decodeTaskStatus("paused")).toThrow(MalformedFrameError);
     expect(decodeTaskStatus("awaiting_review")).toBe("awaiting_review");
     expect(() => decodeWorkspaceMode("bind_mount")).toThrow(MalformedFrameError);
     expect(() => decodeErrorCode("SOMETHING_WEIRD")).toThrow(MalformedFrameError);
@@ -223,14 +231,15 @@ describe("payload decoders", () => {
     });
     expect(changeSet.hostDirty).toBe(true);
     expect(changeSet.changes[0]?.status).toBe("modified");
-    expect(() =>
+    // An additive status is listed with its raw value, not refused wholesale.
+    expect(
       decodeChangeSet({
         taskId: "t",
         baseCommit: "b",
         hostDirty: false,
         changes: [{ path: "p", status: "force_pushed" }],
-      }),
-    ).toThrow(/unknown value/);
+      }).changes[0],
+    ).toEqual({ path: "p", status: "unknown", unrecognizedStatus: "force_pushed" });
   });
 
   it("decodes an aborted apply with its reason", () => {
@@ -333,7 +342,7 @@ describe("additive fields deserialize from a pre-revision wire AND the new one",
     expect(after[0]?.repositories?.[0]).toBe("/repos/atlas");
   });
 
-  it("SandboxSummary.workspaceMode: absent is null (unverified), unknown is refused", () => {
+  it("SandboxSummary.workspaceMode: absent is null (unverified), unknown is unverified too", () => {
     const rows = decodeSandboxSummaries([
       { name: "no-row", probedState: "running", boundProjectId: null },
       {
@@ -352,9 +361,16 @@ describe("additive fields deserialize from a pre-revision wire AND the new one",
     expect(rows[0]?.workspaceMode).toBeNull();
     expect(rows[1]?.workspaceMode).toBe("direct_mount");
     expect(rows[2]?.workspaceMode).toBe("sbx_clone");
+    // An unrecognised mode lands on the SAME unverified reading (null), never on
+    // a guessed known mode; the raw value is kept for the copy.
+    const unknown = decodeSandboxSummaries([
+      { name: "x", probedState: null, boundProjectId: null, workspaceMode: "bind_mount" },
+    ]);
+    expect(unknown[0]?.workspaceMode).toBeNull();
+    expect(unknown[0]?.unrecognizedWorkspaceMode).toBe("bind_mount");
     expect(() =>
       decodeSandboxSummaries([
-        { name: "x", probedState: null, boundProjectId: null, workspaceMode: "bind_mount" },
+        { name: "x", probedState: null, boundProjectId: null, workspaceMode: true },
       ]),
     ).toThrow(MalformedFrameError);
   });
@@ -381,10 +397,11 @@ describe("the three new reads keep Core's envelope shapes", () => {
       { id: "t1", conversationId: "c1", status: "awaiting_review", baseCommit: "abc" },
     ]);
     expect(rows[0]).toMatchObject({ status: "awaiting_review", baseCommit: "abc" });
-    // An unknown status is refused, not normalized to something nearby.
-    expect(() =>
-      decodeTaskSummaries([{ id: "t", conversationId: "c", status: "resumed" }]),
-    ).toThrow(MalformedFrameError);
+    // An unknown status is never normalized to something nearby ("resumed" is
+    // NOT running): it is kept raw as "unknown" so the rest of the page decodes.
+    expect(
+      decodeTaskSummaries([{ id: "t", conversationId: "c", status: "resumed" }])[0],
+    ).toMatchObject({ status: "unknown", unrecognizedStatus: "resumed" });
   });
 
   it("conversation.history is an OBJECT with both bounds disclosed", () => {
