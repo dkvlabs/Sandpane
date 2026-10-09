@@ -519,4 +519,39 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0027 — Task Git context and host worktrees (C3, Core-internal)
+
+- **date:** 2026-10-09
+- **phase:** P2/P4 groundwork. **Not wire-reachable yet;** P2/P4 checklist items are not ticked.
+- **commit:** `2232d88` (feat(core): task Git context and host worktrees, with fail-closed discard (C3))
+- **details:**
+  - **Migration v3:** `worktree_path` and `worktree_removed_at`.
+  - **Internal `create_task`:** records the full base OID.
+    - host_worktree allocates `sandpane/<id>` under `<data>/worktrees`. Submodules are refused. The worktree is rolled back if the database write fails.
+    - direct_mount is labeled live-writable.
+    - sbx_clone records no unverified base.
+  - **`git.review`:** routes by workspace mode.
+  - **Fail-closed discard:**
+    - plan, then execute;
+    - checks: clean, no ignored files, no hidden-index entries, branch at base, branch not symbolic, no writer-lock holder;
+    - never uses `--force`; deletes the branch with `update-ref --no-deref` compare-and-delete;
+    - records durable intent and outcome events.
+  - **Hardening on every git call:**
+    - untracked files are visible regardless of repo config;
+    - `ignoreStat` is off;
+    - repo-local `excludesFile` is overridden, and the user's vetted global excludes file is honoured.
+  - **Orphans:** a read-only startup report; nothing is deleted.
+  - **Security review:** the first version was **blocked** for two Criticals (a symref task ref deleted the user's branch; `showUntrackedFiles=no` let discard delete untracked work). Both are fixed and re-verified with the reviewer's PoCs.
+  - **Downgrade boundary:** an older Core refuses the v3 database. Restore `<db>.pre-v3.bak` to downgrade.
+- **files:** `core/crates/sandpane-core/src/{db.rs,git.rs,workspace.rs,lib.rs}`, `core/crates/sandpane-service/{src/lib.rs,src/main.rs,tests/task_git_context.rs}`
+- **verification:**
+  - clippy `-D warnings` clean;
+  - `cargo test` 209 passed (run twice);
+  - schema drift in sync;
+  - VS Code live check 56/56;
+  - sbx_clone against real sbx: UNVERIFIED.
+- **review:** [audit/0027-core-task-git-context-review.md](audit/0027-core-task-git-context-review.md) — phase + security (BLOCK → fixed) + security re-review; PASS-WITH-WARNINGS (sandbox-binding preconditions recorded)
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->

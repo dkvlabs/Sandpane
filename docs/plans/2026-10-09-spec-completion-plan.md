@@ -41,7 +41,7 @@ Protocol additions follow the design of record: [2026-10-09-protocol-v1-addition
 
 1. Sandbox lifecycle: `sandbox.stop` and `sandbox.remove` (confirmed, `rm --force` behind server confirmation). `start` maps to the documented path or is reported unsupported.
 2. Project/conversation lifecycle: update/archive/delete, repo add/remove, conversation rename/archive/delete/export (redacted), persisted `sandboxId`.
-3. Task Git context: `repo_id`, `base_commit`, `task_branch`, worktree allocation and cleanup.
+3. Task Git context: `repo_id`, `base_commit`, `task_branch`, worktree allocation and cleanup. **Core-internal part done `2232d88` (entry 0027).** Not wire-reachable until the A-series protocol additions. `integration_status`, per-task `sandbox_name` and the retention policy are still open.
 4. `git.diff` (per file) and `git.apply` of selected files: merge/cherry-pick `--no-commit` or `apply --3way`, conflict rollback, dirty gate on touched paths.
 5. Approved verification commands (`verification.approve/list/run`, injectable executor) and stack detection into `project_context`.
 6. Scheduler wiring (bounded queue, limits from settings) and idempotency keys.
