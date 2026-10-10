@@ -554,4 +554,20 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0028 — Re-vet the global excludes file on repository registration
+
+- **date:** 2026-10-10
+- **phase:** P2/P4 hardening (follow-up to 0027). Core-internal; no protocol change.
+- **commit:** `ab68c5b` (fix(core): re-vet the global excludes file when repositories are registered)
+- **details:**
+  - `project.create` re-runs `accept_excludes_file` against the current repositories, the new ones and the worktree root, under the DB lock and before the insert. Any failure revokes the file for every repository: one-way, `/dev/null` until restart, one stderr line.
+  - `accept_excludes_file` also refuses a file or parent directory writable by group or others.
+  - `GitRunner`'s excludes fields are private; `with_excludes_file`, `active_excludes_file` and `revoke_excludes` are the only access.
+  - Known residuals (recorded in the audit): grandparent-directory swaps by other local users, Linux umask-002 users fall back to `/dev/null`, transient errors revoke until restart, no re-vet on mount.
+- **files:** `core/crates/sandpane-core/src/git.rs`, `core/crates/sandpane-service/{src/lib.rs,tests/task_git_context.rs}`
+- **verification:** fmt clean; clippy `-D warnings` clean; `cargo test` 214 passed; schema drift in sync; new tests observed failing first.
+- **review:** [audit/0028-core-excludes-revet-review.md](audit/0028-core-excludes-revet-review.md) — security review PASS-WITH-NOTES; Suggestions 1 and 6 fixed before commit
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
