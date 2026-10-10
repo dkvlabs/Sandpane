@@ -41,7 +41,7 @@ Protocol additions follow the design of record: [2026-10-09-protocol-v1-addition
 
 1. Sandbox lifecycle: `sandbox.stop` and `sandbox.remove` (confirmed, `rm --force` behind server confirmation). `start` maps to the documented path or is reported unsupported.
 2. Project/conversation lifecycle: update/archive/delete, repo add/remove, conversation rename/archive/delete/export (redacted), persisted `sandboxId`.
-3. Task Git context: `repo_id`, `base_commit`, `task_branch`, worktree allocation and cleanup. **Core-internal part done `2232d88` (entry 0027).** Not wire-reachable until the A-series protocol additions. `integration_status`, per-task `sandbox_name` and the retention policy are still open.
+3. Task Git context: `repo_id`, `base_commit`, `task_branch`, worktree allocation and cleanup. **Core-internal part done `2232d88` (entry 0027); the global excludes file is re-vetted on repository registration `ab68c5b` (entry 0028).** Not wire-reachable until the A-series protocol additions. `integration_status`, per-task `sandbox_name` and the retention policy are still open.
 4. `git.diff` (per file) and `git.apply` of selected files: merge/cherry-pick `--no-commit` or `apply --3way`, conflict rollback, dirty gate on touched paths.
 5. Approved verification commands (`verification.approve/list/run`, injectable executor) and stack detection into `project_context`.
 6. Scheduler wiring (bounded queue, limits from settings) and idempotency keys.
@@ -53,11 +53,11 @@ Protocol additions follow the design of record: [2026-10-09-protocol-v1-addition
 
 - **Desktop:** persistent shell (TopBar, icon rail, nested project/chat tree, StatusBar, Inspector); S03 chat screen; Dashboard and Cockpit; ⌘K palette; S00 onboarding; native notifications, single-instance and store plugins; sandbox lifecycle UI; DiffViewer; redacted diagnostics export; macOS unsigned `tauri build`.
 - **VS Code:** conversation tabs and history paging; activity and changed-files views; project auto-select from workspace folders; specs/03 §4 context actions; diagnostics consent; per-file apply; jsdom adversarial tests, ESLint, `@vscode/test-electron`; sandbox lifecycle; verification.
-- **JetBrains:** per its review backlog (F4); lifecycle and diff parity; `buildPlugin` and `verifyPlugin`.
+- **JetBrains:** per its review backlog (F4); lifecycle and diff parity; `buildPlugin` and `verifyPlugin`. Unknown-enum tolerance and the anti-spoofing hardening (table-row Apply dialog) landed in entry 0029; follow-ups from its reviews are listed in that audit record.
 
 ### R — README
 
-Every step to build, run and install the Core service, desktop app, VS Code extension and JetBrains plugin, each one actually executed in this session. Anything not executed is labeled unverified.
+Every step to build, run and install the Core service, desktop app, VS Code extension and JetBrains plugin, each one actually executed in this session. Anything not executed is labeled unverified. **Done** in the root README "Install and run" (entry 0030): every build/package/install step executed from a fresh clone in isolated directories; GUI launches remain UNVERIFIED.
 
 ## Blocked — owner and unblock action
 
