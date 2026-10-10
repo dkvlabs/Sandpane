@@ -570,4 +570,33 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0029 — JetBrains protocol tolerance and anti-spoofing hardening
+
+- **date:** 2026-10-10
+- **phase:** P6 (JB) hardening; security-review follow-up to 0020.
+- **commit:** `9bc6230` (fix(jetbrains): tolerate unknown protocol enums and harden dialogs against spoofing)
+- **details:**
+  - `Reported<E>` for `TaskStatus`, `FileChangeStatus`, `WorkspaceMode`: a newer Core's new value no longer fails whole calls; unknown-status files are listed, never selected; unknown workspace mode treated as live-writable.
+  - `VisibleText` reveals hidden characters by code point on every surface.
+  - Apply and send-context dialogs built by `DialogHtml` as table rows, so a wrapped crafted path cannot fake an entry or header (security review C1, BLOCK → fixed). NOT-sent entries use `[x<n>]` markers.
+  - Bounded conflict and case-collision lists; NFC + case-fold exclusion of unknown-status twins; single-line Core text in notifications; code-point truncation; UNVERIFIED mode notice; flags for literal escape sequences and look-alike compatibility characters.
+  - No protocol or schema change; drift guard extended.
+- **files:** `clients/jetbrains/**` (28 files; new `model/Reported.kt`, `text/VisibleText.kt`, `ui/ApplyConfirmation.kt`, `ui/SendContextMessages.kt`, five new test classes)
+- **verification:** `test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache` → 205 tests, 0 failures; `verifyPlugin` → Compatible; invisible-character scan 0; reviewer probe 129 991 layouts, 0 escapes.
+- **review:** [audit/0029-jetbrains-tolerance-antispoofing-review.md](audit/0029-jetbrains-tolerance-antispoofing-review.md) — security BLOCK → fixed; phase PASS-WITH-NOTES; security re-review PASS-WITH-NOTES, its three Warnings fixed before commit
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
+## 0030 — README install and run guide
+
+- **date:** 2026-10-10
+- **phase:** R (goal deliverable: every step to run/install the apps).
+- **commit:** `4c1f8c3` (docs(readme): install and run guide for Core, desktop, VS Code and JetBrains)
+- **details:** prerequisites; Core build/run with socket, DB and sbx overrides and an isolated trial setup; desktop (`tauri dev`/`tauri build`), VS Code (`npm run package`, `--install-extension`, isolated profile), JetBrains (`buildPlugin`, Install Plugin from Disk, `runIde`); `make check`; a record of what was executed. Status paragraph refreshed; plan statuses updated.
+- **files:** `README.md`, `docs/plans/2026-10-09-spec-completion-plan.md`
+- **verification:** every build/package/install step executed from a fresh clone of `27dbb9b` in isolated directories (Core build + start, VS Code 280 tests + package + isolated install + live 56/56, desktop 351 tests + `tauri build` + live 8/8, JetBrains `buildPlugin` + `verifyPlugin` Compatible). GUI launches and Linux: UNVERIFIED.
+- **review:** [audit/0030-readme-install-guide-review.md](audit/0030-readme-install-guide-review.md) — checklist pass with executed commands
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
