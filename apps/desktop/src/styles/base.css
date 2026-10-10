@@ -1300,3 +1300,57 @@ button.chip {
     gap: 2px;
   }
 }
+
+/* ------------------------------------------------ sandbox lifecycle (A1) */
+
+.row--stacked {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.row__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.sandbox-lifecycle {
+  gap: var(--space-2);
+}
+
+.sandbox-lifecycle__notes {
+  font-size: 11.5px;
+  margin: 0;
+}
+
+.removal-external {
+  border: 2px solid var(--danger, #e5484d);
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-strong);
+  font-size: 12.5px;
+}
+
+.removal-impact {
+  margin: 0;
+  padding-left: var(--space-4);
+  color: var(--text-strong);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.removal-impact__overflow {
+  font-size: 11.5px;
+  color: var(--text-subtle);
+}
+
+.stop-tasks {
+  color: var(--text-strong);
+}
+
+.stop-tasks--risk {
+  font-weight: 600;
+  color: var(--danger);
+}

@@ -20,19 +20,20 @@ an earlier revision of this README claimed that while the crate did not compile 
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — review-fix pass, 2026-10-09
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A1 lifecycle pass, 2026-10-10
 
-Run fresh after the A1–A12 / W4–W6 / S9 fixes. Every row below is a command that was actually run,
-with its actual result:
+Run fresh after the A1 sandbox-lifecycle client work (protocol design 2026-10-09 §3 row A1) and its
+security/phase review fixes. Every row below is a command that was actually run, with its actual
+result, except where a row says it was not re-run:
 
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **12 files, 273 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
-| `npm run build` (`tsc --noEmit && vite build`) | OK — `dist/` emitted (main chunk 338.83 kB JS, 20.65 kB CSS at the time of this run; sizes move with every change) |
+| `npm test` (`vitest run`) | OK — **15 files, 401 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
 | `cd src-tauri && cargo check --offline` | OK — `Finished dev profile` |
 | `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
-| `cd src-tauri && cargo test --offline` | OK — **31 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied) |
+| `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF) |
 | `make desktop-check` (repo root) | OK — runs all of the above except `npm run build`; now includes `cargo fmt --check`, `check`, `clippy`, `test` for `src-tauri` |
 
 **Correction of an earlier claim.** A previous revision of this table reported `cargo check` OK
@@ -40,6 +41,17 @@ and "7 passed" for `src-tauri`. That was false at the time: since commit `fbc45e
 to compile (`E0308`, `replay_safe(request.method)` passed a `String` where a `Method` was required),
 and `make check` never compiled `src-tauri` because it is not in the `core/` workspace. The crate
 now compiles, and `make desktop-check` builds and tests it, so the same regression fails the gate.
+
+### A1 sandbox lifecycle (stop / remove / sbx agent) — status
+
+| Item | Status |
+| --- | --- |
+| Stop (confirmed; shows re-queried state, UNKNOWN when `requeried` is absent) | Functional headless: unit-tested against an in-memory FakeCore. **UNVERIFIED live** — never run against a real Core + sbx |
+| Remove (Core two-step token; dialog shows impact, sbx id, expiry, "NOT CONFIRMED AS CREATED BY SANDPANE"; cancel sends nothing) | Functional headless, same tests. **UNVERIFIED live** — never run against real sbx |
+| Stop dialog active-task count | Reads `task.list`; today's Core never records `sandboxName` on tasks, so the dialog says the count cannot be checked instead of showing 0 |
+| sbx agent in the create wizard (default `shell`) | Functional headless; non-shell agents only when the Core advertises A1. **UNVERIFIED live** |
+| FakeCore `sandbox.stop` / `sandbox.remove` handlers | **Modeled** on `sandpane-service` source (`sandbox_stop`, `sandbox_remove`, `confirm.rs`), **not captured** from a live run |
+| The hook that sends `sandbox.stop` / step 2 after the dialog confirms (`useSandboxLifecycle`) | No DOM test (no jsdom in this suite); the pure controllers are tested, and the dialogs are checked as SSR markup only. Focus trap / Escape / focus return in a real webview are unverified |
 
 ### Live Core run (earlier evidence — NOT re-run in the review-fix pass)
 
@@ -62,7 +74,9 @@ SANDPANE_SOCKET=/tmp/sp-desk-final/run/s.sock npx vitest run --reporter=verbose 
 
 What that run measured (not asserted from prose):
 
-- `system.probe` → `methods` is the 14-name list, `Method::ALL` order.
+- `system.probe` → `methods` was the 14-name list, `Method::ALL` order, for the Core of that run.
+  The A1 Core advertises 16 (`sandbox.stop`, `sandbox.remove` added); that has NOT been re-run
+  live from the desktop.
 - `project.list` → rows carry `repositories`; `project.create` echoes them.
 - `task.list` / `conversation.list` / `conversation.history` exist and answer.
 - `conversation.history` is an **object** (`messages`, `truncated`, `nextSequence`); with
@@ -163,7 +177,7 @@ React view  →  CoreClient (src/lib/core-client.ts)      ← framing, id correl
 - **Wire contract is shared, not re-invented.** `src/lib/protocol.ts` mirrors
   `core/crates/sandpane-protocol` exactly: camelCase payload fields, `snake_case` statuses and
   workspace modes, `SCREAMING_SNAKE_CASE` error codes, `{v,id,…}` frames, the `AgentEvent`
-  tagged union, and the same 14-name `Method` surface as `clients/vscode`. `schemas/*.json` is
+  tagged union, and the same 16-name `Method` surface as `clients/vscode`. `schemas/*.json` is
   the third copy; they move together, and `tests/protocol-drift.test.ts` reads the Rust crate and
   the schemas to prove it.
 - **Feature detection, never assumption.** Every additive read is gated on
@@ -185,9 +199,10 @@ React view  →  CoreClient (src/lib/core-client.ts)      ← framing, id correl
   - One per-method deadline covers connect, write, read and the single retry (after a 150 ms
     pause) a read-only method may get after a FAST failure (socket missing/refused, write broke,
     Core closed before answering); a timeout is never retried. Budgets: `sandbox.create` 320 s,
-    `sandbox.list` 40 s, everything else 12 s — each below the webview's own deadline for the
-    same method (330 s / 45 s / 15 s), drift-tested per method, so the webview always hears the
-    proxy's verdict.
+    `sandbox.list` 40 s, `sandbox.stop` 350 s, `sandbox.remove` 390 s, everything else 12 s —
+    each below the webview's own deadline for the same method (330 s / 45 s / 360 s / 400 s /
+    15 s), drift-tested per method, so the webview always hears the proxy's verdict. Neither
+    `sandbox.stop` nor either step of `sandbox.remove` is replay-safe, so neither is ever re-sent.
   - A lost answer to a state-changing method — including a write that broke part-way, since
     Core handles a final unterminated line at EOF — comes back with `mayHaveBeenApplied: true`,
     and the UI says "may have been applied — re-read state" instead of offering a blind retry.
@@ -235,7 +250,7 @@ one that happens, and the drop count is exposed rather than hidden.
 | `#/projects/:id`, `#/projects/:id/conversations/:cid` | ProjectWorkspace | `conversation.list` (Core's chats, not just this window's), `conversation.history`, sandbox picker + chat + activity timeline + review |
 | `#/chats` | Chats | `conversation.list` when advertised (cross-client chats reopen here); falls back to this window's list and says so |
 | `#/tasks`, `#/tasks/:id` | Tasks & Review | `task.list` + event replay, `task.cancel`, `git.review`, `git.apply`; the review's live-writable disclosure comes from the task's own sandbox (`sandboxName` → `sandbox.list` mode), unknown = UNVERIFIED |
-| `#/sandboxes`, `#/sandboxes/new` | Sandboxes + wizard | `sandbox.list` (incl. `workspaceMode`), `sandbox.create` (start/stop/delete: no method yet) |
+| `#/sandboxes`, `#/sandboxes/new` | Sandboxes + wizard | `sandbox.list` (incl. `workspaceMode`, `agent`), `sandbox.create` (incl. the optional sbx `agent`, default `shell`), `sandbox.stop` and two-step `sandbox.remove` when advertised (both behind confirmations); Start is shown as unsupported (sbx v0.47 has no `start`) |
 | `#/agents` | Agents | `system.probe` `agents[]` |
 | `#/templates` | Templates | read-only unsupported state (no template RPC) |
 | `#/integrations` | Integrations | guidance for editors/native apps/SSH/MCP/policies |
@@ -308,7 +323,7 @@ apps/desktop/
 allowlist the proxy enforces cannot drift from Core's `Method::parse`, while keeping its own
 lockfile. That path was previously `../../core/…`, which resolved to the non-existent
 `apps/core/crates/sandpane-protocol`; dependency resolution failed and the crate had never been
-compiled. The crate is now compiled, linted and tested by `make desktop-check` (31 Rust tests), so
+compiled. The crate is now compiled, linted and tested by `make desktop-check` (32 Rust tests), so
 a non-compiling shell can no longer hide behind a green `make check`.
 
 ---
@@ -319,8 +334,10 @@ a non-compiling shell can no longer hide behind a green `make check`.
   place), native folder picker, OS notifications, command palette. Chat history is no longer
   blocked on Core — `conversation.list`/`conversation.history` exist and are wired; what remains
   is archive/export/search, for which no method exists.
-- **DT2:** sandbox detail, start/stop/remove with confirmations, capability-gated advanced
-  wizard options, project↔sandbox binding beyond `sandbox.create`.
+- **DT2:** stop and remove with confirmations are implemented (A1; see "A1 sandbox lifecycle"
+  under Verification). Start stays unsupported because sbx v0.47 has no `start` command. Still
+  deferred: capability-gated advanced wizard options, and project↔sandbox binding beyond
+  `sandbox.create`.
 - **DT3:** real diff text viewer (no `git.diff` in v1), selective apply UX, verification
   history, "open in IDE", approval responses (no approval RPC exists).
 - **DT4:** network policy, port publishing (loopback by default), templates, MCP, secret

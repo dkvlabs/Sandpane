@@ -60,7 +60,9 @@ interface SandpaneRpc {
   'project.create': { request: { name: string; repositories: string[] }; response: Project /* + repositories: string[] */ };
   'project.list': { request: {}; response: Project[] };
   'sandbox.list': { request: {}; response: SandboxSummary[] /* each may carry workspaceMode; ABSENT when unbound */ };
-  'sandbox.create': { request: SandboxCreateSpec; response: SandboxSummary };
+  'sandbox.create': { request: SandboxCreateSpec /* + agent?: built-in sbx agent, default "shell" */; response: SandboxSummary /* + agent?: as sbx reports it */ };
+  'sandbox.stop': { request: { name: string }; response: { stopped: true; requeried?: SandboxSummary /* ABSENT = not listed or re-query failed: state unknown */ } };
+  'sandbox.remove': { request: { name: string; confirmToken?: string }; response: { confirmation?: ConfirmationRequest /* step 1: nothing changed */; removed?: true /* step 2 */ } /* two-step token flow: docs/plans/2026-10-09-protocol-v1-additions.md §2 */ };
   'conversation.create': { request: { projectId: string; agentId: string; sandboxId?: string }; response: Conversation };
   'conversation.send': { request: { conversationId: string; content: string; attachments?: ContextRef[] }; response: { taskId: string } };
   'conversation.list': { request: { projectId?: string; limit?: number }; response: Conversation[] };
@@ -75,7 +77,7 @@ interface SandpaneRpc {
 
 Neither prompts nor file paths are executable commands. CLI operations are implemented as specific backend methods with strictly constructed argument arrays.
 
-**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 14-method v1 surface (`docs/CHANGELOG.md` 0010). Rules that keep it honest:
+**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 16-method v1 surface (`docs/CHANGELOG.md` 0010; `sandbox.stop` and `sandbox.remove` added by A1 of `docs/plans/2026-10-09-protocol-v1-additions.md`; there is no `sandbox.start` because sbx v0.47 has none). Rules that keep it honest:
 
 - **`PROTOCOL_VERSION` stays `1`** — the revision is additive only: new methods, new optional request fields, new response fields that are absent-tolerant (`#[serde(default)]`). Nothing was renamed or removed, so an older client's frames still parse.
 - **`task.subscribe` cursor semantics** are now explicit, because one scalar `afterSequence` applied across a project-wide replay silently skips the unseen events of tasks whose per-task sequences are lower (sequences restart at 1 per task): when `taskId` is present the scalar governs and `afterSequences` is ignored; without `taskId`, each task replays from `afterSequences[taskId]` (a task absent from the map replays from 0); with no map at all the legacy shared-scalar behavior is preserved. Clients that need correct catch-up across tasks must send the map.
@@ -91,7 +93,7 @@ SQLite: WAL mode, foreign keys, indexed events and migrations. Store Sandpane's 
 |---|---|---|
 | `projects` | id, name, description, created_at, archived_at | user-owned; stable ID |
 | `repositories` | id, project_id, canonical_path, remote_url | canonicalize before use |
-| `sandbox_bindings` | id, project_id, sandbox_name, workspace_mode, repo_id | SBX state always probed before actions |
+| `sandbox_bindings` | id, project_id, sandbox_name, workspace_mode, repo_id, sbx_id, removed_at | SBX state always probed before actions; `sbx_id` + `removed_at` added in schema v4 — rows are marked removed, never deleted |
 | `conversations` | id, project_id, title, agent_id, created_at, archived_at | more than one per project |
 | `messages` | id, conversation_id, role, content, sequence | redact or encrypt optional sensitive history |
 | `agent_sessions` | id, conversation_id, provider, native_session_id, capability_snapshot | native session may be unavailable |

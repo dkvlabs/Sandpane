@@ -4,9 +4,10 @@
 //   * NOTHING is sent that the guards in [CoreGuards] refuse — an invalid id, limit or cursor
 //     map never reaches the socket, and the returned future fails with [CoreValidationException],
 //     which is this client's word, never a Core verdict (AGENTS.md rule 5).
-//   * The three additive v1 methods are gated on ADVERTISEMENT (`CoreCapabilities.methods`), not
-//     on a version number: `protocolVersion` stayed 1 across this revision, so assuming a method
-//     from it would send a request an older Core answers with VALIDATION_FAILED.
+//   * The additive methods (the three v1 reads and the A1 sandbox lifecycle) are gated on
+//     ADVERTISEMENT (`CoreCapabilities.methods`), not on a version number: `protocolVersion` stayed
+//     1 across these revisions, so assuming a method from it would send a request an older Core
+//     answers with VALIDATION_FAILED.
 //   * Every call returns a CompletableFuture and performs no Swing work; the caller owns the
 //     EDT hop (docs/specs/04 §2).
 package labs.dkv.sandpane.core
@@ -17,7 +18,12 @@ import labs.dkv.sandpane.model.ConversationHistoryResult
 import labs.dkv.sandpane.model.ConversationListParams
 import labs.dkv.sandpane.model.CoreCapabilities
 import labs.dkv.sandpane.model.CoreJson
+import labs.dkv.sandpane.model.CoreErrorCodes
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.model.SandboxRemoveParams
+import labs.dkv.sandpane.model.SandboxRemoveResult
+import labs.dkv.sandpane.model.SandboxStopParams
+import labs.dkv.sandpane.model.SandboxStopResult
 import labs.dkv.sandpane.model.TaskEvent
 import labs.dkv.sandpane.model.TaskListParams
 import labs.dkv.sandpane.model.TaskStatus
@@ -58,14 +64,15 @@ class CoreCommands(
     fun advertises(method: String): Boolean = capabilities()?.advertises(method) == true
 
     /**
-     * The advertisement gap for an additive v1 method, or null when it may be called.
+     * The advertisement gap for an additive method, or null when it may be called.
      *
      * Refusing locally keeps a pre-revision Core from answering for a surface it never promised,
      * and keeps the refusal out of the wire entirely. The eleven original methods need no gate —
-     * they are the protocol-v1 baseline every Core dispatches.
+     * they are the protocol-v1 baseline every Core dispatches; everything in
+     * [CoreMethods.REQUIRES_ADVERTISEMENT] (the discovery reads and the A1 sandbox lifecycle) does.
      */
-    private fun advertisementGap(method: String): MethodNotSupportedException? {
-        if (!CoreMethods.ADDITIVE_IN_V1.contains(method)) return null
+    fun advertisementGap(method: String): MethodNotSupportedException? {
+        if (!CoreMethods.REQUIRES_ADVERTISEMENT.contains(method)) return null
         val caps = capabilities()
             ?: return MethodNotSupportedException(
                 method,
@@ -159,6 +166,94 @@ class CoreCommands(
         }
         return rpc.request(CoreMethods.CONVERSATION_HISTORY, payload)
             .thenApply { CoreJson.decodeFromJsonElement(ConversationHistoryResult.serializer(), it) }
+    }
+
+    // -----------------------------------------------------------------------
+    // sandbox.stop / sandbox.remove (A1)
+    // -----------------------------------------------------------------------
+
+    /**
+     * `sandbox.stop {name}` → [SandboxStopResult]. Not destructive, so no token; feature-detected,
+     * name-guarded, and never retried (the caller words a missing answer as "outcome unknown").
+     */
+    fun sandboxStop(name: String): CompletableFuture<SandboxStopResult> {
+        advertisementGap(CoreMethods.SANDBOX_STOP)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildStopPayload(name)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.SANDBOX_STOP, payload)
+            .thenApply { CoreJson.decodeFromJsonElement(SandboxStopResult.serializer(), it) }
+    }
+
+    /**
+     * Step 1 of `sandbox.remove`: `{name}` with NO `confirmToken` key at all. Core changes nothing
+     * and answers a confirmation; the caller must pass it through [RemoveConfirmationCheck.decide]
+     * before anything else happens.
+     */
+    fun sandboxRemoveRequest(name: String): CompletableFuture<SandboxRemoveResult> {
+        advertisementGap(CoreMethods.SANDBOX_REMOVE)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildRemovePayload(name, token = null)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.SANDBOX_REMOVE, payload).thenApply(::decodeRemoveAnswer)
+    }
+
+    /**
+     * Step 2 of `sandbox.remove`: the same name plus the token Core issued at step 1. It takes an
+     * [IssuedRemoval] — which only [RemoveConfirmationCheck.decide] can make — rather than a raw
+     * string, so there is no way to send a token that did not come from step 1 for this name.
+     */
+    fun sandboxRemoveConfirm(issued: IssuedRemoval): CompletableFuture<SandboxRemoveResult> {
+        advertisementGap(CoreMethods.SANDBOX_REMOVE)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildRemovePayload(issued.name, token = issued.token)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.SANDBOX_REMOVE, payload).thenApply(::decodeRemoveAnswer)
+    }
+
+    /**
+     * Decode a `sandbox.remove` answer WITHOUT ever echoing it (security W2). kotlinx.serialization
+     * puts the offending JSON input in its exception message, and a remove answer can carry a
+     * confirmation token; that message would flow through [ErrorAttribution] into a notification.
+     * A shape mismatch therefore becomes a fixed-text [CoreRpcException] raised by THIS plugin.
+     */
+    private fun decodeRemoveAnswer(ok: JsonElement): SandboxRemoveResult = try {
+        CoreJson.decodeFromJsonElement(SandboxRemoveResult.serializer(), ok)
+    } catch (_: Exception) {
+        throw CoreRpcException(
+            CoreErrorCodes.INTERNAL,
+            "Core's ${CoreMethods.SANDBOX_REMOVE} answer did not have the expected shape; its content " +
+                "is not shown because it may carry a confirmation token",
+            raisedByCore = false,
+        )
+    }
+
+    /** `{"name": …}` after the addressable-name guard. Side-effect-free, for the exact-frame tests. */
+    internal fun buildStopPayload(name: String): JsonElement =
+        CoreJson.encodeToJsonElement(
+            SandboxStopParams.serializer(),
+            SandboxStopParams(CoreGuards.requireAddressableSandboxName(name)),
+        )
+
+    /**
+     * `{"name": …}` (step 1, token null ⇒ key ABSENT via `explicitNulls = false`) or
+     * `{"name": …, "confirmToken": …}` (step 2). A token not shaped like Core's is refused here.
+     */
+    private fun buildRemovePayload(name: String, token: String?): JsonElement {
+        val checked = CoreGuards.requireAddressableSandboxName(name)
+        if (token != null && !CoreGuards.isConfirmTokenShape(token)) {
+            throw CoreValidationException("confirmToken", "not the shape Core issues; nothing was sent")
+        }
+        return CoreJson.encodeToJsonElement(
+            SandboxRemoveParams.serializer(),
+            SandboxRemoveParams(name = checked, confirmToken = token),
+        )
     }
 
     // -----------------------------------------------------------------------

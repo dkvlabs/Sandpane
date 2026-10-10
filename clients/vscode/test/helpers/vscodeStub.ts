@@ -10,6 +10,13 @@ export interface RecordedCommand {
   args: unknown[];
 }
 
+/** One native message call: text, the options object (modal/detail) and offered buttons. */
+export interface RecordedMessage {
+  message: string;
+  options: { modal?: boolean; detail?: string } | undefined;
+  items: string[];
+}
+
 export interface StubUri {
   scheme: string;
   path: string;
@@ -45,6 +52,8 @@ export const stub = {
   warnings: [] as string[],
   infos: [] as string[],
   errors: [] as string[],
+  /** Every warning call with its options (modal/detail) — what a modal SHOWED. */
+  warningCalls: [] as RecordedMessage[],
   /** Next answers for modal prompts, by button label the code offers. */
   answers: new Map<string, string | undefined>(),
   reset(): void {
@@ -55,6 +64,7 @@ export const stub = {
     this.warnings.length = 0;
     this.infos.length = 0;
     this.errors.length = 0;
+    this.warningCalls.length = 0;
     this.answers.clear();
   },
 };
@@ -96,6 +106,14 @@ export const window = {
   activeTextEditor: undefined,
   showWarningMessage: (message: string, ...items: unknown[]) => {
     stub.warnings.push(message);
+    const first = items[0];
+    const options =
+      first !== null && typeof first === 'object' ? (first as RecordedMessage['options']) : undefined;
+    stub.warningCalls.push({
+      message,
+      options,
+      items: items.filter((item): item is string => typeof item === 'string'),
+    });
     return answer(items);
   },
   showInformationMessage: (message: string, ...items: unknown[]) => {

@@ -8,7 +8,7 @@
  * UI remembers, and it only ever asks Core for events after it.
  */
 
-import { useCallback, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import {
   useInfiniteQuery,
   useMutation,
@@ -27,6 +27,15 @@ import {
   type ProbeOutcome,
 } from "./core-client";
 import { TaskEventStore } from "./event-store";
+import {
+  SandboxRemovalFlow,
+  SandboxStopConfirm,
+  countActiveTasksOn,
+  lifecycleGates,
+  type StopConfirmState,
+  type LifecycleGates,
+  type RemovalState,
+} from "./sandbox-lifecycle";
 import {
   addConversation,
   listConversations,
@@ -61,6 +70,7 @@ import {
   type Method,
   type Project,
   type SandboxCreateSpec,
+  type SandboxStopResult,
   type SandboxSummary,
   type TaskStatus,
   type TaskSummary,
@@ -484,6 +494,88 @@ export function useCreateSandbox() {
       void qc.invalidateQueries({ queryKey: queryKeys.probe });
     },
   });
+}
+
+/**
+ * `sandbox.stop` (A1). Never retried (not replay-safe); the list is re-read on
+ * SETTLED, not just success, because a lost answer may still have stopped it.
+ */
+export function useStopSandbox(
+  report: {
+    onSuccess?: (result: SandboxStopResult, name: string) => void;
+    onError?: (error: CoreRequestError, name: string) => void;
+    onSettled?: (name: string) => void;
+  } = {},
+) {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  // Hook-level callbacks (not `mutate(…, callbacks)`): they still fire when the
+  // row that started the stop has unmounted because the re-read dropped it.
+  return useMutation<SandboxStopResult, CoreRequestError, string>({
+    mutationFn: (name) => deps.client.stopSandbox(name),
+    retry: false,
+    onSuccess: (result, name) => report.onSuccess?.(result, name),
+    onError: (error, name) => report.onError?.(asCoreRequestError(error), name),
+    onSettled: (_data, _error, name) => {
+      report.onSettled?.(name);
+      void qc.invalidateQueries({ queryKey: queryKeys.sandboxes });
+    },
+  });
+}
+
+/**
+ * The stop confirmation controller for one view. The active-task count reads
+ * `task.list` (all projects) only when THIS Core advertises it; the latest probe
+ * is read at open time through a ref.
+ */
+export function useStopConfirm(): { confirm: SandboxStopConfirm; state: StopConfirmState } {
+  const deps = useDeps();
+  const link = useCoreLink();
+  const capabilities = capabilitiesOf(link);
+  const capsRef = useRef(capabilities);
+  useEffect(() => {
+    capsRef.current = capabilities;
+  }, [capabilities]);
+  const ref = useRef<SandboxStopConfirm | null>(null);
+  if (ref.current === null) {
+    ref.current = new SandboxStopConfirm((name) =>
+      countActiveTasksOn(
+        deps.client,
+        capsRef.current !== null && coreAdvertisesMethod(capsRef.current, "task.list"),
+        name,
+      ),
+    );
+  }
+  const confirm = ref.current;
+  const state = useSyncExternalStore(confirm.subscribe, confirm.getState);
+  return { confirm, state };
+}
+
+/**
+ * One two-step `sandbox.remove` flow per mounted row/view. The controller holds
+ * the confirmation token in memory only; it never reaches React Query, Zustand,
+ * a route or a log. The sandbox list is re-read after every Core exchange.
+ */
+export function useSandboxRemovalFlow(): { flow: SandboxRemovalFlow; state: RemovalState } {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  const ref = useRef<SandboxRemovalFlow | null>(null);
+  if (ref.current === null) {
+    ref.current = new SandboxRemovalFlow(deps.client, {
+      onSettled: () => {
+        void qc.invalidateQueries({ queryKey: queryKeys.sandboxes });
+      },
+    });
+  }
+  const flow = ref.current;
+  const state = useSyncExternalStore(flow.subscribe, flow.getState);
+  return { flow, state };
+}
+
+/** Stop/Remove gates folded from the probe (`unprobed` ≠ `unsupported`). */
+export function useLifecycleGates(): LifecycleGates {
+  const link = useCoreLink();
+  return lifecycleGates(capabilitiesOf(link));
 }
 
 export function useCreateConversation() {

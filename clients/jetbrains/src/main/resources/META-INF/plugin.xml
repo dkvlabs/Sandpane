@@ -91,9 +91,12 @@
     </extensions>
 
     <!-- Actions mirror specs/04 §3 (IDE integration with explicit authorization).
-         Every action performs read-only Core calls plus bounded editor-context collection;
-         the one mutating action (Apply Task) requires explicit confirmation and is executed
-         by Core as a Git operation, never by writing host files here. -->
+         Read-only Core calls plus bounded editor-context collection, except the mutating ones,
+         each behind an explicit user choice and executed by Core, never by this plugin:
+         Apply Task (confirmed Git operation), Stop Sandbox (explicit pick; not destructive) and
+         Remove Sandbox (Core's two-step server-side confirmation token, design 2026-10-09 §2).
+         Stop/Remove are gated on system.probe advertising the method. Start Sandbox sends
+         nothing: sbx v0.47 has no start, so it only explains the unsupported state. -->
     <actions>
         <group id="labs.dkv.sandpane.Toolwindow"
                text="Sandpane"
@@ -121,6 +124,21 @@
                     class="labs.dkv.sandpane.actions.RefreshSandboxesAction"
                     text="Sandpane: Refresh Projects and Sandboxes"
                     description="Re-probe project and sandbox state from Core (read-only; state is never assumed)"/>
+
+            <action id="labs.dkv.sandpane.StopSandbox"
+                    class="labs.dkv.sandpane.actions.StopSandboxAction"
+                    text="Sandpane: Stop Sandbox…"
+                    description="Stop a sandbox through Core (sbx stop), then show the state Core re-queries"/>
+
+            <action id="labs.dkv.sandpane.RemoveSandbox"
+                    class="labs.dkv.sandpane.actions.RemoveSandboxAction"
+                    text="Sandpane: Remove Sandbox…"
+                    description="Remove a sandbox through Core after Core's own confirmation (sbx rm)"/>
+
+            <action id="labs.dkv.sandpane.StartSandbox"
+                    class="labs.dkv.sandpane.actions.StartSandboxAction"
+                    text="Sandpane: Start Sandbox (not supported)"
+                    description="Start: not supported by sbx v0.47 (use `sbx run --name &lt;name&gt;` in a terminal)"/>
         </group>
     </actions>
 </idea-plugin>

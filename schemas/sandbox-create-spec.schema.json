@@ -22,6 +22,11 @@
     "repoPath": {
       "type": ["string", "null"],
       "description": "Absolute host path of the repository to bind; canonicalized + containment-checked by Core."
+    },
+    "agent": {
+      "type": "string",
+      "enum": ["claude", "codex", "copilot", "cursor", "devin", "docker-agent", "droid", "gemini", "kiro", "opencode", "shell"],
+      "description": "Optional (A1, additive). Exact built-in agent from the captured sbx v0.47.0 `create --help`; absent → \"shell\" (provider-free). Sandbox-kit references (local dirs, ZIPs, git URLs, OCI refs) are refused with VALIDATION_FAILED; --cloud is never passed. Accepting a provider agent is not a verification claim (see core-capabilities.agents[].verified)."
     }
   }
 }

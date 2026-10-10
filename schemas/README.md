@@ -38,8 +38,10 @@ gate instead of drifting silently.
 frames (`rpc-request`, `rpc-response`, `agent-event`, `task-event`,
 `core-capabilities`) plus the two payloads a client must construct or consume
 blind (`sandbox-create-spec`, `change-set`) have their own files. Params for
-`task.list` / `conversation.list` / `conversation.history` are defined by the
-Rust types, pinned by the value-set gate and by each client's wire-parity test;
+`task.list` / `conversation.list` / `conversation.history`, and the A1
+`sandbox.stop` / `sandbox.remove` params and results (`SandboxStopParams`,
+`SandboxStopResult`, `SandboxRemoveParams`, `SandboxRemoveResult`,
+`ConfirmationRequest`) are defined by the Rust types, pinned by the value-set gate and by each client's wire-parity test;
 their `docs/specs/02 §2` contract block is the human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7
 generated-bindings deliverable, not here.

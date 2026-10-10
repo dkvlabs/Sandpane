@@ -10,7 +10,10 @@ import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.Project as SandpaneProject
 import labs.dkv.sandpane.model.ProjectCreateParams
 import labs.dkv.sandpane.model.SandboxCreateSpec
+import labs.dkv.sandpane.model.SandboxStopResult
 import labs.dkv.sandpane.model.SandboxSummary
+import labs.dkv.sandpane.model.SbxAgents
+import labs.dkv.sandpane.text.VisibleText
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.buildJsonObject
 import java.io.File
@@ -40,6 +43,16 @@ class SbxService(private val project: Project) {
         val failure: String?,
     ) {
         val isEmpty: Boolean get() = projects.isNullOrEmpty() && sandboxes.isNullOrEmpty()
+
+        /**
+         * Why [sandboxes] is unavailable, or null when Core's list is present. A failed refresh is
+         * named with its reason (revealed single-line) instead of being worded as "not read yet".
+         */
+        fun sandboxListGap(): String? = when {
+            sandboxes != null -> null
+            failure != null -> "the last refresh failed: ${VisibleText.reveal(failure)}"
+            else -> "Core's sandbox list has not been read in this window yet"
+        }
 
         fun ageSeconds(nowMillis: Long = System.currentTimeMillis()): Long =
             if (probedAtMillis <= 0) Long.MAX_VALUE else (nowMillis - probedAtMillis) / 1_000
@@ -210,12 +223,23 @@ class SbxService(private val project: Project) {
         SbxClientValidation.requireSandboxName(spec.name)
         SbxClientValidation.requireOpaqueId(spec.projectId, "projectId")
         spec.repoPath?.let { SbxClientValidation.requireAbsolutePath(it, "repoPath") }
+        // A1: absent stays absent (Core defaults to the provider-free `shell`); a present value must
+        // be an exact built-in sbx agent — nothing outside the allowlist is ever sent.
+        spec.agent?.let { SbxClientValidation.requireSbxAgent(it) }
         return connection.call(
             CoreMethods.SANDBOX_CREATE,
             CoreJson.encodeToJsonElement(SandboxCreateSpec.serializer(), spec),
             SandboxSummary.serializer(),
         ).also { afterMutation(it) }
     }
+
+    /**
+     * `sandbox.stop` (A1) for an explicit user choice, followed by a re-probe whatever the outcome —
+     * the result's `requeried` is Core's word for the state, and the list must not keep showing the
+     * pre-stop row. Never retried here: a missing answer is "outcome unknown" ([labs.dkv.sandpane.core.StopReport]).
+     */
+    fun stopSandbox(name: String): CompletableFuture<SandboxStopResult> =
+        connection.commands.sandboxStop(name).also { afterMutation(it) }
 
     /** Creating a conversation mutates Core state; called only from an explicit user action. */
     fun createConversation(params: ConversationCreateParams): CompletableFuture<Conversation> {
@@ -279,6 +303,16 @@ object SbxClientValidation {
         // A name is a label, never a path or an argument: refuse control characters outright.
         if (trimmed.any { it.code < 0x20 }) {
             throw IllegalArgumentException("project name contains control characters")
+        }
+    }
+
+    /** `SandboxCreateSpec.agent` must be an exact built-in sbx v0.47 agent ([SbxAgents.V0_47]). */
+    fun requireSbxAgent(agent: String) {
+        if (!SbxAgents.isAllowlisted(agent)) {
+            throw IllegalArgumentException(
+                "agent '${truncate(agent)}' is not a built-in sbx v0.47 agent (allowed: " +
+                    "${SbxAgents.V0_47.joinToString(", ")}); sandbox-kit references are never sent",
+            )
         }
     }
 

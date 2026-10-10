@@ -162,9 +162,12 @@ export function decodeLine(line: string): { ok: true; frame: InboundFrame } | { 
   try {
     value = JSON.parse(trimmed);
   } catch (e) {
+    // Kind + length only: V8's SyntaxError message quotes the input, which
+    // could copy part of a confirmation token into the output channel.
+    const kind = e instanceof Error ? e.name : 'parse error';
     return {
       ok: false,
-      error: { reason: 'invalid_json', message: `not JSON: ${String(e)}` },
+      error: { reason: 'invalid_json', message: `not JSON: ${kind} (line length ${trimmed.length})` },
     };
   }
   if (!isPlainObject(value)) {

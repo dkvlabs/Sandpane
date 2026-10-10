@@ -15,6 +15,14 @@ client) implementing the JB0/JB1 surface of
 > **205 tests, 0 failures, 0 errors, 0 skipped**, and `./gradlew verifyPlugin --offline` still
 > reports **`Compatible`** against IU-262.10968.63. The 161-test figures below are the U4 baseline.
 >
+> Re-run on 10.10.2026 after the A1 sandbox-lifecycle client work and its security/phase-review fixes (`sandbox.stop`, two-step
+> `sandbox.remove`, `SandboxCreateSpec.agent` / `SandboxSummary.agent`, 16-method pin):
+> `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache` passes with
+> **243 tests, 0 failures, 0 errors, 0 skipped** across 29 test classes, and
+> `./gradlew verifyPlugin --offline` reports **`Compatible`** against IU-262.10968.63 with no
+> deprecated/experimental/internal usage reports. The new actions were **never launched in an IDE**
+> and never exercised against a running Core or a real `sbx`.
+>
 > **Proven on this host** (exact commands and outputs in "Checks actually run" below):
 > `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
 > (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
@@ -203,21 +211,28 @@ clients/jetbrains/
     │   │   ├── core/ReplayCursors.kt         # per-task cursor seam behind task.subscribe's afterSequences
     │   │   ├── core/ErrorAttribution.kt      # provenance of a failure: this plugin refused vs Core answered
     │   │   ├── core/EventStream.kt           # per-task checkpoint, bounded window, fan-out
-    │   │   ├── model/Models.kt               # kotlinx mirrors of sandpane-protocol (wire names, 14 methods)
+    │   │   ├── model/Models.kt               # kotlinx mirrors of sandpane-protocol (wire names, 16 methods)
     │   │   ├── model/WorkspaceModeView.kt    # workspaceMode rendering; absence => UNVERIFIED/live-writable
     │   │   ├── ui/ChatPanel.kt               # Swing list/composer/pickers/attachments/status + 50 ms flush
     │   │   ├── actions/{StartTask,ReviewChanges,ApplyTask,RefreshSandboxes}Action.kt
+    │   │   ├── actions/SandboxLifecycleActions.kt # Stop / Remove (two-step token) / Start (unsupported)
+    │   │   ├── core/SandboxLifecycle.kt      # step-1 check, IssuedRemoval, remove flow, stop report
+    │   │   ├── core/MethodDeadlines.kt       # per-method read deadlines (stop 360 s, remove 400 s)
+    │   │   ├── ui/SandboxDialogs.kt          # remove confirmation content + sandbox chooser
     │   │   ├── services/{SandpaneContextProvider,EditorDiffProvider,SbxService,TaskMonitorService}.kt
     │   │   ├── services/FolderMatching.kt    # folder → Core project, pure and canonicalized on both sides
     │   │   └── settings/{SandpaneSettings,SandpaneConfigurable}.kt
     │   └── resources/META-INF/plugin.xml
     └── test/kotlin/labs/dkv/sandpane/
         ├── core/CoreClientFramingTest.kt     # byte-level framing + wire names        (29 tests)
-        ├── core/CoreCommandsTest.kt          # guards, gates, the three cursor shapes  (28 tests)
+        ├── core/CoreCommandsTest.kt          # guards, gates, the three cursor shapes  (30 tests)
+        ├── core/SandboxLifecycleTest.kt      # A1 frames, token flow, stop report       (25 tests)
         ├── core/ErrorAttributionTest.kt      # failure provenance sentences             (13 tests)
-        ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (8 tests)
+        ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (14 tests)
         ├── core/ReplayCursorSemanticsTest.kt # per-task vs shared-scalar replay         (7 tests)
-        └── services/FolderMatchingTest.kt    # folder matching + workspace-mode views  (12 tests)
+        ├── services/FolderMatchingTest.kt    # folder matching + workspace-mode views  (12 tests)
+        ├── services/SnapshotGapTest.kt       # why the sandbox list is missing          (3 tests)
+        └── ui/RemoveConfirmationDialogTest.kt # hostile impact lines, external header    (5 tests)
 ```
 
 Module layout deviates from specs/04 §2's sketch in two deliberate ways: models live in one
@@ -263,13 +278,16 @@ truth; `schemas/*.json` is hand-synced with it): camelCase payload fields, snake
 dotted `AgentEvent` discriminators, `v/id/method/params` frames with flattened `ok`/`err`, and
 `MAX_FRAME_BYTES = 4 MiB` from `sandpane-service`.
 
-The method surface is **14** (`Method::ALL` in Rust), of which **11** are the original protocol-v1
-baseline and **3** are additive in this revision: `task.list`, `conversation.list`,
-`conversation.history`. The additive fields are `CoreCapabilities.methods`,
+The method surface is **16** (`Method::ALL` in Rust), of which **11** are the original protocol-v1
+baseline, **3** are the additive discovery reads (`task.list`, `conversation.list`,
+`conversation.history`) and **2** are addition A1 (`sandbox.stop`, `sandbox.remove`). All five
+additive methods are gated on `system.probe`'s `methods` (`CoreMethods.REQUIRES_ADVERTISEMENT`):
+not advertised ⇒ the action is visibly disabled and nothing is sent. There is deliberately **no**
+`sandbox.start` (sbx v0.47 has none); the Start Sandbox action only shows that unsupported state. The additive fields are `CoreCapabilities.methods`,
 `Project.repositories`, `SandboxSummary.workspaceMode` and the optional
 `TaskSubscribeParams.afterSequences`.
 
-This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (9 tests), which
+This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (14 tests), which
 reads the Rust sources and the schemas out of the working tree and compares them against the
 Kotlin mirror: method names **and their order**, the `Method::parse` arms, the
 `rpc-request.schema.json` `method` enum, every `pub const` numeric bound (evaluated, not copied), the
@@ -398,7 +416,27 @@ discovery revision this client is now synced to**):
 - **Local IPC only.** `SocketChannel` + `UnixDomainSocketAddress`; a non-local or scheme-like
   path is refused, and Windows resolves to an explicit `TransportUnsupported` state instead of
   falling back to TCP.
-- **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **14** protocol
+- **Sandbox lifecycle (A1).** Stop / Remove pick a sandbox from Core's last `sandbox.list` (including
+  ones with no Sandpane binding). Stop: `{name}`, deadline 360 s; an absent `requeried` is shown as
+  state UNKNOWN, never "stopped". Remove: step 1 `{name}` (no token key) off the EDT; Core's answer
+  must be a `sandbox.remove` confirmation for that exact name with a 64-hex token, or nothing more
+  happens; a native dialog (Core strings revealed + escaped via `DialogHtml`, impact capped at 20,
+  bold "NOT CONFIRMED AS CREATED BY SANDPANE" first when `external`, expiry shown, "Remove Sandbox" vs Cancel with
+  Cancel default and focused); only on Remove and before `expiresAt`, step 2 `{name, confirmToken}`
+  off the EDT, deadline 400 s. The token is never displayed, and is masked in any logged late frame
+  (`FrameRedaction`). Core serves one connection serially, so while a stop/remove runs, this IDE's
+  other Core requests on the shared socket queue and may hit their own 15 s timeout (reported, not
+  retried) — including **`task.cancel`, which can be delayed behind a running stop/remove** (accepted
+  head-of-line-blocking follow-up W3: a dedicated connection for long calls, or concurrent dispatch
+  in Core). The stop/remove future itself is not cancelled by that. When `external` is true the
+  dialog's first line is the bold shared header "NOT CONFIRMED AS CREATED BY SANDPANE" plus "Core
+  cannot confirm Sandpane created this sandbox (no Sandpane binding is recorded for this sbx id)." —
+  it never claims the sandbox was made outside Sandpane. A step-2 `VALIDATION_FAILED` is worded "Core
+  ran nothing" only for Core's token or sandbox-name refusal (prefixes pinned against the Rust
+  source); any other is "not known". A malformed remove answer is never echoed (it may hold a token). Neither step is retried; a
+  step-2 timeout/transport failure is "outcome unknown". The list is re-probed afterwards. Create has
+  no UI in this plugin: `SandboxCreateSpec.agent` is typed and allowlisted (sbx v0.47 built-ins) only.
+- **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **16** protocol
   method names before writing a byte; there is no free-form RPC. The refusal is a
   `CoreValidationException` — this client's own word — and not a `CoreRpcException`, because Core
   never saw the request.
@@ -472,6 +510,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Gate, offline from clean | `./gradlew clean --offline`, then `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache --console=plain` | `BUILD SUCCESSFUL in 17s`, `19 actionable tasks: 16 executed, 3 up-to-date`; `compileKotlin`, `compileTestKotlin`, `test`, `buildPlugin`, `verifyPluginStructure` executed |
 | Unit tests | JUnit XML in `build/test-results/test` | **161 tests, 0 failures, 0 errors, 0 skipped**, 20 result files (both runs) |
 | Gate after the anti-spoofing + enum-tolerance hardening, with the table-layout fix (10.10.2026; an intermediate 09.10.2026 run of the same command had 196 tests) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache --console=plain`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 17s`; **205 tests, 0 failures, 0 errors, 0 skipped**, 26 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; 55 source files (32 main, 23 test) |
+| Gate after the A1 sandbox-lifecycle client work (10.10.2026) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 16s`; **243 tests, 0 failures, 0 errors, 0 skipped**, 29 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (report dir holds only verdict/telemetry/dependencies — no deprecated/experimental/internal usage files); 62 source files (36 main, 26 test) — re-run after the A1 security/phase-review fixes |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |
@@ -480,7 +519,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Toolchain actually used | `./gradlew --version`, `./gradlew javaToolchains` | Gradle 9.8.1, Launcher JVM 23 (GraalVM CE); toolchain 25 = `Eclipse Temurin JDK 25 (25.0.3+9-LTS)`, `Detected by: Auto-provisioned by Gradle` |
 | Wrapper integrity | `shasum -a 256 gradle/wrapper/gradle-wrapper.jar` | `3b8a2577…8e98` = the published `gradle-9.8.1-wrapper.jar.sha256` |
 | Drift gate can fail (negative control) | mutated Kotlin mirror, then a mutated **copy** of the Rust sources via `-PsandpaneRepoRoot` | red in both directions with a message naming the drifted wire string; green after restore — see "Drift gate and its negative control" (recorded before U4; the gate ran green again in the suite above) |
-| Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 14 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
+| Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 16 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
 | Subprocess misuse (`ProcessBuilder`, `Runtime.exec`, `sh -c`, `bash -lc`) | grep over `src/main/kotlin` | **none** — no subprocess surface exists in this module |
 | Internal/private API references (`com.intellij.internal`, JetBrains AI, `setAccessible`, `Unsafe`, reflection) | grep, plus Plugin Verifier | none |
 | TCP / network surface | grep | none — every `TCP` hit is prose stating it is never used |

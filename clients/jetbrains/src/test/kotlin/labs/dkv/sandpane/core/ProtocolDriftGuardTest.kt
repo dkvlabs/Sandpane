@@ -82,6 +82,8 @@ class ProtocolDriftGuardTest {
 
     private val rust by lazy { read("core/crates/sandpane-protocol/src/lib.rs") }
     private val service by lazy { read("core/crates/sandpane-service/src/lib.rs") }
+    private val validation by lazy { read("core/crates/sandpane-core/src/validation.rs") }
+    private val confirm by lazy { read("core/crates/sandpane-service/src/confirm.rs") }
     private val requestSchema by lazy { read("schemas/rpc-request.schema.json") }
     private val capabilitiesSchema by lazy { read("schemas/core-capabilities.schema.json") }
     private val sandboxSpecSchema by lazy { read("schemas/sandbox-create-spec.schema.json") }
@@ -201,7 +203,7 @@ class ProtocolDriftGuardTest {
     fun kotlinMethodsMatchRustMethodAllExactlyIncludingOrder() {
         val fromAll = methodAllWireNames()
         assertEquals(CoreMethods.ALL, fromAll, "CoreMethods.ALL drifted from Method::ALL (order included)")
-        assertEquals(14, fromAll.size, "the discovery revision advertises 14 methods")
+        assertEquals(16, fromAll.size, "addition A1 advertises 16 methods")
 
         // parse() must accept every advertised name, and the schema enum must carry the same set.
         val parsed = parseArms().toSet()
@@ -215,12 +217,15 @@ class ProtocolDriftGuardTest {
 
         // A rename must break THIS test, not ship silently: the names the plugin sends are taken
         // from the same list Core dispatches, and no invented name is ever allowlisted.
-        listOf("task.list", "conversation.list", "conversation.history").forEach { added ->
+        listOf("task.list", "conversation.list", "conversation.history", "sandbox.stop", "sandbox.remove").forEach { added ->
             assertTrue(fromAll.contains(added), "Rust no longer advertises $added")
             assertTrue(CoreMethods.ALL.contains(added), "the Kotlin mirror dropped $added")
             assertTrue(rust.contains("=> \"$added\""), "as_str has no arm for $added")
         }
-        listOf("shell.exec", "sbx.raw", "fs.read", "process.spawn").forEach { forbidden ->
+        // sbx v0.47 has no `start`: neither Rust nor this client may grow a sandbox.start.
+        assertFalse(fromAll.contains("sandbox.start"), "Rust advertises sandbox.start, which sbx v0.47 cannot do")
+        assertFalse(rust.contains("\"sandbox.start\" =>"), "Method::parse accepts sandbox.start")
+        listOf("shell.exec", "sbx.raw", "fs.read", "process.spawn", "sandbox.start").forEach { forbidden ->
             assertFalse(CoreMethods.isAllowlisted(forbidden), "$forbidden must never be callable")
         }
     }
@@ -228,7 +233,7 @@ class ProtocolDriftGuardTest {
     @Test
     fun methodAdvertisementIsDerivedNotHandWritten() {
         assertTrue(
-            rust.contains("pub const ALL: [Method; 14]"),
+            rust.contains("pub const ALL: [Method; 16]"),
             "Method::ALL's declared length changed — update CoreMethods.ALL and this gate",
         )
         assertTrue(
@@ -309,6 +314,15 @@ class ProtocolDriftGuardTest {
             "pub messages: Vec<MessageRecord>" to "messages",
             "pub statuses: Vec<TaskStatus>" to "statuses",
             "pub limit: Option<u32>" to "limit",
+            // A1
+            "pub agent: Option<String>" to "val agent: String? = null",
+            "pub confirm_token: Option<String>" to "confirmToken",
+            "pub requeried: Option<SandboxSummary>" to "requeried",
+            "pub expires_at: String" to "expiresAt",
+            "pub removed: Option<bool>" to "removed",
+            "pub confirmation: Option<ConfirmationRequest>" to "confirmation",
+            "pub external: bool" to "external",
+            "pub impact: Vec<String>" to "impact",
         )
         for ((rustField, wireName) in added) {
             assertTrue(rust.contains(rustField), "Rust no longer has `$rustField`")
@@ -320,6 +334,12 @@ class ProtocolDriftGuardTest {
             "pub struct ConversationHistoryParams",
             "pub struct MessageRecord",
             "pub struct ConversationHistoryResult",
+            "pub struct SandboxStopParams",
+            "pub struct SandboxStopResult",
+            "pub struct SandboxRemoveParams",
+            "pub struct SandboxRemoveResult",
+            "pub struct ConfirmationRequest",
+            "pub struct ConfirmationTarget",
         )) {
             assertTrue(rust.contains(struct), "Rust no longer defines $struct")
         }
@@ -432,6 +452,88 @@ class ProtocolDriftGuardTest {
                 "Core appends `$kind`, which this client renders as unrecognized — add it deliberately",
             )
         }
+    }
+
+    /**
+     * A1: the Kotlin agent allowlist, the schema's `agent` enum and Core's `SBX_AGENTS_V0_47` are the
+     * same ordered list — so a create spec can never carry an agent Core would refuse, and Core can
+     * never accept one this client's surface does not know.
+     */
+    @Test
+    fun sbxAgentAllowlistMatchesSchemaAndCore() {
+        assertEquals(
+            labs.dkv.sandpane.model.SbxAgents.V0_47,
+            schemaStringEnum(sandboxSpecSchema, "agent"),
+            "schemas/sandbox-create-spec.schema.json agent enum drifted from SbxAgents.V0_47",
+        )
+        val decl = Regex("""pub const SBX_AGENTS_V0_47: &\[&str\] = &\[([\s\S]*?)\];""").find(validation)
+            ?: fail("sandpane-core validation.rs has no SBX_AGENTS_V0_47")
+        val core = Regex(""""([^"]+)"""").findAll(decl.groupValues[1]).map { it.groupValues[1] }.toList()
+        assertEquals(labs.dkv.sandpane.model.SbxAgents.V0_47, core, "Core's SBX_AGENTS_V0_47 drifted")
+        assertEquals("shell", labs.dkv.sandpane.model.SbxAgents.DEFAULT)
+        assertFalse(requiredOf(sandboxSpecSchema, root).contains("agent"), "agent became required — not additive")
+    }
+
+    /**
+     * A1: [CoreGuards.requireAddressableSandboxName] mirrors `Validator::sandbox_name` (the rule Core
+     * applies before `sbx stop`/`sbx rm`), not the stricter create-schema pattern. Pinned on the Rust
+     * text so a change there fails here.
+     */
+    @Test
+    fun addressableSandboxNameRuleMatchesCore() {
+        val fn = Regex("""pub fn sandbox_name\(name: &str\)[\s\S]*?\n    \}""").find(validation)?.value
+            ?: fail("Validator::sandbox_name not found")
+        assertTrue(fn.contains("Self::bounded(name, 128)?;"), "Core's sandbox-name length bound changed")
+        assertEquals(128, CoreGuards.MAX_SANDBOX_NAME_LEN)
+        assertTrue(fn.contains("c.is_ascii_alphanumeric() || c == '-' || c == '.'"), "Core's sandbox-name charset changed")
+        assertTrue(fn.contains("name.chars().count() < 2"), "Core's two-character minimum changed")
+        assertTrue(fn.contains("eq_ignore_ascii_case(\"default\")"), "Core's reserved name changed")
+    }
+
+    /** A1: the confirmation token shape the client accepts is the one Core issues (64 lowercase hex). */
+    @Test
+    fun confirmationTokenShapeMatchesCore() {
+        assertTrue(confirm.contains("pub const TOKEN_HEX_LEN: usize = 64;"), "Core's token length changed")
+        assertTrue(CoreGuards.isConfirmTokenShape("0123456789abcdef".repeat(4)))
+        assertFalse(CoreGuards.isConfirmTokenShape("0123456789ABCDEF".repeat(4)))
+    }
+
+    /**
+     * Security W1: a step-2 `VALIDATION_FAILED` is worded "Core ran nothing" ONLY when Core's message
+     * is its token refusal or its sandbox-name refusal. Both prefixes are read from the Rust source,
+     * so a reworded refusal fails here instead of silently falling into the "not known" branch.
+     */
+    @Test
+    fun ranNothingRefusalPrefixesMatchCore() {
+        val decl = Regex("""pub const TOKEN_REJECTED_MESSAGE: &str =\s*"([^"]*)""").find(confirm)
+            ?: fail("confirm.rs has no TOKEN_REJECTED_MESSAGE")
+        assertTrue(
+            decl.groupValues[1].startsWith(CoreRemoveRefusals.TOKEN_REJECTED_PREFIX),
+            "Core's TOKEN_REJECTED_MESSAGE no longer starts with the prefix the client matches",
+        )
+        assertTrue(
+            service.contains("format!(\"${CoreRemoveRefusals.NAME_REFUSAL_PREFIX}{e}\")"),
+            "Core's sandbox-name refusal no longer starts with '${CoreRemoveRefusals.NAME_REFUSAL_PREFIX}'",
+        )
+    }
+
+    /**
+     * Review I2: the client deadline floors must outlast Core's worst case, computed from the
+     * `RunLimits` Core really uses (`sandpane-core/src/process.rs`): stop = mutation + query,
+     * remove step 2 = query + mutation + query.
+     */
+    @Test
+    fun lifecycleDeadlineFloorsOutlastCoresRunLimits() {
+        val process = read("core/crates/sandpane-core/src/process.rs")
+        fun secs(name: String): Int {
+            val m = Regex("""pub const $name: RunLimits = RunLimits \{\s*timeout: Duration::from_secs\((\d+)\)""").find(process)
+                ?: fail("process.rs has no RunLimits::$name with a from_secs timeout")
+            return m.groupValues[1].toInt()
+        }
+        val query = secs("QUERY") * 1000
+        val mutation = secs("MUTATION") * 1000
+        assertTrue(MethodDeadlines.SANDBOX_STOP_MS > mutation + query, "stop floor no longer outlasts Core")
+        assertTrue(MethodDeadlines.SANDBOX_REMOVE_MS > query + mutation + query, "remove floor no longer outlasts Core")
     }
 
     // ------------------------------------------------------------------

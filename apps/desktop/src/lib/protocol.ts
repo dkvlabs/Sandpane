@@ -102,7 +102,9 @@ export const ERROR_CODES: readonly ErrorCode[] = [
  *
  * `conversation.list`, `conversation.history` and `task.list` are ADDITIVE v1
  * methods: a pre-revision Core does not dispatch them, so callers feature-detect
- * with `coreAdvertisesMethod` instead of assuming (AGENTS rule 5).
+ * with `coreAdvertisesMethod` instead of assuming (AGENTS rule 5). So are the A1
+ * lifecycle methods `sandbox.stop` and `sandbox.remove` (design 2026-10-09 §3).
+ * There is deliberately NO `sandbox.start`: sbx v0.47 has no `start` command.
  */
 export const METHODS = [
   "system.probe",
@@ -110,6 +112,8 @@ export const METHODS = [
   "project.list",
   "sandbox.list",
   "sandbox.create",
+  "sandbox.stop",
+  "sandbox.remove",
   "conversation.create",
   "conversation.send",
   "conversation.list",
@@ -247,6 +251,41 @@ export interface SandboxCreateSpec {
   projectId: string;
   workspaceMode: WorkspaceMode;
   repoPath?: string;
+  /**
+   * Built-in sbx agent the sandbox is created with (A1, additive). Absent →
+   * Core uses the provider-free `shell`. Only an exact member of `SBX_AGENTS`
+   * may ever be sent; Core refuses anything else (kit references run
+   * third-party code). Accepting a provider agent is NOT a verification claim.
+   */
+  agent?: SbxAgent;
+}
+
+/**
+ * Built-in agents of the captured `sbx v0.47.0 create --help`, mirrored from
+ * `sandpane_core::validation::SBX_AGENTS_V0_47` and the `agent` enum of
+ * `schemas/sandbox-create-spec.schema.json` (drift-tested against both).
+ */
+export const SBX_AGENTS = [
+  "claude",
+  "codex",
+  "copilot",
+  "cursor",
+  "devin",
+  "docker-agent",
+  "droid",
+  "gemini",
+  "kiro",
+  "opencode",
+  "shell",
+] as const;
+
+export type SbxAgent = (typeof SBX_AGENTS)[number];
+
+/** Core's default when `agent` is absent: the provider-free shell. */
+export const DEFAULT_SBX_AGENT: SbxAgent = "shell";
+
+export function isSbxAgent(value: unknown): value is SbxAgent {
+  return typeof value === "string" && (SBX_AGENTS as readonly string[]).includes(value);
 }
 
 export interface SandboxSummary {
@@ -272,7 +311,74 @@ export interface SandboxSummary {
    * exists only so the UI can say what Core actually sent.
    */
   unrecognizedWorkspaceMode?: string;
+  /**
+   * The agent sbx itself reports for this sandbox in `ls --json` (A1,
+   * additive). A probed FACT, never a verification claim — verification lives
+   * only in `CoreCapabilities.agents[].verified`. Absent when sbx reported none
+   * or the Core predates A1; the key is then omitted, never invented.
+   */
+  agent?: string;
 }
+
+/** `sandbox.stop` params (A1). Not destructive: no confirmation token. */
+export interface SandboxStopParams {
+  name: string;
+}
+
+/**
+ * `sandbox.stop` result. `stopped: true` only says `sbx stop` exited 0. The
+ * state is whatever the post-stop re-query reported in `requeried`; ABSENT
+ * means the sandbox is no longer listed or the re-query failed, and the UI must
+ * show the state as UNKNOWN — never assume "stopped".
+ */
+export interface SandboxStopResult {
+  stopped: boolean;
+  requeried?: SandboxSummary;
+}
+
+/** `sandbox.remove` params (A1, two-step confirmation; design 2026-10-09 §2). */
+export interface SandboxRemoveParams {
+  name: string;
+  /** Step 2 only. Step 1 omits the key entirely. */
+  confirmToken?: string;
+}
+
+/** The identity a confirmation token is bound to (name AND sbx id). */
+export interface ConfirmationTarget {
+  name: string;
+  id: string;
+}
+
+/**
+ * Core's server-side destructive-action confirmation. The token is 256-bit,
+ * single-use, memory-only in Core, and expires at `expiresAt` (RFC 3339 UTC).
+ * `external: true` means Core cannot confirm Sandpane created the target: no
+ * Sandpane binding is recorded for this sbx id. That covers a sandbox made
+ * outside Sandpane, a pre-A1 binding with no recorded id, and a binding that
+ * belongs to an earlier sandbox with a different sbx id — so clients must NOT
+ * claim "created outside Sandpane". Shown prominently with every `impact` line.
+ */
+export interface ConfirmationRequest {
+  /** 64 lowercase hex characters. Never logged, routed or persisted. */
+  token: string;
+  expiresAt: string;
+  action: string;
+  target: ConfirmationTarget;
+  impact: string[];
+  external: boolean;
+}
+
+/** Token shape Core issues (256 bits as lowercase hex). */
+export const CONFIRM_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * `sandbox.remove` result as this client decodes it: exactly one of the two
+ * wire fields is present — `confirmation` (step 1, nothing changed) or
+ * `removed: true` (step 2).
+ */
+export type SandboxRemoveResult =
+  | { kind: "confirmation"; confirmation: ConfirmationRequest }
+  | { kind: "removed" };
 
 export type WorkspaceMode =
   | "direct_mount"

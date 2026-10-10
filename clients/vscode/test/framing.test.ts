@@ -165,3 +165,18 @@ describe('NDJSON framing codec', () => {
     if (parsed.ok) expect(parsed.frame.kind).toBe('notification');
   });
 });
+
+describe('decode failures never echo frame content (security review I1)', () => {
+  it('a malformed line is reported by kind and length only, no input snippet', () => {
+    const secret = '0123456789abcdef'.repeat(4);
+    const line = `{"v":1,"id":"x","ok":{"confirmation":{"token":"${secret}"`;
+    const result = decodeLine(line);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.reason).toBe('invalid_json');
+    expect(result.error.message).toBe(`not JSON: SyntaxError (line length ${line.length})`);
+    for (const fragment of [secret, secret.slice(0, 8), 'confirmation', 'token']) {
+      expect(result.error.message).not.toContain(fragment);
+    }
+  });
+});

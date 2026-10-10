@@ -188,7 +188,9 @@ class ConnectionManager(private val application: Application?) : Disposable {
             future.completeExceptionally(CoreTransportException(notReadyReason()))
             return future
         }
-        val timeoutMs = settings().requestTimeoutMs.toLong()
+        // Same per-method rule as CoreClient's own layers: the shortest waiting layer is the one
+        // that fires, so all of them must agree ([MethodDeadlines]).
+        val timeoutMs = MethodDeadlines.forMethod(method, settings().requestTimeoutMs).toLong()
         io.execute {
             try {
                 val frame = active.request(method, params).get(timeoutMs, TimeUnit.MILLISECONDS)
@@ -548,7 +550,7 @@ class ConnectionManager(private val application: Application?) : Disposable {
                 val next = CoreClient(
                     socketAddress = UnixDomainSocketAddress.of(transport.path),
                     requestTimeoutMs = settings().requestTimeoutMs,
-                    onUnsolicited = { line -> log("unsolicited frame: ${truncate(line)}") },
+                    onUnsolicited = { line -> log("unsolicited frame: ${truncate(FrameRedaction.redact(line))}") },
                     onClosed = { cause -> onClientClosed(myGeneration, cause) },
                 )
                 try {

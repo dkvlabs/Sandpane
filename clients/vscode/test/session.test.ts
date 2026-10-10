@@ -25,16 +25,44 @@ interface Frame {
   params: Record<string, unknown>;
 }
 
+/** `Method::ALL` order — what an A1 Core advertises (16 methods). */
 const ALL_METHODS = [
-  'system.probe', 'project.list', 'project.create', 'sandbox.list', 'sandbox.create',
+  'system.probe', 'project.create', 'project.list', 'sandbox.list', 'sandbox.create',
+  'sandbox.stop', 'sandbox.remove',
   'conversation.create', 'conversation.send', 'conversation.list', 'conversation.history',
   'task.cancel', 'task.list', 'task.subscribe', 'git.review', 'git.apply',
 ];
+
+/** A pre-A1 Core: the 14 methods before sandbox.stop / sandbox.remove. */
+const PRE_A1_METHODS = ALL_METHODS.filter((m) => m !== 'sandbox.stop' && m !== 'sandbox.remove');
+
+const TOKEN = '0123456789abcdef'.repeat(4);
 
 /** Scripted Core: projects p1/p2, one queued task each, sandboxes with recorded modes. */
 class ScriptedCore {
   readonly requests: Frame[] = [];
   refuseConnect = false;
+  /** What system.probe advertises. */
+  methods: string[] = ALL_METHODS;
+  /** Future-Core shape: task.list rows carry `sandboxName`. Today's Core never sets it. */
+  taskSandboxNames = false;
+  /** `sandbox.stop` answer. */
+  stopAnswer: { ok: unknown } | { err: { code: string; message: string } } = {
+    ok: { stopped: true, requeried: { name: 'atlas-box', probedState: 'stopped', boundProjectId: 'p1', workspaceMode: 'sbx_clone' } },
+  };
+  /** `sandbox.remove` step-1 confirmation (step 1 = no confirmToken). */
+  confirmation: Record<string, unknown> = {
+    token: TOKEN,
+    expiresAt: '2026-10-10T12:02:00Z',
+    action: 'sandbox.remove',
+    target: { name: 'atlas-box', id: 'b5ebec73-e2ae-471a-811a-e011cfb1948e' },
+    impact: ['removes sandbox atlas-box', 'its sbx-clone workspace is deleted'],
+    external: false,
+  };
+  /** `sandbox.remove` step-2 answer. */
+  removeAnswer: { ok: unknown } | { err: { code: string; message: string } } = { ok: { removed: true } };
+  /** Sandboxes `sandbox.list` reports after a successful remove. */
+  removed = new Set<string>();
   agentVerified = true;
   /** When set, sandbox.list answers this structured error (with details). */
   sandboxListError: { code: string; message: string; details?: unknown } | null = null;
@@ -97,7 +125,7 @@ class ScriptedCore {
             platform: 'darwin',
             sbx: { installed: true },
             agents: [{ id: 'codex', verified: this.agentVerified, supportsStreaming: false, supportsCancel: false, supportsResume: false }],
-            methods: ALL_METHODS,
+            methods: this.methods,
           },
         };
       case 'project.list':
@@ -114,13 +142,36 @@ class ScriptedCore {
             { name: 'atlas-box', probedState: 'running', boundProjectId: 'p1', workspaceMode: 'sbx_clone' },
             { name: 'nova-live', probedState: 'running', boundProjectId: 'p2', workspaceMode: 'direct_mount' },
             { name: 'atlas-unrecorded', probedState: 'running', boundProjectId: 'p1' },
-          ],
+          ].filter((s) => !this.removed.has(s.name)),
         };
+      case 'sandbox.create':
+        return {
+          ok: {
+            name: p['name'],
+            probedState: 'running',
+            boundProjectId: p['projectId'],
+            workspaceMode: p['workspaceMode'],
+            agent: p['agent'] ?? 'shell',
+          },
+        };
+      case 'sandbox.stop':
+        return this.stopAnswer;
+      case 'sandbox.remove':
+        if (p['confirmToken'] === undefined) return { ok: { confirmation: this.confirmation } };
+        if ('ok' in this.removeAnswer) this.removed.add(String(p['name']));
+        return this.removeAnswer;
       case 'task.list':
         return {
           ok: [...this.taskProject.entries()]
-            .filter(([, project]) => project === p['projectId'])
-            .map(([id, project]) => ({ id, conversationId: project === 'p1' ? 'c1' : 'c2', status: 'queued' })),
+            .filter(([, project]) => p['projectId'] === undefined || project === p['projectId'])
+            .map(([id, project]) => ({
+              id,
+              conversationId: project === 'p1' ? 'c1' : 'c2',
+              status: 'queued',
+              // Real Core never fills sandboxName (tasks.sandbox_binding_id is
+              // never written); `taskSandboxNames` simulates a future Core.
+              ...(this.taskSandboxNames ? { sandboxName: project === 'p1' ? 'atlas-box' : 'nova-live' } : {}),
+            })),
         };
       case 'conversation.list':
         return { ok: p['projectId'] === 'p1' ? [{ id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', createdAt: '' }] : [] };
@@ -174,6 +225,9 @@ async function settle(rounds = 12): Promise<void> {
   for (let i = 0; i < rounds; i += 1) await flush();
 }
 
+/** Session wall clock; tests may move it (e.g. past a confirmation's expiry). */
+const clock = { now: Date.parse('2026-10-10T12:00:00Z'), reads: [] as number[], after: null as null | { reads: number; now: number } };
+
 function makeSession(core: ScriptedCore, state = new MemoryState()) {
   const timers = new FakeTimers();
   const context = { workspaceState: state } as unknown as vscode.ExtensionContext;
@@ -181,11 +235,22 @@ function makeSession(core: ScriptedCore, state = new MemoryState()) {
     transportFactory: core.transportFactory,
     setTimer: timers.set,
     clearTimer: timers.clear,
+    now: () => {
+      // Optionally jump the clock after N reads (e.g. while a modal is open).
+      if (clock.after && clock.reads.length >= clock.after.reads) clock.now = clock.after.now;
+      clock.reads.push(clock.now);
+      return clock.now;
+    },
   });
   return { session, timers, state };
 }
 
-beforeEach(() => stub.reset());
+beforeEach(() => {
+  stub.reset();
+  clock.now = Date.parse('2026-10-10T12:00:00Z');
+  clock.reads = [];
+  clock.after = null;
+});
 afterEach(() => stub.reset());
 
 describe('loading (bugs 9, 12d)', () => {
@@ -551,5 +616,277 @@ describe('sandbox selection is validated against Core (S3)', () => {
     expect(state.values.get('sandpane.ui.selectedSandbox')).toBe('atlas-box');
     expect(session.snapshot().status?.text).toMatch(/not listed by Core/);
     session.dispose();
+  });
+});
+
+describe('A1 sandbox lifecycle: stop / remove / create agent', () => {
+  async function online(core = new ScriptedCore()) {
+    const made = makeSession(core);
+    await made.session.attach();
+    await settle();
+    return { core, ...made };
+  }
+
+  it('stop is refused visibly — no sandbox.stop frame — when Core does not advertise it', async () => {
+    const core = new ScriptedCore();
+    core.methods = PRE_A1_METHODS;
+    const { session } = await online(core);
+    stub.answers.set('Stop sandbox', 'Stop sandbox');
+    expect(await session.stopSandbox('atlas-box')).toBeUndefined();
+    expect(core.calls('sandbox.stop')).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toMatch(/not supported by the attached Sandpane Core.*"sandbox\.stop"/);
+    session.dispose();
+  });
+
+  it('stop sends {name} only after the modal, then re-lists sandboxes', async () => {
+    const { core, session } = await online();
+    stub.answers.set('Stop sandbox', 'Stop sandbox');
+    const listsBefore = core.calls('sandbox.list').length;
+    await session.stopSandbox('atlas-box');
+    const call = stub.warningCalls.find((c) => c.items.includes('Stop sandbox'));
+    expect(call?.options?.modal).toBe(true);
+    expect(core.calls('sandbox.stop').map((f) => f.params)).toEqual([{ name: 'atlas-box' }]);
+    expect(core.calls('sandbox.list').length).toBe(listsBefore + 1);
+    expect(session.snapshot().status?.text).toContain('sbx now reports state: stopped');
+    session.dispose();
+  });
+
+  it('FUTURE Core path: stop counts active tasks once Core records task.sandboxName', async () => {
+    const core = new ScriptedCore();
+    core.taskSandboxNames = true;
+    const { session } = await online(core);
+    await session.stopSandbox('atlas-box');
+    const listed = core.calls('task.list').at(-1);
+    expect(listed?.params['projectId']).toBeUndefined();
+    expect(listed?.params['statuses']).not.toContain('completed');
+    const call = stub.warningCalls.find((c) => c.items.includes('Stop sandbox'));
+    expect(call?.message).toBe('Stop sandbox "atlas-box"? 1 active task(s) use it.');
+    expect(call?.options?.detail).toContain('WARNING: 1 active task(s) recorded by Core run in this sandbox');
+    session.dispose();
+  });
+
+  it('real Core shape (tasks without sandboxName): active tasks "cannot be checked", never "none"', async () => {
+    const { core, session } = await online();
+    await session.stopSandbox('atlas-box');
+    expect(core.calls('task.list').length).toBeGreaterThan(0);
+    const call = stub.warningCalls.find((c) => c.items.includes('Stop sandbox'));
+    expect(call?.message).toBe('Stop sandbox "atlas-box"?');
+    expect(call?.options?.detail).toContain(
+      'Active tasks in this sandbox cannot be checked: Core does not yet record which sandbox a task uses.',
+    );
+    expect(call?.options?.detail).not.toContain('no active task');
+    session.dispose();
+  });
+
+  it('stop and remove address an sbx-named sandbox the create rule would refuse (W3)', async () => {
+    const core = new ScriptedCore();
+    core.confirmation = { ...core.confirmation, target: { name: 'Atlas.Demo', id: 'b5ebec73-e2ae-471a-811a-e011cfb1948e' } };
+    const { session } = await online(core);
+    stub.answers.set('Stop sandbox', 'Stop sandbox');
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    await session.stopSandbox('Atlas.Demo');
+    expect(core.calls('sandbox.stop').map((f) => f.params)).toEqual([{ name: 'Atlas.Demo' }]);
+    await session.removeSandbox('Atlas.Demo');
+    expect(core.calls('sandbox.remove').map((f) => f.params)).toEqual([
+      { name: 'Atlas.Demo' },
+      { name: 'Atlas.Demo', confirmToken: TOKEN },
+    ]);
+    session.dispose();
+  });
+
+  it('stop cancelled in the modal sends nothing', async () => {
+    const { core, session } = await online();
+    await session.stopSandbox('atlas-box');
+    expect(core.calls('sandbox.stop')).toHaveLength(0);
+    expect(session.snapshot().status?.text).toBe('Stop not confirmed; nothing was sent.');
+    session.dispose();
+  });
+
+  it('an absent re-query shows the state as UNKNOWN, never "stopped"', async () => {
+    const core = new ScriptedCore();
+    core.stopAnswer = { ok: { stopped: true } };
+    const { session } = await online(core);
+    stub.answers.set('Stop sandbox', 'Stop sandbox');
+    await session.stopSandbox('atlas-box');
+    const status = session.snapshot().status;
+    expect(status?.tone).toBe('info');
+    expect(status?.text).toContain('UNKNOWN');
+    expect(status?.text).not.toMatch(/reports state: stopped/);
+    session.dispose();
+  });
+
+  it('remove is refused visibly — no sandbox.remove frame — when not advertised', async () => {
+    const core = new ScriptedCore();
+    core.methods = PRE_A1_METHODS;
+    const { session } = await online(core);
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    expect(await session.removeSandbox('atlas-box')).toBe(false);
+    expect(core.calls('sandbox.remove')).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toMatch(/"sandbox\.remove"/);
+    session.dispose();
+  });
+
+  it('remove cancelled: step 1 only — step 2 is never sent', async () => {
+    const { core, session } = await online();
+    // No scripted answer for "Remove sandbox" ⇒ the modal is dismissed.
+    expect(await session.removeSandbox('atlas-box')).toBe(false);
+    const frames = core.calls('sandbox.remove');
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.params).toEqual({ name: 'atlas-box' });
+    expect(session.snapshot().status?.text).toMatch(/nothing was sent/);
+    session.dispose();
+  });
+
+  it('remove confirmed: step 2 carries exactly the step-1 token, then the list is re-read', async () => {
+    const { core, session } = await online();
+    session.selectSandbox('atlas-box');
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    const listsBefore = core.calls('sandbox.list').length;
+    expect(await session.removeSandbox('atlas-box')).toBe(true);
+    const frames = core.calls('sandbox.remove');
+    expect(frames.map((f) => f.params)).toEqual([{ name: 'atlas-box' }, { name: 'atlas-box', confirmToken: TOKEN }]);
+    expect(core.calls('sandbox.list').length).toBe(listsBefore + 1);
+    const snap = session.snapshot();
+    expect(snap.sandboxes.map((s) => s.name)).not.toContain('atlas-box');
+    expect(snap.selectedSandbox).toBeNull();
+    expect(snap.status?.tone).toBe('ok');
+    // The modal showed identity, impact and expiry, and was native + modal.
+    const call = stub.warningCalls.find((c) => c.items.includes('Remove sandbox'));
+    expect(call?.options?.modal).toBe(true);
+    expect(call?.message).toBe('Remove sandbox "atlas-box"?');
+    expect(call?.options?.detail).toContain('sbx id: b5ebec73-e2ae-471a-811a-e011cfb1948e');
+    expect(call?.options?.detail).toContain('• removes sandbox atlas-box');
+    expect(call?.options?.detail).toContain('• its sbx-clone workspace is deleted');
+    expect(call?.options?.detail).toContain('(in about 120 s)');
+    session.dispose();
+  });
+
+  it('a confirmation that expires while the modal is open is never sent (W1)', async () => {
+    const { core, session } = await online();
+    // The user clicks "Remove sandbox" only after Core's expiry has passed.
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    // Read 1 builds the modal (12:00:00, "in about 120 s"); read 2 is the
+    // click — by then Core's expiry (12:02:00) has passed.
+    clock.after = { reads: 1, now: Date.parse('2026-10-10T12:02:00Z') };
+    expect(await session.removeSandbox('atlas-box')).toBe(false);
+    const detail = stub.warningCalls.find((c) => c.items.includes('Remove sandbox'))?.options?.detail ?? '';
+    expect(detail).toContain('(in about 120 s)');
+    expect(clock.reads).toEqual([Date.parse('2026-10-10T12:00:00Z'), Date.parse('2026-10-10T12:02:00Z')]);
+    expect(core.calls('sandbox.remove').map((f) => f.params)).toEqual([{ name: 'atlas-box' }]);
+    expect(session.snapshot().status?.text).toBe('Confirmation expired — nothing was sent; run Remove again.');
+    session.dispose();
+  });
+
+  it('an unparseable expiry fails closed: no step 2 (W1)', async () => {
+    const core = new ScriptedCore();
+    core.confirmation = { ...core.confirmation, expiresAt: 'soon' };
+    const { session } = await online(core);
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    expect(await session.removeSandbox('atlas-box')).toBe(false);
+    expect(core.calls('sandbox.remove')).toHaveLength(1);
+    const detail = stub.warningCalls.find((c) => c.items.includes('Remove sandbox'))?.options?.detail ?? '';
+    expect(detail).toContain('cannot be used');
+    expect(session.snapshot().status?.text).toBe('Confirmation expired — nothing was sent; run Remove again.');
+    session.dispose();
+  });
+
+  it('external: NOT CONFIRMED AS CREATED BY SANDPANE leads the modal title and body', async () => {
+    const core = new ScriptedCore();
+    core.confirmation = { ...core.confirmation, external: true };
+    const { session } = await online(core);
+    await session.removeSandbox('atlas-box');
+    const call = stub.warningCalls.find((c) => c.items.includes('Remove sandbox'));
+    expect(call?.message.startsWith('NOT CONFIRMED AS CREATED BY SANDPANE')).toBe(true);
+    expect(call?.options?.detail?.startsWith('NOT CONFIRMED AS CREATED BY SANDPANE')).toBe(true);
+    expect(call?.options?.detail).toContain('Core cannot confirm Sandpane created this sandbox (no Sandpane binding is recorded for this sbx id).');
+    expect(call?.options?.detail).not.toContain('created outside');
+    expect(core.calls('sandbox.remove')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it('hostile impact lines are shown escaped, on one line each', async () => {
+    const core = new ScriptedCore();
+    const rlo = String.fromCodePoint(0x202e);
+    core.confirmation = {
+      ...core.confirmation,
+      impact: [`deletes ${rlo}fdp.exe`, 'removes atlas-box' + String.fromCodePoint(10) + 'Nothing is deleted, safe to confirm'],
+    };
+    const { session } = await online(core);
+    await session.removeSandbox('atlas-box');
+    const detail = stub.warningCalls.find((c) => c.items.includes('Remove sandbox'))?.options?.detail ?? '';
+    expect(detail).not.toContain(rlo);
+    expect(detail).toContain('deletes ' + String.fromCodePoint(92) + 'u202Efdp.exe');
+    expect(detail.split(String.fromCodePoint(10))).not.toContain('Nothing is deleted, safe to confirm');
+    expect(detail).toContain('WARNING: text from Core contained invisible or control characters');
+    session.dispose();
+  });
+
+  it('a step-1 answer for a different target is never presented and never confirmed', async () => {
+    const core = new ScriptedCore();
+    core.confirmation = { ...core.confirmation, target: { name: 'nova-live', id: 'x' } };
+    const { session } = await online(core);
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    expect(await session.removeSandbox('atlas-box')).toBe(false);
+    expect(stub.warningCalls.some((c) => c.items.includes('Remove sandbox'))).toBe(false);
+    expect(core.calls('sandbox.remove')).toHaveLength(1);
+    expect(stub.errors.at(-1)).toMatch(/step 2 is not sent/);
+    session.dispose();
+  });
+
+  it('a refused token (VALIDATION_FAILED) is explained and nothing is retried', async () => {
+    const core = new ScriptedCore();
+    core.removeAnswer = { err: { code: 'VALIDATION_FAILED', message: 'confirmation token is invalid or expired' } };
+    const { session } = await online(core);
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    expect(await session.removeSandbox('atlas-box')).toBe(false);
+    expect(core.calls('sandbox.remove')).toHaveLength(2);
+    expect(stub.errors.at(-1)).toContain('Core refused the confirmation');
+    expect(stub.errors.at(-1)).toContain('Nothing was removed');
+    session.dispose();
+  });
+
+  it('a same-named replacement (CONFLICT) is explained', async () => {
+    const core = new ScriptedCore();
+    core.removeAnswer = { err: { code: 'CONFLICT', message: 'sandbox identity changed' } };
+    const { session } = await online(core);
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    await session.removeSandbox('atlas-box');
+    expect(stub.errors.at(-1)).toContain('same-named replacement');
+    expect(core.calls('sandbox.remove')).toHaveLength(2);
+    session.dispose();
+  });
+
+  it('Core error text is shown with hidden characters escaped', async () => {
+    const core = new ScriptedCore();
+    const rlo = String.fromCodePoint(0x202e);
+    core.removeAnswer = { err: { code: 'NOT_FOUND', message: `gone ${rlo}[ok](command:evil)` } };
+    const { session } = await online(core);
+    stub.answers.set('Remove sandbox', 'Remove sandbox');
+    await session.removeSandbox('atlas-box');
+    const shown = stub.errors.at(-1) ?? '';
+    expect(shown).not.toContain(rlo);
+    expect(shown).toContain(String.fromCodePoint(92) + 'u202E');
+    expect(shown).not.toContain('](command:');
+    session.dispose();
+  });
+
+  it('create: a non-shell agent is sent only to an A1 Core; default shell is omitted', async () => {
+    const { core, session } = await online();
+    await session.createSandbox({ name: 'atlas-agent', projectId: 'p1', workspaceMode: 'mountless', agent: 'codex' });
+    await session.createSandbox({ name: 'atlas-shell', projectId: 'p1', workspaceMode: 'mountless' });
+    const sent = core.calls('sandbox.create').map((f) => f.params);
+    expect(sent[0]).toMatchObject({ name: 'atlas-agent', agent: 'codex' });
+    expect(Object.keys(sent[1] ?? {})).not.toContain('agent');
+    session.dispose();
+
+    const old = new ScriptedCore();
+    old.methods = PRE_A1_METHODS;
+    const pre = await online(old);
+    expect(
+      await pre.session.createSandbox({ name: 'atlas-agent', projectId: 'p1', workspaceMode: 'mountless', agent: 'codex' }),
+    ).toBeUndefined();
+    expect(old.calls('sandbox.create')).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toMatch(/predates agent selection/);
+    pre.session.dispose();
   });
 });

@@ -21,9 +21,11 @@ not implemented. Nothing here pretends to be a capability it does not have.
 | Durable-event catch-up from a checkpoint (`task.subscribe`, per-task `afterSequences`) | **functional** | `test/catchup.test.ts` + live: a shared scalar is shown to skip the behind task's unseen events, and `afterSequences` recovers them |
 | Live updates: `task.subscribe` re-pulled every 2 s while the connection is online and some task of the selected project is non-terminal (Core never pushes); scoped to the selected project and rebuilt when it changes, and a late answer for a previous project is discarded; a refused project-wide replay falls back to task-scoped pulls (at most 64 tasks — unfinished first, then most recently active — omission reported) | **functional (headless)** | `test/eventFeed.test.ts`, `test/session.test.ts` |
 | Core socket trust check: before every connect the socket path is `lstat`ed and must be a Unix socket (not a symlink) owned by the current uid with no group/other bits; otherwise the client refuses with guidance | **functional** | `test/transport.test.ts` (real sockets: 0666, foreign uid, symlink, regular file, stale socket). Live: the 2026-10-09 `scripts/live-core-check.mjs` run (56/56) attached through this check to the 0600 socket `sandpane-service` created — that shows real Core's socket is ACCEPTED; refusals are proven only by the unit tests |
-| Typed wrappers for exactly the 14 Core methods | **functional** | `test/commands.test.ts` (22) + live: all 14 exercised against the real service |
+| Typed wrappers for exactly the 16 Core methods (`sandbox.remove` has two wrappers, one per confirmation step) | **functional** | `test/commands.test.ts` (22), `test/sandboxLifecycle.test.ts` + live (2026-10-09, pre-A1): the 14 earlier methods exercised against the real service. `sandbox.stop` / `sandbox.remove` are **not** called by the live check (they would drive the real `sbx`) — UNVERIFIED live |
+| A1 sandbox lifecycle: Stop / Remove / Start commands. Stop and Remove are gated on the `system.probe` advertisement (not advertised ⇒ visible refusal, no frame). Remove is the two-step server-side confirmation: step 1 shows a native modal with the target name + sbx id, every `impact` line (max 20 × 200 chars, rest counted), the expiry and — when `external` — `NOT CONFIRMED AS CREATED BY SANDPANE` first ("Core cannot confirm Sandpane created this sandbox (no Sandpane binding is recorded for this sbx id)."; `external` also covers pre-A1 bindings without an id and bindings for an earlier same-named sandbox, so the copy never claims who created it); a confirmation whose expiry has passed at click time, or cannot be read, is never sent; only the "Remove sandbox" button sends step 2 with the step-1 token; cancel sends nothing. Stop with no `requeried` is shown as UNKNOWN, never "stopped". Stop/Remove address sandboxes by Core's `Validator::sandbox_name` rule (uppercase and `.` allowed, so sbx-named sandboxes such as `Atlas.Demo` are reachable; pinned against the Rust source), while New Sandbox keeps the stricter create rule. Start is visibly unsupported (sbx v0.47 has no start). Create offers an agent choice (default provider-free `shell`, sent as an absent field; others labeled "agent not verified") only when Core advertises the A1 methods | **functional (headless)** | `test/sandboxLifecycle.test.ts`, `test/session.test.ts` — never run inside a real VS Code window or against a real `sbx` from this extension |
+| Anti-spoofing for Core text in native surfaces: hidden/bidi/control characters shown as `\uXXXX`, notification link syntax `](` broken, lengths capped (mirrors JetBrains `VisibleText`) | **functional** | `test/sandboxLifecycle.test.ts`, `test/session.test.ts` (error box, modal detail) |
 | Read-only enumeration + bounded transcript (`task.list`, `conversation.list`, `conversation.history`) | **functional** | live: project scoping, status filter, `truncated`/`nextSequence` paging against real rows |
-| Feature discovery from `system.probe` → `methods` (additive methods are detected, never assumed) | **functional** | `test/protocolWire.test.ts` (13) + live: Core advertises 14 and it equals `schemas/rpc-request.schema.json` |
+| Feature discovery from `system.probe` → `methods` (additive methods are detected, never assumed) | **functional** | `test/protocolWire.test.ts` (15, pinned at 16 methods incl. the sbx agent allowlist vs the schema) + live (2026-10-09, pre-A1): Core advertised 14 and it equalled `schemas/rpc-request.schema.json`; the live check now pins 16 and has not been re-run by this change |
 | TS protocol types mirrored from Rust (`camelCase` payloads, `snake_case` statuses/modes, `SCREAMING_SNAKE` codes) | **functional + drift-guarded** | `test/protocolWire.test.ts` reads `core/crates/sandpane-protocol/src/lib.rs`, `sandpane-service/src/lib.rs` and `schemas/*.json` and fails on a rename |
 | Display-only task reducer (no invented transitions), incl. `task.list` hydration | **functional** | `test/reducer.test.ts` (20) + live: `cancelled` appears only because Core appended it; double cancel → `CONFLICT` |
 | Context attachments: selection/active file/diagnostics, explicit list before send, secret exclusion | **functional (planner)** — Core v1 accepts the references but does **not** store or forward them (verified in `sandpane-service` `conversation_send`); the UI says so next to every list | `test/context.test.ts` |
@@ -34,14 +36,16 @@ not implemented. Nothing here pretends to be a capability it does not have.
 | Remote-host gate (`env.remoteName`) → explicit unsupported state | **functional** | `test/vscodeGuards.test.ts` |
 | Webview CSP (nonce, `default-src 'none'`, no inline script/style, escaping) | **functional** | `test/webview.test.ts` (8) |
 | Sidebar webview (plain TypeScript): composer built once and never replaced (draft, writable checkbox and focus survive every state push), regions patched in place, pushes coalesced per animation frame, stable ids on task buttons | **functional (headless)** | `test/sidebarApp.test.ts` runs the real `app.ts` (compiled once by the real `tsc` with the shipped `tsconfig.webview.json`, run in `node:vm`) against a minimal fake DOM — no jsdom dependency |
-| Task tree, status bar, 9 commands, the sidebar inside VS Code | **wired, needs a human-in-the-loop run** | compiles; never launched inside a real VS Code window yet |
+| Task tree, status bar, 12 commands, the sidebar inside VS Code | **wired, needs a human-in-the-loop run** | compiles; never launched inside a real VS Code window yet |
 
 ### Live integration against a real Core
 
 `scripts/live-core-check.mjs` runs the compiled client against the actual
 `sandpane-service` binary over its Unix socket (temp socket + temp DB, nothing
 mocked). Latest run on this host (2026-10-09, after the review-fix revision and
-the Core error-code update) — **56/56 checks passed**, including:
+the Core error-code update, BEFORE A1 — the script now pins 16 methods and
+adds an A1 advertisement check; it has not been re-run since) — **56/56 checks
+passed**, including:
 
 ```
 PASS  system.probe advertises exactly the 14 methods the client allowlists
@@ -138,7 +142,7 @@ fake duplex. `src/session.ts` is exercised through `test/helpers/vscodeStub.ts`
 
 ```
 src/
-├── extension.ts              activate/deactivate: 9 commands (progress-wrapped),
+├── extension.ts              activate/deactivate: 12 commands (progress-wrapped),
 │                             status bar, webview + tree registration
 ├── session.ts                the one controller: Core client + state fan-out to
 │                             sidebar / tree / status bar
@@ -147,7 +151,7 @@ src/
 │   ├── events.ts             AgentEvent / TaskEvent / TaskStatus / ErrorCode
 │   ├── connection.ts         NDJSON codec, id correlation, timeouts, backoff
 │   ├── transport.ts          the real node:net socket transport (injected seam)
-│   ├── commands.ts           typed wrappers for exactly 14 methods + guards
+│   ├── commands.ts           typed wrappers for exactly 16 methods + guards
 │   ├── catchup.ts            EventCheckpoint + pull-based resume (per-task cursors),
 │   │                         ProjectEventFeed (polling + task-scoped fallback)
 │   ├── socketTrust.ts        socket owner/type/mode verdict before connecting
@@ -182,7 +186,7 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
   cannot reach the socket or the network), per-render nonce, all interpolation
   escaped.
 - **No free-form RPC.** `CoreConnection.request` re-checks the method against the
-  14-name allowlist at runtime; the wire has no exec method, and Core answers
+  16-name allowlist at runtime; the wire has no exec method, and Core answers
   `VALIDATION_FAILED` if a client ignores that (verified live). The wrapper
   surface is exactly the allowlist — `test/commands.test.ts` asserts one wrapper
   per advertised method and no extra callable method.
@@ -236,15 +240,23 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
   validation and the direct-mount confirmation exist; the multi-step wizard UI
   does not. Reason: P3 UI work sequenced after the sidebar's Core round-trip was
   proven.
-- **DEFERRED: start/stop/delete sandbox.** There is no `sandbox.start` /
-  `sandbox.stop` / `sandbox.delete` method in protocol v1 (14 methods total, and
-  none of them is sandbox lifecycle beyond create/list), and
-  inventing one client-side is forbidden. Requires a Core protocol change plus a
-  verified SBX adapter path (`docs/specs/07` P1/P8). Sandboxes can currently only
-  be listed and created. `sbx` 0.47.0 is now installed on this host and
-  `sandbox.list` answers live (see the run above); `sandbox.create` (real
-  `sbx create`, up to 300 s in Core — the client waits 330 s for that one
-  method) has not been exercised from this extension.
+- **Stop / remove sandbox (A1): implemented, UNVERIFIED live.** `sandbox.stop`
+  (client deadline 360 s) and the two-step `sandbox.remove` (400 s per step,
+  never retried) are wired to "Sandpane: Stop Sandbox" / "Sandpane: Remove
+  Sandbox" and covered headlessly; neither has been run from this extension
+  against a real `sbx`. **Start is NOT supported**: sbx v0.47 has no `start`
+  command, so "Sandpane: Start Sandbox" only explains that (use
+  `sbx run --name <name>` in a terminal) and sends nothing.
+  `sandbox.create` (real `sbx create`, up to 300 s in Core — the client waits
+  330 s) has not been exercised from this extension either.
+- **Long lifecycle calls share the one Core connection.** Core serves this
+  window's connection serially, so while a stop or remove runs (up to ~6
+  minutes: `sbx stop`/`sbx rm` plus re-query) other calls and event polls on
+  the same connection may hit their 15 s client deadline. Those timeouts are
+  reported as such and are not retried; refresh once the action finishes.
+- **Not in the sidebar yet:** stop/remove/start are command-palette commands
+  with a fresh `sandbox.list` picker; the webview's sandbox list has no buttons
+  for them and does not show the sbx-reported `agent`.
 
 ### VS2 — chat and multi-project
 - **DEFERRED (P0 gate): real streaming chat.** Core advertises
@@ -356,7 +368,7 @@ media/                        sandpane.svg (Activity Bar), sidebar.css (theme to
 | 3 | second window shows the same state, no duplicate process | **PARTIAL** — two socket clients on one `instanceId` verified live; two VS Code windows: PENDING |
 | 4 | selection with spaces/Unicode/newlines arrives exactly, no shell execution | **PARTIAL** — verified live: a hostile multi-line *message body* is stored verbatim and Core has no exec method (rejects one). NOT verified: the selection itself — the client sends only a `kind:"selection"` reference (no content, no Core-defined range grammar), and Core v1's `conversation_send` ignores `attachments`, so selection content never reaches Core today. Needs Core attachment storage + selection grammar |
 | 5 | apply with dirty host files aborts safely | **PARTIAL** — Core's precondition gates abort (verified live for the no-Git-context case); the dirty-host path with a real repo: PENDING |
-| 6 | stop sandbox with active tasks warns | **PENDING** — no `sandbox.stop` method in v1 |
+| 6 | stop sandbox with active tasks warns | **PENDING** — Core does not yet record which sandbox a task uses (`tasks.sandbox_binding_id` is never written; `task.sandboxName` is always absent), so the Stop modal says "Active tasks in this sandbox cannot be checked: Core does not yet record which sandbox a task uses." The counting path exists and is tested against a simulated future Core shape only |
 | 7 | omitted Codex adapter shows an unsupported explanation | **VERIFIED** live (Core-level) — `adapter.unavailable` + `PERMISSION_DENIED`, no terminal scraping fallback exists in this client; the sidebar rendering of it inside a real window: PENDING |
 | 8 | unsupported remote host does not bind the wrong filesystem | **PARTIAL** — `host.ts` gate is unit-tested and every command checks it; inside a real remote window: PENDING (review 0006 #5: re-labelled from "VERIFIED (logic)" for consistency with rows 2/3/5) |
 

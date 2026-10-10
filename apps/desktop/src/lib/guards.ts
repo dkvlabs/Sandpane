@@ -15,6 +15,7 @@
  */
 
 import {
+  CONFIRM_TOKEN_PATTERN,
   MAX_CURSOR_KEY_LEN,
   MAX_LIST_LIMIT,
   MAX_SCOPING_ID_LEN,
@@ -313,4 +314,87 @@ export function buildConversationHistoryParams(
   const limit = clampLimit(params.limit);
   if (limit !== undefined) payload.limit = limit;
   return payload;
+}
+
+// ---------------------------------------------------------------------------
+// A1 sandbox lifecycle (`sandbox.stop`, `sandbox.remove`)
+// ---------------------------------------------------------------------------
+
+/** `Validator::sandbox_name`'s length bound (Sandpane's own sanity limit). */
+export const ADDRESSABLE_SANDBOX_NAME_MAX = 128;
+
+/**
+ * Mirror of Core's `Validator::sandbox_name`
+ * (core/crates/sandpane-core/src/validation.rs) — the rule for ADDRESSING an
+ * existing sandbox, which is sbx's own documented `--name` rule: 2..=128
+ * characters, only ASCII letters, digits, `-` and `.`, starting with a letter or
+ * digit, and not `default` in any case. Uppercase and periods are legal because
+ * sbx itself names sandboxes like `claude-My.Project`.
+ *
+ * Used for stop/remove ONLY. Creating a sandbox keeps the stricter wizard rule
+ * (`validateSandboxName`). Drift-tested against the Rust source.
+ */
+export function validateAddressableSandboxName(name: string): string | null {
+  if (name.length === 0) return "value is empty";
+  if (charCount(name) > ADDRESSABLE_SANDBOX_NAME_MAX) {
+    return `value exceeds max length ${ADDRESSABLE_SANDBOX_NAME_MAX}`;
+  }
+  for (const ch of name) {
+    if (!/^[A-Za-z0-9.-]$/.test(ch)) {
+      const code = ch.codePointAt(0) ?? 0;
+      return `contains a disallowed character U+${code.toString(16).padStart(4, "0")}`;
+    }
+  }
+  if (charCount(name) < 2) return "sandbox name must be at least two characters";
+  if (!/^[A-Za-z0-9]/.test(name)) return "sandbox name must start with an ASCII letter or digit";
+  if (name.toLowerCase() === "default") return "'default' is a reserved sandbox name";
+  return null;
+}
+
+/**
+ * A sandbox name about to reach `sandbox.stop` / `sandbox.remove`, checked with
+ * Core's addressing rule BEFORE the frame is written, so sandboxes sbx named
+ * itself (uppercase, periods) stay stoppable and removable. Core re-validates;
+ * this is the faster local refusal.
+ */
+export function requireSandboxName(name: string | null | undefined): string {
+  if (typeof name !== "string") {
+    throw new CoreValidationError("name", "value is required");
+  }
+  const problem = validateAddressableSandboxName(name);
+  if (problem !== null) throw new CoreValidationError("name", problem);
+  return name;
+}
+
+/** `sandbox.stop` params: exactly `{ name }`. */
+export function buildSandboxStopParams(name: string): { name: string } {
+  return { name: requireSandboxName(name) };
+}
+
+/**
+ * `sandbox.remove` STEP 1 params: exactly `{ name }` — the `confirmToken` key is
+ * absent (not null, not empty), so Core issues a confirmation and changes nothing.
+ */
+export function buildSandboxRemoveRequestParams(name: string): { name: string } {
+  return { name: requireSandboxName(name) };
+}
+
+/**
+ * `sandbox.remove` STEP 2 params: `{ name, confirmToken }`. The token must have
+ * the shape Core issues (64 lowercase hex); anything else is refused locally so
+ * a garbled value never reaches Core. The token itself never appears in the
+ * refusal text.
+ */
+export function buildSandboxRemoveConfirmParams(
+  name: string,
+  confirmToken: string,
+): { name: string; confirmToken: string } {
+  const checked = requireSandboxName(name);
+  if (typeof confirmToken !== "string" || !CONFIRM_TOKEN_PATTERN.test(confirmToken)) {
+    throw new CoreValidationError(
+      "confirmToken",
+      "must be the 64-character lowercase hex token Core issued in step 1",
+    );
+  }
+  return { name: checked, confirmToken };
 }

@@ -155,9 +155,10 @@ class CoreClient(
         }
 
         // Deadlines without a coroutines dependency: CompletableFuture.orTimeout (JDK 9+)
-        // owns its own delayer thread, so nothing here needs a scheduler of its own.
+        // owns its own delayer thread, so nothing here needs a scheduler of its own. The
+        // deadline is per method ([MethodDeadlines]): sandbox.stop/remove outlast the default.
         return future
-            .orTimeout(requestTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .orTimeout(deadlineMs(method), TimeUnit.MILLISECONDS)
             .whenComplete { _, error ->
                 if (error != null) {
                     pending.remove(id)
@@ -179,7 +180,7 @@ class CoreClient(
         deserializer: KSerializer<T>,
     ): T {
         assertNotEdt("CoreClient.requestBlocking($method)")
-        val frame = request(method, params).get(requestTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        val frame = request(method, params).get(deadlineMs(method), TimeUnit.MILLISECONDS)
         val error = frame.err
         if (error != null) throw CoreRpcException(error.code, error.message)
         val ok = frame.ok
@@ -190,12 +191,16 @@ class CoreClient(
     /** Send and wait for the raw `ok` element (for responses with no typed shape yet). */
     fun requestOkBlocking(method: String, params: JsonElement): JsonElement {
         assertNotEdt("CoreClient.requestBlocking($method)")
-        val frame = request(method, params).get(requestTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        val frame = request(method, params).get(deadlineMs(method), TimeUnit.MILLISECONDS)
         val error = frame.err
         if (error != null) throw CoreRpcException(error.code, error.message)
         return frame.ok
             ?: throw CoreRpcException("INTERNAL", "empty ok payload for $method", raisedByCore = false)
     }
+
+    /** The read deadline for [method]: the configured timeout, raised for the long A1 methods. */
+    private fun deadlineMs(method: String): Long =
+        MethodDeadlines.forMethod(method, requestTimeoutMs).toLong()
 
     private fun writeFrame(line: String) {
         val bytes = line.toByteArray(Charsets.UTF_8)

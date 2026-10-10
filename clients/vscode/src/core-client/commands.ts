@@ -1,6 +1,9 @@
 /**
- * Typed wrappers for **exactly** the 14 Core methods (`sandpane_protocol::Method`
- * / `Method::ALL`).
+ * Typed wrappers for **exactly** the 16 Core methods (`sandpane_protocol::Method`
+ * / `Method::ALL`). Every wrapper maps to one Core method; `sandbox.remove` has
+ * two wrappers because its two confirmation steps are deliberately separate
+ * calls (`sandboxRemoveRequest` never carries a token, `sandboxRemoveConfirm`
+ * always does).
  *
  * Every payload key is written in the wire spelling (camelCase), every enum in
  * its wire spelling (snake_case / SCREAMING_SNAKE). Unknown methods are
@@ -16,6 +19,10 @@
  * methods: a pre-revision Core does not dispatch them. Callers that must work
  * against any Core feature-detect with `coreAdvertisesMethod(probe, 'task.list')`
  * instead of assuming the method exists.
+ *
+ * `sandbox.stop` and `sandbox.remove` are A1 additions (design 2026-10-09 §3):
+ * callers gate them on `coreAdvertisesMethod` too. Neither is replay-safe, so
+ * neither is ever retried automatically.
  */
 
 import { CoreConnection } from './connection';
@@ -29,17 +36,23 @@ import type {
   ConversationHistoryResult,
   ConversationListParams,
   ConversationSendParams,
+  ConfirmationRequest,
   CoreCapabilities,
   GitApplyParams,
   Project,
   ProjectCreateParams,
   SandboxCreateSpec,
+  SandboxRemoveResult,
+  SandboxStopResult,
   SandboxSummary,
+  SbxAgent,
   TaskListParams,
   TaskSubscribeParams,
   TaskSummary,
 } from './protocol';
 import {
+  SBX_AGENTS,
+  isSbxAgent,
   MAX_CURSOR_KEY_LEN,
   MAX_LIST_LIMIT,
   MAX_SCOPING_ID_LEN,
@@ -75,6 +88,36 @@ export function validateSandboxName(name: string): string {
   if (name.includes('--')) {
     throw new CoreValidationError('name', 'contains the disallowed sequence "--"');
   }
+  return name;
+}
+
+/** `Validator::sandbox_name`'s length bound (Sandpane's own; sbx documents none). */
+export const MAX_ADDRESSABLE_SANDBOX_NAME_LEN = 128;
+
+/**
+ * `Validator::sandbox_name` in Core — the rule for ADDRESSING an existing
+ * sandbox (stop / remove / pick). It follows sbx v0.47's documented `--name`
+ * rule, so names sbx itself generates (`<agent>-<workdir>`, e.g. `Atlas.Demo`)
+ * are reachable: 2..=128 chars of ASCII letters, digits, `-` and `.`, a leading
+ * letter or digit (never read as an option), and `default` (any case) is
+ * reserved. Pinned against the Rust source by `test/protocolWire.test.ts`.
+ *
+ * `validateSandboxName` (below) stays the stricter rule for names this client
+ * CREATES.
+ */
+export function validateAddressableSandboxName(name: string, field = 'name'): string {
+  if (typeof name !== 'string' || name.length === 0) throw new CoreValidationError(field, 'value is empty');
+  if (name.length > MAX_ADDRESSABLE_SANDBOX_NAME_LEN) {
+    throw new CoreValidationError(field, `value exceeds max length ${MAX_ADDRESSABLE_SANDBOX_NAME_LEN}`);
+  }
+  if (!/^[A-Za-z0-9.-]+$/.test(name)) {
+    throw new CoreValidationError(field, 'only ASCII letters, digits, "-" and "." are allowed');
+  }
+  if (name.length < 2) throw new CoreValidationError(field, 'sandbox name must be at least two characters');
+  if (!/^[A-Za-z0-9]/.test(name)) {
+    throw new CoreValidationError(field, 'sandbox name must start with an ASCII letter or digit');
+  }
+  if (name.toLowerCase() === 'default') throw new CoreValidationError(field, "'default' is a reserved sandbox name");
   return name;
 }
 
@@ -250,7 +293,7 @@ export interface CancelResult {
 /**
  * A wrapper is an async surface: a failed guard must REJECT the returned
  * promise, never throw synchronously out of a `Promise`-typed call. Kept out of
- * the class so the prototype exposes exactly the 14 protocol methods.
+ * the class so the prototype exposes only protocol wrappers.
  */
 function guarded<R>(work: () => Promise<R>): Promise<R> {
   try {
@@ -266,6 +309,86 @@ function guarded<R>(work: () => Promise<R>): Promise<R> {
  * other method keeps the connection's default deadline.
  */
 export const SANDBOX_CREATE_TIMEOUT_MS = 330_000;
+
+/**
+ * `sandbox.stop` runs `sbx stop` (Core allows 300 s) and then re-queries
+ * `sbx ls --json` (30 s): up to ~330 s inside Core, so the client waits 360 s.
+ * A client timeout means the outcome is UNKNOWN, not that the stop failed.
+ */
+export const SANDBOX_STOP_TIMEOUT_MS = 360_000;
+
+/**
+ * `sandbox.remove` (either step) — step 1 probes the target, step 2 runs
+ * `sbx rm --force` after the token check. Client deadline 400 s. NOT replay-safe:
+ * never retried automatically.
+ */
+export const SANDBOX_REMOVE_TIMEOUT_MS = 400_000;
+
+/** Core's confirmation token shape: 256-bit random, 64 lowercase hex chars. */
+export const CONFIRM_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+
+/** `Validator::sbx_agent` — an EXACT built-in agent name, nothing else. */
+export function validateSbxAgent(value: unknown, field = 'agent'): SbxAgent {
+  if (!isSbxAgent(value)) {
+    throw new CoreValidationError(
+      field,
+      `"${String(value)}" is not a built-in sbx agent (allowed: ${SBX_AGENTS.join(', ')})`,
+    );
+  }
+  return value;
+}
+
+export function validateConfirmToken(value: unknown, field = 'confirmToken'): string {
+  if (typeof value !== 'string' || !CONFIRM_TOKEN_PATTERN.test(value)) {
+    throw new CoreValidationError(field, 'not a Core confirmation token (64 lowercase hex characters)');
+  }
+  return value;
+}
+
+/**
+ * Checks a step-1 answer before anything is shown to the user or a step 2 is
+ * possible. Every check is a client verdict about Core's answer; a failure
+ * means the confirmation is NOT presented and step 2 is never sent.
+ */
+export function parseConfirmationRequest(
+  raw: unknown,
+  expected: { action: string; name: string },
+): ConfirmationRequest {
+  const refuse = (why: string): never => {
+    throw new CoreValidationError(
+      'confirmation',
+      `Core's confirmation answer was not accepted (${why}); nothing was confirmed and step 2 is not sent`,
+    );
+  };
+  if (!raw || typeof raw !== 'object') refuse('the answer is not an object');
+  const outer = raw as SandboxRemoveResult;
+  if (outer.removed === true) refuse('step 1 claimed the action already happened');
+  const c = outer.confirmation;
+  if (!c || typeof c !== 'object') refuse('no confirmation in the answer');
+  const conf = c as Partial<ConfirmationRequest>;
+  if (typeof conf.token !== 'string' || !CONFIRM_TOKEN_PATTERN.test(conf.token)) {
+    refuse('malformed token');
+  }
+  if (conf.action !== expected.action) refuse(`it is for a different action`);
+  const target = conf.target as Partial<ConfirmationRequest['target']> | undefined;
+  if (!target || typeof target.name !== 'string' || typeof target.id !== 'string') {
+    refuse('no target identity');
+  }
+  if (target?.name !== expected.name) refuse('it names a different sandbox than the one requested');
+  if (typeof conf.expiresAt !== 'string') refuse('no expiry');
+  if (!Array.isArray(conf.impact) || !conf.impact.every((line) => typeof line === 'string')) {
+    refuse('impact is not a list of lines');
+  }
+  if (typeof conf.external !== 'boolean') refuse('the external flag is missing');
+  return {
+    token: conf.token as string,
+    expiresAt: conf.expiresAt as string,
+    action: conf.action as string,
+    target: { name: target?.name as string, id: target?.id as string },
+    impact: conf.impact as string[],
+    external: conf.external as boolean,
+  };
+}
 
 export class CoreCommands {
   constructor(private readonly connection: CoreConnection) {}
@@ -305,10 +428,63 @@ export class CoreCommands {
       if (typeof spec.repoPath === 'string' && spec.repoPath.length > 0) {
         payload['repoPath'] = validateAbsoluteRepoPath(spec.repoPath);
       }
+      // A1: sent exactly when the caller chose one (absent = Core's `shell`).
+      // Only an exact built-in leaves this client; Core re-validates.
+      if (spec.agent !== undefined) payload['agent'] = validateSbxAgent(spec.agent);
       return this.connection.request<SandboxSummary>('sandbox.create', payload, {
         timeoutMs: SANDBOX_CREATE_TIMEOUT_MS,
       });
     });
+  }
+
+  /**
+   * `{name}` → `{stopped, requeried?}` (A1). Not destructive, no token.
+   * `requeried` absent ⇒ the state is UNKNOWN (no longer listed, or the
+   * re-query failed) — callers never read it as "stopped".
+   */
+  sandboxStop(name: string): Promise<SandboxStopResult> {
+    return guarded(() =>
+      this.connection.request<SandboxStopResult>(
+        'sandbox.stop',
+        { name: validateAddressableSandboxName(name) },
+        { timeoutMs: SANDBOX_STOP_TIMEOUT_MS },
+      ),
+    );
+  }
+
+  /**
+   * `sandbox.remove` STEP 1: `{name}` (never a token) → the server-side
+   * `ConfirmationRequest`. Core changes nothing. The answer is checked by
+   * `parseConfirmationRequest` (token shape, action, target name) before it is
+   * returned, so a caller can only ever present a well-formed confirmation.
+   */
+  sandboxRemoveRequest(name: string): Promise<ConfirmationRequest> {
+    return guarded(async () => {
+      const validName = validateAddressableSandboxName(name);
+      const raw = await this.connection.request<unknown>(
+        'sandbox.remove',
+        { name: validName },
+        { timeoutMs: SANDBOX_REMOVE_TIMEOUT_MS },
+      );
+      return parseConfirmationRequest(raw, { action: 'sandbox.remove', name: validName });
+    });
+  }
+
+  /**
+   * `sandbox.remove` STEP 2: `{name, confirmToken}` → `{removed: true}`. Only
+   * call this after the user explicitly confirmed the step-1 answer; the token
+   * is single-use and bound by Core to the target's name AND sbx id. A wrong,
+   * expired or reused token is Core's VALIDATION_FAILED, a same-named
+   * replacement CONFLICT, a vanished sandbox NOT_FOUND. Never retried.
+   */
+  sandboxRemoveConfirm(name: string, confirmToken: string): Promise<SandboxRemoveResult> {
+    return guarded(() =>
+      this.connection.request<SandboxRemoveResult>(
+        'sandbox.remove',
+        { name: validateAddressableSandboxName(name), confirmToken: validateConfirmToken(confirmToken) },
+        { timeoutMs: SANDBOX_REMOVE_TIMEOUT_MS },
+      ),
+    );
   }
 
   conversationCreate(params: ConversationCreateParams): Promise<Conversation> {

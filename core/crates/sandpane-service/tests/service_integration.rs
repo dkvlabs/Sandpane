@@ -14,12 +14,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rusqlite::params;
 use sandpane_core::sbx::SbxLocator;
 use sandpane_core::{Database, EventLog};
 use sandpane_protocol::Method;
-use sandpane_service::{serve_connection, ServerInner};
+use sandpane_service::confirm::{ConfirmationBinding, CONFIRMATION_TTL};
+use sandpane_service::{serve_connection, CoreConfig, ServerInner};
 
 struct TestServer {
     client: UnixStream,
@@ -43,9 +45,15 @@ fn start_server_at(
     dir: tempfile::TempDir,
     db_path: std::path::PathBuf,
 ) -> TestServer {
-    let socket_path = dir.path().join("test.sock");
     let db = Database::open(&db_path).unwrap();
     let inner = ServerInner::new(db, locator);
+    serve_inner(inner, dir)
+}
+
+/// Serve an already-built [`ServerInner`] (custom `CoreConfig`) on a socket
+/// inside `dir`.
+fn serve_inner(inner: Arc<ServerInner>, dir: tempfile::TempDir) -> TestServer {
+    let socket_path = dir.path().join("test.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
     let serve_inner = Arc::clone(&inner);
     let handle = std::thread::spawn(move || {
@@ -97,7 +105,11 @@ fn no_sbx() -> SbxLocator {
 /// Stand-in for `sbx v0.47.0` (see module docs). `list_json` is what
 /// `ls --json` prints (real row shape: `name`/`status`/…); `create_error`, when
 /// set, is printed to stderr by `create` with exit 1 (real error format);
-/// `ls_error` likewise for `ls`. Every invocation's argv is appended to
+/// `ls_error` likewise for `ls`. `stop`/`rm` print `stop.err`/`rm.err` with
+/// exit 1 when present; on success they move `ls.after-stop.json` /
+/// `ls.after-rm.json` (when present) over `ls.json`, so the post-mutation
+/// re-query sees the new state; `rm.sleep` makes `rm` take ~1 s (a window
+/// for concurrency tests). Every invocation's argv is appended to
 /// `argv.log` (one line per call, args separated by U+001F).
 struct FakeSbx {
     dir: tempfile::TempDir,
@@ -106,6 +118,34 @@ struct FakeSbx {
 impl FakeSbx {
     fn locator(&self) -> SbxLocator {
         SbxLocator::with_search(None, vec![self.dir.path().to_path_buf()])
+    }
+
+    /// Forget the argv log so a test can assert ONLY what a later step ran.
+    fn reset_calls(&self) {
+        let _ = std::fs::remove_file(self.dir.path().join("argv.log"));
+    }
+
+    /// Replace what `ls --json` prints from now on (a data file, never code).
+    fn set_ls(&self, json: &str) {
+        std::fs::write(self.dir.path().join("ls.json"), format!("{json}\n")).unwrap();
+    }
+
+    /// What `ls --json` prints after the next successful `rm` / `stop`.
+    fn ls_after(&self, verb: &str, json: &str) {
+        std::fs::write(
+            self.dir.path().join(format!("ls.after-{verb}.json")),
+            format!("{json}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Make `verb` fail with this stderr (exit 1), as the real CLI does.
+    fn fail(&self, verb: &str, stderr: &str) {
+        std::fs::write(
+            self.dir.path().join(format!("{verb}.err")),
+            format!("{stderr}\n"),
+        )
+        .unwrap();
     }
 
     fn calls(&self) -> Vec<Vec<String>> {
@@ -138,6 +178,15 @@ case "$*" in
   create\ *)
     if [ -f "$d/create.sleep" ]; then sleep 5; fi
     if [ -f "$d/create.err" ]; then cat "$d/create.err" >&2; exit 1; fi
+    exit 0 ;;
+  stop\ *)
+    if [ -f "$d/stop.err" ]; then cat "$d/stop.err" >&2; exit 1; fi
+    if [ -f "$d/ls.after-stop.json" ]; then mv "$d/ls.after-stop.json" "$d/ls.json"; fi
+    exit 0 ;;
+  rm\ *)
+    if [ -f "$d/rm.sleep" ]; then sleep 1; fi
+    if [ -f "$d/rm.err" ]; then cat "$d/rm.err" >&2; exit 1; fi
+    if [ -f "$d/ls.after-rm.json" ]; then mv "$d/ls.after-rm.json" "$d/ls.json"; fi
     exit 0 ;;
   *) echo 'unsupported by stand-in' >&2; exit 64 ;;
 esac
@@ -2245,4 +2294,853 @@ fn create_timeout_requeries_and_never_orphans_a_created_sandbox() {
         .as_str()
         .unwrap()
         .contains("timed out"));
+}
+
+// ---------------------------------------------------------------------------
+// A1: sandbox.stop, two-step sandbox.remove, SandboxCreateSpec.agent
+// ---------------------------------------------------------------------------
+
+const ATLAS_ID: &str = "b5ebec73-e2ae-471a-811a-e011cfb1948e";
+const ATLAS_REPLACEMENT_ID: &str = "d0d0d0d0-e2ae-471a-811a-e011cfb1948e";
+const NOVA_ID: &str = "c5ebec73-e2ae-471a-811a-e011cfb1948e";
+const EMPTY_LS: &str = r#"{"sandboxes":[]}"#;
+/// Captured `errors/stop_not_found.txt` / `errors/rm_not_found.txt` shape.
+const NOT_FOUND_ERR: &str = "error: sandbox 'atlas-auth' not found\n  try: sbx ls";
+
+fn ls_with_atlas(id: &str, status: &str) -> String {
+    format!(
+        r#"{{"sandboxes":[{{"name":"atlas-auth","id":"{id}","agent":"shell","status":"{status}","last_used_at":"2026-10-09T17:31:30Z","workspaces":[],"created_at":"2026-10-09T17:31:28Z"}}]}}"#
+    )
+}
+
+fn v(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| a.to_string()).collect()
+}
+
+/// Record a Sandpane binding for `atlas-auth` (mountless) through the real
+/// `sandbox.create` path, then forget the argv it produced.
+fn bind_atlas(s: &mut TestServer, fake: &FakeSbx) -> serde_json::Value {
+    let project = s.ok(
+        "bind-p",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": []}),
+    );
+    s.ok(
+        "bind-c",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-auth", "projectId": project["id"], "workspaceMode": "mountless"}),
+    );
+    fake.reset_calls();
+    project
+}
+
+fn binding_rows(s: &TestServer) -> Vec<(String, Option<String>)> {
+    let db = s.inner.lock_db();
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT sandbox_name, removed_at FROM sandbox_bindings ORDER BY rowid")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows
+}
+
+#[test]
+fn sandbox_stop_runs_the_exact_vector_and_reports_the_requeried_state() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    fake.ls_after("stop", &ls_with_atlas(ATLAS_ID, "stopped"));
+    let mut s = start_server(fake.locator());
+    let out = s.ok(
+        "1",
+        "sandbox.stop",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    assert_eq!(out["stopped"], true);
+    // State comes from the re-query, never from exit 0.
+    assert_eq!(out["requeried"]["name"], "atlas-auth");
+    assert_eq!(out["requeried"]["probedState"], "stopped");
+    assert_eq!(out["requeried"]["agent"], "shell");
+    assert_eq!(
+        fake.calls(),
+        vec![v(&["stop", "atlas-auth"]), v(&["ls", "--json"])]
+    );
+}
+
+#[test]
+fn sandbox_stop_not_found_and_unlisted_after_stop_are_honest() {
+    let fake = fake_sbx(EMPTY_LS, None, None);
+    let mut s = start_server(fake.locator());
+    // Exit 0 but the re-query does not list it: requeried is ABSENT.
+    let out = s.ok(
+        "1",
+        "sandbox.stop",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    assert_eq!(out, serde_json::json!({"stopped": true}));
+    // The real not-found error text becomes NOT_FOUND, and no re-query runs.
+    fake.fail("stop", NOT_FOUND_ERR);
+    fake.reset_calls();
+    let err = s.err(
+        "2",
+        "sandbox.stop",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    assert_eq!(err["code"], "NOT_FOUND");
+    assert_eq!(fake.calls(), vec![v(&["stop", "atlas-auth"])]);
+}
+
+#[test]
+fn stop_and_remove_refuse_hostile_names_before_any_exec() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    for evil in [
+        "a;rm -rf /",
+        "$(whoami)",
+        "--force",
+        "a b",
+        "default",
+        "x",
+        "",
+    ] {
+        for method in ["sandbox.stop", "sandbox.remove"] {
+            let err = s.err("1", method, serde_json::json!({"name": evil}));
+            assert_eq!(err["code"], "VALIDATION_FAILED", "{method} {evil:?}");
+        }
+    }
+    let err = s.err("2", "sandbox.remove", serde_json::json!({}));
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn sandbox_remove_two_step_flow_removes_and_marks_the_binding() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    bind_atlas(&mut s, &fake);
+
+    // Step 1: describe + issue. Nothing changes; only `ls` runs.
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    assert!(step1.get("removed").is_none(), "{step1}");
+    let c = &step1["confirmation"];
+    let token = c["token"].as_str().unwrap().to_string();
+    assert_eq!(token.len(), 64);
+    assert!(token
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    assert_eq!(c["action"], "sandbox.remove");
+    assert_eq!(
+        c["target"],
+        serde_json::json!({"name": "atlas-auth", "id": ATLAS_ID})
+    );
+    assert_eq!(c["external"], false);
+    let expires = c["expiresAt"].as_str().unwrap();
+    assert!(expires.ends_with('Z') && expires.len() == 20, "{expires}");
+    let impact: Vec<&str> = c["impact"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    assert!(
+        impact.iter().any(|l| l.contains("atlas-auth")),
+        "{impact:?}"
+    );
+    assert!(impact.iter().any(|l| l.contains("mountless")), "{impact:?}");
+    assert_eq!(fake.calls(), vec![v(&["ls", "--json"])]);
+    assert_eq!(binding_rows(&s), vec![("atlas-auth".into(), None)]);
+
+    // Step 2: token + identity re-check, then `rm --force`, then re-query.
+    fake.reset_calls();
+    fake.ls_after("rm", EMPTY_LS);
+    let step2 = s.ok(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(step2, serde_json::json!({"removed": true}));
+    assert_eq!(
+        fake.calls(),
+        vec![
+            v(&["ls", "--json"]),
+            v(&["rm", "--force", "atlas-auth"]),
+            v(&["ls", "--json"])
+        ]
+    );
+    // Marked removed, never deleted.
+    let rows = binding_rows(&s);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].1.is_some(), "binding marked removed: {rows:?}");
+
+    // Reuse: single-use, so nothing runs.
+    fake.reset_calls();
+    let err = s.err(
+        "3",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+
+    // A NEW same-named sandbox never inherits the removed binding.
+    fake.set_ls(&ls_with_atlas(ATLAS_REPLACEMENT_ID, "running"));
+    let list = s.ok("4", "sandbox.list", serde_json::json!({}));
+    let row = &list.as_array().unwrap()[0];
+    assert_eq!(row["name"], "atlas-auth");
+    assert!(row.get("workspaceMode").is_none(), "{row}");
+    assert!(row["boundProjectId"].is_null(), "{row}");
+    // …and a confirmation for it is flagged external.
+    let again = s.ok(
+        "5",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    assert_eq!(again["confirmation"]["external"], true);
+    assert_eq!(again["confirmation"]["target"]["id"], ATLAS_REPLACEMENT_ID);
+}
+
+#[test]
+fn sandbox_remove_flags_a_sandbox_not_created_by_sandpane() {
+    let fake = fake_sbx(ROWS_RUNNING_STOPPED, None, None);
+    let mut s = start_server(fake.locator());
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "nova-search"}),
+    );
+    let c = &step1["confirmation"];
+    assert_eq!(c["external"], true);
+    assert_eq!(c["target"]["id"], NOVA_ID);
+    assert!(
+        c["impact"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("not created by Sandpane")),
+        "{c}"
+    );
+    assert_eq!(fake.calls(), vec![v(&["ls", "--json"])]);
+}
+
+#[test]
+fn sandbox_remove_step_one_for_a_missing_sandbox_is_not_found() {
+    let fake = fake_sbx(EMPTY_LS, None, None);
+    let mut s = start_server(fake.locator());
+    let err = s.err(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    assert_eq!(err["code"], "NOT_FOUND");
+    assert!(s.inner.lock_confirmations().is_empty(), "no token issued");
+}
+
+#[test]
+fn sandbox_remove_refuses_to_bind_a_row_without_an_sbx_id() {
+    let fake = fake_sbx(
+        r#"{"sandboxes":[{"name":"atlas-auth","status":"running"}]}"#,
+        None,
+        None,
+    );
+    let mut s = start_server(fake.locator());
+    let err = s.err(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    // Fail closed: an sbx row without an id gives Core nothing to bind.
+    assert_eq!(err["code"], "INTERNAL");
+    assert!(
+        err["message"].as_str().unwrap().contains("no usable id"),
+        "{err}"
+    );
+    assert!(
+        s.inner.lock_confirmations().is_empty(),
+        "no identity, no token"
+    );
+}
+
+/// `rm` is NEVER invoked for a missing, wrong, malformed, reused, expired,
+/// other-action or other-target token — and nothing else runs either.
+#[test]
+fn sandbox_remove_never_runs_rm_without_a_valid_token() {
+    let fake = fake_sbx(ROWS_RUNNING_STOPPED, None, None);
+    let mut s = start_server(fake.locator());
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    fake.reset_calls();
+
+    let wrong = "0".repeat(64);
+    let other_action = s
+        .inner
+        .lock_confirmations()
+        .issue(
+            ConfirmationBinding {
+                action: "project.delete".into(),
+                name: "atlas-auth".into(),
+                id: ATLAS_ID.into(),
+            },
+            Instant::now(),
+            CONFIRMATION_TTL,
+        )
+        .unwrap();
+    for (label, name, tok) in [
+        ("wrong", "atlas-auth", wrong.as_str()),
+        ("malformed", "atlas-auth", "not-a-token; rm -rf /"),
+        ("empty", "atlas-auth", ""),
+        ("other action", "atlas-auth", other_action.as_str()),
+        // Presenting atlas-auth's token for another sandbox burns it…
+        ("other target", "nova-search", token.as_str()),
+        // …so it is now a reused token for its own target too.
+        ("reused", "atlas-auth", token.as_str()),
+    ] {
+        let err = s.err(
+            label,
+            "sandbox.remove",
+            serde_json::json!({"name": name, "confirmToken": tok}),
+        );
+        assert_eq!(err["code"], "VALIDATION_FAILED", "{label}");
+        // The message never says which part mismatched.
+        let msg = err["message"].as_str().unwrap();
+        assert!(
+            !msg.contains(ATLAS_ID) && !msg.contains("project.delete"),
+            "{msg}"
+        );
+    }
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn expired_token_never_runs_rm() {
+    let fake = fake_sbx(ROWS_RUNNING_STOPPED, None, None);
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("t.sqlite3")).unwrap();
+    let inner = ServerInner::with_config(
+        db,
+        fake.locator(),
+        CoreConfig {
+            // Test-only: a zero lifetime, so the token is expired on arrival.
+            confirmation_ttl: Some(Duration::ZERO),
+            ..CoreConfig::default()
+        },
+    );
+    let mut s = serve_inner(inner, dir);
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    fake.reset_calls();
+    std::thread::sleep(Duration::from_millis(5));
+    let err = s.err(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn same_named_replacement_is_a_conflict_and_never_removed() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    // Between the steps the sandbox was replaced by another with the same name.
+    fake.set_ls(&ls_with_atlas(ATLAS_REPLACEMENT_ID, "running"));
+    fake.reset_calls();
+    let err = s.err(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "CONFLICT");
+    assert_eq!(fake.calls(), vec![v(&["ls", "--json"])]);
+    // The token was consumed by that attempt.
+    fake.set_ls(&ls_with_atlas(ATLAS_ID, "running"));
+    fake.reset_calls();
+    let err = s.err(
+        "3",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn sandbox_gone_between_steps_is_not_found_and_never_removed() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    fake.set_ls(EMPTY_LS);
+    fake.reset_calls();
+    let err = s.err(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "NOT_FOUND");
+    assert_eq!(fake.calls(), vec![v(&["ls", "--json"])]);
+}
+
+#[test]
+fn rm_exit_zero_but_still_listed_is_not_reported_as_removed() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    bind_atlas(&mut s, &fake);
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    // No ls.after-rm.json: the re-query still lists the sandbox.
+    let err = s.err(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "INTERNAL");
+    assert_eq!(binding_rows(&s), vec![("atlas-auth".into(), None)]);
+}
+
+#[test]
+fn rm_failure_is_classified_and_the_binding_stays_in_force() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    bind_atlas(&mut s, &fake);
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    fake.fail("rm", NOT_FOUND_ERR);
+    fake.reset_calls();
+    let err = s.err(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    // Step-2 invariant: once `rm` has run, never VALIDATION_FAILED /
+    // CONFLICT / NOT_FOUND (those mean "nothing ran"). sbx's own words stay
+    // in details.
+    assert_eq!(err["code"], "INTERNAL");
+    assert_eq!(
+        err["details"]["sbxError"], "sandbox 'atlas-auth' not found",
+        "{err}"
+    );
+    let rms = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.first().map(String::as_str) == Some("rm"))
+        .count();
+    assert_eq!(rms, 1);
+    assert_eq!(binding_rows(&s), vec![("atlas-auth".into(), None)]);
+}
+
+#[test]
+fn post_rm_requery_failure_is_internal_and_the_binding_stays_live() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    bind_atlas(&mut s, &fake);
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    // `rm` exits 0, then the re-query prints unparseable output (which
+    // `sbx_list` reports as VALIDATION_FAILED on its own).
+    fake.ls_after("rm", "this is not json");
+    fake.reset_calls();
+    let err = s.err(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "INTERNAL", "{err}");
+    let msg = err["message"].as_str().unwrap();
+    assert!(msg.contains("removal is unconfirmed"), "{msg}");
+    assert_eq!(
+        fake.calls(),
+        vec![
+            v(&["ls", "--json"]),
+            v(&["rm", "--force", "atlas-auth"]),
+            v(&["ls", "--json"])
+        ],
+        "rm ran exactly once"
+    );
+    assert_eq!(binding_rows(&s), vec![("atlas-auth".into(), None)]);
+}
+
+#[test]
+fn sandbox_create_agent_is_an_exact_built_in_and_defaults_to_shell() {
+    let fake = fake_sbx(EMPTY_LS, None, None);
+    let mut s = start_server(fake.locator());
+    let project = s.ok(
+        "1",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": []}),
+    );
+    // Kit references and anything else outside the captured built-in list are
+    // refused before any exec.
+    for bad in [
+        "./my-kit",
+        "/opt/kits/agent",
+        "kit.zip",
+        "https://github.com/example/kit.git",
+        "docker.io/example/kit:1",
+        "oci://example/kit",
+        "Shell",
+        "",
+        "--cloud",
+        "shell --cloud",
+    ] {
+        let err = s.err(
+            "2",
+            "sandbox.create",
+            serde_json::json!({"name": "atlas-kit", "projectId": project["id"],
+                               "workspaceMode": "mountless", "agent": bad}),
+        );
+        assert_eq!(err["code"], "VALIDATION_FAILED", "{bad:?}");
+    }
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+
+    let created = s.ok(
+        "3",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-codex", "projectId": project["id"],
+                           "workspaceMode": "mountless", "agent": "codex"}),
+    );
+    // Accepting a provider agent is not a verification claim.
+    assert!(created.get("verified").is_none(), "{created}");
+    s.ok(
+        "4",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-default", "projectId": project["id"],
+                           "workspaceMode": "mountless"}),
+    );
+    let creates: Vec<Vec<String>> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.first().map(String::as_str) == Some("create"))
+        .collect();
+    assert_eq!(
+        creates,
+        vec![
+            v(&["create", "--name", "atlas-codex", "codex"]),
+            v(&["create", "--name", "atlas-default", "shell"]),
+        ]
+    );
+    assert!(
+        fake.calls().iter().flatten().all(|a| a != "--cloud"),
+        "--cloud is never passed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A1 security follow-up (review W1, W2, I4, I5)
+// ---------------------------------------------------------------------------
+
+fn binding_rows_full(s: &TestServer) -> Vec<(String, Option<String>, Option<String>)> {
+    let db = s.inner.lock_db();
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT id, sbx_id, removed_at FROM sandbox_bindings ORDER BY rowid")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows
+}
+
+/// A binding row written the pre-A1 way (no sbx identity).
+fn insert_legacy_binding(s: &TestServer, row_id: &str, mode: &str) {
+    let db = s.inner.lock_db();
+    db.conn()
+        .execute_batch(
+            "INSERT OR IGNORE INTO projects (id,name,created_at) VALUES ('p-legacy','Nova Demo','t')",
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO sandbox_bindings (id,project_id,sandbox_name,workspace_mode,created_at)
+             VALUES (?1,'p-legacy','atlas-auth',?2,'2026-01-01T00:00:00Z')",
+            params![row_id, mode],
+        )
+        .unwrap();
+}
+
+fn impact_lines(confirmation: &serde_json::Value) -> Vec<String> {
+    confirmation["impact"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn create_records_the_probed_sbx_id_on_the_binding() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    bind_atlas(&mut s, &fake);
+    let rows = binding_rows_full(&s);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.as_deref(), Some(ATLAS_ID));
+}
+
+#[test]
+fn legacy_binding_without_sbx_id_is_external_with_a_disclosure() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    insert_legacy_binding(&s, "legacy-1", "direct_mount");
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let c = &step1["confirmation"];
+    assert_eq!(
+        c["external"], true,
+        "Core cannot confirm Sandpane created it"
+    );
+    let impact = impact_lines(c);
+    assert!(
+        impact.iter().any(|l| l.contains("has no recorded sbx id")),
+        "{impact:?}"
+    );
+    assert!(
+        !impact.iter().any(|l| l.contains("workspace mode")),
+        "no mode claim without an id-matched binding: {impact:?}"
+    );
+    // Removing the only sandbox with that name retires the legacy row too.
+    fake.ls_after("rm", EMPTY_LS);
+    s.ok(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": c["token"]}),
+    );
+    let rows = binding_rows_full(&s);
+    assert!(rows[0].2.is_some(), "legacy row marked removed: {rows:?}");
+}
+
+#[test]
+fn a_binding_for_an_earlier_same_named_sandbox_never_vouches_for_a_replacement() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    bind_atlas(&mut s, &fake);
+    // Out of band: the sandbox was removed and recreated under the same name.
+    fake.set_ls(&ls_with_atlas(ATLAS_REPLACEMENT_ID, "running"));
+
+    // sandbox.list no longer lends the old binding's mode/project to it.
+    let list = s.ok("1", "sandbox.list", serde_json::json!({}));
+    let row = &list.as_array().unwrap()[0];
+    assert!(row.get("workspaceMode").is_none(), "{row}");
+    assert!(row["boundProjectId"].is_null(), "{row}");
+
+    let step1 = s.ok(
+        "2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let c = &step1["confirmation"];
+    assert_eq!(c["external"], true);
+    assert_eq!(c["target"]["id"], ATLAS_REPLACEMENT_ID);
+    let impact = impact_lines(c);
+    assert!(
+        !impact.iter().any(|l| l.contains("workspace mode")),
+        "{impact:?}"
+    );
+    // Removing the replacement leaves the earlier sandbox's binding alone:
+    // only rows bound to the removed sbx id are marked.
+    fake.ls_after("rm", EMPTY_LS);
+    s.ok(
+        "3",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": c["token"]}),
+    );
+    let rows = binding_rows_full(&s);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.as_deref(), Some(ATLAS_ID));
+    assert_eq!(rows[0].2, None, "{rows:?}");
+}
+
+#[test]
+fn legacy_binding_still_joins_sandbox_list_by_name() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    insert_legacy_binding(&s, "legacy-1", "direct_mount");
+    let list = s.ok("1", "sandbox.list", serde_json::json!({}));
+    // Unchanged pre-A1 behaviour for rows with no sbx identity.
+    assert_eq!(list[0]["workspaceMode"], "direct_mount");
+    assert_eq!(list[0]["boundProjectId"], "p-legacy");
+}
+
+#[test]
+fn an_operation_in_flight_on_a_name_refuses_create_and_remove_running_nothing() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = s.ok(
+        "p",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": []}),
+    );
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    fake.reset_calls();
+
+    let inner = Arc::clone(&s.inner);
+    let guard = inner.sandbox_ops.try_acquire("atlas-auth").unwrap();
+    let err = s.err(
+        "2",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-auth", "projectId": project["id"], "workspaceMode": "mountless"}),
+    );
+    assert_eq!(err["code"], "CONFLICT");
+    assert!(
+        err["message"].as_str().unwrap().contains("in progress"),
+        "{err}"
+    );
+    let err = s.err(
+        "3",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "CONFLICT");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    // Another name is unaffected.
+    s.ok(
+        "4",
+        "sandbox.create",
+        serde_json::json!({"name": "nova-search", "projectId": project["id"], "workspaceMode": "mountless"}),
+    );
+    drop(guard);
+    // The refused attempt still consumed the token (every attempt burns it).
+    let err = s.err(
+        "5",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(err["code"], "VALIDATION_FAILED");
+    assert!(!s.inner.sandbox_ops.is_held("atlas-auth"));
+}
+
+#[test]
+fn removal_marks_only_the_binding_rows_captured_before_rm() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    bind_atlas(&mut s, &fake);
+    let step1 = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let token = step1["confirmation"]["token"].as_str().unwrap().to_string();
+    fake.ls_after("rm", EMPTY_LS);
+    std::fs::write(fake.dir.path().join("rm.sleep"), "").unwrap();
+    fake.reset_calls();
+
+    let inner = Arc::clone(&s.inner);
+    let worker = std::thread::spawn(move || {
+        let out = s.ok(
+            "2",
+            "sandbox.remove",
+            serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+        );
+        (s, out)
+    });
+    // Wait until `rm` is running, then write a row the way an out-of-lock
+    // writer would. The DB mutex must be free while the subprocess runs.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fake
+        .calls()
+        .iter()
+        .any(|c| c.first().map(String::as_str) == Some("rm"))
+    {
+        assert!(Instant::now() < deadline, "rm never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    {
+        let db = inner.lock_db();
+        db.conn()
+            .execute(
+                "INSERT INTO sandbox_bindings (id,project_id,sandbox_name,workspace_mode,created_at,sbx_id)
+                 SELECT 'late-row', project_id, 'atlas-auth', 'mountless', '2099-01-01T00:00:00Z', ?1
+                 FROM sandbox_bindings LIMIT 1",
+                params![ATLAS_REPLACEMENT_ID],
+            )
+            .unwrap();
+    }
+    let (s, out) = worker.join().unwrap();
+    assert_eq!(out, serde_json::json!({"removed": true}));
+    let rows = binding_rows_full(&s);
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].2.is_some(), "captured row marked: {rows:?}");
+    assert_eq!(rows[1].0, "late-row");
+    assert_eq!(rows[1].2, None, "row inserted after the capture untouched");
+}
+
+#[test]
+fn sbx_id_with_a_newline_is_refused_fail_closed() {
+    let fake = fake_sbx(
+        r#"{"sandboxes":[{"name":"atlas-auth","id":"b5ebec73\nforged","agent":"shell","status":"running"}]}"#,
+        None,
+        None,
+    );
+    let mut s = start_server(fake.locator());
+    let err = s.err(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    assert_eq!(err["code"], "INTERNAL");
+    assert!(
+        err["message"].as_str().unwrap().contains("no usable id"),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("forged"), "never relayed: {err}");
+    assert!(s.inner.lock_confirmations().is_empty());
+}
+
+#[test]
+fn a_spoofing_agent_string_from_sbx_is_dropped_from_summaries() {
+    let fake = fake_sbx(
+        r#"{"sandboxes":[{"name":"atlas-auth","id":"b5ebec73-e2ae-471a-811a-e011cfb1948e","agent":"shell\n(verified by Sandpane)","status":"running"},{"name":"nova-search","id":"c5ebec73-e2ae-471a-811a-e011cfb1948e","agent":"docker-agent","status":"stopped"}]}"#,
+        None,
+        None,
+    );
+    let mut s = start_server(fake.locator());
+    let list = s.ok("1", "sandbox.list", serde_json::json!({}));
+    assert!(list[0].get("agent").is_none(), "{}", list[0]);
+    assert_eq!(list[1]["agent"], "docker-agent");
 }

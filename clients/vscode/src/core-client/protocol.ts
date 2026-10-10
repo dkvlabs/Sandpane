@@ -60,6 +60,10 @@ export const MAX_SCOPING_ID_LEN = 200;
  * order of Rust's `Method::ALL` — the single list that backs
  * `CoreCapabilities.methods`. Unknown methods are impossible to call; there is
  * deliberately no free-form execution method (specs/02 §2).
+ *
+ * A1 (design 2026-10-09 §3) added `sandbox.stop` and `sandbox.remove`. There is
+ * deliberately NO `sandbox.start`: sbx v0.47 has no start command, so the UI
+ * shows it as visibly unsupported instead of inventing one.
  */
 export const CORE_METHODS = [
   'system.probe',
@@ -67,6 +71,8 @@ export const CORE_METHODS = [
   'project.list',
   'sandbox.list',
   'sandbox.create',
+  'sandbox.stop',
+  'sandbox.remove',
   'conversation.create',
   'conversation.send',
   'conversation.list',
@@ -214,6 +220,42 @@ export interface SandboxCreateSpec {
   projectId: string;
   workspaceMode: WorkspaceMode;
   repoPath?: string | null;
+  /**
+   * A1, additive: built-in sbx agent the sandbox is created with. Absent → Core
+   * uses the provider-free `shell`. Must be one of `SBX_AGENTS` exactly; Core
+   * refuses anything else (incl. sandbox-kit references) with VALIDATION_FAILED.
+   * Accepting a provider agent is NOT a verification claim — that lives only in
+   * `CoreCapabilities.agents[].verified`.
+   */
+  agent?: string;
+}
+
+/**
+ * The exact built-in agents of the captured sbx v0.47.0 `create --help`
+ * (`SBX_AGENTS_V0_47` in sandpane-core, `schemas/sandbox-create-spec.schema.json`
+ * `agent.enum`). Order matches the schema.
+ */
+export const SBX_AGENTS = [
+  'claude',
+  'codex',
+  'copilot',
+  'cursor',
+  'devin',
+  'docker-agent',
+  'droid',
+  'gemini',
+  'kiro',
+  'opencode',
+  'shell',
+] as const;
+
+export type SbxAgent = (typeof SBX_AGENTS)[number];
+
+/** Core's `DEFAULT_SANDBOX_AGENT`: what an absent `agent` means. */
+export const DEFAULT_SBX_AGENT: SbxAgent = 'shell';
+
+export function isSbxAgent(value: unknown): value is SbxAgent {
+  return typeof value === 'string' && (SBX_AGENTS as readonly string[]).includes(value);
 }
 
 export interface SandboxSummary {
@@ -232,6 +274,67 @@ export interface SandboxSummary {
    * render the mode as UNVERIFIED, never as safe.
    */
   workspaceMode?: WorkspaceMode | null;
+  /**
+   * A1, additive: the agent sbx itself reports in `ls --json`. A probed FACT,
+   * never a verification claim. Absent when sbx did not report one.
+   */
+  agent?: string | null;
+}
+
+/** `sandbox.stop` params (A1). Not destructive: no confirmation token. */
+export interface SandboxStopParams {
+  name: string;
+}
+
+/**
+ * `sandbox.stop` result. `stopped: true` only says `sbx stop` exited 0. The
+ * state is whatever the post-stop re-query reports in `requeried`; when
+ * `requeried` is ABSENT the sandbox is no longer listed or the re-query failed,
+ * and the state must be shown as UNKNOWN — never assumed "stopped".
+ */
+export interface SandboxStopResult {
+  stopped: boolean;
+  requeried?: SandboxSummary | null;
+}
+
+/**
+ * `sandbox.remove` params (A1, two-step server-side confirmation, design
+ * 2026-10-09 §2). Without `confirmToken` Core changes nothing and answers a
+ * `ConfirmationRequest`; with it, Core re-checks the target identity and acts.
+ */
+export interface SandboxRemoveParams {
+  name: string;
+  confirmToken?: string;
+}
+
+/** Identity a confirmation token is bound to: the name AND the sbx `id`. */
+export interface ConfirmationTarget {
+  name: string;
+  id: string;
+}
+
+/**
+ * Server-side destructive-action confirmation. `token` is 256-bit random
+ * (64 lowercase hex), single-use, in Core memory only, valid until `expiresAt`
+ * (RFC 3339, 120 s after issue). `external: true` = Core has no Sandpane
+ * binding recorded for this sbx id (this also covers a pre-A1 binding without
+ * an id, or a binding for an earlier sandbox of the same name). It does NOT
+ * prove who created the sandbox; clients show "NOT CONFIRMED AS CREATED BY
+ * SANDPANE" prominently.
+ */
+export interface ConfirmationRequest {
+  token: string;
+  expiresAt: string;
+  action: string;
+  target: ConfirmationTarget;
+  impact: string[];
+  external: boolean;
+}
+
+/** `sandbox.remove` result: `confirmation` for step 1, `removed: true` for step 2. */
+export interface SandboxRemoveResult {
+  confirmation?: ConfirmationRequest | null;
+  removed?: boolean | null;
 }
 
 export interface ConversationCreateParams {

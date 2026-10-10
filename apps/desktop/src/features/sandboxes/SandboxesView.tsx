@@ -2,9 +2,21 @@ import { useState } from "react";
 import {
   capabilitiesOf,
   useCoreLink,
+  useLifecycleGates,
   useSandboxes,
 } from "../../lib/hooks";
-import { foldSbxView, sandboxModeView } from "../../lib/reducers";
+import {
+  displayRevealed,
+  foldSbxView,
+  sandboxModeView,
+  type FeatureGate,
+} from "../../lib/reducers";
+import { gateBlockLabel } from "../../lib/sandbox-lifecycle";
+import {
+  SandboxLifecycleControls,
+  SandboxLifecycleNotices,
+  useSandboxLifecycle,
+} from "../../components/sandbox/SandboxLifecycle";
 import { AppShell, ViewHeader } from "../../components/layout/AppShell";
 import {
   ConnectionBanner,
@@ -84,6 +96,8 @@ function SandboxList({
   const link = useCoreLink();
   const { sandboxes, isLoading, error } = useSandboxes();
   const attached = link.kind === "attached";
+  // View-level, so stop/remove outcomes survive the list re-read that drops a row.
+  const lifecycle = useSandboxLifecycle();
 
   const shown = sandboxes.filter((sandbox) => {
     if (filter === "all") return true;
@@ -110,6 +124,7 @@ function SandboxList({
         />
       }
     >
+      <SandboxLifecycleNotices lifecycle={lifecycle} />
       {!attached ? (
         <EmptyState
           variant="offline"
@@ -142,39 +157,49 @@ function SandboxList({
       ) : (
         <ul className="list">
           {shown.map((sandbox) => (
-            <li key={sandbox.name} className="row">
-              <span className="row__title">
-                <Mono>{sandbox.name}</Mono>
-              </span>
-              <span className="row__meta">
-                {sandbox.probedState === null ? (
-                  <Badge tone="neutral">state unknown (not probed)</Badge>
-                ) : (
-                  <Badge tone="info">{sandbox.probedState}</Badge>
-                )}
-                {sandbox.boundProjectId === null ? (
-                  " unbound"
-                ) : (
-                  <>
-                    {" "}
-                    · project <Mono>{sandbox.boundProjectId.slice(0, 8)}</Mono>
-                  </>
-                )}{" "}
-                {/* Core's recorded binding mode, or the UNVERIFIED reading — a
-                    sandbox with a probed state but no mode is never shown safe. */}
-                <Badge
-                  tone={
-                    sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).verified
-                      ? sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).liveWritable
-                        ? "danger"
-                        : "neutral"
-                      : "attention"
-                  }
-                  title={sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).blurb}
-                >
-                  {sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).label}
-                </Badge>
-              </span>
+            <li key={sandbox.name} className="row row--stacked">
+              <div className="row__head">
+                <span className="row__title">
+                  <Mono>{sandbox.name}</Mono>
+                </span>
+                <span className="row__meta">
+                  {sandbox.probedState === null ? (
+                    <Badge tone="neutral">state unknown (not probed)</Badge>
+                  ) : (
+                    <Badge tone="info">{sandbox.probedState}</Badge>
+                  )}
+                  {sandbox.boundProjectId === null ? (
+                    " unbound"
+                  ) : (
+                    <>
+                      {" "}
+                      · project <Mono>{sandbox.boundProjectId.slice(0, 8)}</Mono>
+                    </>
+                  )}{" "}
+                  {/* Core's recorded binding mode, or the UNVERIFIED reading — a
+                      sandbox with a probed state but no mode is never shown safe. */}
+                  <Badge
+                    tone={
+                      sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).verified
+                        ? sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).liveWritable
+                          ? "danger"
+                          : "neutral"
+                        : "attention"
+                    }
+                    title={sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).blurb}
+                  >
+                    {sandboxModeView(sandbox.workspaceMode, sandbox.unrecognizedWorkspaceMode).label}
+                  </Badge>
+                  {sandbox.agent !== undefined && (
+                    // What sbx reported for this sandbox — a probed fact, not a
+                    // verification claim.
+                    <Badge tone="neutral" title="Agent as reported by sbx ls; not a Sandpane verification">
+                      sbx agent {displayRevealed(sandbox.agent, 40).text}
+                    </Badge>
+                  )}
+                </span>
+              </div>
+              <SandboxLifecycleControls sandbox={sandbox} lifecycle={lifecycle} />
             </li>
           ))}
         </ul>
@@ -186,6 +211,7 @@ function SandboxList({
 function CapabilityPanel() {
   const link = useCoreLink();
   const sbx = foldSbxView(capabilitiesOf(link));
+  const gates = useLifecycleGates();
   return (
     <Panel
       title="Lifecycle and detail features"
@@ -220,13 +246,36 @@ function CapabilityPanel() {
             <td>sandbox.create with a validated spec; Core re-queries SBX after the mutation.</td>
           </tr>
           <tr>
-            <td>Start / stop / delete</td>
+            <td>Start</td>
             <td>
-              <Badge tone="neutral">not supported by this build</Badge>
+              <Badge tone="neutral">not supported by sbx v0.47</Badge>
             </td>
             <td>
-              No <Mono>task</Mono>-free lifecycle method exists in protocol v1. Ship it in DT2 as{" "}
-              <Mono>sandbox.start|stop|remove</Mono> with confirmations, then surface it here.
+              sbx v0.47 has no <Mono>start</Mono> command; a stopped sandbox is restarted with the
+              interactive <Mono>sbx run --name &lt;name&gt;</Mono> in a terminal. Sandpane does not run
+              it for you.
+            </td>
+          </tr>
+          <tr>
+            <td>Stop</td>
+            <td>
+              <LifecycleGateBadge gate={gates.stop} />
+            </td>
+            <td>
+              <Mono>sandbox.stop</Mono> runs <Mono>sbx stop</Mono>, then Core re-queries SBX. The state
+              shown afterwards is the re-queried one; if Core could not re-query, it is shown as
+              unknown.
+            </td>
+          </tr>
+          <tr>
+            <td>Remove</td>
+            <td>
+              <LifecycleGateBadge gate={gates.remove} />
+            </td>
+            <td>
+              <Mono>sandbox.remove</Mono> is a two-step confirmation held by Core: Core first describes
+              the impact and issues a short-lived, single-use token; only your explicit confirmation
+              sends it back.
             </td>
           </tr>
           <tr>
@@ -249,11 +298,20 @@ function CapabilityPanel() {
         </tbody>
       </table>
       <Warning tone="neutral" title="Destructive actions">
-        Removing a sandbox with an active task will require an explicit confirmation naming the
-        consequence (the task's workspace disappears). That dialog exists in the component set and
-        is wired as soon as the Core method does.
+        Remove always shows Core's own impact list, the sandbox's sbx id and the confirmation's
+        expiry, and says prominently when Core has no record of Sandpane creating the sandbox.
+        Cancelling sends nothing; neither Stop nor Remove is ever retried automatically.
       </Warning>
     </Panel>
+  );
+}
+
+function LifecycleGateBadge({ gate }: { gate: FeatureGate }) {
+  const blocked = gateBlockLabel(gate);
+  return (
+    <Badge tone={blocked === null ? "success" : "neutral"} title={gate.note}>
+      {blocked === null ? "available" : blocked}
+    </Badge>
   );
 }
 
@@ -285,6 +343,7 @@ export function SandboxDetailView({ route }: { route: Route }) {
   const { sandboxes, error } = useSandboxes();
   const name = route.params.sandboxName ?? "";
   const sandbox = sandboxes.find((s) => s.name === name) ?? null;
+  const lifecycle = useSandboxLifecycle();
   // Read from Core's binding record for this name — never a guessed default.
   const mode = sandboxModeView(sandbox?.workspaceMode, sandbox?.unrecognizedWorkspaceMode);
 
@@ -297,6 +356,7 @@ export function SandboxDetailView({ route }: { route: Route }) {
     >
       <ViewHeader title={`Sandbox ${name}`} subtitle="Probed state only." />
       <ConnectionBanner link={link} onRetry={refetch} />
+      <SandboxLifecycleNotices lifecycle={lifecycle} />
       <Panel title="Overview">
         {error !== null ? (
           <ErrorPanel error={error} />
@@ -325,6 +385,14 @@ export function SandboxDetailView({ route }: { route: Route }) {
               </dd>
             </div>
             <div className="kv">
+              <dt>sbx agent</dt>
+              <dd>
+                {sandbox.agent === undefined
+                  ? "not reported"
+                  : `${displayRevealed(sandbox.agent, 40).text} (reported by sbx; not a Sandpane verification)`}
+              </dd>
+            </div>
+            <div className="kv">
               <dt>live-writable</dt>
               <dd>
                 {mode.liveWritable
@@ -335,6 +403,11 @@ export function SandboxDetailView({ route }: { route: Route }) {
           </dl>
         )}
       </Panel>
+      {sandbox !== null && error === null && (
+        <Panel title="Lifecycle">
+          <SandboxLifecycleControls sandbox={sandbox} lifecycle={lifecycle} />
+        </Panel>
+      )}
     </AppShell>
   );
 }

@@ -21,6 +21,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
+# OS RNG for 256-bit destructive-action confirmation tokens (A1). Already in
+# the lockfile (uuid's own RNG); pinned to that resolved version.
+getrandom = "=0.4.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

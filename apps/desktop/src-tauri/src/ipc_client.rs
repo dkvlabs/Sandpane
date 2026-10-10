@@ -45,12 +45,16 @@ pub const PROXY_DEADLINE_MS: u64 = 12_000;
 const RETRY_DELAY: Duration = Duration::from_millis(150);
 
 /// Per-method proxy budget. Core's `sandbox.create` may legitimately run up to
-/// 300 s (image pull) and `sandbox.list` up to 30 s; everything else answers
-/// well inside the default.
+/// 300 s (image pull) and `sandbox.list` up to 30 s; `sandbox.stop` (stop plus
+/// the `ls --json` re-query) up to about 330 s, and `sandbox.remove` step 2
+/// (identity re-check plus `rm --force`) a little longer. Everything else
+/// answers well inside the default.
 pub fn proxy_deadline_ms(method: Method) -> u64 {
     match method {
         Method::SandboxCreate => 320_000,
         Method::SandboxList => 40_000,
+        Method::SandboxStop => 350_000,
+        Method::SandboxRemove => 390_000,
         _ => PROXY_DEADLINE_MS,
     }
 }
@@ -66,6 +70,10 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
 /// `task.cancel` is deliberately excluded even though it is idempotent in effect:
 /// Core answers the second cancel with `CONFLICT`, which would surface to the user
 /// as a spurious failure of an operation that already succeeded.
+///
+/// `sandbox.stop` and `sandbox.remove` (A1) are excluded too. Stop changes the
+/// sandbox; remove's step 1 mints a single-use confirmation token in Core and
+/// step 2 removes the sandbox, so neither step may ever be re-sent blindly.
 ///
 /// `src/lib/core-client.ts` mirrors this list as `REPLAY_SAFE_METHODS`; the
 /// drift test parses this `matches!` and fails if the two ever differ.
@@ -655,13 +663,24 @@ mod tests {
     /// method Core does not dispatch.
     #[test]
     fn additive_v1_reads_are_forwarded() {
-        for method in ["task.list", "conversation.list", "conversation.history"] {
+        for method in [
+            "task.list",
+            "conversation.list",
+            "conversation.history",
+            "sandbox.stop",
+            "sandbox.remove",
+        ] {
             assert!(
                 validate_frame(&frame(method)).is_ok(),
                 "{method} must be allowlisted because Core's crate parses it"
             );
         }
-        assert_eq!(Method::ALL.len(), 14);
+        assert_eq!(Method::ALL.len(), 16);
+        // sbx v0.47 has no `start`; the crate does not parse one, so neither does the proxy.
+        assert_eq!(
+            validate_frame(&frame("sandbox.start")).unwrap_err().code,
+            "METHOD_NOT_ALLOWED"
+        );
     }
 
     #[test]
@@ -747,6 +766,8 @@ mod tests {
             Method::ConversationSend,
             Method::GitApply,
             Method::TaskCancel,
+            Method::SandboxStop,
+            Method::SandboxRemove,
         ] {
             assert!(!replay_safe(m), "{m:?} must never be re-sent");
         }
@@ -803,6 +824,8 @@ mod tests {
     fn long_running_methods_get_their_own_budget() {
         assert_eq!(proxy_deadline_ms(Method::SandboxCreate), 320_000);
         assert_eq!(proxy_deadline_ms(Method::SandboxList), 40_000);
+        assert_eq!(proxy_deadline_ms(Method::SandboxStop), 350_000);
+        assert_eq!(proxy_deadline_ms(Method::SandboxRemove), 390_000);
         assert_eq!(proxy_deadline_ms(Method::GitApply), PROXY_DEADLINE_MS);
         assert_eq!(proxy_deadline_ms(Method::SystemProbe), PROXY_DEADLINE_MS);
     }
@@ -838,6 +861,12 @@ mod tests {
         assert!(mutated.may_have_been_applied);
         assert!(mutated.message.contains("may have been applied"));
         assert!(mutated.message.contains("Re-read state"));
+        // A1: a lost stop, or either step of the two-step remove, is never a
+        // plain timeout that invites a blind retry.
+        for m in [Method::SandboxStop, Method::SandboxRemove] {
+            let lost = after_write(m, ProxyError::new("TIMEOUT", "t"));
+            assert!(lost.may_have_been_applied, "{m:?}");
+        }
         let read = after_write(Method::TaskList, ProxyError::new("TIMEOUT", "t"));
         assert!(!read.may_have_been_applied);
         assert_eq!(read.message, "t");
@@ -1192,6 +1221,23 @@ mod tests {
             assert_eq!(err.code, "CONNECTION_CLOSED");
             assert!(err.may_have_been_applied);
             assert_eq!(server.join().unwrap().len(), 1);
+        }
+
+        /// A1: neither `sandbox.stop` nor either step of `sandbox.remove` is
+        /// re-sent after an early EOF — step 1 mints a single-use token in Core.
+        #[test]
+        fn sandbox_stop_and_remove_are_never_retried_after_an_early_eof() {
+            for line in [
+                r#"{"v":1,"id":"desk-1","method":"sandbox.stop","params":{"name":"atlas-demo"}}"#,
+                r#"{"v":1,"id":"desk-1","method":"sandbox.remove","params":{"name":"atlas-demo"}}"#,
+            ] {
+                let sock = TempSock::new();
+                let server = serve(&sock, Duration::from_millis(700), close_first_then_answer);
+                let err = proxy_frame(line, &sock.path, Some(Duration::from_secs(5))).unwrap_err();
+                assert_eq!(err.code, "CONNECTION_CLOSED", "{line}");
+                assert!(err.may_have_been_applied, "{line}");
+                assert_eq!(server.join().unwrap().len(), 1, "{line}: written once");
+            }
         }
 
         #[test]

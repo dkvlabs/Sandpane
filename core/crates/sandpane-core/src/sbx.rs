@@ -212,23 +212,30 @@ pub enum SbxWorkspace<'a> {
     Clone(&'a Path),
 }
 
-/// Proof that the SERVER recorded explicit user confirmation to remove
-/// exactly this sandbox (sbx-cli-integration rule 6). `sbx rm` prompts unless
-/// `--force` is given, and Core is non-interactive, so `--force` is only ever
-/// emitted together with this token.
+/// Evidence that the server-enforced two-step confirmation for removing
+/// exactly this sandbox completed (sbx-cli-integration rule 6). `sbx rm`
+/// prompts unless `--force` is given, and Core is non-interactive, so
+/// `--force` is only ever emitted together with this value.
 ///
-/// No protocol method constructs one yet: sandbox removal has no RPC in
-/// protocol v1 (it needs a request field carrying the confirmation, which is
-/// a protocol decision). The builder exists, is tested against the captured
-/// help and CRUD outputs, and is wired to nothing.
+/// The only constructor call in Core is `sandbox.remove` step 2 in
+/// `sandpane-service`, AFTER a single-use, unexpired, 256-bit confirmation
+/// token issued by step 1 was consumed and the sandbox's sbx `id` was
+/// re-checked against the id the token is bound to (design 2026-10-09 §2).
+///
+/// What it is NOT: proof that a human was present. Any same-user process can
+/// speak the Core socket, call step 1 and replay the returned token into step
+/// 2; the socket's same-user authentication cannot tell that process from a
+/// client UI (the specs/06 §3 malicious same-user attacker). The two steps
+/// stop a single accidental or stale request and bind the action to the
+/// target identity the user was shown — nothing more.
 #[derive(Debug)]
 pub struct RemovalConfirmation {
     sandbox: String,
 }
 
 impl RemovalConfirmation {
-    /// Call ONLY after the server has recorded the user's explicit
-    /// confirmation for removing `sandbox` (never on a client's say-so alone).
+    /// Call ONLY after the server-enforced two-step confirmation for removing
+    /// `sandbox` completed (never on a single request's say-so alone).
     pub fn user_confirmed(sandbox: &str) -> Self {
         Self {
             sandbox: sandbox.to_string(),
@@ -363,10 +370,15 @@ impl SbxSandboxStatus {
 /// One row of `sbx ls --json` (captured `crud/02_ls_json_after_create.txt`:
 /// `name`, `id`, `agent`, `status`, `last_used_at`, `workspaces`,
 /// `created_at`). Only the fields Core uses are read; unknown fields are
-/// ignored.
+/// ignored. `id` is the sandbox's sbx identity — it is what a destructive
+/// confirmation is bound to, so a same-named replacement is detectable.
+/// `id` and `agent` are ABSENT when sbx printed none or a value outside the
+/// captured shapes ([`Validator::sbx_sandbox_id`],
+/// [`Validator::sbx_reported_agent`]) — never invented, never relayed raw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SbxListEntry {
     pub name: String,
+    pub id: Option<String>,
     pub status: SbxSandboxStatus,
     pub agent: Option<String>,
 }
@@ -374,6 +386,8 @@ pub struct SbxListEntry {
 #[derive(Deserialize)]
 struct RawListRow {
     name: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -404,12 +418,15 @@ pub fn parse_list_json(output: &str) -> Result<Vec<SbxListEntry>, SbxError> {
         .into_iter()
         .map(|r| SbxListEntry {
             name: r.name,
+            // Relayed to clients, so only the captured shapes pass; anything
+            // else is ABSENT (review I4/I5), never relayed or rewritten.
+            id: r.id.filter(|id| Validator::sbx_sandbox_id(id).is_ok()),
             status: match r.status.as_deref() {
                 Some("running") => SbxSandboxStatus::Running,
                 Some("stopped") => SbxSandboxStatus::Stopped,
                 _ => SbxSandboxStatus::Unknown,
             },
-            agent: r.agent,
+            agent: r.agent.filter(|a| Validator::sbx_reported_agent(a).is_ok()),
         })
         .collect())
 }
@@ -839,6 +856,7 @@ mod tests {
             running,
             vec![SbxListEntry {
                 name: "sandpane-p0-probe".into(),
+                id: Some("b5ebec73-e2ae-471a-811a-e011cfb1948e".into()),
                 status: SbxSandboxStatus::Running,
                 agent: Some("shell".into()),
             }]
@@ -860,6 +878,8 @@ mod tests {
         .unwrap();
         assert_eq!(rows[0].status, SbxSandboxStatus::Unknown);
         assert_eq!(rows[1].status, SbxSandboxStatus::Unknown);
+        // A row without `id` parses with the identity ABSENT, never invented.
+        assert_eq!(rows[1].id, None);
         // The hand-written illustrative list.json used `state`, which no real
         // capture has: it now parses only to Unknown, never to a guessed value.
         let meta = include_str!("../tests/fixtures/sbx/_meta.json");
@@ -869,6 +889,25 @@ mod tests {
         assert!(illustrative
             .iter()
             .all(|e| e.status == SbxSandboxStatus::Unknown));
+    }
+
+    /// Review I4/I5: `id` and `agent` are relayed to clients (confirmation
+    /// target, summary), so values outside the captured shapes are dropped
+    /// to `None` — never relayed, never "cleaned up" into something else.
+    #[test]
+    fn malformed_id_and_agent_are_dropped_not_relayed() {
+        let rows = parse_list_json(
+            r#"{"sandboxes":[
+                {"name":"a1","id":"b5ebec73\nforged","agent":"shell\n(verified)","status":"running"},
+                {"name":"b2","id":"ok-id-1","agent":"docker-agent","status":"stopped"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(rows[0].id, None);
+        assert_eq!(rows[0].agent, None);
+        assert_eq!(rows[0].status, SbxSandboxStatus::Running, "row itself kept");
+        assert_eq!(rows[1].id.as_deref(), Some("ok-id-1"));
+        assert_eq!(rows[1].agent.as_deref(), Some("docker-agent"));
     }
 
     #[test]

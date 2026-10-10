@@ -1698,9 +1698,25 @@ const MAX_PATH_CHARS = 1024;
  * ONLY — the raw path is what selection and `git.apply` use.
  */
 export function displayPath(path: string): { text: string; unusual: boolean } {
-  const points = Array.from(path);
-  const cut = points.length > MAX_PATH_CHARS;
-  const head = cut ? points.slice(0, MAX_PATH_CHARS).join("") : path;
+  return displayRevealed(path, MAX_PATH_CHARS);
+}
+
+/**
+ * Display form of ANY untrusted single-line text Core relayed (a path, a
+ * confirmation `impact` line, a target name): hidden, control and look-alike
+ * characters become visible escapes instead of being stripped, so a U+202E or
+ * an embedded newline can neither reorder the text nor fake an extra line, and
+ * `unusual` says that something was revealed. Cut at `maxChars` code points
+ * with the remainder counted. The result is plain text for React to render —
+ * never HTML.
+ */
+export function displayRevealed(
+  value: string,
+  maxChars: number,
+): { text: string; unusual: boolean } {
+  const points = Array.from(value);
+  const cut = points.length > maxChars;
+  const head = cut ? points.slice(0, maxChars).join("") : value;
   let unusual = false;
   const escaped = head.replace(PATH_ESCAPE, (ch) => {
     unusual = true;
@@ -1709,7 +1725,7 @@ export function displayPath(path: string): { text: string; unusual: boolean } {
     return code > 0xffff ? `\\u{${hex}}` : `\\u${hex.padStart(4, "0")}`;
   });
   return {
-    text: cut ? `${escaped}… (${points.length - MAX_PATH_CHARS} more characters)` : escaped,
+    text: cut ? `${escaped}… (${points.length - maxChars} more characters)` : escaped,
     unusual,
   };
 }
@@ -1784,7 +1800,27 @@ const CORE_ERROR_COPY: Record<ErrorCode, Omit<ErrorCopy, "reason">> = {
   },
 };
 
+/** Longest Core/transport reason shown, in code points (the cut is disclosed). */
+export const MAX_REASON_CHARS = 600;
+/** Longest error title shown, in code points. */
+const MAX_ERROR_TITLE_CHARS = 300;
+
+/**
+ * User-facing copy for any request failure. Core's `message` routinely carries
+ * sbx stderr, which can contain bidi overrides, U+2028/U+2029 or newlines, so
+ * the reason and title are REVEALED (hidden characters shown as `\uXXXX`, never
+ * applied) and capped here, once, for every surface that renders an error.
+ */
 export function describeCoreError(err: CoreRequestError): ErrorCopy {
+  const copy = describeCoreErrorUnrevealed(err);
+  return {
+    ...copy,
+    title: displayRevealed(copy.title, MAX_ERROR_TITLE_CHARS).text,
+    reason: displayRevealed(copy.reason, MAX_REASON_CHARS).text,
+  };
+}
+
+function describeCoreErrorUnrevealed(err: CoreRequestError): ErrorCopy {
   if (err.isCoreError && err.code === UNRECOGNIZED_CORE_CODE) {
     // Core answered with a code this build does not know: show Core's verdict
     // as itself — the raw code and Core's own message — without guessing what

@@ -9,8 +9,8 @@
  * what *will* be asked for, not what is running.
  */
 
-import type { SandboxCreateSpec, WorkspaceMode } from "./protocol";
-import { WORKSPACE_MODES } from "./protocol";
+import type { SandboxCreateSpec, SbxAgent, WorkspaceMode } from "./protocol";
+import { DEFAULT_SBX_AGENT, WORKSPACE_MODES, isSbxAgent } from "./protocol";
 
 export const SANDBOX_NAME_MAX = 63;
 
@@ -40,12 +40,24 @@ export interface WizardContext {
   knownAgentIds: readonly string[];
   /** Advanced settings are only offered after capability detection succeeds. */
   advancedAvailable: boolean;
+  /**
+   * Whether THIS Core honours `SandboxCreateSpec.agent` (A1). Absent/false: only
+   * the default `shell` may be chosen, because a pre-A1 Core silently ignores
+   * the key and would create a shell sandbox while the review claimed otherwise.
+   */
+  sbxAgentFieldAvailable?: boolean;
 }
 
 export interface SandboxDraft {
   name: string;
   projectId: string;
   agentId: string;
+  /**
+   * The built-in sbx agent the sandbox is created with (A1). Defaults to the
+   * provider-free `shell`; only `SBX_AGENTS` members are ever sent. Distinct
+   * from `agentId`, which is a Core adapter id from `system.probe`.
+   */
+  sbxAgent: SbxAgent;
   workspaceMode: WorkspaceMode | null;
   repoPath: string;
   step: WizardStep;
@@ -56,6 +68,7 @@ export function emptyDraft(): SandboxDraft {
     name: "",
     projectId: "",
     agentId: "",
+    sbxAgent: DEFAULT_SBX_AGENT,
     workspaceMode: null,
     repoPath: "",
     step: "project",
@@ -63,7 +76,7 @@ export function emptyDraft(): SandboxDraft {
 }
 
 export type FieldErrors = Partial<
-  Record<"name" | "projectId" | "agentId" | "workspaceMode" | "repoPath", string>
+  Record<"name" | "projectId" | "agentId" | "sbxAgent" | "workspaceMode" | "repoPath", string>
 >;
 
 const NAME_ALLOWLIST = /^[a-z0-9-]+$/;
@@ -166,6 +179,13 @@ export function fieldErrors(
       "Pick a verified agent, or create the sandbox anyway and run nothing yet.";
   }
 
+  if (!isSbxAgent(draft.sbxAgent)) {
+    errors.sbxAgent = "Pick one of the built-in sbx agents.";
+  } else if (draft.sbxAgent !== DEFAULT_SBX_AGENT && context.sbxAgentFieldAvailable !== true) {
+    errors.sbxAgent =
+      "This Core does not support choosing the sbx agent (it would silently create a shell sandbox). Use shell, or upgrade Core.";
+  }
+
   if (draft.workspaceMode === null) {
     errors.workspaceMode = "Choose how the workspace is isolated.";
   } else if (!WORKSPACE_MODES.includes(draft.workspaceMode)) {
@@ -181,7 +201,7 @@ export function fieldErrors(
 /** Which fields gate which step (design spec S04: inline validation per step). */
 const STEP_FIELDS: Record<WizardStep, (keyof FieldErrors)[]> = {
   project: ["name", "projectId"],
-  agent: ["agentId"],
+  agent: ["agentId", "sbxAgent"],
   isolation: ["workspaceMode", "repoPath"],
   review: [],
 };
@@ -227,6 +247,12 @@ export function buildSpec(draft: SandboxDraft): SandboxCreateSpec {
     workspaceMode: draft.workspaceMode,
   };
   if (draft.repoPath.trim().length > 0) spec.repoPath = draft.repoPath.trim();
+  // Never send a value outside the allowlist. `shell` is Core's default, so it is
+  // omitted (an older Core then never sees the key at all).
+  if (!isSbxAgent(draft.sbxAgent)) {
+    throw new Error("buildSpec requires a built-in sbx agent");
+  }
+  if (draft.sbxAgent !== DEFAULT_SBX_AGENT) spec.agent = draft.sbxAgent;
   return spec;
 }
 
@@ -244,6 +270,11 @@ export function reviewWarnings(
   if (draft.agentId && !context.verifiedAgentIds.includes(draft.agentId)) {
     warnings.push(
       `No verified adapter for "${draft.agentId}" in this Core build: a task would stay queued rather than run.`,
+    );
+  }
+  if (draft.sbxAgent !== DEFAULT_SBX_AGENT) {
+    warnings.push(
+      `The sbx agent "${draft.sbxAgent}" is not verified by Sandpane and may need provider sign-in inside the sandbox. Sandpane never imports provider credentials.`,
     );
   }
   if (!context.advancedAvailable) {

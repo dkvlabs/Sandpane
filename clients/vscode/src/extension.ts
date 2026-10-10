@@ -2,8 +2,9 @@
  * Extension entry point (specs/03 §2).
  *
  * activate(): attach to Core, register the sidebar webview, the task tree, the
- * nine commands (each one is a progress-wrapped call into the typed Core
- * client) and the status bar item.
+ * twelve commands (each one is a progress-wrapped call into the typed Core
+ * client, or an honest explanation of what is not offered) and the status bar
+ * item.
  *
  * deactivate(): dispose subscriptions ONLY. A detached window must never be able
  * to terminate a running task — Core owns the agent processes (specs/02 §1,
@@ -18,7 +19,13 @@ import { SandpaneTaskTreeProvider } from './vscode/taskTree';
 import { coreDataDir, unsupportedPlatformReason } from './core-client/paths';
 import { allWorkspaceModeViews } from './vscode/workspaces';
 import { isKnownWorkspaceMode } from './vscode/workspaces';
-import { validateSandboxName, CoreValidationError } from './core-client/commands';
+import {
+  validateSandboxName,
+  validateAddressableSandboxName,
+  CoreValidationError,
+} from './core-client/commands';
+import { agentPickItems, sandboxPickItem, startUnsupportedMessage } from './vscode/sandboxActions';
+import type { SbxAgent } from './core-client/protocol';
 
 const CORE_AVAILABLE_CONTEXT = 'sandpane.coreAvailable';
 
@@ -124,7 +131,7 @@ export function deactivate(): void {
 /** Printed and copied for the user; the extension never runs it (ADR 1). */
 const START_SERVICE_COMMAND = 'cd core && cargo run -p sandpane-service';
 
-/** The nine contributed commands, each wrapped in a progress notification. */
+/** The twelve contributed commands, each wrapped in a progress notification. */
 function registrations(
   session: SandpaneSession,
   output: vscode.OutputChannel,
@@ -229,6 +236,20 @@ function registrations(
           );
           if (acknowledged !== 'I understand, continue') return undefined;
         }
+        // A1 agent choice — offered only when this Core accepts the field (a
+        // pre-A1 Core would silently ignore it). Default: provider-free shell,
+        // sent as an absent field.
+        let agent: SbxAgent | undefined;
+        if (session.coreAdvertises('sandbox.remove')) {
+          const picked = await vscode.window.showQuickPick(agentPickItems(), {
+            title: 'Agent inside the sandbox (sbx built-in)',
+            placeHolder: 'shell is provider-free; any other agent is not verified by Sandpane',
+          });
+          if (!picked) return undefined;
+          agent = picked.agent;
+        } else {
+          log('agent choice not offered: this Core does not advertise the A1 methods (default shell is used)');
+        }
         const folder = vscode.workspace.workspaceFolders?.[0];
         const repoPath =
           mode.mode === 'mountless' || !folder || folder.uri.scheme !== 'file'
@@ -239,6 +260,7 @@ function registrations(
           projectId,
           workspaceMode: mode.mode,
           ...(repoPath ? { repoPath } : {}),
+          ...(agent !== undefined ? { agent } : {}),
         });
       }),
     ),
@@ -308,6 +330,37 @@ function registrations(
         return undefined;
       }),
     ),
+
+    vscode.commands.registerCommand('sandpane.stopSandbox', (nameArg?: unknown) =>
+      guard('Sandpane: stop sandbox (sbx stop can take up to 5 minutes)', async () => {
+        const name = await sandboxArgOrPick(session, nameArg, 'Stop which sandbox?');
+        if (!name) return undefined;
+        return session.stopSandbox(name);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.removeSandbox', (nameArg?: unknown) =>
+      guard('Sandpane: remove sandbox', async () => {
+        const name = await sandboxArgOrPick(session, nameArg, 'Remove which sandbox?');
+        if (!name) return undefined;
+        return session.removeSandbox(name);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.startSandbox', (nameArg?: unknown) => {
+      // Visibly unsupported (sbx v0.47 has no start). Nothing is sent to Core
+      // and nothing is run; the hint is text for the user's own terminal.
+      let name: string | null = null;
+      if (typeof nameArg === 'string') {
+        try {
+          name = validateAddressableSandboxName(nameArg);
+        } catch {
+          name = null;
+        }
+      }
+      void vscode.window.showWarningMessage(startUnsupportedMessage(name));
+      return Promise.resolve(undefined);
+    }),
 
     vscode.commands.registerCommand('sandpane.refreshSandboxes', () =>
       guard('Sandpane: refresh from Core', () => session.refresh()),
@@ -396,6 +449,27 @@ async function pickProject(session: SandpaneSession): Promise<string | undefined
   }
   const picked = await vscode.window.showQuickPick(options, { title: 'Project' });
   return picked?.id;
+}
+
+/**
+ * A sandbox name from a command argument (validated) or from a fresh Core
+ * `sandbox.list` picker. Labels are plain text (hidden characters escaped).
+ */
+async function sandboxArgOrPick(
+  session: SandpaneSession,
+  nameArg: unknown,
+  title: string,
+): Promise<string | undefined> {
+  if (typeof nameArg === 'string') return validateAddressableSandboxName(nameArg);
+  const sandboxes = await session.listSandboxOptions();
+  if (sandboxes.length === 0) {
+    void vscode.window.showInformationMessage(
+      'Core lists no sandbox (or it is not attached). Run "Sandpane: Refresh Sandboxes" to re-read sbx.',
+    );
+    return undefined;
+  }
+  const picked = await vscode.window.showQuickPick(sandboxes.map(sandboxPickItem), { title });
+  return picked?.name;
 }
 
 async function pickTask(session: SandpaneSession): Promise<string | undefined> {

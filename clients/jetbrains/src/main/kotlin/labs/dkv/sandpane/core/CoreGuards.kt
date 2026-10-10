@@ -153,6 +153,62 @@ object CoreGuards {
     }
 
     /**
+     * `sandpane_core::validation::Validator::sandbox_name` — the rule Core applies to a name it must
+     * ADDRESS (`sandbox.stop` / `sandbox.remove`), which is the `sbx v0.47 --name` rule: 2..=128
+     * characters, ASCII letters, digits, `-` and `.` only, a letter or digit first (so no value can be
+     * read as an option), and not the reserved `default`.
+     *
+     * Deliberately LOOSER than the create-spec schema pattern (lowercase, no `.`): sandboxes sbx named
+     * itself, or that were created outside Sandpane, must still be stoppable and removable. A name
+     * that fails here never reaches the wire (AGENTS.md rule 2); Core validates it again.
+     */
+    fun requireAddressableSandboxName(name: String): String {
+        if (name.isEmpty()) throw CoreValidationException("name", "sandbox name is empty")
+        if (name.length > MAX_SANDBOX_NAME_LEN) {
+            throw CoreValidationException("name", "sandbox name exceeds max length $MAX_SANDBOX_NAME_LEN")
+        }
+        if (name.length < 2) throw CoreValidationException("name", "sandbox name must be at least two characters")
+        if (!name.all { it.isAsciiAlphanumeric() || it == '-' || it == '.' }) {
+            throw CoreValidationException("name", "sandbox name may contain only ASCII letters, digits, '-' and '.'")
+        }
+        if (!name[0].isAsciiAlphanumeric()) {
+            throw CoreValidationException("name", "sandbox name must start with an ASCII letter or digit")
+        }
+        if (name.equals("default", ignoreCase = true)) {
+            throw CoreValidationException("name", "'default' is a reserved sandbox name")
+        }
+        return name
+    }
+
+    /** Mirrors Core's 128-character sanity bound on an addressed sandbox name. */
+    const val MAX_SANDBOX_NAME_LEN: Int = 128
+
+    private fun Char.isAsciiAlphanumeric(): Boolean = this in 'a'..'z' || this in 'A'..'Z' || this in '0'..'9'
+
+    /**
+     * `SandboxCreateSpec.agent` (A1): absent stays absent (Core defaults to `shell`); a present value
+     * must be an exact built-in agent of the pinned sbx ([labs.dkv.sandpane.model.SbxAgents.V0_47]).
+     * Sandbox-kit references — local paths, ZIPs, git or OCI refs — run third-party code and are
+     * refused here as well as in Core.
+     */
+    fun optionalSbxAgent(agent: String?): String? {
+        if (agent == null) return null
+        if (!labs.dkv.sandpane.model.SbxAgents.isAllowlisted(agent)) {
+            throw CoreValidationException(
+                "agent",
+                "not a built-in sbx v0.47 agent (allowed: ${labs.dkv.sandpane.model.SbxAgents.V0_47.joinToString(", ")})",
+            )
+        }
+        return agent
+    }
+
+    /** Shape of a Core confirmation token: 256 random bits as 64 lowercase hex characters. */
+    private val CONFIRM_TOKEN: Regex = Regex("^[0-9a-f]{64}$")
+
+    /** Whether [token] has the exact shape Core issues; anything else is never sent back. */
+    fun isConfirmTokenShape(token: String): Boolean = CONFIRM_TOKEN.matches(token)
+
+    /**
      * `task.list.statuses` are Core's OWN stored values, deserialized into a closed enum — an
      * unknown string is `VALIDATION_FAILED`, never normalized into a state that happens to
      * exist. Duplicates are collapsed here because they mean nothing in an SQL IN-list, and

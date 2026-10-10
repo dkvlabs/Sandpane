@@ -139,8 +139,8 @@ async function main() {
 
   // ---- method advertisement (the discovery revision) --------------------
   check(
-    'system.probe advertises exactly the 14 methods the client allowlists',
-    Array.isArray(caps.methods) && caps.methods.length === 14 && caps.methods.join(',') === CORE_METHODS.join(','),
+    'system.probe advertises exactly the 16 methods the client allowlists',
+    Array.isArray(caps.methods) && caps.methods.length === 16 && caps.methods.join(',') === CORE_METHODS.join(','),
     (caps.methods ?? []).join(','),
   );
   const schemaMethods = JSON.parse(
@@ -158,6 +158,15 @@ async function main() {
       coreAdvertisesMethod(caps, 'conversation.history') &&
       coreAdvertisesMethod({ methods: ['system.probe'] }, 'task.list') === false,
     `task.list=${coreAdvertisesMethod(caps, 'task.list')}`,
+  );
+  // A1: advertisement only. This harness never CALLS sandbox.stop/remove —
+  // against a host with sbx installed that would drive the real CLI.
+  check(
+    'A1: Core advertises sandbox.stop + sandbox.remove and no sandbox.start (sbx v0.47 has none)',
+    coreAdvertisesMethod(caps, 'sandbox.stop') &&
+      coreAdvertisesMethod(caps, 'sandbox.remove') &&
+      !(caps.methods ?? []).includes('sandbox.start'),
+    (caps.methods ?? []).filter((m) => m.startsWith('sandbox.')).join(','),
   );
 
   // ---- two clients, one core (specs/03 §6.3) ---------------------------

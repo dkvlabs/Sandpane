@@ -28,7 +28,7 @@ pub struct Database {
 }
 
 /// Newest schema version this build understands.
-pub const LATEST_SCHEMA_VERSION: i64 = 3;
+pub const LATEST_SCHEMA_VERSION: i64 = 4;
 
 /// Schema v1: the entity set from specs/02 §3.
 const MIGRATION_V1: &str = r#"
@@ -187,6 +187,24 @@ CREATE UNIQUE INDEX idx_tasks_worktree_path ON tasks(worktree_path)
     WHERE worktree_path IS NOT NULL;
 "#;
 
+/// Schema v4 (A1, `sandbox.remove`): a binding is MARKED removed when Core
+/// removed its sandbox through the confirmed two-step flow — the row is kept
+/// (audit trail; tasks may still reference it) and never deleted. Reads that
+/// report a binding as in force (`sandbox.list` mode/project join, the
+/// `external` check) consider only rows with `removed_at IS NULL`, so a new
+/// sandbox that reuses the name never inherits the removed one's mode. Every
+/// existing row is NULL (still in force) after the upgrade.
+///
+/// `sbx_id` records the sbx `id` of the sandbox the binding was made for
+/// (from the post-create `ls --json` re-query), so "did Sandpane create THIS
+/// sandbox" is answered by identity, not by name (review W1). Pre-A1 rows
+/// stay NULL — never back-filled or guessed — and are reported as unable to
+/// confirm Sandpane created the sandbox.
+const MIGRATION_V4: &str = r#"
+ALTER TABLE sandbox_bindings ADD COLUMN removed_at TEXT;
+ALTER TABLE sandbox_bindings ADD COLUMN sbx_id TEXT;
+"#;
+
 impl Database {
     /// Open (or create) the database at `path` and migrate to the latest
     /// schema. Refuses databases from a newer schema version.
@@ -251,6 +269,9 @@ impl Database {
         }
         if current < 3 {
             self.apply_migration(3, MIGRATION_V3)?;
+        }
+        if current < 4 {
+            self.apply_migration(4, MIGRATION_V4)?;
         }
         Ok(())
     }
@@ -470,7 +491,7 @@ mod tests {
                 .unwrap();
         }
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let row: (String, String, String, Option<String>, Option<String>, i64) = db
             .conn()
             .query_row(
@@ -523,8 +544,74 @@ mod tests {
         drop(db);
         // Re-open: idempotent, no second backup.
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         assert!(!dir.path().join("core.sqlite3.pre-v3.bak.1").exists());
+    }
+
+    /// A1 migration: a REAL v3 file (v1+v2+v3 SQL, a binding row written the
+    /// pre-A1 way) upgrades forward to v4: the binding row is intact with
+    /// `removed_at` NULL (still in force), a consistent backup of the v3 file
+    /// is taken, and marking a binding removed is an UPDATE, never a delete.
+    #[test]
+    fn v3_database_migrates_forward_to_v4_with_removed_at_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch(MIGRATION_V3).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO sandbox_bindings (id,project_id,sandbox_name,workspace_mode,created_at)
+                     VALUES ('b1','p1','atlas-auth','direct_mount','t');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 4);
+        let row: (String, String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT sandbox_name, workspace_mode, removed_at FROM sandbox_bindings WHERE id='b1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("atlas-auth".into(), "direct_mount".into(), None));
+        // Pre-A1 rows carry no sbx identity: NULL, never back-filled or guessed.
+        let sbx_id: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT sbx_id FROM sandbox_bindings WHERE id='b1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sbx_id, None);
+        let backup = dir.path().join("core.sqlite3.pre-v4.bak");
+        assert!(backup.exists());
+        let b = Connection::open(&backup).unwrap();
+        let v: i64 = b
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+        db.conn()
+            .execute(
+                "UPDATE sandbox_bindings SET removed_at='t2' WHERE sandbox_name='atlas-auth'",
+                [],
+            )
+            .unwrap();
+        let kept: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sandbox_bindings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "a removed binding is marked, never deleted");
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 4);
+        assert!(!dir.path().join("core.sqlite3.pre-v4.bak.1").exists());
     }
 
     #[test]

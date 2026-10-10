@@ -114,8 +114,13 @@ val CoreJson: Json = Json {
  *
  * [ALL] is an ORDERED list mirroring `Method::ALL` in Rust — the single list `CoreCapabilities.methods`
  * is derived from — because [labs.dkv.sandpane.core.ProtocolDriftGuardTest] compares order as well as
- * membership. The three additive protocol-v1 methods (`conversation.list`, `conversation.history`,
- * `task.list`) sit at their Rust positions; nothing existing was renamed or removed.
+ * membership. The three additive protocol-v1 discovery methods (`conversation.list`,
+ * `conversation.history`, `task.list`) and the two A1 sandbox-lifecycle methods (`sandbox.stop`,
+ * `sandbox.remove`) sit at their Rust positions; nothing existing was renamed or removed.
+ *
+ * There is deliberately NO `sandbox.start`: sbx v0.47 has no `start` command (restart is the
+ * interactive `sbx run --name`), so Core does not dispatch one and this client never sends one —
+ * see [SANDBOX_START_UNSUPPORTED].
  */
 object CoreMethods {
     const val SYSTEM_PROBE: String = "system.probe"
@@ -123,6 +128,12 @@ object CoreMethods {
     const val PROJECT_LIST: String = "project.list"
     const val SANDBOX_LIST: String = "sandbox.list"
     const val SANDBOX_CREATE: String = "sandbox.create"
+
+    /** A1: `sbx stop NAME` + `ls --json` re-query. Not destructive, so no confirmation token. */
+    const val SANDBOX_STOP: String = "sandbox.stop"
+
+    /** A1: two-step server-side confirmation (design 2026-10-09 §2) before `sbx rm`. */
+    const val SANDBOX_REMOVE: String = "sandbox.remove"
     const val CONVERSATION_CREATE: String = "conversation.create"
     const val CONVERSATION_SEND: String = "conversation.send"
     const val CONVERSATION_LIST: String = "conversation.list"
@@ -133,18 +144,36 @@ object CoreMethods {
     const val GIT_REVIEW: String = "git.review"
     const val GIT_APPLY: String = "git.apply"
 
-    /** Wire order of `Method::ALL` — 14 methods as of the protocol-v1 discovery revision. */
+    /** Wire order of `Method::ALL` — 16 methods as of protocol-v1 addition A1. */
     val ALL: List<String> = listOf(
         SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST, SANDBOX_LIST, SANDBOX_CREATE,
+        SANDBOX_STOP, SANDBOX_REMOVE,
         CONVERSATION_CREATE, CONVERSATION_SEND, CONVERSATION_LIST, CONVERSATION_HISTORY,
         TASK_CANCEL, TASK_LIST, TASK_SUBSCRIBE, GIT_REVIEW, GIT_APPLY,
     )
 
     /**
-     * The methods this revision ADDED, which a pre-discovery Core does NOT dispatch. Feature
-     * detection is mandatory for exactly these — see [CoreCapabilities.advertises].
+     * The methods the protocol-v1 discovery revision ADDED, which a pre-discovery Core does NOT
+     * dispatch.
      */
     val ADDITIVE_IN_V1: Set<String> = setOf(CONVERSATION_LIST, CONVERSATION_HISTORY, TASK_LIST)
+
+    /** The methods addition A1 ADDED (design 2026-10-09 §3); a pre-A1 Core does NOT dispatch them. */
+    val ADDITIVE_A1: Set<String> = setOf(SANDBOX_STOP, SANDBOX_REMOVE)
+
+    /**
+     * Every method beyond the eleven-method v1 baseline. Feature detection is mandatory for exactly
+     * these — see [CoreCapabilities.advertises]: a call is refused locally, before a byte is written,
+     * when the connected Core's `system.probe` does not list it (design 2026-10-09 §1 rule 3).
+     */
+    val REQUIRES_ADVERTISEMENT: Set<String> = ADDITIVE_IN_V1 + ADDITIVE_A1
+
+    /**
+     * The honest unsupported state for starting a sandbox (design 2026-10-09 §3 row A1). Shown to the
+     * user verbatim; never turned into a request.
+     */
+    const val SANDBOX_START_UNSUPPORTED: String =
+        "Start: not supported by sbx v0.47 (use `sbx run --name <name>` in a terminal)"
 
     /** Sent only to Core after this check; nothing here reaches a shell. */
     fun isAllowlisted(method: String): Boolean = ALL.contains(method)
@@ -315,7 +344,48 @@ data class SandboxCreateSpec(
     @SerialName("projectId") val projectId: String,
     @SerialName("workspaceMode") val workspaceMode: WorkspaceMode,
     @SerialName("repoPath") val repoPath: String? = null,
+    /**
+     * A1, additive: the built-in sbx agent to create the sandbox with. NULL keeps the key off the
+     * wire (`explicitNulls = false`), and Core then uses the provider-free `shell` — so the request
+     * an older Core sees is byte-identical to before. A value must be in [SbxAgents.V0_47]; anything
+     * else (a sandbox-kit path, ZIP, git or OCI ref) is refused locally before sending
+     * ([labs.dkv.sandpane.core.CoreGuards.optionalSbxAgent]) and by Core again.
+     */
+    val agent: String? = null,
 )
+
+/**
+ * The built-in agents of the pinned sbx v0.47.0 (`sbx create --help`, captured in Core's fixtures),
+ * mirrored from `sandpane_core::validation::SBX_AGENTS_V0_47` and the `agent` enum of
+ * `schemas/sandbox-create-spec.schema.json`; [labs.dkv.sandpane.core.ProtocolDriftGuardTest] pins
+ * all three together.
+ *
+ * Being on this list is NOT a verification claim. Whether Sandpane has a verified adapter for an
+ * agent is stated only by `CoreCapabilities.agents[].verified`.
+ */
+object SbxAgents {
+    /** Core's default when `agent` is absent: no provider account, no sign-in. */
+    const val DEFAULT: String = "shell"
+
+    val V0_47: List<String> = listOf(
+        "claude", "codex", "copilot", "cursor", "devin", "docker-agent", "droid", "gemini", "kiro",
+        "opencode", "shell",
+    )
+
+    fun isAllowlisted(agent: String): Boolean = V0_47.contains(agent)
+
+    /**
+     * The label a create surface shows for [agent]. `shell` is the only provider-free choice;
+     * every other entry says plainly that it is unverified and may need a provider sign-in inside
+     * the sandbox (no provider credential is ever handled by this plugin).
+     */
+    fun label(agent: String): String =
+        if (agent == DEFAULT) {
+            "shell (provider-free)"
+        } else {
+            "$agent — agent not verified — may need provider sign-in inside the sandbox"
+        }
+}
 
 @Serializable
 data class SandboxSummary(
@@ -339,10 +409,86 @@ data class SandboxSummary(
      */
     @Serializable(with = ReportedWorkspaceModeSerializer::class)
     @SerialName("workspaceMode") val workspaceMode: Reported<WorkspaceMode>? = null,
+    /**
+     * A1, additive: the agent `sbx ls --json` reports for this sandbox — a probed FACT, never a
+     * verification claim (`CoreCapabilities.agents[].verified` is the only such claim). NULL when
+     * sbx reported none or the Core predates A1; shown as "not reported", never guessed.
+     */
+    val agent: String? = null,
 ) {
     /** Presentation of the mode exactly as Core reported it (absent ⇒ unverified, never safe). */
     fun modeView(): WorkspaceModeView = WorkspaceModeView.forSandbox(this)
 }
+
+/** `sandbox.stop` params (A1). Not destructive: no confirmation token. */
+@Serializable
+data class SandboxStopParams(val name: String)
+
+/**
+ * `sandbox.stop` result. `stopped: true` only says `sbx stop` exited 0. The state is whatever the
+ * post-stop re-query reports in [requeried]; ABSENT means the sandbox is no longer listed or the
+ * re-query failed, and the UI must then say the state is UNKNOWN — never "stopped" (specs/02 §5:
+ * exit 0 is not desired state).
+ */
+@Serializable
+data class SandboxStopResult(
+    val stopped: Boolean,
+    val requeried: SandboxSummary? = null,
+)
+
+/**
+ * `sandbox.remove` params (A1, two-step confirmation). Step 1 leaves [confirmToken] NULL, so the key
+ * is absent on the wire and Core changes nothing; step 2 carries the token step 1 issued.
+ */
+@Serializable
+data class SandboxRemoveParams(
+    val name: String,
+    @SerialName("confirmToken") val confirmToken: String? = null,
+) {
+    /** The token is a single-use secret: never printed, even from a debug or error path. */
+    override fun toString(): String =
+        "SandboxRemoveParams(name=$name, confirmToken=${if (confirmToken == null) "absent" else "<redacted>"})"
+}
+
+/** The identity a confirmation token is bound to: the name AND the sbx id it had at issue. */
+@Serializable
+data class ConfirmationTarget(val name: String, val id: String)
+
+/**
+ * Core's server-side destructive-action confirmation (design 2026-10-09 §2).
+ *
+ * [token] is a single-use secret: it is never rendered, logged or put in a notification, and
+ * [toString] redacts it so no error path can print it by accident.
+ */
+@Serializable
+data class ConfirmationRequest(
+    val token: String,
+    /** RFC 3339 UTC; Core's TTL is 120 s. Shown to the user, and checked before step 2 is sent. */
+    @SerialName("expiresAt") val expiresAt: String,
+    val action: String,
+    val target: ConfirmationTarget,
+    val impact: List<String> = emptyList(),
+    /**
+     * True when Core cannot confirm Sandpane created the target: no Sandpane binding is recorded for
+     * this sbx id. Not proof it was made outside Sandpane — a pre-A1 binding without a recorded sbx id,
+     * or a binding for an earlier sandbox of the same name, also reads as `true`. Shown prominently.
+     */
+    val external: Boolean,
+) {
+    override fun toString(): String =
+        "ConfirmationRequest(token=<redacted>, expiresAt=$expiresAt, action=$action, target=$target, " +
+            "impact=${impact.size} line(s), external=$external)"
+}
+
+/**
+ * `sandbox.remove` result: exactly one field is present — [confirmation] for step 1 (nothing
+ * changed), [removed] for step 2.
+ */
+@Serializable
+data class SandboxRemoveResult(
+    val confirmation: ConfirmationRequest? = null,
+    val removed: Boolean? = null,
+)
 
 /** Workspace mapping modes (specs/02 §7). */
 @Serializable

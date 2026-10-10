@@ -22,11 +22,13 @@ import {
   type ConversationHistoryResult,
   type ConversationListParams,
   type ChangeSet,
+  type ConfirmationRequest,
   type ConversationSendParams,
   type CoreCapabilities,
   type ErrorCode,
   type Method,
   type RpcOkFrame,
+  type SandboxStopResult,
   type SandboxSummary,
   type TaskEvent,
   type TaskListParams,
@@ -39,6 +41,8 @@ import {
   decodeConversationHistory,
   decodeConversations,
   decodeCoreCapabilities,
+  decodeSandboxRemoveResult,
+  decodeSandboxStopResult,
   decodeSandboxSummaries,
   decodeTaskEvents,
   decodeTaskSummaries,
@@ -48,6 +52,9 @@ import {
   CoreValidationError,
   buildConversationHistoryParams,
   buildConversationListParams,
+  buildSandboxRemoveConfirmParams,
+  buildSandboxRemoveRequestParams,
+  buildSandboxStopParams,
   buildTaskListParams,
   buildTaskSubscribeParams,
 } from "./guards";
@@ -156,13 +163,17 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 /**
  * Per-method deadlines for calls Core may legitimately run long: `sandbox.create`
- * can pull an image for up to 300 s and `sandbox.list` can take up to 30 s.
- * Each stays above the proxy's own budget for that method
- * (`proxy_deadline_ms` in ipc_client.rs: 320 s / 40 s), per-method drift-tested.
+ * can pull an image for up to 300 s and `sandbox.list` can take up to 30 s;
+ * `sandbox.stop` (stop + re-query) can take about 330 s, and `sandbox.remove`
+ * step 2 (identity re-check + `rm --force`) a little longer. Each stays above
+ * the proxy's own budget for that method (`proxy_deadline_ms` in ipc_client.rs:
+ * 320 s / 40 s / 350 s / 390 s), per-method drift-tested.
  */
 export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
   "sandbox.create": 330_000,
   "sandbox.list": 45_000,
+  "sandbox.stop": 360_000,
+  "sandbox.remove": 400_000,
 };
 
 /** The webview deadline for one method with the default options. */
@@ -174,6 +185,10 @@ export function requestTimeoutFor(method: Method): number {
  * Methods with no server-side effect. Mirrors `replay_safe` in
  * src-tauri/src/ipc_client.rs exactly (drift-tested). For every OTHER method a
  * lost answer is reported as "may have been applied — re-read state".
+ *
+ * `sandbox.stop` and `sandbox.remove` are deliberately absent — including
+ * remove's step 1: it mints a single-use token in Core, and step 2 acts. Neither
+ * step is ever re-sent automatically.
  */
 export const REPLAY_SAFE_METHODS: ReadonlySet<Method> = new Set<Method>([
   "system.probe",
@@ -456,6 +471,63 @@ export class CoreClient {
   /** `sandbox.list`, decoded (an unrecognised workspace mode reads as UNVERIFIED). */
   async listSandboxSummaries(): Promise<SandboxSummary[]> {
     return decodeSandboxSummaries(await this.request("sandbox.list", {}));
+  }
+
+  /**
+   * `sandbox.stop` (A1, feature-gated on `system.probe`). Not destructive, so no
+   * token. The result's `requeried` row is the post-stop state; when it is
+   * ABSENT the state is unknown — never read it as "stopped". Not replay-safe:
+   * a lost answer says "may have been applied", and nothing retries it.
+   */
+  async stopSandbox(name: string): Promise<SandboxStopResult> {
+    const params = preflight(() => buildSandboxStopParams(name));
+    return decodeSandboxStopResult(await this.request("sandbox.stop", params));
+  }
+
+  /**
+   * `sandbox.remove` STEP 1: sends exactly `{ name }`. Core changes nothing and
+   * answers a confirmation (token, expiry, impact, external). The confirmation
+   * must name the sandbox that was asked about; anything else is refused so a
+   * token can never be confirmed against the wrong target.
+   */
+  async requestSandboxRemoval(name: string): Promise<ConfirmationRequest> {
+    const params = preflight(() => buildSandboxRemoveRequestParams(name));
+    const result = decodeSandboxRemoveResult(await this.request("sandbox.remove", params));
+    if (result.kind !== "confirmation") {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "sandbox.remove step 1 answered `removed` without a confirmation token; re-read the sandbox list",
+        { mayHaveBeenApplied: true },
+      );
+    }
+    if (result.confirmation.target.name !== params.name) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "sandbox.remove confirmation names a different sandbox than the one requested; nothing was confirmed",
+      );
+    }
+    return result.confirmation;
+  }
+
+  /**
+   * `sandbox.remove` STEP 2: sends `{ name, confirmToken }` with the token from
+   * step 1. Only a decoded `removed: true` is a success. Core answers a bad,
+   * expired or reused token with `VALIDATION_FAILED`, a same-named replacement
+   * with `CONFLICT`, and a vanished sandbox with `NOT_FOUND`. Never retried.
+   */
+  async confirmSandboxRemoval(name: string, confirmToken: string): Promise<{ removed: true }> {
+    const params = preflight(() => buildSandboxRemoveConfirmParams(name, confirmToken));
+    const result = decodeSandboxRemoveResult(await this.request("sandbox.remove", params));
+    if (result.kind !== "removed") {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "sandbox.remove step 2 answered with a new confirmation instead of `removed`; nothing is reported as removed",
+      );
+    }
+    return { removed: true };
   }
 
   /** `git.review`, decoded (an unrecognised file status is listed, never applied). */

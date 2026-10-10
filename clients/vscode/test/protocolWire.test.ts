@@ -11,8 +11,11 @@ import {
   MAX_CURSOR_KEY_LEN,
   MAX_SCOPING_ID_LEN,
   PROTOCOL_VERSION,
+  SBX_AGENTS,
+  DEFAULT_SBX_AGENT,
   coreAdvertisesMethod,
 } from '../src/core-client/protocol';
+import { MAX_ADDRESSABLE_SANDBOX_NAME_LEN } from '../src/core-client/commands';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -133,11 +136,12 @@ describe('wire names match the Rust protocol crate', () => {
     expect(serviceLib).toContain('pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;');
   });
 
-  it('declares exactly the 14 method names Core parses, in Method::ALL order', () => {
+  it('declares exactly the 16 method names Core parses, in Method::ALL order', () => {
     // (1) every `"dotted.name" =>` arm of Rust's `Method::parse`.
     const fromRust = [...rustProtocol.matchAll(/"([a-z]+\.[a-z]+)" =>/g)].map((m) => m[1]);
     expect(fromRust.sort()).toEqual([...CORE_METHODS].sort());
-    expect(new Set(fromRust).size).toBe(14);
+    expect(new Set(fromRust).size).toBe(16);
+    expect(CORE_METHODS).toHaveLength(16);
     // (2) the advertisement list itself, including ORDER — `CoreCapabilities.methods`
     // is derived from it, and a name that renames in Rust must break here.
     expect(methodAllWireNames()).toEqual([...CORE_METHODS]);
@@ -158,10 +162,70 @@ describe('wire names match the Rust protocol crate', () => {
     for (const added of ['task.list', 'conversation.list', 'conversation.history']) {
       expect(CORE_METHODS).toContain(added);
     }
+    // A1: stop/remove sit right after sandbox.create; there is NO sandbox.start
+    // (sbx v0.47 has none), on either side of the wire.
+    expect(CORE_METHODS.slice(4, 7)).toEqual(['sandbox.create', 'sandbox.stop', 'sandbox.remove']);
+    expect(CORE_METHODS).not.toContain('sandbox.start');
+    expect(rustProtocol).not.toContain('"sandbox.start" =>');
+  });
+
+  it('pins the A1 sandbox lifecycle wire shapes against Rust and the schemas', () => {
+    for (const struct of [
+      'pub struct SandboxStopParams',
+      'pub struct SandboxStopResult',
+      'pub struct SandboxRemoveParams',
+      'pub struct ConfirmationTarget',
+      'pub struct ConfirmationRequest',
+      'pub struct SandboxRemoveResult',
+    ]) {
+      expect(rustProtocol).toContain(struct);
+    }
+    // Rust snake_case field → the camelCase wire name this client sends/reads.
+    const pinned: [string, string][] = [
+      ['pub confirm_token: Option<String>', 'confirmToken'],
+      ['pub expires_at: String', 'expiresAt'],
+      ['pub requeried: Option<SandboxSummary>', 'requeried'],
+      ['pub impact: Vec<String>', 'impact'],
+      ['pub external: bool', 'external'],
+      ['pub removed: Option<bool>', 'removed'],
+      ['pub stopped: bool', 'stopped'],
+      ['pub agent: Option<String>', 'agent'],
+    ];
+    const tsClient = read('clients/vscode/src/core-client/protocol.ts');
+    for (const [rust, wire] of pinned) {
+      expect(rustProtocol, `rust field "${rust}"`).toContain(rust);
+      expect(tsClient, `TS wire name "${wire}"`).toContain(wire);
+    }
+    // `requeried` and `agent` are absent-tolerant on the Rust side.
+    expect(rustProtocol).toMatch(/skip_serializing_if = "Option::is_none"\)\]\n\s+pub requeried/);
+  });
+
+  it('pins the addressable sandbox-name rule to Validator::sandbox_name (W3)', () => {
+    const validation = read('core/crates/sandpane-core/src/validation.rs');
+    const fn = /pub fn sandbox_name\(name: &str\)[\s\S]*?\n    \}/.exec(validation)?.[0];
+    if (!fn) throw new Error('Validator::sandbox_name not found');
+    expect(fn, "Core's length bound").toContain('Self::bounded(name, 128)?;');
+    expect(MAX_ADDRESSABLE_SANDBOX_NAME_LEN).toBe(128);
+    expect(fn, "Core's charset").toContain("c.is_ascii_alphanumeric() || c == '-' || c == '.'");
+    expect(fn, "Core's two-character minimum").toContain('name.chars().count() < 2');
+    expect(fn, "Core's leading-character rule").toContain('.is_some_and(|c| c.is_ascii_alphanumeric())');
+    expect(fn, "Core's reserved name").toContain('eq_ignore_ascii_case("default")');
+  });
+
+  it('pins the sbx agent allowlist to the create-spec schema', () => {
+    const specSchema = JSON.parse(read('schemas/sandbox-create-spec.schema.json')) as {
+      properties: { agent?: { enum: string[] } };
+      required?: string[];
+    };
+    expect(specSchema.properties.agent?.enum).toEqual([...SBX_AGENTS]);
+    // Optional + defaulted to the provider-free shell by Core.
+    expect(specSchema.required ?? []).not.toContain('agent');
+    expect(DEFAULT_SBX_AGENT).toBe('shell');
+    expect(serviceLib).toContain('pub const DEFAULT_SANDBOX_AGENT: &str = "shell";');
   });
 
   it('pins the method advertisement (`Method::ALL` → `CoreCapabilities.methods`)', () => {
-    expect(rustProtocol).toContain('pub const ALL: [Method; 14]');
+    expect(rustProtocol).toContain('pub const ALL: [Method; 16]');
     // Derived, never hand-written: `wire_names()` maps over ALL…
     expect(rustProtocol).toMatch(/pub fn wire_names\(\) -> Vec<&'static str> \{[\s\S]*Self::ALL\.iter\(\)/);
     // …and the probe answers with it.

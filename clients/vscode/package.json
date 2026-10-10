@@ -73,6 +73,18 @@
         "title": "Sandpane: Apply Task Changes (Git)"
       },
       {
+        "command": "sandpane.stopSandbox",
+        "title": "Sandpane: Stop Sandbox"
+      },
+      {
+        "command": "sandpane.removeSandbox",
+        "title": "Sandpane: Remove Sandbox"
+      },
+      {
+        "command": "sandpane.startSandbox",
+        "title": "Sandpane: Start Sandbox (not supported by sbx v0.47)"
+      },
+      {
         "command": "sandpane.refreshSandboxes",
         "title": "Sandpane: Refresh Sandboxes"
       },

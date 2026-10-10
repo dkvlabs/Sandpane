@@ -61,7 +61,7 @@ import kotlin.test.assertTrue
  *     core/crates/sandpane-protocol/src/lib.rs;
  *   - the protocol-v1 additive fields: an OLD frame parses, and an absent value stays absent on
  *     the way out instead of becoming `null`, `{}`, or a benign workspace mode;
- *   - the 14-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
+ *   - the 16-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
  *     compared by [ProtocolDriftGuardTest]).
  *
  * NOT covered here, on purpose: a live socket round trip. `SocketChannel` against
@@ -193,7 +193,11 @@ class CoreClientFramingTest {
         assertFalse(CoreMethods.isAllowlisted("shell.exec"))
         assertFalse(CoreMethods.isAllowlisted("system.probe; ls"))
         assertFalse(CoreMethods.isAllowlisted("task.subscribe "))
-        assertEquals(14, CoreMethods.ALL.size)
+        // A1: stop/remove are allowlisted; there is deliberately no sandbox.start.
+        assertTrue(CoreMethods.isAllowlisted("sandbox.stop"))
+        assertTrue(CoreMethods.isAllowlisted("sandbox.remove"))
+        assertFalse(CoreMethods.isAllowlisted("sandbox.start"))
+        assertEquals(16, CoreMethods.ALL.size)
     }
 
     @Test
@@ -204,6 +208,7 @@ class CoreClientFramingTest {
         assertEquals(
             listOf(
                 "system.probe", "project.create", "project.list", "sandbox.list", "sandbox.create",
+                "sandbox.stop", "sandbox.remove",
                 "conversation.create", "conversation.send", "conversation.list", "conversation.history",
                 "task.cancel", "task.list", "task.subscribe", "git.review", "git.apply",
             ),
@@ -211,6 +216,8 @@ class CoreClientFramingTest {
         )
         assertEquals(3, CoreMethods.ADDITIVE_IN_V1.size)
         assertTrue(CoreMethods.ADDITIVE_IN_V1.containsAll(setOf("task.list", "conversation.list", "conversation.history")))
+        assertEquals(setOf("sandbox.stop", "sandbox.remove"), CoreMethods.ADDITIVE_A1)
+        assertEquals(CoreMethods.ADDITIVE_IN_V1 + CoreMethods.ADDITIVE_A1, CoreMethods.REQUIRES_ADVERTISEMENT)
     }
 
     // -----------------------------------------------------------------------

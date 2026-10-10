@@ -47,6 +47,53 @@ export interface FakeCoreOptions {
   legacyCore?: boolean;
   /** Answer `task.subscribe` with the oversized-replay refusal instead of events. */
   refuseReplayAsOversized?: boolean;
+  /**
+   * Override the `system.probe` `methods` list (e.g. a Core that predates A1 and
+   * advertises neither `sandbox.stop` nor `sandbox.remove`). Methods left out are
+   * also refused when called, as a Core that does not dispatch them would.
+   */
+  advertisedMethods?: readonly string[];
+}
+
+/** Every method the A1 Core dispatches, in `Method::ALL` order. */
+export const A1_CORE_METHODS: readonly string[] = [
+  "system.probe",
+  "project.create",
+  "project.list",
+  "sandbox.list",
+  "sandbox.create",
+  "sandbox.stop",
+  "sandbox.remove",
+  "conversation.create",
+  "conversation.send",
+  "conversation.list",
+  "conversation.history",
+  "task.cancel",
+  "task.list",
+  "task.subscribe",
+  "git.review",
+  "git.apply",
+];
+
+/**
+ * Core's verbatim token refusal (`confirm::TOKEN_REJECTED_MESSAGE`). The A1
+ * stop/remove behaviour below is MODELED on `sandpane-service/src/lib.rs`
+ * (`sandbox_stop`, `sandbox_remove`) and `confirm.rs` as read from the working
+ * tree — it was NOT captured from a live Core run, unlike the additive-v1
+ * reads above.
+ */
+export const TOKEN_REJECTED_MESSAGE =
+  "confirmation token is invalid, expired, already used, or not for this action and target; " +
+  "request a new confirmation";
+
+/** A sandbox the double's `sbx` holds (name + sbx id + Sandpane binding). */
+export interface FakeSandbox {
+  name: string;
+  id: string;
+  status: "running" | "stopped";
+  /** Sandpane binding present → not external. */
+  bound: boolean;
+  agent?: string;
 }
 
 export interface FakeConversation extends Conversation {
@@ -60,6 +107,17 @@ export class FakeCore {
   readonly events: TaskEvent[] = [];
   readonly tasks: TaskSummary[] = [];
   readonly conversations: FakeConversation[] = [];
+  /** The double's sbx inventory for the A1 lifecycle methods. */
+  readonly sandboxes: FakeSandbox[] = [];
+  /** Pending confirmation tokens → bound identity (single-use, like Core). */
+  private readonly tokens = new Map<string, { name: string; id: string; expiresAtMs: number }>();
+  private tokenSeq = 0;
+  /** Clock for confirmation expiry; tests may move it. */
+  public nowMs = Date.parse("2026-10-10T00:00:00Z");
+  /** When true, the post-stop re-query "fails" and `requeried` is omitted. */
+  public stopRequeryFails = false;
+  /** Extra impact lines appended to every confirmation (hostile-content tests). */
+  public extraImpact: string[] = [];
   /** Every request frame the client sent, decoded. */
   readonly requests: { v: number; id: string; method: string; params: unknown }[] = [];
   /** Params of every frame per method, for cursor/wire-shape assertions. */
@@ -221,6 +279,13 @@ export class FakeCore {
     });
     const params = (request.params ?? {}) as Record<string, unknown>;
 
+    if (
+      this.options.advertisedMethods !== undefined &&
+      !this.options.advertisedMethods.includes(request.method)
+    ) {
+      return err("VALIDATION_FAILED", `unknown method ${request.method}`);
+    }
+
     switch (request.method) {
       case "system.probe": {
         this.probeCount += 1;
@@ -242,22 +307,7 @@ export class FakeCore {
         };
         // A pre-discovery Core does not send the field at all (additive).
         if (!this.options.legacyCore) {
-          capabilities.methods = [
-            "system.probe",
-            "project.create",
-            "project.list",
-            "sandbox.list",
-            "sandbox.create",
-            "conversation.create",
-            "conversation.send",
-            "conversation.list",
-            "conversation.history",
-            "task.cancel",
-            "task.list",
-            "task.subscribe",
-            "git.review",
-            "git.apply",
-          ];
+          capabilities.methods = [...(this.options.advertisedMethods ?? A1_CORE_METHODS)];
         }
         return ok(capabilities);
       }
@@ -364,6 +414,80 @@ export class FakeCore {
       }
       case "task.cancel":
         return ok({ requested: true });
+
+      // -- A1 lifecycle (modeled on the service source, see header) -----------
+
+      case "sandbox.stop": {
+        const name = String(params.name ?? "");
+        const box = this.sandboxes.find((b) => b.name === name);
+        if (box === undefined) return err("NOT_FOUND", `sandbox ${JSON.stringify(name)} is not listed by sbx`);
+        box.status = "stopped";
+        if (this.stopRequeryFails) return ok({ stopped: true });
+        return ok({
+          stopped: true,
+          requeried: {
+            name: box.name,
+            probedState: box.status,
+            boundProjectId: box.bound ? "p1" : null,
+            ...(box.agent === undefined ? {} : { agent: box.agent }),
+          },
+        });
+      }
+      case "sandbox.remove": {
+        const name = String(params.name ?? "");
+        const token = params.confirmToken;
+        if (token === undefined) {
+          const box = this.sandboxes.find((b) => b.name === name);
+          if (box === undefined) {
+            return err("NOT_FOUND", `sandbox ${JSON.stringify(name)} is not listed by sbx`);
+          }
+          this.tokenSeq += 1;
+          const minted = this.tokenSeq.toString(16).padStart(64, "0");
+          const expiresAtMs = this.nowMs + 120_000;
+          this.tokens.set(minted, { name, id: box.id, expiresAtMs });
+          return ok({
+            confirmation: {
+              token: minted,
+              expiresAt: new Date(Math.floor(expiresAtMs / 1000) * 1000)
+                .toISOString()
+                .replace(".000Z", "Z"),
+              action: "sandbox.remove",
+              target: { name, id: box.id },
+              impact: [
+                `removes sandbox ${name} (sbx id ${box.id}) and everything inside it; this cannot be undone`,
+                ...(box.bound
+                  ? []
+                  : [
+                      "not created by Sandpane: Core has no binding for this sandbox and cannot describe what it holds",
+                    ]),
+                ...this.extraImpact,
+              ],
+              external: !box.bound,
+            },
+          });
+        }
+        // Step 2: the token is consumed FIRST, whatever happens next.
+        const bound = typeof token === "string" ? this.tokens.get(token) : undefined;
+        if (typeof token === "string") this.tokens.delete(token);
+        if (bound === undefined || bound.name !== name || this.nowMs >= bound.expiresAtMs) {
+          return err("VALIDATION_FAILED", TOKEN_REJECTED_MESSAGE);
+        }
+        const index = this.sandboxes.findIndex((b) => b.name === name);
+        if (index < 0) {
+          return err(
+            "NOT_FOUND",
+            `sandbox ${JSON.stringify(name)} is no longer listed by sbx; nothing was removed`,
+          );
+        }
+        if (this.sandboxes[index]?.id !== bound.id) {
+          return err(
+            "CONFLICT",
+            `sandbox ${JSON.stringify(name)} is not the sandbox that was confirmed (its sbx id changed); nothing was removed — request a new confirmation`,
+          );
+        }
+        this.sandboxes.splice(index, 1);
+        return ok({ removed: true });
+      }
       default:
         return err("VALIDATION_FAILED", `unknown method ${request.method}`);
     }

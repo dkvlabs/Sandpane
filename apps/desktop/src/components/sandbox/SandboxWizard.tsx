@@ -7,7 +7,14 @@ import {
   useSandboxes,
 } from "../../lib/hooks";
 import { associateFolder, foldAgentView, workspaceModeView } from "../../lib/reducers";
-import { WORKSPACE_MODES, type Project, type WorkspaceMode } from "../../lib/protocol";
+import {
+  DEFAULT_SBX_AGENT,
+  WORKSPACE_MODES,
+  isSbxAgent,
+  type Project,
+  type WorkspaceMode,
+} from "../../lib/protocol";
+import { agentFieldHonoured, sbxAgentOptions } from "../../lib/sandbox-lifecycle";
 import {
   QUICK_STEPS,
   STEP_TITLES,
@@ -54,6 +61,9 @@ export function SandboxWizard() {
 
   const capabilities = capabilitiesOf(link);
   const agents = capabilities?.agents ?? [];
+  // A1 signal: a Core that advertises `sandbox.remove` also honours
+  // `SandboxCreateSpec.agent`. An older Core would silently ignore the key.
+  const sbxAgentHonoured = agentFieldHonoured(capabilities);
 
   const context: WizardContext = useMemo(
     () => ({
@@ -63,8 +73,9 @@ export function SandboxWizard() {
       // Core does not probe SBX features in this build, so advanced settings
       // stay unavailable rather than being offered blindly.
       advancedAvailable: false,
+      sbxAgentFieldAvailable: sbxAgentHonoured,
     }),
-    [sandboxes, agents],
+    [sandboxes, agents, sbxAgentHonoured],
   );
 
   if (link.kind !== "attached") {
@@ -149,7 +160,7 @@ export function SandboxWizard() {
 
       {draft.step === "agent" && (
         <div className="stack">
-          <Field label="Agent" error={errors.agentId}>
+          <Field label="Coding agent (Core adapter)" error={errors.agentId}>
             {(id) => (
               <select
                 id={id}
@@ -170,6 +181,37 @@ export function SandboxWizard() {
               </select>
             )}
           </Field>
+          <Field
+            label="Sandbox agent (sbx)"
+            error={errors.sbxAgent}
+            hint="The built-in sbx agent the sandbox is created with. shell needs no provider account; every other agent is not verified by Sandpane and may ask you to sign in to its provider inside the sandbox."
+          >
+            {(id) => (
+              <select
+                id={id}
+                className="input"
+                value={draft.sbxAgent}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  // Only an allowlisted value can ever reach the draft.
+                  if (isSbxAgent(value)) setDraft({ ...draft, sbxAgent: value });
+                }}
+              >
+                {sbxAgentOptions(sbxAgentHonoured).map((option) => (
+                  <option key={option.id} value={option.id} disabled={option.disabled}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+          {!sbxAgentHonoured && (
+            <Warning tone="neutral" title="Only shell is available with this Core">
+              This Core does not advertise <Mono>sandbox.remove</Mono>, the signal that it also
+              understands the sandbox agent choice. An older Core would silently ignore the choice
+              and create a shell sandbox, so the other agents are not supported by this Core.
+            </Warning>
+          )}
           {agents.length === 0 && (
             <Warning tone="danger" title="Core reported no agent adapters">
               Nothing is selectable. This is reported as-is rather than filling the list with
@@ -265,6 +307,17 @@ export function SandboxWizard() {
                   <Badge tone="success">verified adapter</Badge>
                 ) : (
                   <Badge tone="attention">not verified</Badge>
+                )}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>sandbox agent (sbx)</dt>
+              <dd>
+                <Mono>{draft.sbxAgent}</Mono>{" "}
+                {draft.sbxAgent === DEFAULT_SBX_AGENT ? (
+                  <Badge tone="neutral">provider-free</Badge>
+                ) : (
+                  <Badge tone="attention">agent not verified</Badge>
                 )}
               </dd>
             </div>

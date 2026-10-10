@@ -14,7 +14,13 @@
 
 import * as vscode from 'vscode';
 import { realpath } from 'node:fs/promises';
-import { CoreCommands, verifiedAgents, CoreValidationError } from './core-client/commands';
+import {
+  CoreCommands,
+  verifiedAgents,
+  CoreValidationError,
+  errorCodeOf,
+  validateAddressableSandboxName,
+} from './core-client/commands';
 import {
   CoreConnection,
   CoreRpcError,
@@ -27,12 +33,17 @@ import { createSocketTransport } from './core-client/transport';
 import type {
   AgentCapability,
   ChangeSet,
+  ConfirmationRequest,
   Conversation,
   CoreCapabilities,
+  CoreMethodName,
   Project,
+  SandboxStopResult,
   SandboxSummary,
+  SbxAgent,
 } from './core-client/protocol';
-import { coreAdvertisesMethod } from './core-client/protocol';
+import { coreAdvertisesMethod, MAX_LIST_LIMIT } from './core-client/protocol';
+import { TASK_STATUSES, isTerminalStatus } from './core-client/events';
 import { EMPTY_STATE, reduceTaskView, selectTasks, type TaskViewState } from './state/reducer';
 import {
   authorizeSend,
@@ -46,6 +57,15 @@ import {
 import { evaluateHostContext, type HostVerdict } from './vscode/host';
 import { explainFailure, remediationFrom, toFailure, type GuidanceAction } from './vscode/diagnostics';
 import { workspaceModeView } from './vscode/workspaces';
+import {
+  REMOVE_BUTTON,
+  STOP_BUTTON,
+  notAdvertisedMessage,
+  removeConfirmationView,
+  stopConfirmation,
+  stopOutcomeView,
+} from './vscode/sandboxActions';
+import { plainText } from './text/visibleText';
 import {
   DEFAULT_CONTEXT_POLICY,
   planContextAttachments,
@@ -91,6 +111,8 @@ export interface SessionDeps {
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
   requestTimeoutMs?: number;
+  /** Wall clock for confirmation expiry display (tests pin it). */
+  now?: () => number;
 }
 
 const VSCODE_URI: UriFactory<vscode.Uri> = { file: (fsPath: string) => vscode.Uri.file(fsPath) };
@@ -422,22 +444,46 @@ export class SandpaneSession {
     projectId: string;
     workspaceMode: 'direct_mount' | 'sbx_clone' | 'host_worktree' | 'mountless';
     repoPath?: string;
+    /** A1: absent = Core's provider-free `shell` (works with every Core). */
+    agent?: SbxAgent;
   }): Promise<SandboxSummary | undefined> {
+    // A pre-A1 Core would silently IGNORE an `agent` field and create a shell
+    // sandbox while the UI said otherwise. `sandbox.remove` is advertised from
+    // the same A1 build that accepts `agent`, so it is the marker.
+    if (input.agent !== undefined && !this.coreAdvertises('sandbox.remove')) {
+      const text =
+        `Agent "${input.agent}" cannot be requested: the attached Core predates agent selection ` +
+        '(it does not advertise the A1 methods). Nothing was sent; create without choosing an agent ' +
+        'to get the default shell.';
+      void vscode.window.showWarningMessage(text);
+      this.setStatus('error', text);
+      this.emit();
+      return undefined;
+    }
     try {
       const summary = await this.commands.sandboxCreate({
         name: input.name,
         projectId: input.projectId,
         workspaceMode: input.workspaceMode,
         ...(input.repoPath ? { repoPath: input.repoPath } : {}),
+        ...(input.agent !== undefined ? { agent: input.agent } : {}),
       });
       this.sandboxes = [...this.sandboxes.filter((s) => s.name !== summary.name), summary];
       // The header/gate read the mode from Core's returned summary; if Core
       // returned none, it shows UNVERIFIED rather than the requested mode.
       this.selectSandbox(summary.name);
       const view = workspaceModeView(input.workspaceMode);
+      const requestedAgent = input.agent ?? 'shell';
+      const reportedAgent = typeof summary.agent === 'string' && summary.agent.length > 0 ? summary.agent : null;
+      const agentNote =
+        reportedAgent === null
+          ? ` · requested agent ${requestedAgent}; sbx did not report the sandbox's agent`
+          : reportedAgent === requestedAgent
+            ? ` · sbx reports agent ${plainText(reportedAgent, 64)}${requestedAgent === 'shell' ? '' : ' (not verified by Sandpane)'}`
+            : ` · requested agent ${requestedAgent} but sbx reports ${plainText(reportedAgent, 64)}`;
       this.setStatus(
         'ok',
-        `Sandbox "${summary.name}" created — requested ${view.label}${view.hostWritable ? ` (${view.badge})` : ''}`,
+        `Sandbox "${plainText(summary.name, 128)}" created — requested ${view.label}${view.hostWritable ? ` (${view.badge})` : ''}${agentNote}`,
       );
       this.emit();
       return summary;
@@ -445,6 +491,260 @@ export class SandpaneSession {
       this.reportError(error, 'sandbox.create');
       return undefined;
     }
+  }
+
+  /** Whether the attached Core advertised `method` in its last probe. */
+  coreAdvertises(method: CoreMethodName): boolean {
+    return coreAdvertisesMethod(this.capabilities, method);
+  }
+
+  /**
+   * Fresh sandbox list straight from Core for command pickers (like
+   * `listProjectOptions`). Falls back to the last snapshot only when Core is
+   * unreachable, and logs that it did.
+   */
+  async listSandboxOptions(): Promise<SandboxSummary[]> {
+    try {
+      this.sandboxes = await this.commands.sandboxList();
+    } catch (error) {
+      this.log(`sandbox.list failed while picking: ${describe(error)} — using the last snapshot`);
+    }
+    return this.sandboxes;
+  }
+
+  /**
+   * Gate for an additive method (design 2026-10-09 §1.3). The probe is re-read
+   * so the verdict is about THIS Core instance — it may have been restarted
+   * with another build. Not advertised → a visible refusal and NO frame for the
+   * method; Core not attached → a different, equally visible message.
+   */
+  private async ensureAdvertised(method: CoreMethodName, action: string): Promise<boolean> {
+    if (!this.host.supported) {
+      void vscode.window.showWarningMessage(this.host.explanation);
+      return false;
+    }
+    if (this.connection.connectionState !== 'online') {
+      const text =
+        `${action}: Sandpane Core is not attached, so whether it supports "${method}" is unknown. ` +
+        'Nothing was sent. Start Core, then run "Sandpane: Refresh Sandboxes".';
+      void vscode.window.showWarningMessage(text);
+      this.setStatus('error', text);
+      this.emit();
+      return false;
+    }
+    try {
+      this.capabilities = await this.commands.systemProbe();
+    } catch (error) {
+      this.reportError(error, 'system.probe');
+      return false;
+    }
+    if (!coreAdvertisesMethod(this.capabilities, method)) {
+      const text = notAdvertisedMessage(action, method);
+      void vscode.window.showWarningMessage(text);
+      this.setStatus('error', text);
+      this.emit();
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Re-list sandboxes after a lifecycle action, so the view shows what sbx
+   * reports rather than what was requested. A selection Core no longer lists
+   * is cleared. Returns false when the list could not be re-read.
+   */
+  private async refreshSandboxList(): Promise<boolean> {
+    try {
+      this.sandboxes = await this.commands.sandboxList();
+    } catch (error) {
+      this.log(`sandbox.list after a lifecycle action failed: ${describe(error)} — the list may be stale`);
+      return false;
+    }
+    if (this.selectedSandbox && !this.sandboxes.some((s) => s.name === this.selectedSandbox)) {
+      this.selectedSandbox = null;
+      void this.context.workspaceState.update(UI_KEYS.selectedSandbox, undefined);
+      this.dropConversationOutOfScope();
+    }
+    this.emit();
+    return true;
+  }
+
+  /**
+   * A failed lifecycle call. A structured Core error is Core's verdict; anything
+   * else (timeout, closed socket) means the OUTCOME IS UNKNOWN — the sandbox may
+   * or may not have changed. Never retried (neither method is replay-safe).
+   */
+  private reportLifecycleError(error: unknown, operation: string, context: string | null): void {
+    const structured = error instanceof CoreRpcError || error instanceof CoreValidationError;
+    const unknownOutcome = structured
+      ? null
+      : 'No answer from Core: the outcome is UNKNOWN (the sandbox may or may not have changed). ' +
+        'It is not retried — refresh to see what sbx reports.';
+    this.reportError(error, operation, [context, unknownOutcome].filter((p): p is string => p !== null).join(' '));
+  }
+
+  /**
+   * `sandbox.stop` (A1). Gated on the probe; confirmed in a native modal because
+   * processes inside the sandbox end. The state shown afterwards is Core's
+   * re-query — when Core returns none, the state is UNKNOWN, never "stopped".
+   */
+  async stopSandbox(name: string): Promise<SandboxStopResult | undefined> {
+    let validName: string;
+    try {
+      validName = validateAddressableSandboxName(name);
+    } catch (error) {
+      this.reportError(error, 'sandbox.stop');
+      return undefined;
+    }
+    if (!(await this.ensureAdvertised('sandbox.stop', 'Stop sandbox'))) return undefined;
+    const confirm = stopConfirmation(validName, await this.activeTasksIn(validName));
+    const answer = await vscode.window.showWarningMessage(
+      confirm.message,
+      { modal: true, detail: confirm.detail },
+      STOP_BUTTON,
+    );
+    if (answer !== STOP_BUTTON) {
+      this.setStatus('info', 'Stop not confirmed; nothing was sent.');
+      this.emit();
+      return undefined;
+    }
+    let result: SandboxStopResult;
+    try {
+      result = await this.commands.sandboxStop(validName);
+    } catch (error) {
+      this.reportLifecycleError(error, 'sandbox.stop', null);
+      await this.refreshSandboxList();
+      return undefined;
+    }
+    const requeried = result.requeried;
+    this.sandboxes = this.sandboxes.map((s) => {
+      if (s.name !== validName) return s;
+      // Apply Core's re-query; with none, drop the stale state rather than
+      // keep showing "running" (the state is unknown, not "stopped").
+      return requeried && typeof requeried === 'object' && requeried.name === validName
+        ? requeried
+        : { ...s, probedState: null };
+    });
+    const view = stopOutcomeView(validName, result);
+    const listed = await this.refreshSandboxList();
+    this.setStatus(
+      view.stateKnown ? 'ok' : 'info',
+      view.text + (listed ? '' : ' (the sandbox list could not be re-read; it may be stale)'),
+    );
+    this.emit();
+    return result;
+  }
+
+  /**
+   * `sandbox.remove` (A1), two-step server-side confirmation (design §2):
+   *  1. ask Core — it changes nothing and returns a token + impact;
+   *  2. show a NATIVE modal with the target name, sbx id, every impact line
+   *     (capped), the external flag first, and the expiry;
+   *  3. only the explicit "Remove sandbox" button sends step 2 with that token.
+   * Cancel sends nothing; the token expires in Core. Neither step is retried.
+   */
+  async removeSandbox(name: string): Promise<boolean> {
+    let validName: string;
+    try {
+      validName = validateAddressableSandboxName(name);
+    } catch (error) {
+      this.reportError(error, 'sandbox.remove');
+      return false;
+    }
+    if (!(await this.ensureAdvertised('sandbox.remove', 'Remove sandbox'))) return false;
+    let confirmation: ConfirmationRequest;
+    try {
+      confirmation = await this.commands.sandboxRemoveRequest(validName);
+    } catch (error) {
+      // Step 1 changes nothing in Core, so even a timeout leaves nothing to undo.
+      this.reportError(error, 'sandbox.remove (confirmation request)', 'Nothing was removed.');
+      return false;
+    }
+    const view = removeConfirmationView(confirmation, this.now());
+    const answer = await vscode.window.showWarningMessage(
+      view.message,
+      { modal: true, detail: view.detail },
+      REMOVE_BUTTON,
+    );
+    if (answer !== REMOVE_BUTTON) {
+      this.setStatus(
+        'info',
+        `Remove not confirmed — nothing was sent; Core's confirmation for "${validName}" expires on its own.`,
+      );
+      this.emit();
+      return false;
+    }
+    // Fail closed at CLICK time (security review W1): a token that expired
+    // while the modal was open — or whose expiry cannot be read — is never
+    // sent, so step 2 can only ever carry a confirmation still in force.
+    const expiresAt = Date.parse(confirmation.expiresAt);
+    if (!Number.isFinite(expiresAt) || this.now() >= expiresAt) {
+      this.setStatus('info', 'Confirmation expired — nothing was sent; run Remove again.');
+      this.emit();
+      return false;
+    }
+    let removed: boolean;
+    try {
+      const result = await this.commands.sandboxRemoveConfirm(validName, confirmation.token);
+      removed = result.removed === true;
+    } catch (error) {
+      const code = errorCodeOf(error);
+      const context =
+        code === 'VALIDATION_FAILED'
+          ? 'Core refused the confirmation (wrong, expired or already used). Nothing was removed — run Remove again for a fresh confirmation.'
+          : code === 'CONFLICT'
+            ? 'Core reported a conflict: another operation on this sandbox is in progress, or a different ' +
+              'sandbox now carries this name (same-named replacement) — see Core\'s message. Nothing was ' +
+              'removed; run Remove again for a fresh confirmation.'
+            : code === 'NOT_FOUND'
+              ? 'The sandbox disappeared between the confirmation and the removal.'
+              : null;
+      this.reportLifecycleError(error, 'sandbox.remove', context);
+      await this.refreshSandboxList();
+      return false;
+    }
+    const listed = await this.refreshSandboxList();
+    this.setStatus(
+      removed ? 'ok' : 'error',
+      (removed
+        ? `Core removed sandbox "${validName}" (sbx rm ran after Core re-checked its identity).`
+        : `Core did not report the removal of "${validName}" — its state is unknown; refresh to see what sbx lists.`) +
+        (listed ? '' : ' (the sandbox list could not be re-read; it may be stale)'),
+    );
+    this.emit();
+    return removed;
+  }
+
+  /**
+   * Non-terminal Core tasks recorded on `sandbox`, across all projects — Core's
+   * own `task.list`, never this window's cache. `null` = could not be checked.
+   */
+  private async activeTasksIn(sandbox: string): Promise<number | null> {
+    if (!this.coreAdvertises('task.list')) return null;
+    try {
+      const tasks = await this.commands.taskList({
+        statuses: TASK_STATUSES.filter((status) => !isTerminalStatus(status)),
+        limit: MAX_LIST_LIMIT,
+      });
+      // Today's Core never records which sandbox a task uses
+      // (`tasks.sandbox_binding_id` is never written, `sandboxName` is always
+      // absent), so a zero count would be a false "no active task". Only when
+      // Core starts filling `sandboxName` is the count meaningful.
+      if (!tasks.some((task) => typeof task.sandboxName === 'string' && task.sandboxName.length > 0)) {
+        return null;
+      }
+      // A full page may hide more rows: say "cannot be checked" rather than
+      // claim a count Core did not establish.
+      if (tasks.length >= MAX_LIST_LIMIT) return null;
+      return tasks.filter((task) => task.sandboxName === sandbox).length;
+    } catch (error) {
+      this.log(`task.list before stop failed: ${describe(error)}`);
+      return null;
+    }
+  }
+
+  private now(): number {
+    return this.deps.now ? this.deps.now() : Date.now();
   }
 
   /**
@@ -1056,22 +1356,27 @@ export class SandpaneSession {
     this.output = channel;
   }
 
-  /** Error box with mapped guidance + the raw Core message. */
-  reportError(error: unknown, operation: string): void {
+  /**
+   * Error box with mapped guidance + the Core message. Core-supplied text is
+   * shown as plain text: hidden/bidi/control characters are escaped visibly and
+   * notification link syntax is neutralized (anti-spoofing, `plainText`).
+   */
+  reportError(error: unknown, operation: string, context?: string): void {
     const failure = toFailure(error);
     const guidance = explainFailure(error);
     const coreMessage =
       error instanceof CoreRpcError || error instanceof CoreTransportError || error instanceof CoreValidationError
-        ? error.message
+        ? plainText(error.message, 2_000)
         : undefined;
     // Core's own remediation (`details.hint`, e.g. `sbx login` or
     // `sbx policy init …`) is shown verbatim as text for the user to run
     // themselves; Sandpane never executes it.
     const remedy = remediationFrom(error);
+    const remedyHint = remedy ? plainText(remedy.hint, 500) : null;
     const remedyText = remedy
-      ? `Core suggests${remedy.provider ? ` (provider: ${remedy.provider})` : ''}: ${remedy.hint} — run it yourself; Sandpane never runs it.`
+      ? `Core suggests${remedy.provider ? ` (provider: ${plainText(remedy.provider, 100)})` : ''}: ${remedyHint} — run it yourself; Sandpane never runs it.`
       : null;
-    const text = `${operation} — ${[guidance.headline, guidance.explanation, coreMessage ? `Core said: ${coreMessage}` : null, remedyText, guidance.honestUncertainty ?? null]
+    const text = `${operation} — ${[guidance.headline, context && context.length > 0 ? context : null, guidance.explanation, coreMessage ? `Core said: ${coreMessage}` : null, remedyText, guidance.honestUncertainty ?? null]
       .filter((p): p is string => p !== null)
       .join('\n\n')}`;
     this.log(`${operation} failed (${failure.source}): ${coreMessage ?? describe(error)}`);
@@ -1082,7 +1387,10 @@ export class SandpaneSession {
         const action = actions.find((a) => a.label === choice);
         if (action?.command) void vscode.commands.executeCommand(action.command);
       });
-    this.setStatus('error', `${operation}: ${guidance.headline}${remedy ? ` — Core suggests: ${remedy.hint}` : ''}`);
+    this.setStatus(
+      'error',
+      `${operation}: ${guidance.headline}${context && context.length > 0 ? ` — ${context}` : ''}${remedy ? ` — Core suggests: ${remedyHint}` : ''}`,
+    );
     this.emit();
   }
 

@@ -29,8 +29,14 @@ object ActionIds {
     const val REVIEW_CHANGES = "labs.dkv.sandpane.ReviewChanges"
     const val APPLY_TASK = "labs.dkv.sandpane.ApplyTask"
     const val REFRESH_SANDBOXES = "labs.dkv.sandpane.RefreshSandboxes"
+    const val STOP_SANDBOX = "labs.dkv.sandpane.StopSandbox"
+    const val REMOVE_SANDBOX = "labs.dkv.sandpane.RemoveSandbox"
+    const val START_SANDBOX = "labs.dkv.sandpane.StartSandbox"
 
-    val ALL: List<String> = listOf(START_TASK, REVIEW_CHANGES, APPLY_TASK, REFRESH_SANDBOXES)
+    val ALL: List<String> = listOf(
+        START_TASK, REVIEW_CHANGES, APPLY_TASK, REFRESH_SANDBOXES,
+        STOP_SANDBOX, REMOVE_SANDBOX, START_SANDBOX,
+    )
 }
 
 internal const val NOTIFICATION_GROUP_ID = "Sandpane"

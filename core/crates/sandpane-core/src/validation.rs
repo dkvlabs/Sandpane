@@ -119,6 +119,42 @@ impl Validator {
         }
     }
 
+    /// An sbx sandbox `id` as printed by `ls --json`, restricted to the
+    /// captured shape (a UUID: `[A-Za-z0-9-]{1,64}`). It is echoed to clients
+    /// as the confirmation target identity, so anything else (newlines,
+    /// spaces, punctuation) is refused rather than relayed (review I4).
+    pub fn sbx_sandbox_id(id: &str) -> Result<&str, ValidationError> {
+        Self::reported_token(id, 64, |c| c.is_ascii_alphanumeric() || c == '-')
+    }
+
+    /// The agent name sbx REPORTS for a sandbox in `ls --json`: a plain token
+    /// `[A-Za-z0-9._-]{1,64}`. Deliberately a charset check, not the
+    /// built-in allowlist — sbx may report an agent Sandpane would never
+    /// create (e.g. a kit the user installed), and that is still a true fact
+    /// to show; what is refused is text that could spoof UI (review I5).
+    pub fn sbx_reported_agent(agent: &str) -> Result<&str, ValidationError> {
+        Self::reported_token(agent, 64, |c| {
+            c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'
+        })
+    }
+
+    fn reported_token(
+        s: &str,
+        max: usize,
+        ok: impl Fn(char) -> bool,
+    ) -> Result<&str, ValidationError> {
+        if s.is_empty() {
+            return Err(ValidationError::Empty);
+        }
+        if s.len() > max {
+            return Err(ValidationError::TooLong { max });
+        }
+        if let Some(c) = s.chars().find(|c| !ok(*c)) {
+            return Err(ValidationError::DisallowedChar { found: c });
+        }
+        Ok(s)
+    }
+
     /// A host workspace path for `sbx create AGENT PATH`: absolute, valid
     /// UTF-8, no control characters, and no `:` — sbx parses `PATH:ro` as a
     /// read-only mount spec (captured `create --help` example), so a colon in
@@ -385,6 +421,70 @@ mod tests {
         for bad in ["", "Shell", "./my-kit", "../kit.zip", "--clone", "oci://x"] {
             assert!(Validator::sbx_agent(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn sbx_sandbox_id_accepts_only_the_captured_shape() {
+        for ok in [
+            "b5ebec73-e2ae-471a-811a-e011cfb1948e",
+            "a",
+            "ABC-123",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(Validator::sbx_sandbox_id(ok), Ok(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "b5ebec73\nforged",
+            "id with space",
+            "id;rm",
+            "id.dot",
+            "id_underscore",
+            "ünïcode",
+            &"a".repeat(65),
+        ] {
+            assert!(Validator::sbx_sandbox_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn sbx_reported_agent_accepts_only_a_plain_token() {
+        for ok in [
+            "shell",
+            "docker-agent",
+            "my.kit_v2",
+            "Claude",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(Validator::sbx_reported_agent(ok), Ok(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "shell\n(verified)",
+            "two words",
+            "https://example.invalid/kit",
+            "\u{1b}[31mred",
+            &"a".repeat(65),
+        ] {
+            assert!(Validator::sbx_reported_agent(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `schemas/sandbox-create-spec.schema.json` `agent.enum` is not part of
+    /// the value-set drift gate, so it is pinned here to the same allowlist.
+    #[test]
+    fn schema_agent_enum_matches_the_allowlist() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../schemas/sandbox-create-spec.schema.json"
+        ))
+        .unwrap();
+        let listed: Vec<&str> = schema["properties"]["agent"]["enum"]
+            .as_array()
+            .expect("agent enum present")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(listed, SBX_AGENTS_V0_47);
     }
 
     #[test]

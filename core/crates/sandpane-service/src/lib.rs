@@ -9,6 +9,8 @@
 //! Windows named pipes are a P1 transport deliverable; this scaffold serves
 //! Unix sockets only and says so instead of pretending (see `main.rs`).
 
+pub mod confirm;
+pub mod inflight;
 pub mod runtime;
 
 use std::collections::HashMap;
@@ -19,8 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rusqlite::params;
 use sandpane_core::process::RunLimits;
 use sandpane_core::sbx::{
-    classify_failure, parse_daemon_status_json, parse_list_json, SbxCommandBuilder, SbxLocator,
-    SbxVersion, SbxWorkspace,
+    classify_failure, parse_daemon_status_json, parse_list_json, RemovalConfirmation,
+    SbxCommandBuilder, SbxListEntry, SbxLocator, SbxSandboxStatus, SbxVersion, SbxWorkspace,
 };
 use sandpane_core::scheduler::{Admission, Scheduler};
 use sandpane_core::task::{TaskStateMachine, ALL_STATUSES};
@@ -28,12 +30,13 @@ use sandpane_core::validation::Validator;
 use sandpane_core::workspace::{self, WorkspaceError};
 use sandpane_core::{git as scoregit, Database, EventLog};
 use sandpane_protocol::{
-    AgentCapability, AgentEvent, ApplyResult, ChangeSet, Conversation, ConversationCreateParams,
-    ConversationHistoryParams, ConversationHistoryResult, ConversationListParams,
-    ConversationSendParams, CoreCapabilities, ErrorCode, FileChange, FileChangeStatus,
-    GitApplyParams, MessageRecord, Method, Project, ProjectCreateParams, RpcRequest, RpcResponse,
-    SandboxCreateSpec, SandboxSummary, SbxStatus, TaskEvent, TaskListParams, TaskStatus,
-    TaskSubscribeParams, TaskSummary, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
+    AgentCapability, AgentEvent, ApplyResult, ChangeSet, ConfirmationRequest, ConfirmationTarget,
+    Conversation, ConversationCreateParams, ConversationHistoryParams, ConversationHistoryResult,
+    ConversationListParams, ConversationSendParams, CoreCapabilities, ErrorCode, FileChange,
+    FileChangeStatus, GitApplyParams, MessageRecord, Method, Project, ProjectCreateParams,
+    RpcRequest, RpcResponse, SandboxCreateSpec, SandboxRemoveParams, SandboxRemoveResult,
+    SandboxStopParams, SandboxStopResult, SandboxSummary, SbxStatus, TaskEvent, TaskListParams,
+    TaskStatus, TaskSubscribeParams, TaskSummary, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
 };
 
 /// Bounded frame size: refuse oversized input instead of buffering forever
@@ -115,6 +118,11 @@ pub struct CoreConfig {
     /// whenever `project.create` registers repositories, and revoked for good
     /// if one of them contains it.
     pub user_excludes_file: Option<PathBuf>,
+    /// Lifetime of destructive-action confirmation tokens. `None` = the design
+    /// value [`confirm::CONFIRMATION_TTL`] (120 s); a value is CLAMPED to at
+    /// most that, so configuration can only shorten it (tests use zero to
+    /// prove expiry without sleeping out the full window).
+    pub confirmation_ttl: Option<std::time::Duration>,
 }
 
 pub struct ServerInner {
@@ -125,6 +133,12 @@ pub struct ServerInner {
     pub instance_id: String,
     pub git: scoregit::GitRunner,
     pub worktrees_root: Option<PathBuf>,
+    /// Pending destructive-action confirmations (design 2026-10-09 §2):
+    /// memory only, bounded, single-use; they die with Core.
+    pub confirmations: Mutex<confirm::ConfirmationStore>,
+    pub confirmation_ttl: std::time::Duration,
+    /// Sandbox names with a create / confirmed remove in flight (review W2).
+    pub sandbox_ops: inflight::SandboxOpLocks,
 }
 
 impl ServerInner {
@@ -169,6 +183,12 @@ impl ServerInner {
             instance_id: uuid::Uuid::new_v4().to_string(),
             git: scoregit::GitRunner::with_excludes_file(excludes_file),
             worktrees_root: config.worktrees_root,
+            confirmations: Mutex::new(confirm::ConfirmationStore::new()),
+            sandbox_ops: inflight::SandboxOpLocks::new(),
+            confirmation_ttl: config
+                .confirmation_ttl
+                .unwrap_or(confirm::CONFIRMATION_TTL)
+                .min(confirm::CONFIRMATION_TTL),
         });
         // Read-only: report what a crash may have left behind; never delete.
         if inner.worktrees_root.is_some() {
@@ -197,6 +217,10 @@ impl ServerInner {
 
     pub fn lock_scheduler(&self) -> MutexGuard<'_, Scheduler> {
         self.scheduler.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn lock_confirmations(&self) -> MutexGuard<'_, confirm::ConfirmationStore> {
+        self.confirmations.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -484,6 +508,12 @@ fn dispatch(
         Method::SandboxCreate => parse_params::<SandboxCreateSpec>(params)
             .map_err(SvcFailure::from)
             .and_then(|p| sandbox_create(inner, p)),
+        Method::SandboxStop => parse_params::<SandboxStopParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| sandbox_stop(inner, p)),
+        Method::SandboxRemove => parse_params::<SandboxRemoveParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| sandbox_remove(inner, p)),
         Method::ConversationCreate => parse_params::<ConversationCreateParams>(params)
             .and_then(|p| conversation_create(inner, p))
             .map_err(Into::into),
@@ -559,12 +589,16 @@ impl From<sandpane_core::sbx::SbxFailure> for SvcFailure {
     }
 }
 
-/// The agent `sandbox.create` passes to `sbx create`. Protocol v1's
-/// `SandboxCreateSpec` carries no agent, and no agent adapter has passed the
-/// P0 gate, so Core uses the neutral built-in `shell` agent (the agent of the
-/// real captured CRUD round trip) rather than implying a verified coding
-/// agent. Choosing the agent per sandbox needs an additive protocol field.
-pub const SANDBOX_CREATE_AGENT: &str = "shell";
+/// The agent `sandbox.create` passes to `sbx create` when the spec names none
+/// (`SandboxCreateSpec.agent` absent): the neutral, provider-free built-in
+/// `shell` agent (the agent of the real captured CRUD round trip). A named
+/// agent must be an EXACT built-in from the captured `create --help`
+/// (`Validator::sbx_agent`); accepting a provider agent is never a claim that
+/// Sandpane verified it — that is stated only by `system.probe` `agents`.
+pub const DEFAULT_SANDBOX_AGENT: &str = "shell";
+
+/// The action string `sandbox.remove` confirmation tokens are bound to.
+pub const SANDBOX_REMOVE_ACTION: &str = "sandbox.remove";
 
 /// Map a bounded-runner failure to a structured error.
 fn process_failure(what: &str, e: sandpane_core::process::ProcessError) -> SvcFailure {
@@ -956,38 +990,61 @@ fn sandbox_list(inner: &ServerInner) -> Result<serde_json::Value, SvcFailure> {
     // `direct_mount` means live-writable and UIs must label it, so the value
     // has to be real) and the bound project (review 0015 bug 10).
     let db = inner.lock_db();
-    let bindings = newest_bindings(&db)?;
+    let bindings = live_bindings(&db)?;
     let summaries: Vec<SandboxSummary> = entries
         .into_iter()
-        .map(|e| {
-            let binding = bindings.get(&e.name);
-            SandboxSummary {
-                name: e.name.clone(),
-                probed_state: Some(e.status.as_str().to_string()),
-                bound_project_id: binding.map(|b| b.project_id.clone()),
-                workspace_mode: binding.and_then(|b| workspace_mode_from_stored(&b.mode)),
-            }
-        })
+        .map(|e| summarize(e, &bindings))
         .collect();
     serde_json::to_value(summaries).map_err(|e| internal(e).into())
 }
 
-/// The binding row currently in force for a sandbox name.
+/// One probed `ls` row joined with the binding Core has IN FORCE for that
+/// sandbox (see [`binding_for_entry`]; removed bindings never count).
+fn summarize(e: SbxListEntry, bindings: &HashMap<String, Vec<BindingRow>>) -> SandboxSummary {
+    let binding = bindings
+        .get(&e.name)
+        .and_then(|rows| binding_for_entry(rows, e.id.as_deref()));
+    SandboxSummary {
+        probed_state: Some(e.status.as_str().to_string()),
+        bound_project_id: binding.map(|b| b.project_id.clone()),
+        workspace_mode: binding.and_then(|b| workspace_mode_from_stored(&b.mode)),
+        agent: e.agent,
+        name: e.name,
+    }
+}
+
+/// A live (`removed_at IS NULL`) `sandbox_bindings` row.
 struct BindingRow {
     project_id: String,
     mode: String,
+    /// sbx `id` of the sandbox the binding was made for (schema v4); `None`
+    /// on rows written before A1 (or when the post-create re-query failed).
+    sbx_id: Option<String>,
 }
 
-/// Newest recorded binding per sandbox name. Ordering is the recorded
-/// `created_at` with insertion order (`rowid`) as tie-break, so the value
-/// reported is the binding that is currently in force rather than an arbitrary
-/// one. A name Core has no row for is absent from this map, so the fields are
+/// The binding that describes the probed sandbox with sbx id `sbx_id`
+/// (review W1): a row recorded for EXACTLY that id; otherwise — only when the
+/// newest live row has no recorded sbx id (written before A1, or its
+/// post-create re-query failed) — that row, matched by name as before A1. A row recorded for a different sbx id (an earlier sandbox that
+/// had the same name) never describes a replacement.
+fn binding_for_entry<'a>(rows: &'a [BindingRow], sbx_id: Option<&str>) -> Option<&'a BindingRow> {
+    rows.iter()
+        .find(|b| b.sbx_id.is_some() && b.sbx_id.as_deref() == sbx_id)
+        .or_else(|| rows.first().filter(|b| b.sbx_id.is_none()))
+}
+
+/// Every live binding row per sandbox name, newest first (recorded
+/// `created_at`, insertion order `rowid` as tie-break). Rows marked removed by
+/// `sandbox.remove` (schema v4) are excluded, so a new sandbox reusing a
+/// removed sandbox's name never inherits the removed one's (possibly
+/// live-writable) mode. A name with no live row is absent, so the fields are
 /// omitted on the wire.
-fn newest_bindings(db: &Database) -> Result<HashMap<String, BindingRow>, SvcError> {
+fn live_bindings(db: &Database) -> Result<HashMap<String, Vec<BindingRow>>, SvcError> {
     let mut stmt = db
         .conn()
         .prepare(
-            "SELECT sandbox_name, workspace_mode, project_id FROM sandbox_bindings
+            "SELECT sandbox_name, workspace_mode, project_id, sbx_id FROM sandbox_bindings
+             WHERE removed_at IS NULL
              ORDER BY created_at DESC, rowid DESC",
         )
         .map_err(internal)?;
@@ -995,18 +1052,34 @@ fn newest_bindings(db: &Database) -> Result<HashMap<String, BindingRow>, SvcErro
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                BindingRow {
+                    mode: r.get(1)?,
+                    project_id: r.get(2)?,
+                    sbx_id: r.get(3)?,
+                },
             ))
         })
         .map_err(internal)?;
-    let mut out: HashMap<String, BindingRow> = HashMap::new();
+    let mut out: HashMap<String, Vec<BindingRow>> = HashMap::new();
     for row in rows {
-        let (name, mode, project_id) = row.map_err(internal)?;
-        // First seen per name = newest (DESC order); later, older rows lose.
-        out.entry(name).or_insert(BindingRow { project_id, mode });
+        let (name, binding) = row.map_err(internal)?;
+        out.entry(name).or_default().push(binding);
     }
     Ok(out)
+}
+
+/// Claim `name` for a create / confirmed remove (review W2). Refused — with
+/// nothing run — while another such operation on the same name is in flight.
+fn claim_sandbox_name<'a>(
+    inner: &'a ServerInner,
+    name: &str,
+) -> Result<inflight::SandboxOpGuard<'a>, SvcFailure> {
+    inner.sandbox_ops.try_acquire(name).ok_or_else(|| {
+        SvcFailure::from((
+            ErrorCode::Conflict,
+            format!("another operation on sandbox {name:?} is in progress; nothing was run"),
+        ))
+    })
 }
 
 fn sandbox_create(
@@ -1016,6 +1089,13 @@ fn sandbox_create(
     Validator::sandbox_name(&spec.name).map_err(|e| {
         SvcFailure::from((ErrorCode::ValidationFailed, format!("sandbox name: {e}")))
     })?;
+    // Agent: an EXACT built-in from the captured `sbx create --help`, refused
+    // before anything else runs. Kit references (local dirs, ZIPs, git URLs,
+    // OCI refs) execute third-party code and are never accepted; `--cloud`
+    // is never emitted by the builder.
+    let agent = spec.agent.as_deref().unwrap_or(DEFAULT_SANDBOX_AGENT);
+    Validator::sbx_agent(agent)
+        .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, format!("agent: {e}"))))?;
     // host_worktree needs Core-allocated worktrees (git-safe-tasks) that do
     // not exist yet. Refuse BEFORE touching anything, rather than fall back to
     // a live bind mount of the host tree under a "safe" label.
@@ -1121,19 +1201,22 @@ fn sandbox_create(
             )));
         }
     }
+    // Held until this function returns (through the binding insert), so a
+    // confirmed remove of the same name cannot interleave (review W2).
+    let _name_claim = claim_sandbox_name(inner, &spec.name)?;
     let program = locate_sbx(inner)?;
     let workspace = match (&spec.workspace_mode, mount.as_deref()) {
         (WorkspaceMode::DirectMount, Some(p)) => SbxWorkspace::BindMount(p),
         (WorkspaceMode::SbxClone, Some(p)) => SbxWorkspace::Clone(p),
         _ => SbxWorkspace::None,
     };
-    let cmd = SbxCommandBuilder::create(&program, &spec.name, SANDBOX_CREATE_AGENT, workspace)
+    let cmd = SbxCommandBuilder::create(&program, &spec.name, agent, workspace)
         .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, e.to_string())))?;
-    let probed_state = match cmd.run(&inner.sbx_limits.mutation) {
+    let probed = match cmd.run(&inner.sbx_limits.mutation) {
         Ok(out) if out.status.success() => {
             // RE-QUERY after mutation: exit 0 never means desired state
             // (specs/02 §5).
-            probe_sandbox_state(&program, &spec.name, &inner.sbx_limits.query)
+            probe_sandbox_entry(&program, &spec.name, &inner.sbx_limits.query)
         }
         Ok(out) => {
             // Classified against the real captured errors: not signed in →
@@ -1147,14 +1230,15 @@ fn sandbox_create(
             // descendant held its output open), but the sandbox may exist.
             // SBX is the source of truth: re-query, and bind what exists
             // rather than orphan it. Absent → an honest timeout error.
-            match probe_sandbox_state(&program, &spec.name, &inner.sbx_limits.query) {
-                Some(state) => {
+            match probe_sandbox_entry(&program, &spec.name, &inner.sbx_limits.query) {
+                Some(entry) => {
                     eprintln!(
                         "sandpane-service: sbx create {} exceeded {after:?}; sandbox exists \
-                         on re-query ({state}) and is being bound",
-                        spec.name
+                         on re-query ({}) and is being bound",
+                        spec.name,
+                        entry.status.as_str()
                     );
-                    Some(state)
+                    Some(entry)
                 }
                 None => {
                     return Err(SvcFailure::from((
@@ -1177,26 +1261,34 @@ fn sandbox_create(
         let mode_str = workspace_mode_wire(&spec.workspace_mode).to_string();
         db.conn()
             .execute(
-                "INSERT INTO sandbox_bindings (id, project_id, sandbox_name, workspace_mode, created_at)
-                 VALUES (?1,?2,?3,?4,?5)",
+                "INSERT INTO sandbox_bindings
+                     (id, project_id, sandbox_name, workspace_mode, created_at, sbx_id)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
                     uuid::Uuid::new_v4().to_string(),
                     spec.project_id,
                     spec.name,
                     mode_str,
-                    now_rfc3339()
+                    now_rfc3339(),
+                    // The identity sbx reports on the re-query (shape-checked
+                    // at parse). NULL when it could not be probed: such a row
+                    // is then treated like a pre-A1 one, never as a match.
+                    probed.as_ref().and_then(|e| e.id.clone())
                 ],
             )
             .map_err(internal)?;
     }
     let summary = SandboxSummary {
         name: spec.name,
-        probed_state,
+        probed_state: probed.as_ref().map(|e| e.status.as_str().to_string()),
         bound_project_id: Some(spec.project_id),
         // The mode Core just recorded for this binding — the caller asked for
         // it explicitly, so it is a fact, not a guess (specs/02 §7:
         // direct_mount is live-writable).
         workspace_mode: Some(spec.workspace_mode),
+        // What sbx REPORTS on the re-query (absent when not listed) — a probed
+        // fact, not a verification claim.
+        agent: probed.and_then(|e| e.agent),
     };
     serde_json::to_value(summary).map_err(|e| internal(e).into())
 }
@@ -1211,13 +1303,371 @@ fn workspace_mode_wire(mode: &WorkspaceMode) -> &'static str {
     }
 }
 
-/// Post-mutation re-query. `None` = could not be determined (never guessed).
-fn probe_sandbox_state(program: &Path, name: &str, limits: &RunLimits) -> Option<String> {
+/// Post-mutation re-query. `None` = not listed or could not be determined
+/// (never guessed).
+fn probe_sandbox_entry(program: &Path, name: &str, limits: &RunLimits) -> Option<SbxListEntry> {
     sbx_list(program, limits)
         .ok()?
         .into_iter()
         .find(|e| e.name == name)
-        .map(|e| e.status.as_str().to_string())
+}
+
+fn validate_sandbox_name(name: &str) -> Result<(), SvcFailure> {
+    Validator::sandbox_name(name).map_err(|e| {
+        SvcFailure::from((ErrorCode::ValidationFailed, format!("sandbox name: {e}")))
+    })?;
+    Ok(())
+}
+
+/// `sandbox.stop` (A1): `sbx stop NAME`, then the `ls --json` re-query
+/// (specs/02 §5). Not destructive — state is preserved and `sbx run --name`
+/// restarts it — so no confirmation token.
+fn sandbox_stop(
+    inner: &ServerInner,
+    p: SandboxStopParams,
+) -> Result<serde_json::Value, SvcFailure> {
+    validate_sandbox_name(&p.name)?;
+    let program = locate_sbx(inner)?;
+    let cmd = SbxCommandBuilder::stop(&program, &p.name)
+        .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, e.to_string())))?;
+    let out = cmd
+        .run(&inner.sbx_limits.mutation)
+        .map_err(|e| process_failure("sbx stop", e))?;
+    if !out.status.success() {
+        return Err(classify_failure(&out.status.to_string(), &out.stderr_lossy()).into());
+    }
+    // Absent when no longer listed OR the re-query failed: the client shows
+    // the state as unknown, never assumes "stopped".
+    let requeried = match sbx_list(&program, &inner.sbx_limits.query) {
+        Ok(entries) => match entries.into_iter().find(|e| e.name == p.name) {
+            Some(entry) => {
+                let db = inner.lock_db();
+                Some(summarize(entry, &live_bindings(&db)?))
+            }
+            None => None,
+        },
+        Err(f) => {
+            eprintln!(
+                "sandpane-service: sbx stop {} exited 0 but the re-query failed: {}",
+                p.name, f.message
+            );
+            None
+        }
+    };
+    serde_json::to_value(SandboxStopResult {
+        stopped: true,
+        requeried,
+    })
+    .map_err(|e| internal(e).into())
+}
+
+/// `sandbox.remove` (A1): two-step server-side confirmation (design
+/// 2026-10-09 §2, sbx-cli-integration rule 6).
+fn sandbox_remove(
+    inner: &ServerInner,
+    p: SandboxRemoveParams,
+) -> Result<serde_json::Value, SvcFailure> {
+    validate_sandbox_name(&p.name)?;
+    let result = match p.confirm_token {
+        None => SandboxRemoveResult {
+            confirmation: Some(issue_remove_confirmation(inner, &p.name)?),
+            removed: None,
+        },
+        Some(token) => {
+            remove_confirmed(inner, &p.name, &token)?;
+            SandboxRemoveResult {
+                confirmation: None,
+                removed: Some(true),
+            }
+        }
+    };
+    serde_json::to_value(result).map_err(|e| internal(e).into())
+}
+
+/// Step 1: look the sandbox up in SBX (the source of truth), describe the
+/// impact, issue a token bound to (action, name, sbx id). Changes nothing.
+fn issue_remove_confirmation(
+    inner: &ServerInner,
+    name: &str,
+) -> Result<ConfirmationRequest, SvcFailure> {
+    let program = locate_sbx(inner)?;
+    let entry = sbx_list(&program, &inner.sbx_limits.query)?
+        .into_iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| {
+            SvcFailure::from((
+                ErrorCode::NotFound,
+                format!("sandbox {name:?} is not listed by sbx"),
+            ))
+        })?;
+    // Fail closed: without the sbx id there is no identity to bind, and a
+    // same-named replacement could not be told apart.
+    // `parse_list_json` already dropped ids outside the captured shape
+    // (review I4); re-checked here because this is what the token binds.
+    let id = entry
+        .id
+        .clone()
+        .filter(|id| Validator::sbx_sandbox_id(id).is_ok())
+        .ok_or_else(|| {
+            SvcFailure::from((
+                ErrorCode::Internal,
+                format!(
+                    "sbx ls reports no usable id for sandbox {name:?}; refusing to issue a \
+                     removal confirmation that cannot be bound to the sandbox identity"
+                ),
+            ))
+        })?;
+    let rows = {
+        let db = inner.lock_db();
+        live_bindings(&db)?.remove(name).unwrap_or_default()
+    };
+    // `external` is decided by IDENTITY (review W1): Sandpane vouches only for
+    // a live binding recorded for exactly this sbx id.
+    let matched = rows
+        .iter()
+        .find(|b| b.sbx_id.as_deref() == Some(id.as_str()));
+    let impact = removal_impact(name, &id, &entry.status, matched, &rows);
+    let ttl = inner.confirmation_ttl;
+    let token = inner
+        .lock_confirmations()
+        .issue(
+            confirm::ConfirmationBinding {
+                action: SANDBOX_REMOVE_ACTION.to_string(),
+                name: name.to_string(),
+                id: id.clone(),
+            },
+            std::time::Instant::now(),
+            ttl,
+        )
+        .map_err(|e| {
+            SvcFailure::from((
+                ErrorCode::Internal,
+                format!("OS random source unavailable for a confirmation token: {e}"),
+            ))
+        })?;
+    // Wall-clock rendering of the monotonic deadline, floored to the second
+    // so it never promises more time than the token really has.
+    let expires_unix = (std::time::SystemTime::now() + ttl)
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(ConfirmationRequest {
+        token,
+        expires_at: rfc3339_from_unix(expires_unix),
+        action: SANDBOX_REMOVE_ACTION.to_string(),
+        target: ConfirmationTarget {
+            name: name.to_string(),
+            id,
+        },
+        impact,
+        external: matched.is_none(),
+    })
+}
+
+/// Short, human impact lines for the confirmation dialog. Only what Core
+/// knows: the probed state and its own bindings (never a guess about
+/// contents). The workspace-mode line appears ONLY for a binding recorded for
+/// exactly this sbx id (review W1).
+fn removal_impact(
+    name: &str,
+    id: &str,
+    status: &SbxSandboxStatus,
+    matched: Option<&BindingRow>,
+    live_rows: &[BindingRow],
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "removes sandbox {name} (sbx id {id}) and everything inside it; this cannot be undone"
+    )];
+    if *status == SbxSandboxStatus::Running {
+        lines.push("the sandbox is running; anything running inside it is terminated".into());
+    }
+    match matched {
+        Some(b) => {
+            lines.push(match workspace_mode_from_stored(&b.mode) {
+                Some(WorkspaceMode::DirectMount) => "workspace mode direct_mount: host files \
+                     already written through the live-writable mount stay on the host"
+                    .to_string(),
+                Some(WorkspaceMode::SbxClone) => "workspace mode sbx_clone: work in the \
+                     sandbox's private clone that was not fetched to the host is lost"
+                    .to_string(),
+                Some(WorkspaceMode::Mountless) => {
+                    "workspace mode mountless: no host workspace was mounted".to_string()
+                }
+                Some(WorkspaceMode::HostWorktree) => "workspace mode host_worktree: the \
+                     Core-allocated host worktree is not touched by this removal"
+                    .to_string(),
+                None => "workspace mode unknown (Core cannot read its binding row)".to_string(),
+            });
+            lines.push(format!(
+                "the Sandpane binding to project {} is marked removed (kept for audit)",
+                b.project_id
+            ));
+        }
+        None if live_rows.iter().any(|b| b.sbx_id.is_none()) => lines.push(
+            "a Sandpane binding with this name exists but has no recorded sbx id; Core \
+             cannot confirm Sandpane created this sandbox (that binding is marked removed \
+             with it)"
+                .into(),
+        ),
+        None if !live_rows.is_empty() => lines.push(
+            "not created by Sandpane: the Sandpane binding with this name belongs to an \
+             earlier sandbox (a different sbx id) and is not affected"
+                .into(),
+        ),
+        None => lines.push(
+            "not created by Sandpane: Core has no binding for this sandbox and cannot describe \
+             what it holds"
+                .into(),
+        ),
+    }
+    lines
+}
+
+/// Enforce the step-2 invariant on a failure that happened after `sbx rm`
+/// was spawned: a code clients read as "refused, nothing ran"
+/// (`VALIDATION_FAILED`, `CONFLICT`, `NOT_FOUND`) becomes `INTERNAL`, with
+/// the original message prefixed and `details` kept. Other classified codes
+/// (`PROVIDER_AUTH_REQUIRED`, `PERMISSION_DENIED`, `DAEMON_DOWN`, `INTERNAL`)
+/// carry their remediation and pass through.
+fn after_rm(f: SvcFailure, what: &str) -> SvcFailure {
+    match f.code {
+        ErrorCode::ValidationFailed | ErrorCode::Conflict | ErrorCode::NotFound => SvcFailure {
+            code: ErrorCode::Internal,
+            message: format!(
+                "{what} after it ran ({}); removal is unconfirmed and the Sandpane binding is \
+                 left in force",
+                f.message
+            ),
+            details: f.details,
+        },
+        _ => f,
+    }
+}
+
+/// Step 2: consume the token FIRST (every attempt burns it), re-check the
+/// target identity against SBX, only then `sbx rm --force NAME`, then
+/// re-query. The sandbox name is claimed (review W2) from before the identity
+/// re-check through the binding UPDATE, so no Core create/remove of the same
+/// name interleaves; the binding rows to retire are CAPTURED before `rm` and
+/// only those are marked. RESIDUAL RACE (disclosed): `rm` acts on a name, so
+/// a same-named replacement created OUT OF BAND (e.g. `sbx` in a terminal)
+/// between the re-check and `rm` would be the one removed; sbx v0.47 offers
+/// no remove-by-id to close it.
+fn remove_confirmed(inner: &ServerInner, name: &str, token: &str) -> Result<(), SvcFailure> {
+    let bound = inner
+        .lock_confirmations()
+        .consume(
+            token,
+            SANDBOX_REMOVE_ACTION,
+            name,
+            std::time::Instant::now(),
+        )
+        .map_err(|_| {
+            SvcFailure::from((
+                ErrorCode::ValidationFailed,
+                confirm::TOKEN_REJECTED_MESSAGE.to_string(),
+            ))
+        })?;
+    let _name_claim = claim_sandbox_name(inner, name)?;
+    let program = locate_sbx(inner)?;
+    let entry = sbx_list(&program, &inner.sbx_limits.query)?
+        .into_iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| {
+            SvcFailure::from((
+                ErrorCode::NotFound,
+                format!("sandbox {name:?} is no longer listed by sbx; nothing was removed"),
+            ))
+        })?;
+    if entry.id.as_deref() != Some(bound.id.as_str()) {
+        return Err(SvcFailure::from((
+            ErrorCode::Conflict,
+            format!(
+                "sandbox {name:?} is not the sandbox that was confirmed (its sbx id changed); \
+                 nothing was removed — request a new confirmation"
+            ),
+        )));
+    }
+    // Capture BEFORE `rm` exactly the rows this removal retires: live rows
+    // for this name recorded for the confirmed sbx id, plus rows with no
+    // recorded id (pre-A1 or a failed re-query; the only sandbox they could describe is the one being removed or
+    // one already gone). A row written later is never touched (review W2).
+    let captured: Vec<String> = {
+        let db = inner.lock_db();
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT id FROM sandbox_bindings
+                 WHERE sandbox_name = ?1 AND removed_at IS NULL
+                   AND (sbx_id = ?2 OR sbx_id IS NULL)",
+            )
+            .map_err(internal)?;
+        let ids = stmt
+            .query_map(params![name, bound.id], |r| r.get::<_, String>(0))
+            .map_err(internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?;
+        ids
+    };
+    let confirmation = RemovalConfirmation::user_confirmed(name);
+    let cmd = SbxCommandBuilder::remove(&program, name, &confirmation)
+        .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, e.to_string())))?;
+    // ---- STEP-2 INVARIANT: `VALIDATION_FAILED`, `CONFLICT` and `NOT_FOUND`
+    // are returned ONLY above this line, i.e. before `sbx rm` runs, because
+    // clients read them as "refused, nothing ran". From here on (rm
+    // spawned) every failure is `INTERNAL` — or another code that cannot be
+    // read as "nothing ran" — with sbx's own text kept in `details`.
+    let out = cmd
+        .run(&inner.sbx_limits.mutation)
+        .map_err(|e| process_failure("sbx rm", e))?;
+    if !out.status.success() {
+        let f = classify_failure(&out.status.to_string(), &out.stderr_lossy());
+        return Err(after_rm(f.into(), "sbx rm failed"));
+    }
+    // RE-QUERY: exit 0 is not proof. Gone (or only a different same-named
+    // sandbox listed) → the confirmed sandbox is removed.
+    match sbx_list(&program, &inner.sbx_limits.query) {
+        Ok(entries) => {
+            if entries
+                .iter()
+                .any(|e| e.name == name && e.id.as_deref() == Some(bound.id.as_str()))
+            {
+                return Err(SvcFailure::from((
+                    ErrorCode::Internal,
+                    format!(
+                        "sbx rm exited 0 but sandbox {name:?} is still listed; its Sandpane \
+                         binding is left in force"
+                    ),
+                )));
+            }
+        }
+        Err(f) => {
+            // Always INTERNAL: `sbx_list` alone may say VALIDATION_FAILED
+            // (output over cap / unparseable), which here would falsely
+            // read as "token refused, nothing ran".
+            return Err(SvcFailure {
+                code: ErrorCode::Internal,
+                message: format!(
+                    "sbx rm exited 0 but the re-query failed ({}); removal is unconfirmed and \
+                     the Sandpane binding is left in force",
+                    f.message
+                ),
+                details: f.details,
+            });
+        }
+    }
+    let db = inner.lock_db();
+    let tx = db.conn().unchecked_transaction().map_err(internal)?;
+    let removed_at = now_rfc3339();
+    for row_id in &captured {
+        tx.execute(
+            "UPDATE sandbox_bindings SET removed_at = ?1 WHERE id = ?2 AND removed_at IS NULL",
+            params![removed_at, row_id],
+        )
+        .map_err(internal)?;
+    }
+    tx.commit().map_err(internal)?;
+    Ok(())
 }
 
 fn conversation_create(

@@ -248,6 +248,7 @@ export function ConfirmDialog({
   consequence,
   confirmLabel,
   requirePhrase,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }: {
@@ -257,6 +258,11 @@ export function ConfirmDialog({
   confirmLabel: string;
   /** When set, the user must type this exact phrase to enable confirm. */
   requirePhrase?: string;
+  /**
+   * Extra veto on the confirm button (e.g. a server-issued confirmation has
+   * expired, or the request is already in flight). ANDed with the phrase check.
+   */
+  confirmDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -339,7 +345,11 @@ export function ConfirmDialog({
           >
             Cancel
           </Button>
-          <Button variant="danger" disabled={!phraseSatisfied} onClick={onConfirm}>
+          <Button
+            variant="danger"
+            disabled={!phraseSatisfied || confirmDisabled}
+            onClick={onConfirm}
+          >
             {confirmLabel}
           </Button>
         </div>

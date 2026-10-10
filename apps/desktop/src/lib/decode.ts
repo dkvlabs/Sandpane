@@ -16,6 +16,7 @@
 
 import {
   AGENT_EVENT_TYPES,
+  CONFIRM_TOKEN_PATTERN,
   CORE_EVENT_KINDS,
   ERROR_CODES,
   FILE_CHANGE_STATUSES,
@@ -25,6 +26,7 @@ import {
   type AgentCapability,
   type ApplyResult,
   type ChangeSet,
+  type ConfirmationRequest,
   type Conversation,
   type ConversationHistoryResult,
   type CoreCapabilities,
@@ -33,6 +35,8 @@ import {
   type FileChangeStatus,
   type MessageRecord,
   type Project,
+  type SandboxRemoveResult,
+  type SandboxStopResult,
   type SandboxSummary,
   type TaskEvent,
   type TaskStatus,
@@ -241,28 +245,128 @@ export function decodeSandboxSummaries(value: unknown): SandboxSummary[] {
   if (!Array.isArray(value)) {
     throw new MalformedFrameError("sandbox.list must return an array");
   }
-  return value.map((item) => {
-    const s = asRecord(item, "SandboxSummary");
-    // `workspaceMode` is additive and optional: absent/null means Core has no
-    // readable binding row, which the UI must render as UNVERIFIED (and treat as
-    // live-writable), never as safe. A PRESENT string this build does not know
-    // (a mode a newer Core added) decodes to the SAME unverified reading —
-    // `null` — with the raw value kept so the UI can name it; it is never
-    // guessed into one of the four known modes, and never into an isolated one.
-    // A present value of the wrong type is still a malformed frame.
-    const rawMode = s.workspaceMode;
-    const mode =
-      rawMode === undefined || rawMode === null
-        ? null
-        : tolerantEnum(rawMode, "SandboxSummary.workspaceMode", WORKSPACE_MODES);
-    return {
-      name: str(s, "name", "SandboxSummary"),
-      probedState: optStr(s, "probedState", "SandboxSummary"),
-      boundProjectId: optStr(s, "boundProjectId", "SandboxSummary"),
-      workspaceMode: mode === null || mode.value === "unknown" ? null : mode.value,
-      ...(mode !== null && "raw" in mode ? { unrecognizedWorkspaceMode: mode.raw } : {}),
-    };
+  return value.map((item) => decodeSandboxSummary(item));
+}
+
+/**
+ * One `SandboxSummary` row (shared by `sandbox.list` and the `requeried` row of
+ * `sandbox.stop`).
+ */
+export function decodeSandboxSummary(item: unknown): SandboxSummary {
+  const s = asRecord(item, "SandboxSummary");
+  // `workspaceMode` is additive and optional: absent/null means Core has no
+  // readable binding row, which the UI must render as UNVERIFIED (and treat as
+  // live-writable), never as safe. A PRESENT string this build does not know
+  // (a mode a newer Core added) decodes to the SAME unverified reading —
+  // `null` — with the raw value kept so the UI can name it; it is never
+  // guessed into one of the four known modes, and never into an isolated one.
+  // A present value of the wrong type is still a malformed frame.
+  const rawMode = s.workspaceMode;
+  const mode =
+    rawMode === undefined || rawMode === null
+      ? null
+      : tolerantEnum(rawMode, "SandboxSummary.workspaceMode", WORKSPACE_MODES);
+  // `agent` (A1) is what sbx reported — a free string, NOT checked against the
+  // create allowlist (sbx may report agents Sandpane never offers) and never a
+  // verification claim. Absent stays absent: no key is invented.
+  const agent = optStr(s, "agent", "SandboxSummary");
+  return {
+    name: str(s, "name", "SandboxSummary"),
+    probedState: optStr(s, "probedState", "SandboxSummary"),
+    boundProjectId: optStr(s, "boundProjectId", "SandboxSummary"),
+    workspaceMode: mode === null || mode.value === "unknown" ? null : mode.value,
+    ...(mode !== null && "raw" in mode ? { unrecognizedWorkspaceMode: mode.raw } : {}),
+    ...(agent === null ? {} : { agent }),
+  };
+}
+
+/**
+ * `sandbox.stop` result (A1). `requeried` ABSENT is a first-class answer — the
+ * sandbox is no longer listed or the re-query failed — and stays absent, so the
+ * UI shows the state as unknown instead of an assumed "stopped".
+ */
+export function decodeSandboxStopResult(value: unknown): SandboxStopResult {
+  const r = asRecord(value, "SandboxStopResult");
+  const requeried = r.requeried;
+  return {
+    stopped: bool(r, "stopped", "SandboxStopResult"),
+    ...(requeried === undefined || requeried === null
+      ? {}
+      : { requeried: decodeSandboxSummary(requeried) }),
+  };
+}
+
+/**
+ * A server-side destructive-action confirmation. Strict on purpose — this is
+ * the object a destructive step-2 request is built from, so a shape this build
+ * cannot fully read must never be sent back:
+ * - the token must be 64 lowercase hex (it is echoed into the next frame);
+ * - `action` must be the one the caller asked about;
+ * - every impact line must be a string (the dialog shows the first
+ *   `MAX_IMPACT_LINES` and discloses how many more Core sent).
+ * `expiresAt` is kept verbatim; an unparseable value is treated as already
+ * expired by the dialog (fail closed), not rejected here.
+ */
+export function decodeConfirmationRequest(
+  value: unknown,
+  expectedAction: string,
+): ConfirmationRequest {
+  const c = asRecord(value, "ConfirmationRequest");
+  const token = str(c, "token", "ConfirmationRequest");
+  if (!CONFIRM_TOKEN_PATTERN.test(token)) {
+    // The token value itself is never echoed into an error message.
+    throw new MalformedFrameError("ConfirmationRequest.token is not 64 lowercase hex characters");
+  }
+  const action = str(c, "action", "ConfirmationRequest");
+  if (action !== expectedAction) {
+    throw new MalformedFrameError(
+      `ConfirmationRequest.action is not ${expectedAction}; refusing to use this token`,
+    );
+  }
+  const target = asRecord(c.target, "ConfirmationRequest.target");
+  const impact = arr(c, "impact", "ConfirmationRequest").map((line, index) => {
+    if (typeof line !== "string") {
+      throw new MalformedFrameError(`ConfirmationRequest.impact[${index}] must be a string`);
+    }
+    return line;
   });
+  return {
+    token,
+    expiresAt: str(c, "expiresAt", "ConfirmationRequest"),
+    action,
+    target: {
+      name: str(target, "name", "ConfirmationTarget"),
+      id: str(target, "id", "ConfirmationTarget"),
+    },
+    impact,
+    external: bool(c, "external", "ConfirmationRequest"),
+  };
+}
+
+/**
+ * `sandbox.remove` result: exactly one of `confirmation` (step 1) or
+ * `removed: true` (step 2). `removed` present with any value other than `true`
+ * is malformed — it is never shown as a success.
+ */
+export function decodeSandboxRemoveResult(value: unknown): SandboxRemoveResult {
+  const r = asRecord(value, "SandboxRemoveResult");
+  const hasConfirmation = r.confirmation !== undefined && r.confirmation !== null;
+  const hasRemoved = r.removed !== undefined && r.removed !== null;
+  if (hasConfirmation === hasRemoved) {
+    throw new MalformedFrameError(
+      "sandbox.remove must answer exactly one of confirmation / removed",
+    );
+  }
+  if (hasRemoved) {
+    if (r.removed !== true) {
+      throw new MalformedFrameError("SandboxRemoveResult.removed must be true when present");
+    }
+    return { kind: "removed" };
+  }
+  return {
+    kind: "confirmation",
+    confirmation: decodeConfirmationRequest(r.confirmation, "sandbox.remove"),
+  };
 }
 
 export function decodeConversations(value: unknown): Conversation[] {

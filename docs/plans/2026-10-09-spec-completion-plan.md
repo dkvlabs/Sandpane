@@ -39,7 +39,7 @@ All verified versions are recorded in `docs/compatibility.md`.
 
 Protocol additions follow the design of record: [2026-10-09-protocol-v1-additions.md](2026-10-09-protocol-v1-additions.md). It covers additive-only rules, the two-step confirmation token, and landing order A1–A9.
 
-1. Sandbox lifecycle: `sandbox.stop` and `sandbox.remove` (confirmed, `rm --force` behind server confirmation). `start` maps to the documented path or is reported unsupported.
+1. Sandbox lifecycle: `sandbox.stop` and `sandbox.remove` (confirmed, `rm --force` behind server confirmation). `start` maps to the documented path or is reported unsupported. **Done in entry 0031 (A1), all three clients.** Start is reported unsupported (sbx v0.47 has none). Still open: JetBrains has no create UI (the `agent` field is typed only); the VS Code webview has no lifecycle buttons and does not show `agent`; the active-task check before stop/remove waits for per-task sandbox names (A4/C3); the out-of-band same-name race remains (no remove-by-id in sbx v0.47); stop/remove block other calls on a shared client connection (Core serves a connection serially). Never run against a real `sbx`.
 2. Project/conversation lifecycle: update/archive/delete, repo add/remove, conversation rename/archive/delete/export (redacted), persisted `sandboxId`.
 3. Task Git context: `repo_id`, `base_commit`, `task_branch`, worktree allocation and cleanup. **Core-internal part done `2232d88` (entry 0027); the global excludes file is re-vetted on repository registration `ab68c5b` (entry 0028).** Not wire-reachable until the A-series protocol additions. `integration_status`, per-task `sandbox_name` and the retention policy are still open.
 4. `git.diff` (per file) and `git.apply` of selected files: merge/cherry-pick `--no-commit` or `apply --3way`, conflict rollback, dirty gate on touched paths.
@@ -51,8 +51,8 @@ Protocol additions follow the design of record: [2026-10-09-protocol-v1-addition
 
 ### CL — Client features (after each Core protocol step)
 
-- **Desktop:** persistent shell (TopBar, icon rail, nested project/chat tree, StatusBar, Inspector); S03 chat screen; Dashboard and Cockpit; ⌘K palette; S00 onboarding; native notifications, single-instance and store plugins; sandbox lifecycle UI; DiffViewer; redacted diagnostics export; macOS unsigned `tauri build`.
-- **VS Code:** conversation tabs and history paging; activity and changed-files views; project auto-select from workspace folders; specs/03 §4 context actions; diagnostics consent; per-file apply; jsdom adversarial tests, ESLint, `@vscode/test-electron`; sandbox lifecycle; verification.
+- **Desktop:** persistent shell (TopBar, icon rail, nested project/chat tree, StatusBar, Inspector); S03 chat screen; Dashboard and Cockpit; ⌘K palette; S00 onboarding; native notifications, single-instance and store plugins; sandbox lifecycle UI (stop/remove done in 0031); DiffViewer; redacted diagnostics export; macOS unsigned `tauri build`.
+- **VS Code:** conversation tabs and history paging; activity and changed-files views; project auto-select from workspace folders; specs/03 §4 context actions; diagnostics consent; per-file apply; jsdom adversarial tests, ESLint, `@vscode/test-electron`; sandbox lifecycle (stop/remove commands done in 0031; webview buttons open); verification.
 - **JetBrains:** per its review backlog (F4); lifecycle and diff parity; `buildPlugin` and `verifyPlugin`. Unknown-enum tolerance and the anti-spoofing hardening (table-row Apply dialog) landed in entry 0029; follow-ups from its reviews are listed in that audit record.
 
 ### R — README

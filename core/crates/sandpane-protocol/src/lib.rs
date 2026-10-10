@@ -129,6 +129,10 @@ pub enum Method {
     SandboxList,
     #[serde(rename = "sandbox.create")]
     SandboxCreate,
+    #[serde(rename = "sandbox.stop")]
+    SandboxStop,
+    #[serde(rename = "sandbox.remove")]
+    SandboxRemove,
     #[serde(rename = "conversation.create")]
     ConversationCreate,
     #[serde(rename = "conversation.send")]
@@ -155,12 +159,14 @@ impl Method {
     /// from the enum rather than hand-written, and `dispatch` must match
     /// exhaustively over the same enum, so an advertised method always really
     /// exists and a handled method is always advertised.
-    pub const ALL: [Method; 14] = [
+    pub const ALL: [Method; 16] = [
         Self::SystemProbe,
         Self::ProjectCreate,
         Self::ProjectList,
         Self::SandboxList,
         Self::SandboxCreate,
+        Self::SandboxStop,
+        Self::SandboxRemove,
         Self::ConversationCreate,
         Self::ConversationSend,
         Self::ConversationList,
@@ -185,6 +191,8 @@ impl Method {
             "project.list" => Self::ProjectList,
             "sandbox.list" => Self::SandboxList,
             "sandbox.create" => Self::SandboxCreate,
+            "sandbox.stop" => Self::SandboxStop,
+            "sandbox.remove" => Self::SandboxRemove,
             "conversation.create" => Self::ConversationCreate,
             "conversation.send" => Self::ConversationSend,
             "conversation.list" => Self::ConversationList,
@@ -205,6 +213,8 @@ impl Method {
             Self::ProjectList => "project.list",
             Self::SandboxList => "sandbox.list",
             Self::SandboxCreate => "sandbox.create",
+            Self::SandboxStop => "sandbox.stop",
+            Self::SandboxRemove => "sandbox.remove",
             Self::ConversationCreate => "conversation.create",
             Self::ConversationSend => "conversation.send",
             Self::ConversationList => "conversation.list",
@@ -305,6 +315,17 @@ pub struct SandboxCreateSpec {
     /// Host path of the repository to bind; canonicalized + validated by core.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
+    /// Built-in sbx agent to create the sandbox with (A1, additive). Absent →
+    /// Core uses the provider-free `shell` agent. Core accepts ONLY an exact
+    /// built-in agent name from the captured `sbx create --help` of the pinned
+    /// version (`claude, codex, copilot, cursor, devin, docker-agent, droid,
+    /// gemini, kiro, opencode, shell`); sandbox-kit references (local
+    /// directories, ZIPs, git URLs, OCI refs) run third-party code and are
+    /// refused with `VALIDATION_FAILED`. Accepting a provider agent is NOT a
+    /// claim that Sandpane has verified it: verification state lives only in
+    /// `CoreCapabilities.agents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +345,86 @@ pub struct SandboxSummary {
     /// row for this name; the mode is never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mode: Option<WorkspaceMode>,
+    /// The agent sbx itself reports for this sandbox in `ls --json` (A1,
+    /// additive). A probed FACT about the sandbox, never a verification claim:
+    /// whether Sandpane has verified an adapter for it is only ever stated by
+    /// `CoreCapabilities.agents[].verified`. Absent when sbx did not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// `sandbox.stop` params (A1). Not destructive: no confirmation token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxStopParams {
+    pub name: String,
+}
+
+/// `sandbox.stop` result. `stopped: true` only says `sbx stop` exited 0;
+/// the state is whatever the post-stop `sbx ls --json` re-query reports in
+/// `requeried` (specs/02 §5: exit 0 never means desired state). `requeried`
+/// is ABSENT when the sandbox is no longer listed or the re-query could not be
+/// read — clients then show the state as unknown, never as "stopped".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxStopResult {
+    pub stopped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requeried: Option<SandboxSummary>,
+}
+
+/// `sandbox.remove` params (A1, two-step confirmation, design 2026-10-09 §2).
+/// Without `confirmToken` Core changes nothing and answers a
+/// [`ConfirmationRequest`]; with it, Core re-checks the target identity and
+/// removes the sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxRemoveParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_token: Option<String>,
+}
+
+/// Identity a confirmation token is bound to: the sandbox name AND the sbx
+/// `id` of the sandbox that carried that name when the token was issued, so a
+/// same-named replacement is refused with `CONFLICT`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmationTarget {
+    pub name: String,
+    pub id: String,
+}
+
+/// Server-side destructive-action confirmation (design 2026-10-09 §2). The
+/// token is 256-bit random, single-use, held in Core memory only and expires
+/// at `expiresAt` (120 s after issue). `action` is the dotted method the token
+/// is valid for. `external: true` means Core cannot confirm Sandpane created
+/// this sandbox: there is no live binding recorded for THIS sbx id — no
+/// binding at all, a binding that predates sbx-id tracking or has no recorded
+/// id, or a binding for an earlier sandbox with a different id. Every client
+/// must show it prominently together with `impact`. Not a proof of human
+/// presence: see design 2026-10-09 §2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmationRequest {
+    pub token: String,
+    /// RFC 3339 UTC.
+    pub expires_at: String,
+    pub action: String,
+    pub target: ConfirmationTarget,
+    pub impact: Vec<String>,
+    pub external: bool,
+}
+
+/// `sandbox.remove` result: exactly one of the two fields is present —
+/// `confirmation` for step 1 (nothing changed), `removed: true` for step 2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxRemoveResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ConfirmationRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<bool>,
 }
 
 /// Workspace mapping modes (docs/specs/02 §7).
@@ -678,17 +779,21 @@ mod tests {
     }
 
     /// THE wire-name pin for the drift gate (`scripts/schema_drift.py` reads
-    /// these exact strings out of `as_str`): all 14 methods must round-trip
+    /// these exact strings out of `as_str`): all 16 methods must round-trip
     /// through `parse`, `as_str` and serde, and `Method::ALL` must cover every
     /// one of them exactly once — `CoreCapabilities.methods` is derived from it.
+    /// A1 added `sandbox.stop` and `sandbox.remove`; there is deliberately NO
+    /// `sandbox.start` (sbx v0.47 has no `start`).
     #[test]
-    fn all_fourteen_methods_round_trip() {
-        const EXPECTED: [&str; 14] = [
+    fn all_sixteen_methods_round_trip() {
+        const EXPECTED: [&str; 16] = [
             "system.probe",
             "project.create",
             "project.list",
             "sandbox.list",
             "sandbox.create",
+            "sandbox.stop",
+            "sandbox.remove",
             "conversation.create",
             "conversation.send",
             "conversation.list",
@@ -724,6 +829,117 @@ mod tests {
         let mut expected = EXPECTED.to_vec();
         expected.sort_unstable();
         assert_eq!(derived, expected);
+        assert_eq!(
+            Method::parse("sandbox.start"),
+            None,
+            "sbx v0.47 has no start"
+        );
+    }
+
+    #[test]
+    fn sandbox_create_spec_agent_is_optional_and_additive() {
+        // A pre-A1 client omits `agent` entirely: still a valid spec.
+        let old: SandboxCreateSpec = serde_json::from_value(serde_json::json!({
+            "name": "atlas-auth", "projectId": "p1", "workspaceMode": "mountless"
+        }))
+        .unwrap();
+        assert_eq!(old.agent, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("agent"));
+        let new: SandboxCreateSpec = serde_json::from_value(serde_json::json!({
+            "name": "atlas-auth", "projectId": "p1", "workspaceMode": "mountless",
+            "agent": "codex"
+        }))
+        .unwrap();
+        assert_eq!(new.agent.as_deref(), Some("codex"));
+        assert_eq!(serde_json::to_value(&new).unwrap()["agent"], "codex");
+    }
+
+    #[test]
+    fn sandbox_summary_agent_is_absent_tolerant() {
+        let s: SandboxSummary =
+            serde_json::from_str(r#"{"name":"a1","probedState":null,"boundProjectId":null}"#)
+                .unwrap();
+        assert_eq!(s.agent, None);
+        assert!(!serde_json::to_string(&s).unwrap().contains("agent"));
+        let with = SandboxSummary {
+            agent: Some("shell".into()),
+            ..s
+        };
+        assert_eq!(serde_json::to_value(&with).unwrap()["agent"], "shell");
+    }
+
+    #[test]
+    fn sandbox_stop_wire_shapes() {
+        let p: SandboxStopParams =
+            serde_json::from_value(serde_json::json!({"name": "atlas-auth"})).unwrap();
+        assert_eq!(p.name, "atlas-auth");
+        assert!(serde_json::from_value::<SandboxStopParams>(serde_json::json!({})).is_err());
+        let gone = SandboxStopResult {
+            stopped: true,
+            requeried: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&gone).unwrap(),
+            r#"{"stopped":true}"#,
+            "absent requeried is omitted, never null"
+        );
+        let still = SandboxStopResult {
+            stopped: true,
+            requeried: Some(SandboxSummary {
+                name: "atlas-auth".into(),
+                probed_state: Some("stopped".into()),
+                bound_project_id: None,
+                workspace_mode: None,
+                agent: Some("shell".into()),
+            }),
+        };
+        let v = serde_json::to_value(&still).unwrap();
+        assert_eq!(v["requeried"]["probedState"], "stopped");
+        let back: SandboxStopResult = serde_json::from_value(v).unwrap();
+        assert!(back.stopped);
+    }
+
+    #[test]
+    fn sandbox_remove_wire_shapes() {
+        let step1: SandboxRemoveParams =
+            serde_json::from_value(serde_json::json!({"name": "atlas-auth"})).unwrap();
+        assert_eq!(step1.confirm_token, None);
+        let step2: SandboxRemoveParams =
+            serde_json::from_value(serde_json::json!({"name": "atlas-auth", "confirmToken": "ab"}))
+                .unwrap();
+        assert_eq!(step2.confirm_token.as_deref(), Some("ab"));
+
+        let issued = SandboxRemoveResult {
+            confirmation: Some(ConfirmationRequest {
+                token: "t".into(),
+                expires_at: "2026-10-10T00:02:00Z".into(),
+                action: "sandbox.remove".into(),
+                target: ConfirmationTarget {
+                    name: "atlas-auth".into(),
+                    id: "b5ebec73-e2ae-471a-811a-e011cfb1948e".into(),
+                },
+                impact: vec!["removes sandbox atlas-auth".into()],
+                external: true,
+            }),
+            removed: None,
+        };
+        let v = serde_json::to_value(&issued).unwrap();
+        assert_eq!(v["confirmation"]["expiresAt"], "2026-10-10T00:02:00Z");
+        assert_eq!(v["confirmation"]["action"], "sandbox.remove");
+        assert_eq!(
+            v["confirmation"]["target"]["id"],
+            "b5ebec73-e2ae-471a-811a-e011cfb1948e"
+        );
+        assert_eq!(v["confirmation"]["external"], true);
+        assert!(v.get("removed").is_none(), "step 1 never says removed");
+
+        let done = SandboxRemoveResult {
+            confirmation: None,
+            removed: Some(true),
+        };
+        assert_eq!(serde_json::to_string(&done).unwrap(), r#"{"removed":true}"#);
+        let back: SandboxRemoveResult = serde_json::from_str(r#"{"removed":true}"#).unwrap();
+        assert!(back.confirmation.is_none());
     }
 
     #[test]
@@ -846,6 +1062,7 @@ mod tests {
             probed_state: Some("running".into()),
             bound_project_id: Some("p1".into()),
             workspace_mode: Some(WorkspaceMode::DirectMount),
+            agent: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         // Reuses the established snake_case enum names (specs/02 §7).

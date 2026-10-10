@@ -215,38 +215,43 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
     ).toMatchObject({ params: { taskId: 't1', expectedBase: 'refs/heads/main' } });
   });
 
-  it('exposes exactly the 14 allowlisted methods and nothing else', () => {
-    expect(CORE_METHODS).toHaveLength(14);
-    expect(new Set(CORE_METHODS).size).toBe(14);
+  it('exposes exactly the 16 allowlisted methods and nothing else', () => {
+    expect(CORE_METHODS).toHaveLength(16);
+    expect(new Set(CORE_METHODS).size).toBe(16);
     expect(CORE_METHODS).not.toContain('shell.exec');
     expect(CORE_METHODS).not.toContain('sbx.raw');
+    expect(CORE_METHODS).not.toContain('sandbox.start');
     const names = Object.getOwnPropertyNames(CoreCommands.prototype).filter(
       (name) => name !== 'constructor',
     );
-    expect(names.sort()).toEqual(
-      [
-        'conversationCreate',
-        'conversationHistory',
-        'conversationList',
-        'conversationSend',
-        'gitApply',
-        'gitReview',
-        'projectCreate',
-        'projectList',
-        'sandboxCreate',
-        'sandboxList',
-        'systemProbe',
-        'taskCancel',
-        'taskList',
-        'taskSubscribe',
-      ].sort(),
-    );
-    // The wrapper surface must be exactly the allowlist: one wrapper per
-    // Core method, no extra callable method (AGENTS.md: no free-form RPC).
-    // `system.probe` → `systemProbe`, `conversation.history` → `conversationHistory`.
-    const wrapperName = (method: string): string =>
-      method.replace(/\.([a-z])/g, (_all, letter: string) => letter.toUpperCase());
-    expect(names.sort()).toEqual(CORE_METHODS.map(wrapperName).sort());
+    // Every wrapper maps to exactly one Core method, and every Core method has
+    // at least one wrapper. `sandbox.remove` has two on purpose: its two
+    // confirmation steps are separate calls (step 1 never carries a token).
+    const wrapperToMethod: Record<string, string> = {
+      systemProbe: 'system.probe',
+      projectCreate: 'project.create',
+      projectList: 'project.list',
+      sandboxList: 'sandbox.list',
+      sandboxCreate: 'sandbox.create',
+      sandboxStop: 'sandbox.stop',
+      sandboxRemoveRequest: 'sandbox.remove',
+      sandboxRemoveConfirm: 'sandbox.remove',
+      conversationCreate: 'conversation.create',
+      conversationSend: 'conversation.send',
+      conversationList: 'conversation.list',
+      conversationHistory: 'conversation.history',
+      taskCancel: 'task.cancel',
+      taskList: 'task.list',
+      taskSubscribe: 'task.subscribe',
+      gitReview: 'git.review',
+      gitApply: 'git.apply',
+    };
+    // No extra callable method on the prototype (AGENTS.md: no free-form RPC).
+    expect(names.sort()).toEqual(Object.keys(wrapperToMethod).sort());
+    for (const method of Object.values(wrapperToMethod)) {
+      expect(CORE_METHODS as readonly string[]).toContain(method);
+    }
+    expect(new Set(Object.values(wrapperToMethod))).toEqual(new Set(CORE_METHODS));
   });
 });
 
