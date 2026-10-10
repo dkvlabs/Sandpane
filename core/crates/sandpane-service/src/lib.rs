@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::params;
+use sandpane_core::idempotency::{self, Lookup};
 use sandpane_core::process::RunLimits;
 use sandpane_core::sbx::{
     classify_failure, parse_daemon_status_json, parse_list_json, RemovalConfirmation,
@@ -162,14 +163,36 @@ impl ServerInner {
         )
     }
 
-    /// Full constructor (`main.rs` passes `<data_dir>/worktrees`).
+    /// [`Self::try_with_config`] for tests and embedders that treat a failed
+    /// restart reconciliation as a bug: it panics with the reason instead of
+    /// serving unreconciled state. `main.rs` uses the fallible form.
     pub fn with_config(db: Database, sbx_locator: SbxLocator, config: CoreConfig) -> Arc<Self> {
+        Self::try_with_config(db, sbx_locator, config)
+            .unwrap_or_else(|e| panic!("sandpane-service: refusing to start: {e}"))
+    }
+
+    /// Full constructor (`main.rs` passes `<data_dir>/worktrees`).
+    ///
+    /// FAIL CLOSED (A2 review W3): if restart reconciliation cannot be made
+    /// durable — tasks to `interrupted`, `pending` idempotency keys to
+    /// `unknown` — this returns an error and no server exists. Serving
+    /// anyway would let a dead daemon's `running` task or `pending` key be
+    /// observed (or retried) as if it were live.
+    pub fn try_with_config(
+        db: Database,
+        sbx_locator: SbxLocator,
+        config: CoreConfig,
+    ) -> Result<Arc<Self>, ReconciliationFailed> {
         // RESTART RECONCILIATION (specs/02 §1/§4, T09): any task row left in
         // an in-flight state belongs to a dead daemon instance. Every such
         // task becomes `interrupted` — durable event + row update — BEFORE
         // any client can observe it. Nothing is ever auto-resumed, and the
         // scheduler starts empty alongside it.
-        reconcile_after_restart(&db);
+        reconcile_after_restart(&db)?;
+        // A2 (§3.1 items 6, 8): same rule for idempotency claims — a
+        // `pending` row belongs to a dead Core, so its outcome is `unknown`,
+        // never fabricated; then retention runs. Before any client connects.
+        reconcile_idempotency_after_restart(&db)?;
         let excludes_file = vetted_excludes_file(
             &db,
             config.user_excludes_file.as_deref(),
@@ -206,7 +229,7 @@ impl ServerInner {
                 );
             }
         }
-        inner
+        Ok(inner)
     }
 
     /// Poison-tolerant locking: one panicked handler must not brick the
@@ -337,31 +360,47 @@ pub fn reconcilable_statuses() -> Vec<String> {
         .collect()
 }
 
+/// Restart reconciliation could not be made durable; Core must not serve
+/// (A2 review W3). The message names what failed (never row contents).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationFailed(pub String);
+
+impl std::fmt::Display for ReconciliationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReconciliationFailed {}
+
 /// Marks every in-flight task `interrupted` with a durable event. Returns the
 /// affected task ids (used by main.rs startup logging and tests).
-pub fn reconcile_after_restart(db: &Database) -> Vec<String> {
+///
+/// Any database failure is an error (fail closed, review W3): a task left
+/// `running` by a dead daemon must never be served as if it were live. A row
+/// whose status Core cannot parse is not in-flight by definition and is
+/// skipped with a log line.
+pub fn reconcile_after_restart(db: &Database) -> Result<Vec<String>, ReconciliationFailed> {
+    let fail = |what: &str, e: &dyn std::fmt::Display| {
+        ReconciliationFailed(format!("task restart reconciliation failed ({what}): {e}"))
+    };
     let mut out = Vec::new();
     let statuses = reconcilable_statuses();
     let placeholders = statuses.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let stale: Vec<(String, String)> = match db.conn().prepare(&format!(
-        "SELECT id, status FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at"
-    )) {
-        Ok(mut stmt) => {
-            let rows = stmt.query_map(rusqlite::params_from_iter(statuses.iter()), |r| {
+    let stale: Vec<(String, String)> = {
+        let mut stmt = db
+            .conn()
+            .prepare(&format!(
+                "SELECT id, status FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at"
+            ))
+            .map_err(|e| fail("prepare", &e))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(statuses.iter()), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            });
-            match rows {
-                Ok(rows) => rows.filter_map(Result::ok).collect(),
-                Err(e) => {
-                    eprintln!("sandpane-service: reconciliation query failed: {e}");
-                    return out;
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("sandpane-service: reconciliation prepare failed: {e}");
-            return out;
-        }
+            })
+            .map_err(|e| fail("query", &e))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| fail("read row", &e))?
     };
     for (task_id, status_str) in stale {
         let Ok(status) =
@@ -374,17 +413,17 @@ pub fn reconcile_after_restart(db: &Database) -> Vec<String> {
         };
         let mut machine = TaskStateMachine::from_status(status);
         if machine.transition(TaskStatus::Interrupted).is_err() {
-            eprintln!("sandpane-service: reconciliation refused for {task_id} ({status_str})");
-            continue;
+            // Unreachable: `reconcilable_statuses` is derived from the same
+            // table. Refusing here would be a state-machine bug, not data.
+            return Err(ReconciliationFailed(format!(
+                "task restart reconciliation refused for {task_id} ({status_str})"
+            )));
         }
         let now = now_rfc3339();
-        let tx = match db.conn().unchecked_transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                eprintln!("sandpane-service: reconciliation tx begin failed: {e}");
-                continue;
-            }
-        };
+        let tx = db
+            .conn()
+            .unchecked_transaction()
+            .map_err(|e| fail("begin", &e))?;
         let step = (|| -> Result<(), sandpane_core::DbError> {
             let log = EventLog::from_conn(&tx);
             log.append(
@@ -399,11 +438,9 @@ pub fn reconcile_after_restart(db: &Database) -> Vec<String> {
             )?;
             Ok(())
         })();
-        let result = step.and_then(|()| tx.commit().map_err(sandpane_core::DbError::from));
-        match result {
-            Ok(()) => out.push(task_id),
-            Err(e) => eprintln!("sandpane-service: reconciliation of {task_id} failed: {e}"),
-        }
+        step.and_then(|()| tx.commit().map_err(sandpane_core::DbError::from))
+            .map_err(|e| fail(&format!("task {task_id}"), &e))?;
+        out.push(task_id);
     }
     if !out.is_empty() {
         eprintln!(
@@ -412,7 +449,274 @@ pub fn reconcile_after_restart(db: &Database) -> Vec<String> {
             out.join(", ")
         );
     }
-    out
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency keys (A2, design 2026-10-09 §3.1)
+//
+// INVARIANT: a replay — any request whose key is already stored — never runs
+// sbx and never writes a second message/task/event. It is answered from the
+// `idempotency_keys` row alone: the stored result (`done`, same params) or one
+// of the three CONFLICT messages below. No new error code is introduced.
+// ---------------------------------------------------------------------------
+
+pub const IDEM_MSG_MISMATCH: &str =
+    "idempotency key was already used with different parameters; nothing was run";
+pub const IDEM_MSG_PENDING: &str =
+    "an operation with this idempotency key is still in progress; nothing was run";
+pub const IDEM_MSG_UNKNOWN: &str = "the outcome of the earlier request with this idempotency key \
+     is unknown (Core restarted or sbx failed while it ran); re-read state before retrying with \
+     a new key";
+
+/// Startup half of §3.1 items 6 and 8: `pending` → `unknown`, then prune.
+///
+/// FAIL CLOSED (review W3): if `pending` rows cannot be marked `unknown`,
+/// this is an error and Core does not serve — a dead Core's claim would
+/// otherwise read as "in progress" (or, after expiry, as free). A failed
+/// PRUNE only logs: it deletes old `done`/`unknown` rows, so leaving them
+/// changes nothing a client can observe except the table size, and the next
+/// claim prunes again.
+pub fn reconcile_idempotency_after_restart(db: &Database) -> Result<(), ReconciliationFailed> {
+    let now = now_rfc3339();
+    match idempotency::reconcile_pending_to_unknown(db.conn(), &now) {
+        Ok(0) => {}
+        Ok(n) => eprintln!(
+            "sandpane-service: {n} idempotency key(s) were in flight when Core stopped; \
+             marked unknown (refused with that key for the 24 h retention window)"
+        ),
+        Err(e) => {
+            return Err(ReconciliationFailed(format!(
+                "idempotency restart reconciliation failed (pending -> unknown): {e}"
+            )))
+        }
+    }
+    if let Err(e) = idempotency::prune(db.conn(), &idempotency_cutoff(), idempotency::MAX_ROWS) {
+        eprintln!(
+            "sandpane-service: idempotency retention prune failed: {e} \
+             (expired keys kept; the next keyed request prunes again)"
+        );
+    }
+    Ok(())
+}
+
+/// RFC 3339 instant before which stored keys are expired (24 h).
+fn idempotency_cutoff() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    rfc3339_from_unix(now.saturating_sub(idempotency::RETENTION_SECS))
+}
+
+/// A validated key plus the fingerprint of the typed params it guards.
+struct KeyedCall {
+    method: &'static str,
+    key: String,
+    hash: String,
+}
+
+/// Validate `key` (VALIDATION_FAILED before anything runs) and fingerprint
+/// the typed params. `without_key` must be the params with the key removed.
+fn keyed_call<T: serde::Serialize>(
+    method: Method,
+    key: Option<&str>,
+    without_key: &T,
+) -> Result<Option<KeyedCall>, SvcFailure> {
+    let Some(key) = key else { return Ok(None) };
+    Validator::idempotency_key(key).map_err(|e| {
+        SvcFailure::from((ErrorCode::ValidationFailed, format!("idempotencyKey: {e}")))
+    })?;
+    let hash = idempotency::fingerprint(without_key).map_err(internal)?;
+    Ok(Some(KeyedCall {
+        method: method.as_str(),
+        key: key.to_string(),
+        hash,
+    }))
+}
+
+impl KeyedCall {
+    /// The stored answer for this key, or `None` when the key is free.
+    fn stored_answer(&self, inner: &ServerInner) -> Option<Result<serde_json::Value, SvcFailure>> {
+        let found = {
+            let db = inner.lock_db();
+            idempotency::lookup(db.conn(), self.method, &self.key, &self.hash)
+        };
+        let conflict = |m: &str| Some(Err(SvcFailure::from((ErrorCode::Conflict, m.to_string()))));
+        match found {
+            Err(e) => Some(Err(internal(e).into())),
+            Ok(Lookup::Absent) => None,
+            Ok(Lookup::Done(json)) => Some(replay_of(&json)),
+            Ok(Lookup::ParamsMismatch) => conflict(IDEM_MSG_MISMATCH),
+            Ok(Lookup::Pending) => conflict(IDEM_MSG_PENDING),
+            Ok(Lookup::Unknown) => conflict(IDEM_MSG_UNKNOWN),
+        }
+    }
+
+    /// After losing an insert race the row exists: answer from it. (Absent
+    /// again would mean it was released meanwhile — reported as in progress
+    /// rather than re-run.)
+    fn answer_after_race(&self, inner: &ServerInner) -> Result<serde_json::Value, SvcFailure> {
+        self.stored_answer(inner).unwrap_or_else(|| {
+            Err(SvcFailure::from((
+                ErrorCode::Conflict,
+                IDEM_MSG_PENDING.to_string(),
+            )))
+        })
+    }
+}
+
+/// A replay (review W1): the FIRST response exactly as stored, plus
+/// `"replayed": true`. The stored JSON never carries the marker (the first
+/// response serializes `replayed: None` as absent), so it is added here and
+/// only here. A replay is not current state: clients re-read with
+/// `task.list` / `sandbox.list`.
+fn replay_of(stored: &str) -> Result<serde_json::Value, SvcFailure> {
+    let mut v: serde_json::Value = serde_json::from_str(stored).map_err(|e| {
+        SvcFailure::from(internal(format!(
+            "stored idempotent result unreadable: {e}"
+        )))
+    })?;
+    match v.as_object_mut() {
+        Some(obj) => {
+            obj.insert("replayed".to_string(), serde_json::Value::Bool(true));
+            Ok(v)
+        }
+        None => Err(internal("stored idempotent result is not an object").into()),
+    }
+}
+
+/// A committed `pending` claim (`sandbox.create`, §3.1 item 4). Resolved
+/// explicitly — `done` inside the binding transaction ([`Self::disarm`]
+/// afterwards), [`Self::release`] when nothing ran, [`Self::unknown`] when sbx
+/// may have acted. BACKSTOP: dropped unresolved (a panic mid-operation),
+/// it marks the row `unknown`, so it is not reported as "in progress" for
+/// the life of the process and is not re-run with that key within the 24 h
+/// retention window.
+struct PendingClaim<'a> {
+    inner: &'a ServerInner,
+    method: &'static str,
+    key: String,
+    resolved: bool,
+}
+
+enum ClaimOutcome<'a> {
+    Claimed(PendingClaim<'a>),
+    /// Lost the race to a concurrent request: its stored answer.
+    Answered(Result<serde_json::Value, SvcFailure>),
+}
+
+impl KeyedCall {
+    /// Prune, then commit a `pending` claim — a short transaction of its own;
+    /// the DB lock is released before any subprocess runs.
+    fn claim<'a>(&self, inner: &'a ServerInner) -> Result<ClaimOutcome<'a>, SvcFailure> {
+        let won = {
+            let db = inner.lock_db();
+            let tx = db.conn().unchecked_transaction().map_err(internal)?;
+            idempotency::prune(&tx, &idempotency_cutoff(), idempotency::MAX_ROWS)
+                .map_err(internal)?;
+            let won = idempotency::claim(&tx, self.method, &self.key, &self.hash, &now_rfc3339())
+                .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+            won
+        };
+        if !won {
+            return Ok(ClaimOutcome::Answered(self.answer_after_race(inner)));
+        }
+        Ok(ClaimOutcome::Claimed(PendingClaim {
+            inner,
+            method: self.method,
+            key: self.key.clone(),
+            resolved: false,
+        }))
+    }
+}
+
+impl PendingClaim<'_> {
+    /// Nothing ran: delete the claim so the key stays retryable.
+    ///
+    /// On failure the row stays `pending` — FAIL CLOSED: the key is refused
+    /// as "in progress" (nothing re-runs) until restart reconciliation marks
+    /// it `unknown`.
+    fn release(mut self) {
+        self.resolved = true;
+        let db = self.inner.lock_db();
+        if let Err(e) = idempotency::release(db.conn(), self.method, &self.key) {
+            eprintln!(
+                "sandpane-service: releasing idempotency claim for {} failed: {e}; the key stays \
+                 pending (refused as in progress, nothing re-runs) until Core restarts and marks \
+                 it unknown",
+                self.method
+            );
+        }
+    }
+
+    /// sbx may have acted: `unknown` — refused with this key within the 24 h
+    /// retention window.
+    fn unknown(mut self) {
+        self.resolved = true;
+        mark_claim_unknown(self.inner, self.method, &self.key);
+    }
+
+    /// Completed as `done` inside the caller's transaction.
+    fn disarm(mut self) {
+        self.resolved = true;
+    }
+}
+
+impl Drop for PendingClaim<'_> {
+    fn drop(&mut self) {
+        if !self.resolved {
+            mark_claim_unknown(self.inner, self.method, &self.key);
+        }
+    }
+}
+
+/// On failure the row stays `pending` — FAIL CLOSED: refused as "in
+/// progress" (nothing re-runs) until restart reconciliation marks it
+/// `unknown` (and if THAT fails, Core refuses to start).
+fn mark_claim_unknown(inner: &ServerInner, method: &str, key: &str) {
+    let db = inner.lock_db();
+    if let Err(e) = idempotency::mark_unknown(db.conn(), method, key, &now_rfc3339()) {
+        eprintln!(
+            "sandpane-service: marking idempotency claim for {method} unknown failed: {e}; the \
+             key stays pending (refused as in progress, nothing re-runs) until Core restarts and \
+             marks it unknown"
+        );
+    }
+}
+
+/// The send-side write (§3.1 item 3): inserted as `done` INSIDE
+/// `write_new_task`'s transaction.
+pub(crate) struct KeyedWrite<'a> {
+    method: &'static str,
+    key: &'a str,
+    hash: &'a str,
+    result_json: String,
+}
+
+/// Why a task write produced nothing (review I4: a typed variant, not a
+/// message match).
+#[derive(Debug)]
+enum TaskWriteError {
+    /// An ordinary failure, sent to the client as is.
+    Failed(SvcFailure),
+    /// `write_new_task` lost the key insert race to a concurrent request with
+    /// the same key and rolled the WHOLE write back. Never sent to a client:
+    /// the caller re-answers from the winner's row.
+    KeyRace,
+}
+
+impl From<SvcFailure> for TaskWriteError {
+    fn from(f: SvcFailure) -> Self {
+        Self::Failed(f)
+    }
+}
+
+impl From<SvcError> for TaskWriteError {
+    fn from(e: SvcError) -> Self {
+        Self::Failed(e.into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +1093,8 @@ fn system_probe(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
             .into_iter()
             .map(str::to_string)
             .collect(),
+        // Derived from the single const list, like `methods` (A2).
+        features: sandpane_protocol::feature_names(),
     };
     serde_json::to_value(caps).map_err(internal)
 }
@@ -1010,6 +1316,8 @@ fn summarize(e: SbxListEntry, bindings: &HashMap<String, Vec<BindingRow>>) -> Sa
         workspace_mode: binding.and_then(|b| workspace_mode_from_stored(&b.mode)),
         agent: e.agent,
         name: e.name,
+        // Live state, never a replay.
+        replayed: None,
     }
 }
 
@@ -1086,6 +1394,17 @@ fn sandbox_create(
     inner: &ServerInner,
     spec: SandboxCreateSpec,
 ) -> Result<serde_json::Value, SvcFailure> {
+    // A2 §3.1 item 4, step 1 (validate) — the key first, so an invalid key is
+    // VALIDATION_FAILED before anything else is read or run.
+    let keyed = {
+        let mut without_key = spec.clone();
+        without_key.idempotency_key = None;
+        keyed_call(
+            Method::SandboxCreate,
+            spec.idempotency_key.as_deref(),
+            &without_key,
+        )?
+    };
     Validator::sandbox_name(&spec.name).map_err(|e| {
         SvcFailure::from((ErrorCode::ValidationFailed, format!("sandbox name: {e}")))
     })?;
@@ -1201,17 +1520,89 @@ fn sandbox_create(
             )));
         }
     }
-    // Held until this function returns (through the binding insert), so a
-    // confirmed remove of the same name cannot interleave (review W2).
+    // Step 2: look the key up BEFORE the name lock, so a replay of a finished
+    // create returns the stored result rather than CONFLICT (and runs nothing).
+    if let Some(kc) = &keyed {
+        if let Some(answer) = kc.stored_answer(inner) {
+            return answer;
+        }
+    }
+    // Step 3: held until this function returns (through the binding insert),
+    // so a confirmed remove of the same name cannot interleave (review W2).
+    //
+    // Review I5: two CONCURRENT creates with the same key and the same name
+    // both pass step 2 (nothing stored yet); the one that loses THIS lock
+    // gets A1's CONFLICT "another operation on sandbox … is in progress;
+    // nothing was run" — not the key's stored result, which does not exist
+    // until the winner finishes. Nothing runs twice either way; a retry after
+    // the winner completes is a replay.
     let _name_claim = claim_sandbox_name(inner, &spec.name)?;
-    let program = locate_sbx(inner)?;
-    let workspace = match (&spec.workspace_mode, mount.as_deref()) {
+    // Step 4: commit a `pending` claim (its own short transaction).
+    let pending = match &keyed {
+        None => None,
+        Some(kc) => match kc.claim(inner)? {
+            ClaimOutcome::Claimed(p) => Some(p),
+            ClaimOutcome::Answered(answer) => return answer,
+        },
+    };
+    // Steps 5-6: run `sbx create`, then bind + complete the claim together.
+    let completion = keyed.as_ref().map(|kc| (kc.method, kc.key.as_str()));
+    match create_and_bind(inner, &spec, agent, mount.as_deref(), completion) {
+        Ok(v) => {
+            if let Some(p) = pending {
+                p.disarm();
+            }
+            Ok(v)
+        }
+        // §3.1 item 7: only a failure KNOWN to precede the subprocess frees
+        // the key; anything after `sbx create` started may have created the
+        // sandbox, so the key becomes `unknown` and is never run twice.
+        Err(CreateFailure::BeforeStart(f)) => {
+            if let Some(p) = pending {
+                p.release();
+            }
+            Err(f)
+        }
+        Err(CreateFailure::AfterStart(f)) => {
+            if let Some(p) = pending {
+                p.unknown();
+            }
+            Err(f)
+        }
+    }
+}
+
+/// Where a `sandbox.create` failure happened relative to the subprocess.
+enum CreateFailure {
+    /// Nothing ran (sbx not located, argv refused, spawn failed).
+    BeforeStart(SvcFailure),
+    /// `sbx create` started: it may have created the sandbox.
+    AfterStart(SvcFailure),
+}
+
+/// Run `sbx create`, re-query, then write the binding — and, when keyed,
+/// complete the `pending` claim as `done` with the exact result IN THE SAME
+/// TRANSACTION. No DB lock is held while sbx runs.
+fn create_and_bind(
+    inner: &ServerInner,
+    spec: &SandboxCreateSpec,
+    agent: &str,
+    mount: Option<&Path>,
+    completion: Option<(&str, &str)>,
+) -> Result<serde_json::Value, CreateFailure> {
+    use CreateFailure::{AfterStart, BeforeStart};
+    let program = locate_sbx(inner).map_err(BeforeStart)?;
+    let workspace = match (&spec.workspace_mode, mount) {
         (WorkspaceMode::DirectMount, Some(p)) => SbxWorkspace::BindMount(p),
         (WorkspaceMode::SbxClone, Some(p)) => SbxWorkspace::Clone(p),
         _ => SbxWorkspace::None,
     };
-    let cmd = SbxCommandBuilder::create(&program, &spec.name, agent, workspace)
-        .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, e.to_string())))?;
+    let cmd = SbxCommandBuilder::create(&program, &spec.name, agent, workspace).map_err(|e| {
+        BeforeStart(SvcFailure::from((
+            ErrorCode::ValidationFailed,
+            e.to_string(),
+        )))
+    })?;
     let probed = match cmd.run(&inner.sbx_limits.mutation) {
         Ok(out) if out.status.success() => {
             // RE-QUERY after mutation: exit 0 never means desired state
@@ -1223,7 +1614,9 @@ fn sandbox_create(
             // PROVIDER_AUTH_REQUIRED, policy not initialized →
             // PERMISSION_DENIED with the `sbx policy init …` remediation, etc.
             // (review 0015 bug 5).
-            return Err(classify_failure(&out.status.to_string(), &out.stderr_lossy()).into());
+            return Err(AfterStart(
+                classify_failure(&out.status.to_string(), &out.stderr_lossy()).into(),
+            ));
         }
         Err(sandpane_core::process::ProcessError::TimedOut(after)) => {
             // Review S-c: the create was killed at its deadline (or a
@@ -1241,56 +1634,81 @@ fn sandbox_create(
                     Some(entry)
                 }
                 None => {
-                    return Err(SvcFailure::from((
+                    return Err(AfterStart(SvcFailure::from((
                         ErrorCode::Internal,
                         format!(
                             "sbx create timed out after {after:?} and sandbox {:?} is not \
                              present on re-query",
                             spec.name
                         ),
-                    )))
+                    ))))
                 }
             }
         }
-        Err(e) => return Err(process_failure("sbx create", e)),
+        // Could not even start: nothing ran.
+        Err(e @ sandpane_core::process::ProcessError::Spawn(_)) => {
+            return Err(BeforeStart(process_failure("sbx create", e)))
+        }
+        Err(e) => return Err(AfterStart(process_failure("sbx create", e))),
     };
-    {
-        let db = inner.lock_db();
-        // Bare wire name (snake_case, unquoted) — matches tasks.status storage
-        // so P3/P5 can query live-writable workspaces by mode.
-        let mode_str = workspace_mode_wire(&spec.workspace_mode).to_string();
-        db.conn()
-            .execute(
-                "INSERT INTO sandbox_bindings
-                     (id, project_id, sandbox_name, workspace_mode, created_at, sbx_id)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    uuid::Uuid::new_v4().to_string(),
-                    spec.project_id,
-                    spec.name,
-                    mode_str,
-                    now_rfc3339(),
-                    // The identity sbx reports on the re-query (shape-checked
-                    // at parse). NULL when it could not be probed: such a row
-                    // is then treated like a pre-A1 one, never as a match.
-                    probed.as_ref().and_then(|e| e.id.clone())
-                ],
-            )
-            .map_err(internal)?;
-    }
     let summary = SandboxSummary {
-        name: spec.name,
+        name: spec.name.clone(),
         probed_state: probed.as_ref().map(|e| e.status.as_str().to_string()),
-        bound_project_id: Some(spec.project_id),
+        bound_project_id: Some(spec.project_id.clone()),
         // The mode Core just recorded for this binding — the caller asked for
         // it explicitly, so it is a fact, not a guess (specs/02 §7:
         // direct_mount is live-writable).
         workspace_mode: Some(spec.workspace_mode),
         // What sbx REPORTS on the re-query (absent when not listed) — a probed
         // fact, not a verification claim.
-        agent: probed.and_then(|e| e.agent),
+        agent: probed.as_ref().and_then(|e| e.agent.clone()),
+        // The FIRST response: stored without the replay marker (W1).
+        replayed: None,
     };
-    serde_json::to_value(summary).map_err(|e| internal(e).into())
+    let value = serde_json::to_value(&summary).map_err(|e| AfterStart(internal(e).into()))?;
+    let write = || -> Result<(), SvcError> {
+        let db = inner.lock_db();
+        let tx = db.conn().unchecked_transaction().map_err(internal)?;
+        let now = now_rfc3339();
+        // Bare wire name (snake_case, unquoted) — matches tasks.status storage
+        // so P3/P5 can query live-writable workspaces by mode.
+        let mode_str = workspace_mode_wire(&spec.workspace_mode).to_string();
+        tx.execute(
+            "INSERT INTO sandbox_bindings
+                 (id, project_id, sandbox_name, workspace_mode, created_at, sbx_id)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                spec.project_id,
+                spec.name,
+                mode_str,
+                now,
+                // The identity sbx reports on the re-query (shape-checked at
+                // parse). NULL when it could not be probed: such a row is then
+                // treated like a pre-A1 one, never as a match.
+                probed.as_ref().and_then(|e| e.id.clone())
+            ],
+        )
+        .map_err(internal)?;
+        if let Some((method, key)) = completion {
+            if !idempotency::complete(&tx, method, key, &value.to_string(), &now)
+                .map_err(internal)?
+            {
+                // The claim is no longer pending (cannot normally happen:
+                // pending rows are never pruned). The sandbox exists, so the
+                // binding is still committed; the key stays as it is.
+                eprintln!(
+                    "sandpane-service: idempotency claim for sandbox {:?} was not pending at \
+                     completion; binding recorded, key left unchanged",
+                    spec.name
+                );
+            }
+        }
+        tx.commit().map_err(internal)?;
+        Ok(())
+    };
+    write().map_err(|e| AfterStart(e.into()))?;
+    Ok(value)
 }
 
 /// Bare snake_case wire name for a workspace mode (no JSON quotes).
@@ -1769,6 +2187,23 @@ pub fn create_task(
     content: &str,
     workspace: Option<TaskWorkspaceRequest>,
 ) -> Result<TaskSummary, SvcFailure> {
+    create_task_keyed(inner, conversation_id, content, workspace, None).map_err(|e| match e {
+        TaskWriteError::Failed(f) => f,
+        // Unkeyed writes insert no key row, so they cannot lose a key race.
+        TaskWriteError::KeyRace => internal("unkeyed task write reported a key race").into(),
+    })
+}
+
+/// [`create_task`] with an optional A2 key: its `done` row (holding the
+/// returned `TaskSummary`) is written in the SAME transaction as the
+/// message, task and event rows (§3.1 item 3).
+fn create_task_keyed(
+    inner: &ServerInner,
+    conversation_id: &str,
+    content: &str,
+    workspace: Option<TaskWorkspaceRequest>,
+    keyed: Option<&KeyedCall>,
+) -> Result<TaskSummary, TaskWriteError> {
     Validator::display_text(content, 64 * 1024)
         .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, format!("content: {e}"))))?;
     let (project_id, agent_id) = {
@@ -1791,7 +2226,35 @@ pub fn create_task(
         Some(req) => Some(prepare_task_workspace(inner, &project_id, &task_id, req)?),
     };
 
-    let written = write_new_task(inner, &task_id, conversation_id, content, prepared.as_ref());
+    // The result is fully determined before the write, so the key row can
+    // carry it inside the same transaction.
+    let summary = TaskSummary {
+        id: task_id.clone(),
+        conversation_id: conversation_id.to_string(),
+        status: TaskStatus::Queued,
+        sandbox_name: None,
+        task_branch: prepared.as_ref().and_then(|p| p.task_branch.clone()),
+        base_commit: prepared.as_ref().and_then(|p| p.base_commit.clone()),
+        // The FIRST response: stored without the replay marker (W1).
+        replayed: None,
+    };
+    let keyed_write = match keyed {
+        None => None,
+        Some(kc) => Some(KeyedWrite {
+            method: kc.method,
+            key: &kc.key,
+            hash: &kc.hash,
+            result_json: serde_json::to_string(&summary).map_err(internal)?,
+        }),
+    };
+    let written = write_new_task(
+        inner,
+        &task_id,
+        conversation_id,
+        content,
+        prepared.as_ref(),
+        keyed_write.as_ref(),
+    );
     if let Err(e) = written {
         if let (Some(p), Some(root)) = (&prepared, &inner.worktrees_root) {
             if let (Some(repo), Some(wt), Some(branch), Some(base)) = (
@@ -1810,7 +2273,7 @@ pub fn create_task(
                 }
             }
         }
-        return Err(e.into());
+        return Err(e);
     }
 
     // Admission is policy-only in the scaffold: no verified agent adapter
@@ -1874,14 +2337,7 @@ pub fn create_task(
         }
     }
 
-    Ok(TaskSummary {
-        id: task_id,
-        conversation_id: conversation_id.to_string(),
-        status: TaskStatus::Queued,
-        sandbox_name: None,
-        task_branch: prepared.as_ref().and_then(|p| p.task_branch.clone()),
-        base_commit: prepared.as_ref().and_then(|p| p.base_commit.clone()),
-    })
+    Ok(summary)
 }
 
 /// A task's resolved Git context, ready to be stored.
@@ -2055,7 +2511,8 @@ fn write_new_task(
     conversation_id: &str,
     content: &str,
     prepared: Option<&PreparedWorkspace>,
-) -> Result<(), SvcError> {
+    keyed: Option<&KeyedWrite<'_>>,
+) -> Result<(), TaskWriteError> {
     let now = now_rfc3339();
     let mut machine = TaskStateMachine::new();
     // created -> queued is decided up front (pure logic) so the whole write
@@ -2147,6 +2604,19 @@ fn write_new_task(
             params![task_id, now],
         )
         .map_err(internal)?;
+        if let Some(k) = keyed {
+            // A2 §3.1 items 3 and 8: retention, then the `done` row — in this
+            // same transaction, so a crash leaves both or neither. Losing the
+            // insert race returns early: `tx` drops and EVERYTHING above
+            // rolls back.
+            idempotency::prune(&tx, &idempotency_cutoff(), idempotency::MAX_ROWS)
+                .map_err(internal)?;
+            if !idempotency::insert_done(&tx, k.method, k.key, k.hash, &k.result_json, &now)
+                .map_err(internal)?
+            {
+                return Err(TaskWriteError::KeyRace);
+            }
+        }
     }
     tx.commit().map_err(internal)?;
     Ok(())
@@ -2408,10 +2878,33 @@ fn conversation_send(
     inner: &ServerInner,
     p: ConversationSendParams,
 ) -> Result<serde_json::Value, SvcFailure> {
+    let keyed = {
+        let mut without_key = p.clone();
+        without_key.idempotency_key = None;
+        keyed_call(
+            Method::ConversationSend,
+            p.idempotency_key.as_deref(),
+            &without_key,
+        )?
+    };
+    // A replay is answered from the key row alone: nothing is written.
+    if let Some(kc) = &keyed {
+        if let Some(answer) = kc.stored_answer(inner) {
+            return answer;
+        }
+    }
     // Protocol v1 carries no workspace selection, so the wire path creates a
     // task WITHOUT Git context — never an implied worktree or live mount.
-    let summary = create_task(inner, &p.conversation_id, &p.content, None)?;
-    serde_json::to_value(summary).map_err(|e| internal(e).into())
+    match create_task_keyed(inner, &p.conversation_id, &p.content, None, keyed.as_ref()) {
+        Ok(summary) => serde_json::to_value(summary).map_err(|e| internal(e).into()),
+        // Lost the key insert race: the whole write rolled back; answer from
+        // the winner's row (a replay, or CONFLICT if it is not `done`).
+        Err(TaskWriteError::KeyRace) => match &keyed {
+            Some(kc) => kc.answer_after_race(inner),
+            None => Err(internal("unkeyed task write reported a key race").into()),
+        },
+        Err(TaskWriteError::Failed(f)) => Err(f),
+    }
 }
 
 fn task_cancel(inner: &ServerInner, task_id: String) -> Result<serde_json::Value, SvcError> {
@@ -2611,6 +3104,8 @@ fn task_list(inner: &ServerInner, p: TaskListParams) -> Result<serde_json::Value
             id: id.clone(),
             conversation_id,
             status: task_status_from_stored(&stored_status, &id)?,
+            // Live state, never a replay.
+            replayed: None,
         });
     }
     serde_json::to_value(out).map_err(internal)
@@ -3190,6 +3685,43 @@ mod tests {
         .join();
         assert!(r.is_err());
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    /// A2 backstop: a handler that panics while holding an unresolved
+    /// `pending` claim leaves the key `unknown` (refused), never `pending`
+    /// for the life of the process and never free to re-run.
+    #[test]
+    fn a_claim_dropped_by_a_panic_is_marked_unknown() {
+        let i = inner();
+        let kc = KeyedCall {
+            method: "sandbox.create",
+            key: "boom".into(),
+            hash: "h".into(),
+        };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ClaimOutcome::Claimed(_claim) = kc.claim(&i).unwrap() else {
+                panic!("expected a fresh claim");
+            };
+            panic!("handler bug mid-create");
+        }));
+        assert!(r.is_err());
+        let state: String = i
+            .lock_db()
+            .conn()
+            .query_row(
+                "SELECT state FROM idempotency_keys WHERE method='sandbox.create' AND key='boom'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "unknown");
+        match kc.stored_answer(&i) {
+            Some(Err(f)) => {
+                assert_eq!(f.code, ErrorCode::Conflict);
+                assert_eq!(f.message, IDEM_MSG_UNKNOWN);
+            }
+            other => panic!("expected the unknown CONFLICT, got {other:?}"),
+        }
     }
 
     #[test]

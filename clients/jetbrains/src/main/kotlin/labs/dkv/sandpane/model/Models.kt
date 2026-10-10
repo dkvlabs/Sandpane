@@ -272,8 +272,18 @@ data class CoreCapabilities(
      * **"not advertised"**, never "everything".
      */
     val methods: List<String> = emptyList(),
+    /**
+     * A2, additive: optional protocol behaviours this Core implements, which a client cannot infer
+     * from [methods] (a pre-A2 Core silently drops an unknown request field). Absent on an older
+     * Core ⇒ EMPTY ⇒ nothing advertised. Deliberately a list of plain strings, not an enum: a feature
+     * this build does not know is simply ignored, never a decode failure ([CoreFeatures]).
+     */
+    val features: List<String> = emptyList(),
 ) {
     val versionCompatible: Boolean get() = protocolVersion == PROTOCOL_VERSION
+
+    /** Does THIS Core advertise the protocol feature [name]? Unknown names are just "no". */
+    fun hasFeature(name: String): Boolean = features.contains(name)
 
     /**
      * Feature discovery: does THIS Core advertise `method`? A version number is not evidence —
@@ -352,6 +362,13 @@ data class SandboxCreateSpec(
      * ([labs.dkv.sandpane.core.CoreGuards.optionalSbxAgent]) and by Core again.
      */
     val agent: String? = null,
+    /**
+     * A2, additive: retry-safety key, sent ONLY when Core advertises [CoreFeatures.IDEMPOTENCY_KEYS]
+     * (a pre-A2 Core would silently drop it and promise a safety it does not have). NULL keeps the key
+     * off the wire. One fresh key per user action; only an explicit "Retry safely" reuses it
+     * ([labs.dkv.sandpane.core.IdempotencyKeys]).
+     */
+    @SerialName("idempotencyKey") val idempotencyKey: String? = null,
 )
 
 /**
@@ -415,6 +432,13 @@ data class SandboxSummary(
      * sbx reported none or the Core predates A1; shown as "not reported", never guessed.
      */
     val agent: String? = null,
+    /**
+     * A2, additive: `true` when this is Core's STORED first response to an earlier identical keyed
+     * `sandbox.create`, returned instead of running again. It is NOT current state (the sandbox may
+     * since have been stopped or removed): the UI shows the replay notice and re-reads `sandbox.list`.
+     * Absent on a first response.
+     */
+    val replayed: Boolean? = null,
 ) {
     /** Presentation of the mode exactly as Core reported it (absent ⇒ unverified, never safe). */
     fun modeView(): WorkspaceModeView = WorkspaceModeView.forSandbox(this)
@@ -423,6 +447,21 @@ data class SandboxSummary(
 /** `sandbox.stop` params (A1). Not destructive: no confirmation token. */
 @Serializable
 data class SandboxStopParams(val name: String)
+
+/**
+ * The protocol features this client build knows (A2; mirror of `sandpane_protocol::FEATURES` and the
+ * `features.items.examples` of `schemas/core-capabilities.schema.json`, pinned together by
+ * `ProtocolDriftGuardTest`). Any other string a Core advertises is ignored.
+ */
+object CoreFeatures {
+    /** `sandbox.create` / `conversation.send` honour `idempotencyKey` (design 2026-10-09 §3.1). */
+    const val IDEMPOTENCY_KEYS: String = "idempotency-keys"
+
+    /** `sandbox.create` honours `agent` (A1). Replaces the old "sandbox.remove is advertised" inference. */
+    const val SANDBOX_CREATE_AGENT: String = "sandbox-create-agent"
+
+    val KNOWN: List<String> = listOf(IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT)
+}
 
 /**
  * `sandbox.stop` result. `stopped: true` only says `sbx stop` exited 0. The state is whatever the
@@ -612,6 +651,8 @@ data class ConversationSendParams(
     @SerialName("conversationId") val conversationId: String,
     val content: String,
     val attachments: List<ContextRef> = emptyList(),
+    /** A2, additive: see [SandboxCreateSpec.idempotencyKey]; the same rules apply. */
+    @SerialName("idempotencyKey") val idempotencyKey: String? = null,
 )
 
 @Serializable
@@ -729,6 +770,12 @@ data class TaskSummary(
     @SerialName("sandboxName") val sandboxName: String? = null,
     @SerialName("taskBranch") val taskBranch: String? = null,
     @SerialName("baseCommit") val baseCommit: String? = null,
+    /**
+     * A2, additive: `true` when this is Core's STORED first answer to an earlier identical keyed
+     * `conversation.send`. Its [status] is what it was THEN (a `queued` task may since have been
+     * reconciled to `interrupted`), so it is never shown as current; the UI re-reads `task.list`.
+     */
+    val replayed: Boolean? = null,
 )
 
 // ---------------------------------------------------------------------------

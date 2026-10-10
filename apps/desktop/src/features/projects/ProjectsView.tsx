@@ -5,6 +5,7 @@ import {
   useProjects,
 } from "../../lib/hooks";
 import { describeCoreError } from "../../lib/reducers";
+import { RETRY_SAFELY_EXPLANATION, RETRY_SAFELY_LABEL } from "../../lib/idempotency";
 import {
   validateProjectName,
   validateRepositoryPaths,
@@ -237,7 +238,20 @@ export function ProjectsView({ route }: { route: Route }) {
   );
 }
 
-export function ErrorPanel({ error }: { error: CoreRequestError }) {
+/**
+ * One honest rendering of a request failure. `onRetrySafely` is passed ONLY
+ * when the failed request carried an idempotency key and its outcome is
+ * unknown (`retrySafelyOffered`): the button then resends the identical
+ * request with the same key, as an explicit user action. Without it, the
+ * existing "re-read state first" copy stands alone.
+ */
+export function ErrorPanel({
+  error,
+  onRetrySafely,
+}: {
+  error: CoreRequestError;
+  onRetrySafely?: () => void;
+}) {
   const copy = describeCoreError(error);
   return (
     <Warning tone={copy.tone} title={copy.title}>
@@ -252,6 +266,12 @@ export function ErrorPanel({ error }: { error: CoreRequestError }) {
           <strong>Core suggests:</strong> <Mono>{copy.hint}</Mono>
           {copy.provider !== undefined ? ` (${copy.provider})` : ""}; run it yourself in a
           terminal — Sandpane never runs it for you.
+        </p>
+      )}
+      {onRetrySafely !== undefined && (
+        <p>
+          <Button onClick={onRetrySafely}>{RETRY_SAFELY_LABEL}</Button>{" "}
+          <span className="muted">{RETRY_SAFELY_EXPLANATION}</span>
         </p>
       )}
     </Warning>

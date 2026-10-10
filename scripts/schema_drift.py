@@ -5,7 +5,8 @@ The Rust crate `core/crates/sandpane-protocol` is the source of truth and the
 JSON Schemas in `schemas/` are hand-synced (schemas/README.md). This script
 compares the exact WIRE VALUE SETS on both sides — methods, the advertised
 capability set (`Method::ALL`, which backs `core-capabilities.methods`), error
-codes, agent event types, file change statuses, workspace modes, protocol
+codes, agent event types, file change statuses, workspace modes, advertised
+optional features (`FEATURES` -> `core-capabilities.features`), protocol
 version — and fails on any mismatch so drift cannot hide. Every comparison is a
 value SET (adding a method on both sides keeps the gate green; a value missing
 on either side fails it), never a hard-coded snapshot. Field-level shapes
@@ -28,6 +29,8 @@ RUST_WIRE = r'Self::\w+ => "([^"]+)"'
 # names (the set `system.probe` advertises as `methods`).
 RUST_WIRE_ARM = r'Self::(\w+) => "([^"]+)"'
 RUST_METHOD_ALL = r"pub const ALL: \[Method; \d+\] = \[(.*?)\n\s*\];"
+# The single list `system.probe` advertises as `core-capabilities.features`.
+RUST_FEATURES = r"pub const FEATURES: \[&str; \d+\] = \[(.*?)\];"
 
 # The protocol crate is a single lib.rs today; a module split must update this
 # path (that fails as exit 2 — "cannot read", not as fake drift).
@@ -131,6 +134,14 @@ def parse_rust(src: str) -> dict:
     change_statuses = {snake(v) for v in unit_variants(enum_body(src, "FileChangeStatus"), "FileChangeStatus")}
     ws_modes = {snake(v) for v in unit_variants(enum_body(src, "WorkspaceMode"), "WorkspaceMode")}
 
+    m_feat = re.search(RUST_FEATURES, src, re.DOTALL)
+    if not m_feat:
+        raise HarnessError("FEATURES const not found in protocol source — update the checker")
+    feature_list = re.findall(r'"([^"]+)"', m_feat.group(1))
+    if len(feature_list) != len(set(feature_list)):
+        raise HarnessError(f"FEATURES contains duplicates: {feature_list}")
+    features = set(feature_list)
+
     m = re.search(r"pub const PROTOCOL_VERSION: u32 = (\d+)", src)
     if not m:
         raise HarnessError("PROTOCOL_VERSION constant not found in protocol source")
@@ -141,6 +152,7 @@ def parse_rust(src: str) -> dict:
         "agent_types": agent_types,
         "change_statuses": change_statuses,
         "ws_modes": ws_modes,
+        "features": features,
         "protocol_version": int(m.group(1)),
     }
 
@@ -172,6 +184,12 @@ def parse_schemas(schemas: dict) -> dict:
         lambda: set(schemas["sandbox-create-spec"]["properties"]["workspaceMode"]["enum"]),
         "sandbox-create-spec workspaceMode enum",
     )
+    # Deliberately `items.examples`, not an enum: clients must tolerate unknown
+    # feature strings, so the schema documents the set without constraining it.
+    features = need(
+        lambda: set(schemas["core-capabilities"]["properties"]["features"]["items"]["examples"]),
+        "core-capabilities features.items.examples",
+    )
     version = need(
         lambda: schemas["core-capabilities"]["properties"]["protocolVersion"]["const"],
         "core-capabilities protocolVersion const",
@@ -183,6 +201,7 @@ def parse_schemas(schemas: dict) -> dict:
         "event_codes": event_codes,
         "change_statuses": change_statuses,
         "ws_modes": ws_modes,
+        "features": features,
         "protocol_version": version,
     }
 
@@ -221,6 +240,7 @@ def main(repo_root: Path) -> int:
         ("agent event types (agent-event oneOf)", rust["agent_types"], sch["agent_types"]),
         ("file change statuses (change-set)", rust["change_statuses"], sch["change_statuses"]),
         ("workspace modes (sandbox-create-spec)", rust["ws_modes"], sch["ws_modes"]),
+        ("features (FEATURES -> core-capabilities.features)", rust["features"], sch["features"]),
     ]
 
     drifted = False

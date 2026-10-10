@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import {
   capabilitiesOf,
   useCoreLink,
-  useCreateSandbox,
+  useKeyedCreateSandbox,
   useProjects,
   useSandboxes,
 } from "../../lib/hooks";
@@ -15,6 +15,13 @@ import {
   type WorkspaceMode,
 } from "../../lib/protocol";
 import { agentFieldHonoured, sbxAgentOptions } from "../../lib/sandbox-lifecycle";
+import {
+  REPLAY_NOTICE,
+  REPLAY_UNCERTAIN_NOTICE,
+  forNewAction,
+  idempotencyKeysAdvertised,
+} from "../../lib/idempotency";
+import { KeyedWriteFailure } from "../ui/keyed-write";
 import {
   QUICK_STEPS,
   STEP_TITLES,
@@ -39,7 +46,6 @@ import {
   TextInput,
   Warning,
 } from "../ui/primitives";
-import { ErrorPanel } from "../../features/projects/ProjectsView";
 
 /**
  * Quick Create wizard: Project/workspace → Agent → Isolation → Review → Create
@@ -53,7 +59,7 @@ export function SandboxWizard() {
   const link = useCoreLink();
   const { projects } = useProjects();
   const { sandboxes } = useSandboxes();
-  const create = useCreateSandbox();
+  const { write: createWrite, state: create } = useKeyedCreateSandbox();
   const [draft, setDraft] = useState<SandboxDraft>(() => ({
     ...emptyDraft(),
     projectId: projects[0]?.id ?? "",
@@ -61,9 +67,11 @@ export function SandboxWizard() {
 
   const capabilities = capabilitiesOf(link);
   const agents = capabilities?.agents ?? [];
-  // A1 signal: a Core that advertises `sandbox.remove` also honours
-  // `SandboxCreateSpec.agent`. An older Core would silently ignore the key.
+  // `sandbox-create-agent` feature: Core honours `SandboxCreateSpec.agent`. A
+  // Core without it would silently ignore the key and create a shell sandbox.
   const sbxAgentHonoured = agentFieldHonoured(capabilities);
+  // `idempotency-keys` feature (A2): only then does a Create carry a key.
+  const keysAdvertised = idempotencyKeysAdvertised(capabilities);
 
   const context: WizardContext = useMemo(
     () => ({
@@ -207,9 +215,9 @@ export function SandboxWizard() {
           </Field>
           {!sbxAgentHonoured && (
             <Warning tone="neutral" title="Only shell is available with this Core">
-              This Core does not advertise <Mono>sandbox.remove</Mono>, the signal that it also
-              understands the sandbox agent choice. An older Core would silently ignore the choice
-              and create a shell sandbox, so the other agents are not supported by this Core.
+              This Core does not advertise the <Mono>sandbox-create-agent</Mono> feature. A Core
+              without it would silently ignore the choice and create a shell sandbox, so the other
+              agents are not supported by this Core.
             </Warning>
           )}
           {agents.length === 0 && (
@@ -343,16 +351,30 @@ export function SandboxWizard() {
           ))}
           <pre className="spec-preview">{JSON.stringify(trySpec(draft), null, 2)}</pre>
           <p className="muted">
-            This is the exact <Mono>sandbox.create</Mono> payload.{" "}
+            This is the exact <Mono>sandbox.create</Mono> payload
+            {keysAdvertised
+              ? ", plus a fresh random idempotencyKey minted when you click Create (this Core advertises idempotency-keys)."
+              : "."}{" "}
             {advanced ? "" : "No other fields are sent."}
           </p>
-          {create.isError && <ErrorPanel error={create.error} />}
-          {create.isSuccess && (
-            <Warning tone="success" title="Core accepted sandbox.create">
-              The list is re-read from SBX — Core re-queries after every mutation, so exit status
-              alone is never shown as the desired state.
-            </Warning>
+          {create.kind === "sending" && create.retry && (
+            <p className="muted" role="status">
+              Retrying safely — re-checking Core, then resending the identical spec with the same
+              key…
+            </p>
           )}
+          {create.kind === "failed" && <KeyedWriteFailure state={create} write={createWrite} />}
+          {create.kind === "succeeded" &&
+            (create.result.replayed === true || create.result.replayedUncertain === true ? (
+              <Warning tone="attention" title="Replayed result">
+                {create.result.replayed === true ? REPLAY_NOTICE : REPLAY_UNCERTAIN_NOTICE}
+              </Warning>
+            ) : (
+              <Warning tone="success" title="Core accepted sandbox.create">
+                The list is re-read from SBX — Core re-queries after every mutation, so exit status
+                alone is never shown as the desired state.
+              </Warning>
+            ))}
         </div>
       )}
 
@@ -370,10 +392,16 @@ export function SandboxWizard() {
         {atReview ? (
           <Button
             variant="primary"
-            disabled={Object.keys(errors).length > 0 || create.isPending}
-            onClick={() => create.mutate(trySpec(draft) ?? buildSpec(draft))}
+            disabled={Object.keys(errors).length > 0 || create.kind === "sending"}
+            onClick={() =>
+              // One Create click = one user action = one fresh key (A2), and
+              // no key at all when this Core does not advertise the feature.
+              void createWrite.submit(
+                forNewAction(trySpec(draft) ?? buildSpec(draft), keysAdvertised),
+              )
+            }
           >
-            {create.isPending ? "Creating…" : "Create sandbox"}
+            {create.kind === "sending" ? "Creating…" : "Create sandbox"}
           </Button>
         ) : (
           <Button

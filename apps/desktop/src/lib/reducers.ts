@@ -24,6 +24,7 @@ import type {
   WorkspaceMode,
 } from "./protocol";
 import { UNRECOGNIZED_CORE_CODE } from "./core-client";
+import { idempotencyConflictCopy, idempotencyConflictKind } from "./idempotency";
 import type { ProbeOutcome, CoreRequestError } from "./core-client";
 
 // ---------------------------------------------------------------------------
@@ -1800,6 +1801,46 @@ const CORE_ERROR_COPY: Record<ErrorCode, Omit<ErrorCopy, "reason">> = {
   },
 };
 
+/** A1's per-sandbox name lock (`claim_sandbox_name` in sandpane-service). */
+export const NAME_LOCK_PREFIX = "another operation on sandbox ";
+export const NAME_LOCK_SUFFIX = " is in progress; nothing was run";
+
+export function isNameLockConflict(message: string): boolean {
+  return message.startsWith(NAME_LOCK_PREFIX) && message.endsWith(NAME_LOCK_SUFFIX);
+}
+
+/** Copy for an unknown outcome when the request carried NO idempotency key. */
+export const UNKEYED_UNKNOWN_ACTION =
+  "Check state before trying again (this Core does not advertise idempotency keys, so a retry could run it twice).";
+/** Copy for an unknown outcome when the request carried an idempotency key. */
+export const KEYED_UNKNOWN_ACTION =
+  "Re-read state first. Retry safely resends the identical request with the same idempotency key, so Core will not run it twice.";
+
+/**
+ * The single unknown-outcome rendering. `details.idempotencyKeyed` is set by
+ * the client for `sandbox.create` / `conversation.send`; when it is absent
+ * (any other write) the generic "re-read state first" copy applies.
+ */
+function unknownOutcomeCopy(err: CoreRequestError): ErrorCopy {
+  const details = err.details;
+  const keyed =
+    typeof details === "object" && details !== null
+      ? (details as Record<string, unknown>).idempotencyKeyed
+      : undefined;
+  return {
+    title: "Outcome unknown — this may have been applied",
+    reason: err.message,
+    action:
+      keyed === true
+        ? KEYED_UNKNOWN_ACTION
+        : keyed === false
+          ? UNKEYED_UNKNOWN_ACTION
+          : "Re-read state first (refresh this view or re-open the task). Only retry if Core shows the change did not happen; a blind retry can apply it twice.",
+    tone: "attention",
+    ...(err.isCoreError ? coreHints(err) : {}),
+  };
+}
+
 /** Longest Core/transport reason shown, in code points (the cut is disclosed). */
 export const MAX_REASON_CHARS = 600;
 /** Longest error title shown, in code points. */
@@ -1840,6 +1881,33 @@ function describeCoreErrorUnrevealed(err: CoreRequestError): ErrorCopy {
     };
   }
   if (err.isCoreError) {
+    // A2: the three idempotency CONFLICTs share Core's CONFLICT code and are
+    // told apart by Core's exact message (kept verbatim as `reason`). Only
+    // "mismatch"/"pending" may say nothing was run; "unknown" never does.
+    // A keyed write (`sandbox.create` / `conversation.send`) that Core answered
+    // with INTERNAL: sbx or Core may have acted, so this is an unknown outcome.
+    if (err.mayHaveBeenApplied) return unknownOutcomeCopy(err);
+    // A1 name lock: another operation holds this sandbox name; nothing ran.
+    if (err.code === "CONFLICT" && isNameLockConflict(err.message)) {
+      return {
+        title: "Nothing was run — another operation on this sandbox is in progress",
+        reason: err.message,
+        action: "Wait for it to finish, then re-read state before trying again.",
+        tone: "attention",
+        ...coreHints(err),
+      };
+    }
+    const idem = idempotencyConflictKind(err);
+    if (idem !== null) {
+      const copy = idempotencyConflictCopy(idem);
+      return {
+        title: copy.title,
+        reason: err.message,
+        action: copy.action,
+        tone: copy.nothingRan ? "attention" : "danger",
+        ...coreHints(err),
+      };
+    }
     const mapped = Object.prototype.hasOwnProperty.call(CORE_ERROR_COPY, err.code)
       ? CORE_ERROR_COPY[err.code as ErrorCode]
       : undefined;
@@ -1858,15 +1926,7 @@ function describeCoreErrorUnrevealed(err: CoreRequestError): ErrorCopy {
   }
   // A state-changing request whose answer was lost: the outcome is unknown, so
   // the copy is about re-reading state — never "retry", which could apply twice.
-  if (err.mayHaveBeenApplied) {
-    return {
-      title: "Outcome unknown — this may have been applied",
-      reason: err.message,
-      action:
-        "Re-read state first (refresh this view or re-open the task). Only retry if Core shows the change did not happen; a blind retry can apply it twice.",
-      tone: "attention",
-    };
-  }
+  if (err.mayHaveBeenApplied) return unknownOutcomeCopy(err);
   switch (err.code) {
     case "CORE_UNREACHABLE":
       return {

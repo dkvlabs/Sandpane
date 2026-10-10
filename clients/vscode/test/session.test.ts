@@ -88,11 +88,19 @@ class ScriptedCore {
   ]);
   private convCounter = 0;
 
+  private readonly live: TransportHandlers[] = [];
+
+  /** Drop every open connection, as a Core restart would. */
+  drop(): void {
+    for (const h of this.live.splice(0)) h.onClose(new Error('Core went away'));
+  }
+
   transportFactory = (): CoreTransport => {
     let handlers: TransportHandlers | null = null;
     return {
       start: (h: TransportHandlers) => {
         handlers = h;
+        if (!this.refuseConnect) this.live.push(h);
         return this.refuseConnect ? Promise.reject(new Error('ECONNREFUSED')) : Promise.resolve();
       },
       write: (bytes: Uint8Array) => {
@@ -108,6 +116,35 @@ class ScriptedCore {
       close: () => undefined,
     };
   };
+
+  /**
+   * A2 keyed-request model (mirrors Core §3.1): a completed key replays its
+   * FIRST result plus `replayed: true`; `forced` answers the next call of a
+   * method with an error instead (not stored, like Core's pre-run failures).
+   */
+  features: string[] | undefined = ['idempotency-keys', 'sandbox-create-agent'];
+  readonly keyed = new Map<string, Record<string, unknown>>();
+  readonly forced = new Map<string, { code: string; message: string }>();
+
+  private replayFor(frame: Frame): { ok: unknown } | null {
+    const key = frame.params['idempotencyKey'];
+    if (typeof key !== 'string') return null;
+    const stored = this.keyed.get(`${frame.method}:${key}`);
+    return stored ? { ok: { ...stored, replayed: true } } : null;
+  }
+
+  private takeForced(method: string): { err: { code: string; message: string } } | null {
+    const err = this.forced.get(method);
+    if (!err) return null;
+    this.forced.delete(method);
+    return { err };
+  }
+
+  private remember(frame: Frame, result: Record<string, unknown>): { ok: unknown } {
+    const key = frame.params['idempotencyKey'];
+    if (typeof key === 'string') this.keyed.set(`${frame.method}:${key}`, result);
+    return { ok: result };
+  }
 
   calls(method: string): Frame[] {
     return this.requests.filter((r) => r.method === method);
@@ -126,6 +163,7 @@ class ScriptedCore {
             sbx: { installed: true },
             agents: [{ id: 'codex', verified: this.agentVerified, supportsStreaming: false, supportsCancel: false, supportsResume: false }],
             methods: this.methods,
+            ...(this.features !== undefined ? { features: this.features } : {}),
           },
         };
       case 'project.list':
@@ -144,16 +182,19 @@ class ScriptedCore {
             { name: 'atlas-unrecorded', probedState: 'running', boundProjectId: 'p1' },
           ].filter((s) => !this.removed.has(s.name)),
         };
-      case 'sandbox.create':
-        return {
-          ok: {
-            name: p['name'],
-            probedState: 'running',
-            boundProjectId: p['projectId'],
-            workspaceMode: p['workspaceMode'],
-            agent: p['agent'] ?? 'shell',
-          },
-        };
+      case 'sandbox.create': {
+        const stored = this.replayFor(frame);
+        if (stored) return stored;
+        const forced = this.takeForced(frame.method);
+        if (forced) return forced;
+        return this.remember(frame, {
+          name: p['name'],
+          probedState: 'running',
+          boundProjectId: p['projectId'],
+          workspaceMode: p['workspaceMode'],
+          agent: p['agent'] ?? 'shell',
+        });
+      }
       case 'sandbox.stop':
         return this.stopAnswer;
       case 'sandbox.remove':
@@ -189,8 +230,13 @@ class ScriptedCore {
       case 'conversation.create':
         this.convCounter += 1;
         return { ok: { id: `conv-new-${this.convCounter}`, projectId: p['projectId'], title: 't', agentId: 'codex', createdAt: '' } };
-      case 'conversation.send':
-        return { ok: { id: `task-new-${this.requests.length}`, conversationId: p['conversationId'], status: 'queued' } };
+      case 'conversation.send': {
+        const stored = this.replayFor(frame);
+        if (stored) return stored;
+        const forced = this.takeForced(frame.method);
+        if (forced) return forced;
+        return this.remember(frame, { id: `task-new-${this.requests.length}`, conversationId: p['conversationId'], status: 'queued' });
+      }
       case 'git.review':
         return {
           ok: {
@@ -870,7 +916,7 @@ describe('A1 sandbox lifecycle: stop / remove / create agent', () => {
     session.dispose();
   });
 
-  it('create: a non-shell agent is sent only to an A1 Core; default shell is omitted', async () => {
+  it('create: a non-shell agent is sent only when "sandbox-create-agent" is advertised; default shell is omitted', async () => {
     const { core, session } = await online();
     await session.createSandbox({ name: 'atlas-agent', projectId: 'p1', workspaceMode: 'mountless', agent: 'codex' });
     await session.createSandbox({ name: 'atlas-shell', projectId: 'p1', workspaceMode: 'mountless' });
@@ -879,14 +925,320 @@ describe('A1 sandbox lifecycle: stop / remove / create agent', () => {
     expect(Object.keys(sent[1] ?? {})).not.toContain('agent');
     session.dispose();
 
+    // A1 methods advertised but NOT the feature: the method list is no longer
+    // used as a marker (A2 replaced that inference).
     const old = new ScriptedCore();
-    old.methods = PRE_A1_METHODS;
+    old.features = ['idempotency-keys'];
     const pre = await online(old);
     expect(
       await pre.session.createSandbox({ name: 'atlas-agent', projectId: 'p1', workspaceMode: 'mountless', agent: 'codex' }),
     ).toBeUndefined();
     expect(old.calls('sandbox.create')).toHaveLength(0);
-    expect(stub.warnings.at(-1)).toMatch(/predates agent selection/);
+    expect(stub.warnings.at(-1)).toMatch(/does not advertise the "sandbox-create-agent" feature/);
     pre.session.dispose();
+  });
+});
+
+describe('A2 idempotency keys: create / send', () => {
+  const KEY = /^[0-9a-f]{32}$/;
+  const createInput = { name: 'atlas-new', projectId: 'p1', workspaceMode: 'mountless' as const };
+
+  async function online(core = new ScriptedCore()) {
+    const made = makeSession(core);
+    await made.session.attach();
+    await settle();
+    return { core, ...made };
+  }
+
+  /** Select a p1 sandbox and send once (writable gate answered). */
+  async function sendOnce(session: SandpaneSession, text = 'explain the auth flow') {
+    session.selectSandbox('atlas-box');
+    const plan = session.previewContext(false);
+    stub.answers.set('Send anyway', 'Send anyway');
+    await session.send(text, false, plan.planId, 'command');
+  }
+
+  /** Fire the client deadline of the (held) request whose timeout is `ms`. */
+  function expire(timers: FakeTimers, ms: number): void {
+    const timer = timers.pending.find((t) => t.ms === ms);
+    if (!timer) throw new Error(`no pending ${ms} ms timer`);
+    timers.clear(timer.id);
+    timer.fn();
+  }
+
+  it('sends a fresh 32-hex key per create and per send when "idempotency-keys" is advertised', async () => {
+    const { core, session } = await online();
+    await session.createSandbox(createInput);
+    await session.createSandbox({ ...createInput, name: 'atlas-new-2' });
+    const createKeys = core.calls('sandbox.create').map((f) => f.params['idempotencyKey']);
+    expect(createKeys).toHaveLength(2);
+    for (const key of createKeys) expect(key).toMatch(KEY);
+    expect(createKeys[0]).not.toBe(createKeys[1]);
+
+    await sendOnce(session, 'first');
+    await sendOnce(session, 'second');
+    const sendKeys = core.calls('conversation.send').map((f) => f.params['idempotencyKey']);
+    expect(sendKeys).toHaveLength(2);
+    for (const key of sendKeys) expect(key).toMatch(KEY);
+    expect(sendKeys[0]).not.toBe(sendKeys[1]);
+    // Never derived from content: identical text gets a different key.
+    await sendOnce(session, 'first');
+    expect(core.calls('conversation.send').at(-1)?.params['idempotencyKey']).not.toBe(sendKeys[0]);
+    session.dispose();
+  });
+
+  it('sends NO key to a Core without the feature (pre-A2), and ignores unknown feature strings', async () => {
+    const pre = new ScriptedCore();
+    pre.features = undefined;
+    const a = await online(pre);
+    await a.session.createSandbox(createInput);
+    await sendOnce(a.session);
+    expect(Object.keys(pre.calls('sandbox.create')[0]?.params ?? {})).not.toContain('idempotencyKey');
+    expect(Object.keys(pre.calls('conversation.send')[0]?.params ?? {})).not.toContain('idempotencyKey');
+    a.session.dispose();
+
+    const future = new ScriptedCore();
+    future.features = ['some-future-feature', 'idempotency-keys'];
+    const b = await online(future);
+    await b.session.createSandbox(createInput);
+    expect(future.calls('sandbox.create')[0]?.params['idempotencyKey']).toMatch(KEY);
+    expect(b.session.snapshot().connection).toBe('online');
+    b.session.dispose();
+  });
+
+  it('a keyed create with an unknown outcome is NOT retried automatically', async () => {
+    const core = new ScriptedCore();
+    core.hold = (f) => f.method === 'sandbox.create';
+    const { session, timers } = await online(core);
+    const pending = session.createSandbox(createInput);
+    await settle();
+    expire(timers, 330_000);
+    await pending;
+    await settle();
+    expect(core.calls('sandbox.create')).toHaveLength(1);
+    const offered = stub.errorCalls.at(-1);
+    expect(offered?.items).toEqual(['Retry safely']);
+    expect(offered?.message).toContain('outcome UNKNOWN');
+    session.dispose();
+  });
+
+  it('"Retry safely" resends the identical create with the SAME key; a replay is announced and re-read', async () => {
+    const core = new ScriptedCore();
+    let first = true;
+    // Core finished the first create but the answer never arrived.
+    core.hold = (f) => {
+      if (f.method !== 'sandbox.create' || !first) return false;
+      first = false;
+      return true;
+    };
+    const { session, timers } = await online(core);
+    stub.answers.set('Retry safely', 'Retry safely');
+    const pending = session.createSandbox(createInput);
+    await settle();
+    expire(timers, 330_000);
+    await pending;
+    const listsBefore = core.calls('sandbox.list').length;
+    await settle(30);
+    const frames = core.calls('sandbox.create');
+    expect(frames).toHaveLength(2);
+    expect(frames[1]?.params).toEqual(frames[0]?.params);
+    expect(frames[1]?.params['idempotencyKey']).toMatch(KEY);
+    expect(core.calls('sandbox.list').length).toBe(listsBefore + 1);
+    expect(session.snapshot().status).toEqual({
+      tone: 'info',
+      text: 'Core returned the result of your earlier identical request (replayed). It may be out of date; refreshing from Core.',
+    });
+    expect(session.snapshot().status?.text).not.toMatch(/created/);
+    session.dispose();
+  });
+
+  it('a keyed send with an unknown outcome retries only on click, same key and content; the replay re-reads task.list', async () => {
+    const core = new ScriptedCore();
+    let first = true;
+    core.hold = (f) => {
+      if (f.method !== 'conversation.send' || !first) return false;
+      first = false;
+      return true;
+    };
+    const { session, timers } = await online(core);
+    stub.answers.set('Retry safely', 'Retry safely');
+    const sending = sendOnce(session);
+    await settle();
+    expire(timers, 15_000);
+    await sending;
+    const taskLists = core.calls('task.list').length;
+    await settle(30);
+    const frames = core.calls('conversation.send');
+    expect(frames).toHaveLength(2);
+    expect(frames[1]?.params).toEqual(frames[0]?.params);
+    expect(core.calls('task.list').length).toBeGreaterThan(taskLists);
+    expect(session.snapshot().status?.text).toBe(
+      'Core returned the result of your earlier identical request (replayed). It may be out of date; refreshing from Core.',
+    );
+    // The replayed summary's status is never painted as current state.
+    expect(session.snapshot().tasks.map((t) => t.taskId)).not.toContain(
+      `task-new-${core.requests.indexOf(frames[0] as Frame) + 1}`,
+    );
+    session.dispose();
+  });
+
+  /** A keyed create whose answer never arrives; the Retry button is clicked by hand. */
+  async function unknownCreate(core: ScriptedCore) {
+    let first = true;
+    core.hold = (f) => {
+      if (f.method !== 'sandbox.create' || !first) return false;
+      first = false;
+      return true;
+    };
+    stub.manual.add('Retry safely');
+    const made = await online(core);
+    const pending = made.session.createSandbox(createInput);
+    await settle();
+    expire(made.timers, 330_000);
+    await pending;
+    await settle();
+    expect(stub.clicks).toHaveLength(1);
+    return made;
+  }
+
+  it('W1: "Retry safely" re-probes at click time — reconnected to a Core without keys, nothing is sent', async () => {
+    const core = new ScriptedCore();
+    const { session } = await unknownCreate(core);
+    const probes = core.calls('system.probe').length;
+    // Core restarts as a build without idempotency keys; the cached probe is stale.
+    core.features = undefined;
+    core.drop();
+    await settle();
+    stub.clicks.shift()?.('Retry safely');
+    await settle(30);
+    expect(core.calls('system.probe').length).toBeGreaterThan(probes);
+    expect(core.calls('sandbox.create')).toHaveLength(1);
+    expect(stub.errors.at(-1)).toBe(
+      'Not retried: the connected Core does not advertise idempotency keys, so a retry could run it twice. ' +
+        'Nothing was sent — check state first.',
+    );
+    session.dispose();
+  });
+
+  it('W1: the click-time gate also refuses on a live connection whose Core changed features', async () => {
+    const core = new ScriptedCore();
+    const { session } = await unknownCreate(core);
+    core.features = ['sandbox-create-agent'];
+    stub.clicks.shift()?.('Retry safely');
+    await settle(30);
+    expect(core.calls('sandbox.create')).toHaveLength(1);
+    expect(stub.errors.at(-1)).toMatch(/^Not retried: the connected Core does not advertise idempotency keys/);
+    session.dispose();
+  });
+
+  it('W2: the retry attaches first when the connection dropped, then resends the same key', async () => {
+    const core = new ScriptedCore();
+    const { session } = await unknownCreate(core);
+    core.drop();
+    await settle();
+    stub.clicks.shift()?.('Retry safely');
+    await settle(40);
+    const frames = core.calls('sandbox.create');
+    expect(frames).toHaveLength(2);
+    expect(frames[1]?.params).toEqual(frames[0]?.params);
+    expect(session.snapshot().status?.text).toMatch(/replayed/);
+    session.dispose();
+  });
+
+  it('W2: a retry that cannot reach Core keeps the UNKNOWN context and offers "Retry safely" again (same key)', async () => {
+    const core = new ScriptedCore();
+    const { session } = await unknownCreate(core);
+    core.drop();
+    core.refuseConnect = true;
+    await settle();
+    stub.clicks.shift()?.('Retry safely');
+    await settle(30);
+    expect(core.calls('sandbox.create')).toHaveLength(1);
+    const reoffered = stub.errorCalls.at(-1);
+    expect(reoffered?.items).toEqual(['Retry safely']);
+    expect(reoffered?.message).toContain('outcome UNKNOWN');
+    expect(reoffered?.message).toContain('could not reach Core');
+    expect(reoffered?.message).not.toMatch(/Core is not attached/);
+    expect(stub.clicks).toHaveLength(1);
+    // Core comes back; the second click resends the identical request.
+    core.refuseConnect = false;
+    stub.clicks.shift()?.('Retry safely');
+    await settle(40);
+    const frames = core.calls('sandbox.create');
+    expect(frames).toHaveLength(2);
+    expect(frames[1]?.params).toEqual(frames[0]?.params);
+    session.dispose();
+  });
+
+  it('I1: the retry copy says Core may also refuse', async () => {
+    const core = new ScriptedCore();
+    const { session } = await unknownCreate(core);
+    expect(stub.errorCalls.at(-1)?.message).toContain(
+      'Core runs it at most once; otherwise it returns the earlier result or refuses',
+    );
+    session.dispose();
+  });
+
+  it('without a key (pre-A2) an unknown outcome offers NO "Retry safely" and says check first', async () => {
+    const core = new ScriptedCore();
+    core.features = undefined;
+    core.forced.set('sandbox.create', { code: 'INTERNAL', message: 'sbx create failed after it started' });
+    const { session } = await online(core);
+    await session.createSandbox(createInput);
+    const shown = stub.errorCalls.at(-1);
+    expect(shown?.items).not.toContain('Retry safely');
+    expect(shown?.message).toContain('Check before trying again');
+    expect(core.calls('sandbox.create')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it('a keyed INTERNAL failure is an unknown outcome and offers "Retry safely"', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('sandbox.create', { code: 'INTERNAL', message: 'sbx create timed out after 300s' });
+    const { session } = await online(core);
+    await session.createSandbox(createInput);
+    await settle();
+    expect(stub.errorCalls.at(-1)?.items).toEqual(['Retry safely']);
+    expect(core.calls('sandbox.create')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it.each([
+    ['mismatch', 'idempotency key was already used with different parameters; nothing was run', /Nothing was run\./],
+    ['pending', 'an operation with this idempotency key is still in progress; nothing was run', /Nothing was run/],
+    ['name lock', 'another operation on sandbox "atlas-new" is in progress; nothing was run', /another operation on this sandbox is in progress\. Nothing was run\./],
+  ])('CONFLICT %s: plain copy says nothing was run, shows Core\'s message, no retry, no new key', async (_label, message, copy) => {
+    const core = new ScriptedCore();
+    core.forced.set('sandbox.create', { code: 'CONFLICT', message });
+    const { session } = await online(core);
+    await session.createSandbox(createInput);
+    await settle();
+    const shown = stub.errorCalls.at(-1);
+    expect(shown?.message).toMatch(copy);
+    expect(shown?.message).toContain(`Core said: CONFLICT: ${message}`);
+    expect(shown?.items).not.toContain('Retry safely');
+    expect(core.calls('sandbox.create')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it('CONFLICT outcome-unknown: never says "nothing was run", re-reads state, no retry', async () => {
+    const message =
+      'the outcome of the earlier request with this idempotency key is unknown (Core restarted or sbx failed while it ran); re-read state before retrying with a new key';
+    const core = new ScriptedCore();
+    core.forced.set('conversation.send', { code: 'CONFLICT', message });
+    const { session } = await online(core);
+    const taskLists = core.calls('task.list').length;
+    await sendOnce(session);
+    await settle();
+    const shown = stub.errorCalls.at(-1);
+    expect(shown?.message).toContain('Outcome unknown');
+    expect(shown?.message).toContain('a retry needs a new request');
+    expect(shown?.message).toContain(message);
+    expect(shown?.message).not.toMatch(/nothing was run/i);
+    expect(session.snapshot().status?.text ?? '').not.toMatch(/nothing was run/i);
+    expect(shown?.items).not.toContain('Retry safely');
+    expect(core.calls('conversation.send')).toHaveLength(1);
+    expect(core.calls('task.list').length).toBeGreaterThan(taskLists);
+    session.dispose();
   });
 });

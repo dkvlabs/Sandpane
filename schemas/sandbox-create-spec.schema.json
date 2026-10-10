@@ -27,6 +27,13 @@
       "type": "string",
       "enum": ["claude", "codex", "copilot", "cursor", "devin", "docker-agent", "droid", "gemini", "kiro", "opencode", "shell"],
       "description": "Optional (A1, additive). Exact built-in agent from the captured sbx v0.47.0 `create --help`; absent → \"shell\" (provider-free). Sandbox-kit references (local dirs, ZIPs, git URLs, OCI refs) are refused with VALIDATION_FAILED; --cloud is never passed. Accepting a provider agent is not a verification claim (see core-capabilities.agents[].verified)."
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]{1,128}$",
+      "description": "Optional (A2, additive). Retry-safety key, namespaced by method and kept 24 h: a replay with the same params runs nothing and returns the FIRST response unchanged plus replayed:true (SandboxSummary.replayed; absent on a first response) — it is not current state, re-read with sandbox.list; the same key with different params, a still-running key, or a key whose outcome is unknown is CONFLICT. Send only when core-capabilities.features contains 'idempotency-keys'. Not part of the params fingerprint."
     }
   }
 }

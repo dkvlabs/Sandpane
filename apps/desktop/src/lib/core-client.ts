@@ -28,6 +28,7 @@ import {
   type ErrorCode,
   type Method,
   type RpcOkFrame,
+  type SandboxCreateSpec,
   type SandboxStopResult,
   type SandboxSummary,
   type TaskEvent,
@@ -44,6 +45,7 @@ import {
   decodeSandboxRemoveResult,
   decodeSandboxStopResult,
   decodeSandboxSummaries,
+  decodeSandboxSummary,
   decodeTaskEvents,
   decodeTaskSummaries,
   decodeTaskSummary,
@@ -56,6 +58,7 @@ import {
   buildSandboxRemoveRequestParams,
   buildSandboxStopParams,
   buildTaskListParams,
+  checkIdempotencyKey,
   buildTaskSubscribeParams,
 } from "./guards";
 
@@ -450,6 +453,50 @@ export class CoreClient {
     return this.request("sandbox.create", spec);
   }
 
+  /**
+   * `sandbox.create`, decoded. An `idempotencyKey` (A2) is checked against
+   * Core's rule before the frame is written. A response with `replayed: true`
+   * is the FIRST create's answer, not current state — the caller re-reads.
+   */
+  async createSandboxSummary(spec: SandboxCreateSpec): Promise<SandboxSummary> {
+    const params = preflight(() => checkIdempotencyKey(spec));
+    return this.keyedWrite("sandbox.create", params, decodeSandboxSummary);
+  }
+
+  /**
+   * One `sandbox.create` / `conversation.send` exchange with honest failure
+   * semantics for a write (A2 review W3/W4):
+   * - Core answered `ok` but the answer cannot be decoded → Core may have
+   *   applied it: an unknown outcome (`mayHaveBeenApplied`), never a plain
+   *   "client error, retry". The payload is never echoed.
+   * - Core `INTERNAL` → also an unknown outcome (sbx/Core may have acted).
+   * Every such error records whether the request carried an idempotency key,
+   * so the copy can say whether a retry is safe.
+   */
+  private async keyedWrite<P extends { idempotencyKey?: string }, R>(
+    method: "sandbox.create" | "conversation.send",
+    params: P,
+    decode: (value: unknown) => R,
+  ): Promise<R> {
+    const keyed = typeof params.idempotencyKey === "string";
+    let raw: unknown;
+    try {
+      raw = await this.request(method, params);
+    } catch (err) {
+      throw markWriteOutcome(asCoreRequestError(err), keyed);
+    }
+    try {
+      return decode(raw);
+    } catch {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        `Core answered ${method}, but this desktop build could not read the answer. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
+        { mayHaveBeenApplied: true, idempotencyKeyed: keyed },
+      );
+    }
+  }
+
   createConversation(params: unknown) {
     return this.request("conversation.create", params);
   }
@@ -465,7 +512,8 @@ export class CoreClient {
    * as failed and invite a duplicate send.
    */
   async sendConversationMessage(params: ConversationSendParams): Promise<TaskSummary> {
-    return decodeTaskSummary(await this.request("conversation.send", params));
+    const checked = preflight(() => checkIdempotencyKey(params));
+    return this.keyedWrite("conversation.send", checked, decodeTaskSummary);
   }
 
   /** `sandbox.list`, decoded (an unrecognised workspace mode reads as UNVERIFIED). */
@@ -695,6 +743,25 @@ export class CoreClient {
     // Subscriptions keep their checkpoints and simply fail their next pass;
     // the caller decides whether to reattach.
   }
+}
+
+/**
+ * Annotate a failed keyed-write exchange: record `idempotencyKeyed`, and treat a
+ * Core `INTERNAL` as an unknown outcome. Every other verdict is kept as is.
+ */
+function markWriteOutcome(err: CoreRequestError, keyed: boolean): CoreRequestError {
+  const details =
+    typeof err.details === "object" && err.details !== null && !Array.isArray(err.details)
+      ? (err.details as Record<string, unknown>)
+      : err.details === undefined
+        ? {}
+        : { coreDetails: err.details };
+  const unknown = err.mayHaveBeenApplied || (err.isCoreError && err.code === "INTERNAL");
+  return new CoreRequestError(err.source, err.code, err.message, {
+    ...details,
+    ...(unknown ? { mayHaveBeenApplied: true } : {}),
+    idempotencyKeyed: keyed,
+  });
 }
 
 /**

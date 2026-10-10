@@ -56,15 +56,15 @@ Implemented contract (protocol v1, additively revised — see the revision note 
 
 ```ts
 interface SandpaneRpc {
-  'system.probe': { request: {}; response: CoreCapabilities /* + methods: string[] (feature discovery) */ };
+  'system.probe': { request: {}; response: CoreCapabilities /* + methods: string[] (feature discovery); + features: string[] (A2: "idempotency-keys", "sandbox-create-agent"; unknown strings are ignored) */ };
   'project.create': { request: { name: string; repositories: string[] }; response: Project /* + repositories: string[] */ };
   'project.list': { request: {}; response: Project[] };
   'sandbox.list': { request: {}; response: SandboxSummary[] /* each may carry workspaceMode; ABSENT when unbound */ };
-  'sandbox.create': { request: SandboxCreateSpec /* + agent?: built-in sbx agent, default "shell" */; response: SandboxSummary /* + agent?: as sbx reports it */ };
+  'sandbox.create': { request: SandboxCreateSpec /* + agent?: built-in sbx agent, default "shell"; + idempotencyKey?: 1..=128 [A-Za-z0-9._-] (A2) */; response: SandboxSummary /* + agent?: as sbx reports it; + replayed?: true on a keyed replay */ };
   'sandbox.stop': { request: { name: string }; response: { stopped: true; requeried?: SandboxSummary /* ABSENT = not listed or re-query failed: state unknown */ } };
   'sandbox.remove': { request: { name: string; confirmToken?: string }; response: { confirmation?: ConfirmationRequest /* step 1: nothing changed */; removed?: true /* step 2 */ } /* two-step token flow: docs/plans/2026-10-09-protocol-v1-additions.md §2 */ };
   'conversation.create': { request: { projectId: string; agentId: string; sandboxId?: string }; response: Conversation };
-  'conversation.send': { request: { conversationId: string; content: string; attachments?: ContextRef[] }; response: { taskId: string } };
+  'conversation.send': { request: { conversationId: string; content: string; attachments?: ContextRef[]; idempotencyKey?: string /* A2 */ }; response: TaskSummary /* + replayed?: true on a keyed replay */ };
   'conversation.list': { request: { projectId?: string; limit?: number }; response: Conversation[] };
   'conversation.history': { request: { conversationId: string; afterSequence?: number; limit?: number }; response: { messages: MessageRecord[]; truncated: boolean; nextSequence: number } };
   'task.cancel': { request: { taskId: string }; response: { requested: boolean } };
@@ -79,6 +79,7 @@ Neither prompts nor file paths are executable commands. CLI operations are imple
 
 **Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 16-method v1 surface (`docs/CHANGELOG.md` 0010; `sandbox.stop` and `sandbox.remove` added by A1 of `docs/plans/2026-10-09-protocol-v1-additions.md`; there is no `sandbox.start` because sbx v0.47 has none). Rules that keep it honest:
 
+- **Idempotency keys (A2).** A keyed `sandbox.create` / `conversation.send` is stored durably for 24 h; a replay with identical params returns the first response plus `replayed: true` (not current state), different params or an unfinished/unknown earlier attempt give `CONFLICT` and run nothing new. Decisions: `docs/plans/2026-10-09-protocol-v1-additions.md` §3.1.
 - **`PROTOCOL_VERSION` stays `1`** — the revision is additive only: new methods, new optional request fields, new response fields that are absent-tolerant (`#[serde(default)]`). Nothing was renamed or removed, so an older client's frames still parse.
 - **`task.subscribe` cursor semantics** are now explicit, because one scalar `afterSequence` applied across a project-wide replay silently skips the unseen events of tasks whose per-task sequences are lower (sequences restart at 1 per task): when `taskId` is present the scalar governs and `afterSequences` is ignored; without `taskId`, each task replays from `afterSequences[taskId]` (a task absent from the map replays from 0); with no map at all the legacy shared-scalar behavior is preserved. Clients that need correct catch-up across tasks must send the map.
 - **Bounded reads.** `task.list`, `conversation.list` and `conversation.history` clamp `limit` (default 200, max 500) and `conversation.history` additionally caps serialized bytes, disclosing `truncated: true` when either ceiling stopped the scan; a `task.subscribe` replay that cannot fit one IPC frame is refused with `VALIDATION_FAILED` rather than emitted oversized. Bounded responses with truncation disclosure is a §2 requirement, not a nicety.

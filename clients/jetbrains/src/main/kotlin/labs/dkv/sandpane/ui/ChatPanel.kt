@@ -5,10 +5,15 @@ import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
+import com.intellij.notification.NotificationAction
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
 import labs.dkv.sandpane.actions.ActionIds
 import labs.dkv.sandpane.core.AgentGate
 import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.core.ErrorAttribution
+import labs.dkv.sandpane.core.KeyedCall
+import labs.dkv.sandpane.core.KeyedWrites
 import labs.dkv.sandpane.core.RenderedEvent
 import labs.dkv.sandpane.model.AgentEvent
 import labs.dkv.sandpane.model.Conversation
@@ -785,26 +790,81 @@ class ChatPanel(
         addUserRow(content)
         sendButton.isEnabled = false
 
-        tasks.send(params).whenComplete { result, error ->
+        handleSend(tasks.send(params))
+    }
+
+    /**
+     * Report one keyed send (A2). A replay is announced as such and the task rows are re-read from
+     * Core; an unknown outcome of a KEYED send gets a "Retry safely" notification action that resends
+     * the identical params with the same key — on that explicit click only, never automatically.
+     */
+    private fun handleSend(call: KeyedCall<ConversationSendParams, TaskMonitorService.SendResult>) {
+        call.result.whenComplete { result, error ->
             onEdt {
                 if (error != null) {
-                    addSystemRow(ErrorAttribution.describe(CoreMethods.CONVERSATION_SEND, error))
+                    val text = KeyedWrites.describe(CoreMethods.CONVERSATION_SEND, KeyedWrites.classify(error), call.keyed)
+                    addSystemRow(text.body)
+                    if (text.offerRetrySafely) offerRetrySafely(call.params, text)
                 } else if (result != null) {
-                    addSystemRow(
-                        when (result) {
-                            is TaskMonitorService.SendResult.FromSummary ->
-                                // An unknown status is still an ACCEPTED task: Core queued it.
-                                "Core accepted task ${result.taskId.take(8)} · status reported by Core: " +
-                                    result.summary.status.describe()
+                    val notice = KeyedWrites.replayNotice(result.replayed)
+                    if (notice != null) {
+                        // Never a fresh success, never its stored status: say so and re-read Core.
+                        val id = when (result) {
+                            is TaskMonitorService.SendResult.FromSummary -> result.taskId
+                            is TaskMonitorService.SendResult.TaskIdOnly -> result.taskId
+                        }
+                        addSystemRow("$notice (task ${VisibleText.reveal(id.take(8))})")
+                        val selected = projectPicker.selectedItem as? SandpaneProject
+                        if (selected == null) {
+                            addSystemRow("No project is selected, so task.list cannot be re-read here; use Refresh.")
+                        } else {
+                            tasks.hydrateFromTaskList(selected.id).whenComplete { hydration, hydrationError ->
+                                onEdt {
+                                    addSystemRow(
+                                        if (hydrationError != null) {
+                                            ErrorAttribution.describe(CoreMethods.TASK_LIST, hydrationError)
+                                        } else {
+                                            "Re-read after the replay: ${hydration.describe()}"
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        addSystemRow(
+                            when (result) {
+                                is TaskMonitorService.SendResult.FromSummary ->
+                                    // An unknown status is still an ACCEPTED task: Core queued it.
+                                    "Core accepted task ${result.taskId.take(8)} · status reported by Core: " +
+                                        result.summary.status.describe()
 
-                            is TaskMonitorService.SendResult.TaskIdOnly ->
-                                "Core accepted task ${result.taskId.take(8)} (id-only response; see protocol gap 2)"
-                        },
-                    )
+                                is TaskMonitorService.SendResult.TaskIdOnly ->
+                                    "Core accepted task ${result.taskId.take(8)} (id-only response; see protocol gap 2)"
+                            },
+                        )
+                    }
                 }
                 refreshGateUI()
             }
         }
+    }
+
+    /** A notification whose single, expiring action is the explicit "Retry safely" resend. */
+    private fun offerRetrySafely(params: ConversationSendParams, text: KeyedWrites.Text) {
+        val group = NotificationGroupManager.getInstance().getNotificationGroup("Sandpane") ?: return
+        val notification = group.createNotification(
+            NotificationText.escape(VisibleText.reveal(text.title)),
+            NotificationText.escapeMultiline(VisibleText.revealMultiline(text.body)),
+            NotificationType.ERROR,
+        )
+        notification.addAction(
+            NotificationAction.createSimpleExpiring(KeyedWrites.RETRY_SAFELY_LABEL) {
+                if (panelDisposed) return@createSimpleExpiring
+                addSystemRow("Retrying safely with the same idempotency key (identical request).")
+                handleSend(tasks.retrySendSafely(params))
+            },
+        )
+        notification.notify(project)
     }
 
     private fun addUserRow(content: String) {

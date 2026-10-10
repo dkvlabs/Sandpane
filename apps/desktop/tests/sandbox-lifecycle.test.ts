@@ -515,7 +515,7 @@ describe("gating on system.probe", () => {
 
   it("a pre-A1 Core probed through the client gates both off and pins the wizard to shell", async () => {
     const preA1 = A1_CORE_METHODS.filter((m) => m !== "sandbox.stop" && m !== "sandbox.remove");
-    const core = new FakeCore({ advertisedMethods: preA1 });
+    const core = new FakeCore({ advertisedMethods: preA1, features: null });
     const client = new CoreClient(core.transport);
     const outcome = await client.probe();
     if (outcome.kind !== "attached") throw new Error("expected attach");

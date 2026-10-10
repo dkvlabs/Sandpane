@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rusqlite::params;
+use sandpane_core::idempotency;
 use sandpane_core::sbx::SbxLocator;
 use sandpane_core::{Database, EventLog};
-use sandpane_protocol::Method;
+use sandpane_protocol::{ConversationSendParams, Method, SandboxCreateSpec};
 use sandpane_service::confirm::{ConfirmationBinding, CONFIRMATION_TTL};
 use sandpane_service::{serve_connection, CoreConfig, ServerInner};
 
@@ -3143,4 +3144,732 @@ fn a_spoofing_agent_string_from_sbx_is_dropped_from_summaries() {
     let list = s.ok("1", "sandbox.list", serde_json::json!({}));
     assert!(list[0].get("agent").is_none(), "{}", list[0]);
     assert_eq!(list[1]["agent"], "docker-agent");
+}
+
+// ---------------------------------------------------------------------------
+// A2: idempotency keys (design 2026-10-09 §3.1)
+// ---------------------------------------------------------------------------
+
+const MSG_MISMATCH: &str =
+    "idempotency key was already used with different parameters; nothing was run";
+const MSG_PENDING: &str =
+    "an operation with this idempotency key is still in progress; nothing was run";
+const MSG_UNKNOWN: &str = "the outcome of the earlier request with this idempotency key is unknown (Core restarted or sbx failed while it ran); re-read state before retrying with a new key";
+
+/// Fingerprint exactly as Core computes it: the TYPED params with the key
+/// removed.
+fn create_hash(params: &serde_json::Value) -> String {
+    let mut spec: SandboxCreateSpec = serde_json::from_value(params.clone()).unwrap();
+    spec.idempotency_key = None;
+    idempotency::fingerprint(&spec).unwrap()
+}
+
+fn send_hash(params: &serde_json::Value) -> String {
+    let mut p: ConversationSendParams = serde_json::from_value(params.clone()).unwrap();
+    p.idempotency_key = None;
+    idempotency::fingerprint(&p).unwrap()
+}
+
+/// A replay is the first response plus `replayed: true` (review W1).
+fn assert_is_replay_of(replay: &serde_json::Value, first: &serde_json::Value) {
+    assert!(
+        first.get("replayed").is_none(),
+        "first response is never marked: {first}"
+    );
+    assert_eq!(replay["replayed"], true, "{replay}");
+    let mut stripped = replay.clone();
+    stripped.as_object_mut().unwrap().remove("replayed");
+    assert_eq!(&stripped, first, "otherwise the FIRST response, unchanged");
+}
+
+fn key_rows(s: &TestServer) -> Vec<(String, String, String)> {
+    let db = s.inner.lock_db();
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT method, key, state FROM idempotency_keys ORDER BY rowid")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows
+}
+
+/// Row counts of everything a `conversation.send` writes.
+fn write_counts(s: &TestServer) -> [i64; 4] {
+    let db = s.inner.lock_db();
+    let n = |t: &str| -> i64 {
+        db.conn()
+            .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    [
+        n("messages"),
+        n("tasks"),
+        n("task_events"),
+        n("idempotency_keys"),
+    ]
+}
+
+fn create_calls(fake: &FakeSbx) -> usize {
+    fake.calls()
+        .iter()
+        .filter(|c| c.first().map(String::as_str) == Some("create"))
+        .count()
+}
+
+fn new_project(s: &mut TestServer) -> String {
+    let p = s.ok(
+        "proj",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": []}),
+    );
+    p["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn features_are_advertised_from_the_single_const_list() {
+    let mut s = start_server(no_sbx());
+    let caps = s.ok("1", "system.probe", serde_json::json!({}));
+    assert_eq!(
+        caps["features"],
+        serde_json::json!(sandpane_protocol::FEATURES.to_vec())
+    );
+    assert_eq!(
+        caps["features"],
+        serde_json::json!(["idempotency-keys", "sandbox-create-agent"])
+    );
+}
+
+/// INVARIANT under test: a replay never runs sbx (the argv log gains no
+/// line) and returns the stored result.
+#[test]
+fn keyed_create_replay_returns_the_stored_result_and_runs_sbx_once() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    let params = serde_json::json!({"name": "atlas-auth", "projectId": project,
+        "workspaceMode": "mountless", "idempotencyKey": "create-key-1"});
+    let first = s.ok("1", "sandbox.create", params.clone());
+    assert_eq!(first["probedState"], "running");
+    let calls_after_first = fake.calls();
+    assert_eq!(create_calls(&fake), 1);
+    let replay = s.ok("2", "sandbox.create", params);
+    assert_is_replay_of(&replay, &first);
+    assert_eq!(fake.calls(), calls_after_first, "replay ran nothing");
+    assert_eq!(
+        key_rows(&s),
+        vec![(
+            "sandbox.create".into(),
+            "create-key-1".into(),
+            "done".into()
+        )]
+    );
+    // One binding, not two.
+    assert_eq!(binding_rows(&s).len(), 1);
+}
+
+#[test]
+fn keyed_send_replay_returns_the_same_task_and_writes_nothing() {
+    let mut s = start_server(no_sbx());
+    let (_p, conv) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let params = serde_json::json!({"conversationId": conv, "content": "add tests",
+        "idempotencyKey": "send-key-1"});
+    let first = s.ok("1", "conversation.send", params.clone());
+    let task_id = first["id"].as_str().unwrap().to_string();
+    let counts = write_counts(&s);
+    assert_eq!(counts[3], 1, "the key row was written with the task");
+    let replay = s.ok("2", "conversation.send", params);
+    assert_is_replay_of(&replay, &first);
+    assert_eq!(replay["id"], task_id.as_str());
+    assert_eq!(write_counts(&s), counts, "no second message/task/event/key");
+}
+
+#[test]
+fn same_key_with_different_params_is_conflict_and_runs_nothing() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    s.ok(
+        "1",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-auth", "projectId": project,
+            "workspaceMode": "mountless", "idempotencyKey": "k"}),
+    );
+    let calls = fake.calls();
+    let err = s.err(
+        "2",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-other", "projectId": project,
+            "workspaceMode": "mountless", "idempotencyKey": "k"}),
+    );
+    assert_eq!(err["code"], "CONFLICT");
+    assert_eq!(err["message"], MSG_MISMATCH);
+    assert_eq!(fake.calls(), calls);
+
+    let (_p, conv) = make_project_and_conversation(&mut s, "Nova Demo", vec![]);
+    s.ok(
+        "3",
+        "conversation.send",
+        serde_json::json!({"conversationId": conv, "content": "one", "idempotencyKey": "k"}),
+    );
+    let counts = write_counts(&s);
+    let err = s.err(
+        "4",
+        "conversation.send",
+        serde_json::json!({"conversationId": conv, "content": "two", "idempotencyKey": "k"}),
+    );
+    assert_eq!(err["code"], "CONFLICT");
+    assert_eq!(err["message"], MSG_MISMATCH);
+    assert_eq!(write_counts(&s), counts);
+}
+
+#[test]
+fn a_pending_key_is_conflict_in_progress_and_runs_nothing() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    let params = serde_json::json!({"name": "atlas-auth", "projectId": project,
+        "workspaceMode": "mountless", "idempotencyKey": "busy"});
+    {
+        let db = s.inner.lock_db();
+        assert!(idempotency::claim(
+            db.conn(),
+            "sandbox.create",
+            "busy",
+            &create_hash(&params),
+            "2099-01-01T00:00:00Z"
+        )
+        .unwrap());
+    }
+    fake.reset_calls();
+    let err = s.err("1", "sandbox.create", params);
+    assert_eq!(err["code"], "CONFLICT");
+    assert_eq!(err["message"], MSG_PENDING);
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn restart_turns_a_pending_key_unknown_before_serving_and_it_is_refused() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("core.sqlite3");
+    let project_id = "p-restart";
+    let params = serde_json::json!({"name": "atlas-auth", "projectId": project_id,
+        "workspaceMode": "mountless", "idempotencyKey": "mid-flight"});
+    {
+        // A previous Core died between claim and completion.
+        let db = Database::open(&db_path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO projects (id,name,created_at) VALUES (?1,'Atlas Demo','t')",
+                params![project_id],
+            )
+            .unwrap();
+        assert!(idempotency::claim(
+            db.conn(),
+            "sandbox.create",
+            "mid-flight",
+            &create_hash(&params),
+            "2099-01-01T00:00:00Z"
+        )
+        .unwrap());
+        // And an expired row that the startup prune must drop.
+        assert!(idempotency::insert_done(
+            db.conn(),
+            "sandbox.create",
+            "ancient",
+            "h",
+            "{}",
+            "2000-01-01T00:00:00Z"
+        )
+        .unwrap());
+    }
+    let mut s = start_server_at(fake.locator(), dir, db_path);
+    // Production startup already reconciled — before any frame is served.
+    assert_eq!(
+        key_rows(&s),
+        vec![(
+            "sandbox.create".into(),
+            "mid-flight".into(),
+            "unknown".into()
+        )]
+    );
+    let err = s.err("1", "sandbox.create", params);
+    assert_eq!(err["code"], "CONFLICT");
+    assert_eq!(err["message"], MSG_UNKNOWN);
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn a_failure_before_sbx_runs_frees_the_key() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    let params = serde_json::json!({"name": "atlas-auth", "projectId": project,
+        "workspaceMode": "mountless", "idempotencyKey": "retry-me"});
+    // sbx not installed (not executable): fails before anything runs.
+    let bin = fake.dir.path().join("sbx");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = s.err("1", "sandbox.create", params.clone());
+    assert_eq!(err["code"], "NOT_INSTALLED");
+    assert!(key_rows(&s).is_empty(), "claim deleted: key reusable");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    s.ok("2", "sandbox.create", params);
+    assert_eq!(create_calls(&fake), 1);
+    assert_eq!(key_rows(&s)[0].2, "done");
+}
+
+#[test]
+fn a_failure_after_sbx_started_marks_the_key_unknown_and_refuses_retry() {
+    let fake = fake_sbx(
+        &ls_with_atlas(ATLAS_ID, "running"),
+        Some("error: global network policy has not been initialized\n  try: sbx policy init <allow-all|balanced|deny-all>"),
+        None,
+    );
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    let params = serde_json::json!({"name": "atlas-auth", "projectId": project,
+        "workspaceMode": "mountless", "idempotencyKey": "maybe-made"});
+    let err = s.err("1", "sandbox.create", params.clone());
+    assert_eq!(
+        err["code"], "PERMISSION_DENIED",
+        "sbx's own classified error"
+    );
+    assert_eq!(key_rows(&s)[0].2, "unknown");
+    let calls = fake.calls();
+    let err = s.err("2", "sandbox.create", params);
+    assert_eq!(err["code"], "CONFLICT");
+    assert_eq!(err["message"], MSG_UNKNOWN);
+    assert_eq!(fake.calls(), calls, "never run twice");
+    assert_eq!(create_calls(&fake), 1);
+}
+
+#[test]
+fn keys_are_namespaced_by_method() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let (project, conv) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    s.ok(
+        "1",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-auth", "projectId": project,
+            "workspaceMode": "mountless", "idempotencyKey": "shared"}),
+    );
+    s.ok(
+        "2",
+        "conversation.send",
+        serde_json::json!({"conversationId": conv, "content": "hi", "idempotencyKey": "shared"}),
+    );
+    assert_eq!(
+        key_rows(&s),
+        vec![
+            ("sandbox.create".into(), "shared".into(), "done".into()),
+            ("conversation.send".into(), "shared".into(), "done".into()),
+        ]
+    );
+}
+
+#[test]
+fn retention_prunes_expired_and_over_cap_rows_but_never_pending() {
+    let mut s = start_server(no_sbx());
+    let (_p, conv) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    {
+        let db = s.inner.lock_db();
+        let tx = db.conn().unchecked_transaction().unwrap();
+        idempotency::insert_done(
+            &tx,
+            "conversation.send",
+            "expired",
+            "h",
+            "{}",
+            "2000-01-01T00:00:00Z",
+        )
+        .unwrap();
+        idempotency::claim(
+            &tx,
+            "sandbox.create",
+            "old-pending",
+            "h",
+            "2000-01-01T00:00:01Z",
+        )
+        .unwrap();
+        // Fill to the cap with recent rows.
+        for i in 0..idempotency::MAX_ROWS {
+            idempotency::insert_done(
+                &tx,
+                "conversation.send",
+                &format!("filler-{i:05}"),
+                "h",
+                "{}",
+                &format!("2099-01-01T00:{:02}:{:02}Z", (i / 60) % 60, i % 60),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    s.ok(
+        "1",
+        "conversation.send",
+        serde_json::json!({"conversationId": conv, "content": "hi", "idempotencyKey": "fresh"}),
+    );
+    let db = s.inner.lock_db();
+    let count = |sql: &str| -> i64 { db.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM idempotency_keys WHERE key='expired'"),
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM idempotency_keys WHERE key='old-pending' AND state='pending'"),
+        1,
+        "pending is never pruned while Core runs"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM idempotency_keys WHERE key='fresh'"),
+        1
+    );
+    assert!(
+        count("SELECT COUNT(*) FROM idempotency_keys") <= idempotency::MAX_ROWS as i64,
+        "cap enforced"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM idempotency_keys WHERE key='filler-00000'"),
+        0,
+        "oldest done row went first"
+    );
+}
+
+#[test]
+fn invalid_keys_are_refused_before_anything_runs() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let (project, conv) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let counts = write_counts(&s);
+    let long = "a".repeat(129);
+    for bad in ["", "has space", "a/b", "ünï", long.as_str()] {
+        let err = s.err(
+            "1",
+            "sandbox.create",
+            serde_json::json!({"name": "atlas-auth", "projectId": project,
+                "workspaceMode": "mountless", "idempotencyKey": bad}),
+        );
+        assert_eq!(err["code"], "VALIDATION_FAILED", "{bad:?}");
+        let err = s.err(
+            "2",
+            "conversation.send",
+            serde_json::json!({"conversationId": conv, "content": "hi", "idempotencyKey": bad}),
+        );
+        assert_eq!(err["code"], "VALIDATION_FAILED", "{bad:?}");
+    }
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    assert_eq!(write_counts(&s), counts);
+}
+
+#[test]
+fn absent_key_behaves_as_before_and_writes_no_key_row() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let (project, conv) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let params = serde_json::json!({"name": "atlas-auth", "projectId": project, "workspaceMode": "mountless"});
+    s.ok("1", "sandbox.create", params.clone());
+    s.ok("2", "sandbox.create", params);
+    assert_eq!(create_calls(&fake), 2, "no key, no replay protection");
+    let a = s.ok(
+        "3",
+        "conversation.send",
+        serde_json::json!({"conversationId": conv, "content": "x"}),
+    );
+    let b = s.ok(
+        "4",
+        "conversation.send",
+        serde_json::json!({"conversationId": conv, "content": "x"}),
+    );
+    assert_ne!(a["id"], b["id"]);
+    assert!(key_rows(&s).is_empty());
+}
+
+#[test]
+fn fingerprints_used_by_tests_match_core() {
+    // Guard for the helpers above: the key is excluded from the fingerprint.
+    let a = serde_json::json!({"conversationId": "c", "content": "x", "idempotencyKey": "k1"});
+    let b = serde_json::json!({"conversationId": "c", "content": "x", "idempotencyKey": "k2"});
+    assert_eq!(send_hash(&a), send_hash(&b));
+}
+
+/// §3.1 item 7, timeout branch: a keyed create killed at its deadline is
+/// `done` when the re-query finds the sandbox (bound, replayable) and
+/// `unknown` when it does not — sbx may still have made it, so that key is
+/// never run again.
+#[test]
+fn keyed_create_timeout_is_done_when_found_and_unknown_when_not() {
+    use sandpane_core::process::RunLimits;
+    use sandpane_service::SbxLimits;
+    let fast = SbxLimits {
+        mutation: RunLimits {
+            timeout: Duration::from_millis(300),
+            ..RunLimits::MUTATION
+        },
+        ..SbxLimits::default()
+    };
+    let fake = fake_sbx(
+        r#"{"sandboxes":[{"name":"atlas-slow","id":"a1b2","status":"running"}]}"#,
+        None,
+        None,
+    );
+    std::fs::write(fake.dir.path().join("create.sleep"), "").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("t.sqlite3")).unwrap();
+    let inner = ServerInner::with_sbx_limits(db, fake.locator(), fast);
+    let mut s = serve_inner(inner, dir);
+    let project = new_project(&mut s);
+    let call = |s: &mut TestServer, name: &str, key: &str| {
+        s.rpc(
+            "c",
+            "sandbox.create",
+            serde_json::json!({"name": name, "projectId": project,
+                "workspaceMode": "mountless", "idempotencyKey": key}),
+        )
+    };
+    let found = call(&mut s, "atlas-slow", "slow-found");
+    assert_eq!(found["ok"]["probedState"], "running", "{found}");
+    let missing = call(&mut s, "atlas-missing", "slow-missing");
+    assert_eq!(missing["err"]["code"], "INTERNAL", "{missing}");
+    assert_eq!(
+        key_rows(&s),
+        vec![
+            ("sandbox.create".into(), "slow-found".into(), "done".into()),
+            (
+                "sandbox.create".into(),
+                "slow-missing".into(),
+                "unknown".into()
+            ),
+        ]
+    );
+    let calls = fake.calls();
+    let replay = call(&mut s, "atlas-slow", "slow-found");
+    assert_is_replay_of(&replay["ok"], &found["ok"]);
+    let retry = call(&mut s, "atlas-missing", "slow-missing");
+    assert_eq!(retry["err"]["code"], "CONFLICT");
+    assert_eq!(retry["err"]["message"], MSG_UNKNOWN);
+    assert_eq!(fake.calls(), calls, "neither replay ran sbx");
+}
+
+// ---------------------------------------------------------------------------
+// A2 security follow-up (review W1, W3, I4 + disclosed untested paths)
+// ---------------------------------------------------------------------------
+
+/// The stored result is the FIRST response without the replay marker.
+#[test]
+fn stored_result_never_contains_the_replay_marker() {
+    let mut s = start_server(no_sbx());
+    let (_p, conv) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let params = serde_json::json!({"conversationId": conv, "content": "x", "idempotencyKey": "m"});
+    s.ok("1", "conversation.send", params.clone());
+    s.ok("2", "conversation.send", params);
+    let stored: String = s
+        .inner
+        .lock_db()
+        .conn()
+        .query_row("SELECT result_json FROM idempotency_keys", [], |r| r.get(0))
+        .unwrap();
+    assert!(!stored.contains("replayed"), "{stored}");
+}
+
+/// (a) Two clients send the same keyed message at the same moment: exactly
+/// one task and one message exist afterwards; each caller gets the task (the
+/// loser as a replay) or a CONFLICT — never a second task.
+#[test]
+fn concurrent_same_key_sends_create_exactly_one_task() {
+    let mut s = start_server(no_sbx());
+    let (_p, conv) = make_project_and_conversation(&mut s, "Atlas Demo", vec![]);
+    let before = write_counts(&s);
+    let frame = serde_json::json!({"v":1,"id":"r","method":"conversation.send",
+        "params":{"conversationId": conv, "content": "race", "idempotencyKey": "race-key"}})
+    .to_string();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let inner = Arc::clone(&s.inner);
+            let barrier = Arc::clone(&barrier);
+            let frame = frame.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                serde_json::from_str::<serde_json::Value>(&sandpane_service::handle_line(
+                    &inner, &frame,
+                ))
+                .unwrap()
+            })
+        })
+        .collect();
+    let out: Vec<serde_json::Value> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let after = write_counts(&s);
+    assert_eq!(after[0] - before[0], 1, "one message row");
+    assert_eq!(after[1] - before[1], 1, "one task row");
+    assert_eq!(after[3] - before[3], 1, "one key row");
+    let oks: Vec<&serde_json::Value> = out.iter().filter_map(|o| o.get("ok")).collect();
+    assert!(!oks.is_empty(), "{out:?}");
+    for o in &oks {
+        assert_eq!(o["id"], oks[0]["id"], "same task for every success");
+    }
+    // W1 on the race-loser path: exactly one FIRST response (no marker);
+    // any other success is a replay.
+    let firsts = oks.iter().filter(|o| o.get("replayed").is_none()).count();
+    assert_eq!(firsts, 1, "{out:?}");
+    for o in oks.iter().filter(|o| o.get("replayed").is_some()) {
+        assert_eq!(o["replayed"], true, "{o}");
+    }
+    for o in out.iter().filter_map(|o| o.get("err")) {
+        assert_eq!(o["code"], "CONFLICT", "{o}");
+    }
+}
+
+/// (b) `sbx` was located but could not be started (here: a bad interpreter
+/// line): nothing ran, so the claim is released and the key is reusable.
+#[test]
+fn spawn_failure_releases_the_key() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    let bin = fake.dir.path().join("sbx");
+    std::fs::write(&bin, "#!/nonexistent/sandpane-test-interpreter\n").unwrap();
+    let params = serde_json::json!({"name": "atlas-auth", "projectId": project,
+        "workspaceMode": "mountless", "idempotencyKey": "spawn-fail"});
+    let err = s.err("1", "sandbox.create", params.clone());
+    assert_eq!(err["code"], "INTERNAL", "{err}");
+    assert!(
+        err["message"].as_str().unwrap().contains("could not start"),
+        "{err}"
+    );
+    assert!(key_rows(&s).is_empty(), "claim released");
+    std::fs::write(&bin, FAKE_SBX_SCRIPT).unwrap();
+    s.ok("2", "sandbox.create", params);
+    assert_eq!(create_calls(&fake), 1);
+}
+
+/// (c) Startup retention also enforces the row cap.
+#[test]
+fn startup_prune_enforces_the_row_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("core.sqlite3");
+    {
+        let db = Database::open(&db_path).unwrap();
+        let tx = db.conn().unchecked_transaction().unwrap();
+        for i in 0..idempotency::MAX_ROWS + 5 {
+            idempotency::insert_done(
+                &tx,
+                "conversation.send",
+                &format!("k-{i:05}"),
+                "h",
+                "{}",
+                &format!(
+                    "2099-01-01T{:02}:{:02}:{:02}Z",
+                    i / 3600,
+                    (i / 60) % 60,
+                    i % 60
+                ),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let s = start_server_at(no_sbx(), dir, db_path);
+    let db = s.inner.lock_db();
+    let count = |sql: &str| -> i64 { db.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert!(count("SELECT COUNT(*) FROM idempotency_keys") < idempotency::MAX_ROWS as i64);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM idempotency_keys WHERE key='k-00000'"),
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM idempotency_keys WHERE key='k-10004'"),
+        1,
+        "newest kept"
+    );
+}
+
+/// A DB whose reconciliation UPDATEs are blocked by triggers (the stand-in
+/// for an I/O or corruption failure). `which` = "keys" or "tasks".
+fn db_with_blocked_reconciliation(path: &Path, which: &str) {
+    let db = Database::open(path).unwrap();
+    let c = db.conn();
+    match which {
+        "keys" => {
+            idempotency::claim(c, "sandbox.create", "stuck", "h", "2099-01-01T00:00:00Z").unwrap();
+            c.execute_batch(
+                "CREATE TRIGGER block_keys BEFORE UPDATE ON idempotency_keys
+                 BEGIN SELECT RAISE(ABORT, 'test: reconciliation blocked'); END;",
+            )
+            .unwrap();
+        }
+        _ => {
+            c.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO conversations (id,project_id,agent_id,created_at) VALUES ('c1','p1','codex','t');
+                 INSERT INTO tasks (id,conversation_id,status,created_at,updated_at) VALUES ('t1','c1','running','t','t');
+                 CREATE TRIGGER block_tasks BEFORE UPDATE ON tasks
+                 BEGIN SELECT RAISE(ABORT, 'test: reconciliation blocked'); END;",
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// W3: Core must not serve with unreconciled state — the library refuses.
+#[test]
+fn startup_fails_closed_when_reconciliation_fails() {
+    for which in ["keys", "tasks"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        db_with_blocked_reconciliation(&path, which);
+        let db = Database::open(&path).unwrap();
+        let r = ServerInner::try_with_config(db, no_sbx(), CoreConfig::default());
+        let err = match r {
+            Ok(_) => panic!("{which}: Core started with unreconciled state"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("reconcil"), "{which}: {err}");
+    }
+}
+
+/// W3, production binary: it exits non-zero with a clear stderr line and
+/// never serves. sbx is pointed at a nonexistent path, so nothing executes.
+#[test]
+fn service_binary_refuses_to_serve_when_reconciliation_fails() {
+    for which in ["keys", "tasks"] {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir(&run_dir).unwrap();
+        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db_path = dir.path().join("core.sqlite3");
+        db_with_blocked_reconciliation(&db_path, which);
+        let socket = run_dir.join("core.sock");
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sandpane-service"))
+            .env("HOME", dir.path())
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("SANDPANE_DB", &db_path)
+            .env("SANDPANE_SOCKET", &socket)
+            .env("SANDPANE_SBX_PATH", dir.path().join("no-such-sbx"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("{which}: service kept running with unreconciled state");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert_eq!(status.code(), Some(1), "{which}: {stderr}");
+        assert!(stderr.contains("refusing to start"), "{which}: {stderr}");
+        assert!(stderr.contains("reconcil"), "{which}: {stderr}");
+        assert!(!socket.exists(), "{which}: no socket left to connect to");
+    }
 }

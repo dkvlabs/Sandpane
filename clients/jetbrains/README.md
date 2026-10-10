@@ -23,6 +23,13 @@ client) implementing the JB0/JB1 surface of
 > deprecated/experimental/internal usage reports. The new actions were **never launched in an IDE**
 > and never exercised against a running Core or a real `sbx`.
 >
+> Re-run on 10.10.2026 after the A2 client work (idempotency keys + `features`):
+> `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache` passes with
+> **265 tests, 0 failures, 0 errors, 0 skipped** across 30 test classes, and
+> `./gradlew verifyPlugin --offline` reports **`Compatible`** against IU-262.10968.63 (no
+> deprecated/experimental/internal usage reports). A2 is UNVERIFIED end to end: never run in an IDE,
+> never against a running Core, never against a real `sbx`.
+>
 > **Proven on this host** (exact commands and outputs in "Checks actually run" below):
 > `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
 > (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
@@ -217,6 +224,7 @@ clients/jetbrains/
     │   │   ├── actions/{StartTask,ReviewChanges,ApplyTask,RefreshSandboxes}Action.kt
     │   │   ├── actions/SandboxLifecycleActions.kt # Stop / Remove (two-step token) / Start (unsupported)
     │   │   ├── core/SandboxLifecycle.kt      # step-1 check, IssuedRemoval, remove flow, stop report
+    │   │   ├── core/Idempotency.kt           # A2: keys, keyed requests, CONFLICT/unknown copy, replay notice
     │   │   ├── core/MethodDeadlines.kt       # per-method read deadlines (stop 360 s, remove 400 s)
     │   │   ├── ui/SandboxDialogs.kt          # remove confirmation content + sandbox chooser
     │   │   ├── services/{SandpaneContextProvider,EditorDiffProvider,SbxService,TaskMonitorService}.kt
@@ -227,8 +235,9 @@ clients/jetbrains/
         ├── core/CoreClientFramingTest.kt     # byte-level framing + wire names        (29 tests)
         ├── core/CoreCommandsTest.kt          # guards, gates, the three cursor shapes  (30 tests)
         ├── core/SandboxLifecycleTest.kt      # A1 frames, token flow, stop report       (25 tests)
+        ├── core/IdempotencyTest.kt           # A2 keys, features, CONFLICT copy, replay (19 tests)
         ├── core/ErrorAttributionTest.kt      # failure provenance sentences             (13 tests)
-        ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (14 tests)
+        ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (17 tests)
         ├── core/ReplayCursorSemanticsTest.kt # per-task vs shared-scalar replay         (7 tests)
         ├── services/FolderMatchingTest.kt    # folder matching + workspace-mode views  (12 tests)
         ├── services/SnapshotGapTest.kt       # why the sandbox list is missing          (3 tests)
@@ -287,7 +296,7 @@ not advertised ⇒ the action is visibly disabled and nothing is sent. There is 
 `Project.repositories`, `SandboxSummary.workspaceMode` and the optional
 `TaskSubscribeParams.afterSequences`.
 
-This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (14 tests), which
+This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (17 tests), which
 reads the Rust sources and the schemas out of the working tree and compares them against the
 Kotlin mirror: method names **and their order**, the `Method::parse` arms, the
 `rpc-request.schema.json` `method` enum, every `pub const` numeric bound (evaluated, not copied), the
@@ -416,6 +425,24 @@ discovery revision this client is now synced to**):
 - **Local IPC only.** `SocketChannel` + `UnixDomainSocketAddress`; a non-local or scheme-like
   path is refused, and Windows resolves to an explicit `TransportUnsupported` state instead of
   falling back to TCP.
+- **Idempotency keys + features (A2).** `system.probe`'s `features` is parsed absent-tolerantly
+  (older Core ⇒ none; unknown strings ignored). Only when Core advertises `idempotency-keys` does each
+  user action (one chat Send; one `SbxService.createSandbox` call) get ONE fresh key — 32 lowercase hex
+  from `SecureRandom`, never derived from content; without the feature no key is sent at all. The
+  create `agent` field is gated on `sandbox-create-agent` (no longer inferred from `sandbox.remove`)
+  and refused locally otherwise. On an UNKNOWN outcome of a keyed write (timeout, transport loss, Core
+  `INTERNAL`, unusable reply) the chat shows a notification whose one expiring action is **"Retry
+  safely"**: it resends the identical params with the same key, on that click only. Unkeyed: "outcome
+  unknown — check before trying again", no retry offered. There is no automatic retry of any write and
+  no replay-safe method set in this client. CONFLICT copy: key reused with different params / same key
+  still in progress / A1 name lock ⇒ "nothing was run"; earlier outcome unknown ⇒ "outcome unknown —
+  re-read state; a retry needs a new request" (never "nothing was run"); Core's own message is always
+  shown revealed and capped (300 chars). A `replayed: true` answer shows "Core returned the result of
+  your earlier identical request (replayed). It may be out of date; refreshing from Core." and is never
+  shown as a fresh success: a replayed send does not seed its stored status and `task.list` is re-read;
+  a replayed create re-probes `sandbox.list`. Decode failures on these paths never echo the payload.
+  `createSandbox` has no UI caller, so only its service seam (`KeyedRequests`) is tested. Keys live 24 h
+  in Core; after that, the same key would run again.
 - **Sandbox lifecycle (A1).** Stop / Remove pick a sandbox from Core's last `sandbox.list` (including
   ones with no Sandpane binding). Stop: `{name}`, deadline 360 s; an absent `requeried` is shown as
   state UNKNOWN, never "stopped". Remove: step 1 `{name}` (no token key) off the EDT; Core's answer
@@ -511,6 +538,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Unit tests | JUnit XML in `build/test-results/test` | **161 tests, 0 failures, 0 errors, 0 skipped**, 20 result files (both runs) |
 | Gate after the anti-spoofing + enum-tolerance hardening, with the table-layout fix (10.10.2026; an intermediate 09.10.2026 run of the same command had 196 tests) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache --console=plain`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 17s`; **205 tests, 0 failures, 0 errors, 0 skipped**, 26 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; 55 source files (32 main, 23 test) |
 | Gate after the A1 sandbox-lifecycle client work (10.10.2026) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 16s`; **243 tests, 0 failures, 0 errors, 0 skipped**, 29 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (report dir holds only verdict/telemetry/dependencies — no deprecated/experimental/internal usage files); 62 source files (36 main, 26 test) — re-run after the A1 security/phase-review fixes |
+| Gate after the A2 client work (idempotency keys + features, 10.10.2026) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 15s`; **265 tests, 0 failures, 0 errors, 0 skipped**, 30 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 64 source files (37 main, 27 test) |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |

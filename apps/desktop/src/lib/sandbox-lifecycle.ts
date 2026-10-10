@@ -17,8 +17,10 @@ import {
 import {
   SBX_AGENTS,
   DEFAULT_SBX_AGENT,
+  FEATURE_SANDBOX_CREATE_AGENT,
   MAX_LIST_LIMIT,
   TASK_STATUSES,
+  coreAdvertisesFeature,
   coreAdvertisesMethod,
   type ConfirmationRequest,
   type ConfirmationTarget,
@@ -617,10 +619,10 @@ export const UNVERIFIED_AGENT_NOTE =
  * Options for the wizard's sbx agent select: the exact `SBX_AGENTS` allowlist,
  * `shell` first and default. Every other entry is labelled unverified.
  *
- * `agentFieldHonoured` is whether THIS Core understands `SandboxCreateSpec.agent`.
- * A pre-A1 Core would silently IGNORE the key (serde drops unknown fields) and
- * create a shell sandbox while the UI claimed otherwise, so non-shell options
- * are disabled unless the A1 signal (`sandbox.remove` advertised) is present.
+ * `agentFieldHonoured` is whether THIS Core advertises the
+ * `sandbox-create-agent` feature. A Core without it would silently IGNORE the
+ * key (serde drops unknown fields) and create a shell sandbox while the UI
+ * claimed otherwise, so non-shell options are disabled.
  */
 export function sbxAgentOptions(agentFieldHonoured: boolean): SbxAgentOption[] {
   const rest = SBX_AGENTS.filter((id) => id !== DEFAULT_SBX_AGENT);
@@ -636,9 +638,13 @@ export function sbxAgentOptions(agentFieldHonoured: boolean): SbxAgentOption[] {
   ];
 }
 
-/** The A1 signal the wizard uses to decide whether `agent` is honoured. */
+/**
+ * Whether `SandboxCreateSpec.agent` is honoured: Core advertises the
+ * `sandbox-create-agent` feature (A2 §3.1 item 9). This replaced the A1
+ * inference "agent is honoured if `sandbox.remove` is advertised".
+ */
 export function agentFieldHonoured(
-  capabilities: Pick<CoreCapabilities, "methods"> | null,
+  capabilities: Pick<CoreCapabilities, "features"> | null,
 ): boolean {
-  return capabilities !== null && coreAdvertisesMethod(capabilities, "sandbox.remove");
+  return coreAdvertisesFeature(capabilities, FEATURE_SANDBOX_CREATE_AGENT);
 }

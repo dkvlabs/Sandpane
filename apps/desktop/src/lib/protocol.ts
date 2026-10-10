@@ -204,7 +204,42 @@ export interface CoreCapabilities {
    * absent/empty list means "not advertised", not "all".
    */
   methods?: string[];
+  /**
+   * Optional protocol features THIS Core implements (A2, additive): behaviour a
+   * client cannot infer from `methods`, because a Core that predates a request
+   * field silently drops it. Absent on a pre-A2 Core = nothing advertised.
+   * Unknown strings are kept but never acted on (`coreAdvertisesFeature`).
+   */
+  features?: string[];
 }
+
+/** `sandbox.create` / `conversation.send` honour `idempotencyKey` (A2). */
+export const FEATURE_IDEMPOTENCY_KEYS = "idempotency-keys" as const;
+/** `sandbox.create` honours `agent` (A1). */
+export const FEATURE_SANDBOX_CREATE_AGENT = "sandbox-create-agent" as const;
+
+/**
+ * Every feature this desktop build knows, in Rust `FEATURES` order
+ * (drift-tested against `sandpane_protocol::FEATURES` and the schema's
+ * `features.items.examples`). Unknown advertised strings are ignored.
+ */
+export const KNOWN_FEATURES = [FEATURE_IDEMPOTENCY_KEYS, FEATURE_SANDBOX_CREATE_AGENT] as const;
+export type KnownFeature = (typeof KNOWN_FEATURES)[number];
+
+/** Does THIS Core advertise `feature`? Absent/empty list = no. */
+export function coreAdvertisesFeature(
+  capabilities: Pick<CoreCapabilities, "features"> | null | undefined,
+  feature: KnownFeature,
+): boolean {
+  const advertised = capabilities?.features;
+  return Array.isArray(advertised) && advertised.includes(feature);
+}
+
+/**
+ * Core's idempotency-key rule (A2): 1..=128 characters of `[A-Za-z0-9._-]`.
+ * Exactly Core's — never stricter — so a key Core accepts is never refused here.
+ */
+export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 
 export interface SbxStatus {
   installed: boolean;
@@ -258,6 +293,11 @@ export interface SandboxCreateSpec {
    * third-party code). Accepting a provider agent is NOT a verification claim.
    */
   agent?: SbxAgent;
+  /**
+   * Retry-safety key (A2). Sent ONLY when Core advertises `idempotency-keys`;
+   * one fresh key per user action, reused only by an explicit "Retry safely".
+   */
+  idempotencyKey?: string;
 }
 
 /**
@@ -318,6 +358,14 @@ export interface SandboxSummary {
    * or the Core predates A1; the key is then omitted, never invented.
    */
   agent?: string;
+  /**
+   * A2: present (`true`) ONLY when this is a REPLAY of an earlier keyed
+   * `sandbox.create` — the FIRST response, unchanged. It is NOT current state:
+   * the sandbox may since have been stopped or removed; re-read `sandbox.list`.
+   */
+  replayed?: true;
+  /** CLIENT-SIDE ONLY: Core sent a non-boolean `replayed` — maybe a replay. */
+  replayedUncertain?: true;
 }
 
 /** `sandbox.stop` params (A1). Not destructive: no confirmation token. */
@@ -420,6 +468,8 @@ export interface ConversationSendParams {
   conversationId: string;
   content: string;
   attachments: ContextRef[];
+  /** Retry-safety key (A2); same rules as `SandboxCreateSpec.idempotencyKey`. */
+  idempotencyKey?: string;
 }
 
 /**
@@ -561,6 +611,14 @@ export interface TaskSummary {
   sandboxName?: string | null;
   taskBranch?: string | null;
   baseCommit?: string | null;
+  /**
+   * A2: present (`true`) ONLY when this is a REPLAY of an earlier keyed
+   * `conversation.send` — the task as FIRST created. Its status is NOT current
+   * (it may since have been reconciled to `interrupted`); re-read `task.list`.
+   */
+  replayed?: true;
+  /** CLIENT-SIDE ONLY: Core sent a non-boolean `replayed` — maybe a replay. */
+  replayedUncertain?: true;
 }
 
 /** `git.review` result: the ACTUAL change set vs the task base revision. */

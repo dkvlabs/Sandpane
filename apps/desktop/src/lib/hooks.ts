@@ -28,6 +28,11 @@ import {
 } from "./core-client";
 import { TaskEventStore } from "./event-store";
 import {
+  KeyedWrite,
+  keyRecheckFromProbe,
+  type KeyedWriteState,
+} from "./idempotency";
+import {
   SandboxRemovalFlow,
   SandboxStopConfirm,
   countActiveTasksOn,
@@ -60,7 +65,9 @@ import {
   type TranscriptView,
 } from "./reducers";
 import {
+  coreAdvertisesFeature,
   coreAdvertisesMethod,
+  type KnownFeature,
   type ApplyResult,
   type ChangeSet,
   type Conversation,
@@ -484,16 +491,63 @@ export function useCreateProject() {
   });
 }
 
-export function useCreateSandbox() {
+/**
+ * `sandbox.create` as a keyed write (A2): one controller per wizard. The spec
+ * carries an `idempotencyKey` only when the caller minted one for this action.
+ * Never retried automatically; "Retry safely" re-probes Core first. The list
+ * and probe are re-read after every exchange that may have reached Core.
+ */
+export function useKeyedCreateSandbox(): KeyedWriteHandle<SandboxCreateSpec, SandboxSummary> {
   const deps = useDeps();
   const qc = useQueryClient();
-  return useMutation<unknown, CoreRequestError, SandboxCreateSpec>({
-    mutationFn: (spec) => deps.client.createSandbox(spec),
-    onSuccess: () => {
+  return useKeyedWrite<SandboxCreateSpec, SandboxSummary>(
+    (spec) => deps.client.createSandboxSummary(spec),
+    () => {
       void qc.invalidateQueries({ queryKey: queryKeys.sandboxes });
       void qc.invalidateQueries({ queryKey: queryKeys.probe });
     },
+  );
+}
+
+export interface KeyedWriteHandle<P extends { idempotencyKey?: string }, R> {
+  write: KeyedWrite<P, R>;
+  state: KeyedWriteState<P, R>;
+}
+
+/**
+ * One `KeyedWrite` controller for the lifetime of the component. `run` and
+ * `settled` are read through refs so the controller is created once.
+ */
+function useKeyedWrite<P extends { idempotencyKey?: string }, R>(
+  run: (params: P) => Promise<R>,
+  settled: (params: P) => void,
+): KeyedWriteHandle<P, R> {
+  const deps = useDeps();
+  const runRef = useRef(run);
+  const settledRef = useRef(settled);
+  useEffect(() => {
+    runRef.current = run;
+    settledRef.current = settled;
   });
+  const ref = useRef<KeyedWrite<P, R> | null>(null);
+  if (ref.current === null) {
+    ref.current = new KeyedWrite<P, R>((params) => runRef.current(params), {
+      // W1: the CURRENT Core must still advertise keys right before a retry.
+      recheckKeys: async () => keyRecheckFromProbe(await deps.client.probe()),
+      onSettled: (params) => settledRef.current(params),
+    });
+  }
+  const write = ref.current;
+  const state = useSyncExternalStore(write.subscribe, write.getState);
+  return { write, state };
+}
+
+/** Does the attached Core advertise `feature`? `null` while unprobed. */
+export function useCoreFeature(feature: KnownFeature): boolean | null {
+  const link = useCoreLink();
+  const capabilities = capabilitiesOf(link);
+  if (capabilities === null) return null;
+  return coreAdvertisesFeature(capabilities, feature);
 }
 
 /**
@@ -595,33 +649,36 @@ export function useCreateConversation() {
   });
 }
 
+/** Variables of one chat send (the key travels only when minted for this action). */
+export interface SendVariables {
+  conversationId: string;
+  content: string;
+  idempotencyKey?: string;
+}
+
 /**
- * `conversation.send`. The conversation id travels WITH the variables, so the
- * caller can attribute a success or failure to the chat it was sent from even
- * if the user switched tabs while it was in flight.
+ * `conversation.send` as a keyed write (A2). The conversation id travels WITH
+ * the variables, so the caller can attribute an outcome to the chat it was sent
+ * from even if the user switched tabs. Decoded by the client: a status this
+ * build does not recognise is still an ACCEPTED send. History and `task.list`
+ * are re-read after every exchange that may have reached Core.
  */
-export function useSendMessage() {
+export function useKeyedSend(): KeyedWriteHandle<SendVariables, TaskSummary> {
   const deps = useDeps();
   const qc = useQueryClient();
-  return useMutation<
-    TaskSummary,
-    CoreRequestError,
-    { conversationId: string; content: string }
-  >({
-    // Decoded by the client: a status this build does not recognise is still
-    // an ACCEPTED send (Core applied it), never reported as a failure.
-    mutationFn: ({ conversationId, content }) =>
+  return useKeyedWrite<SendVariables, TaskSummary>(
+    ({ conversationId, content, idempotencyKey }) =>
       deps.client.sendConversationMessage({
         conversationId,
         content,
         attachments: [],
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       }),
-    onSettled: (_data, _error, variables) => {
-      // Settled, not just success: a lost answer may still have been stored.
+    (variables) => {
       void qc.invalidateQueries({ queryKey: queryKeys.history(variables.conversationId) });
       void qc.invalidateQueries({ queryKey: ["core", "task-list"] });
     },
-  });
+  );
 }
 
 export function useCancelTask() {

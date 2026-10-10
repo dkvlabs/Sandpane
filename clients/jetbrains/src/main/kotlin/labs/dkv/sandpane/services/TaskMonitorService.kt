@@ -4,6 +4,9 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.core.CoreRpcException
+import labs.dkv.sandpane.core.CoreValidationException
+import labs.dkv.sandpane.core.KeyedCall
+import labs.dkv.sandpane.core.KeyedRequests
 import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.core.EventStream
 import labs.dkv.sandpane.core.RenderedEvent
@@ -92,11 +95,17 @@ class TaskMonitorService(private val project: Project) : Disposable {
 
     /** How a `conversation.send` reply was understood — see protocol gap 2 above. */
     sealed class SendResult {
+        /** A2: Core returned its STORED answer to an earlier identical keyed send (not current state). */
+        abstract val replayed: Boolean
+
         data class FromSummary(val summary: TaskSummary) : SendResult() {
             val taskId: String get() = summary.id
+            override val replayed: Boolean get() = summary.replayed == true
         }
 
-        data class TaskIdOnly(val taskId: String) : SendResult()
+        data class TaskIdOnly(val taskId: String) : SendResult() {
+            override val replayed: Boolean get() = false
+        }
     }
 
     fun interface ViewListener {
@@ -261,18 +270,40 @@ class TaskMonitorService(private val project: Project) : Disposable {
      * `conversation.send`. Content is data, never a command; attachments are validated refs
      * (docs/specs/02 §2). The returned task id is Core's, and replay starts from that moment.
      */
-    fun send(request: ConversationSendParams): CompletableFuture<SendResult> =
-        connection.callJson(
+    fun send(request: ConversationSendParams): KeyedCall<ConversationSendParams, SendResult> =
+        dispatchSend(request, KeyedRequests.newSend(request, connection.capabilities))
+
+    /**
+     * A2 "Retry safely": resend the IDENTICAL params with the SAME key, only on an explicit user
+     * action after an unknown outcome. Refused (nothing sent) without a key or when the connected
+     * Core no longer advertises keys. Never called automatically.
+     */
+    fun retrySendSafely(previous: ConversationSendParams): KeyedCall<ConversationSendParams, SendResult> =
+        dispatchSend(previous, KeyedRequests.retrySend(previous, connection.capabilities))
+
+    private fun dispatchSend(
+        original: ConversationSendParams,
+        prepared: KeyedRequests.Prepared<ConversationSendParams>,
+    ): KeyedCall<ConversationSendParams, SendResult> {
+        val params = when (prepared) {
+            is KeyedRequests.Prepared.Refused -> return KeyedCall(
+                original,
+                null,
+                CompletableFuture.failedFuture(CoreValidationException("idempotencyKey", prepared.reason)),
+            )
+            is KeyedRequests.Prepared.Ready -> prepared.params
+        }
+        val future = connection.callJson(
             CoreMethods.CONVERSATION_SEND,
-            CoreJson.encodeToJsonElement(ConversationSendParams.serializer(), request),
+            CoreJson.encodeToJsonElement(ConversationSendParams.serializer(), params),
         ).thenApply { element ->
             val result = decodeSendResult(element)
-            when (result) {
-                is SendResult.FromSummary -> track(result.taskId, request.conversationId, result.summary)
-                is SendResult.TaskIdOnly -> track(result.taskId, request.conversationId)
-            }
+            // A replayed answer's status is what it was THEN: track the id, never seed that status.
+            track(result.taskId(), params.conversationId, summaryToSeed(result))
             result
         }
+        return KeyedCall(params, params.idempotencyKey, future)
+    }
 
     /** Cancel is a *request*; the resulting status still arrives as durable events. */
     fun cancel(taskId: String): CompletableFuture<CancelAccepted> =
@@ -463,6 +494,18 @@ class TaskMonitorService(private val project: Project) : Disposable {
                     "nothing is shown as accepted",
                 raisedByCore = false,
             )
+        }
+
+        /**
+         * The summary a send may seed its row with: a fresh answer's, never a replayed one's (its
+         * status may since have been reconciled — the caller re-reads `task.list` instead).
+         */
+        internal fun summaryToSeed(result: SendResult): TaskSummary? =
+            (result as? SendResult.FromSummary)?.summary?.takeIf { !result.replayed }
+
+        private fun SendResult.taskId(): String = when (this) {
+            is SendResult.FromSummary -> taskId
+            is SendResult.TaskIdOnly -> taskId
         }
 
         fun instance(project: Project): TaskMonitorService =

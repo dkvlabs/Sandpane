@@ -182,6 +182,36 @@ export interface CoreCapabilities {
    * empty/absent list means "not advertised", never "all".
    */
   methods?: string[];
+  /**
+   * A2, additive: protocol features THIS Core implements (`sandpane_protocol::
+   * FEATURES`) — behaviour a client cannot infer from `methods`, because a
+   * pre-A2 Core silently drops an unknown request field. Absent on an older
+   * Core = nothing advertised. Unknown strings are ignored, never an error.
+   */
+  features?: string[];
+}
+
+/**
+ * The features this client understands (Rust `FEATURES`, schema
+ * `core-capabilities.features.items.examples`; drift-tested).
+ *  - `idempotency-keys`: `sandbox.create` / `conversation.send` honour
+ *    `idempotencyKey` (a replay returns the first result, never runs twice);
+ *  - `sandbox-create-agent`: `sandbox.create` honours `agent`.
+ */
+export const KNOWN_FEATURES = ['idempotency-keys', 'sandbox-create-agent'] as const;
+
+export type CoreFeature = (typeof KNOWN_FEATURES)[number];
+
+/**
+ * Does THIS Core advertise `feature`? Absent / malformed `features` means no;
+ * strings this client does not know are simply never asked about.
+ */
+export function coreAdvertisesFeature(
+  capabilities: Pick<CoreCapabilities, 'features'> | null | undefined,
+  feature: CoreFeature,
+): boolean {
+  const advertised: unknown = capabilities?.features;
+  return Array.isArray(advertised) && advertised.some((f) => f === feature);
 }
 
 export interface Project {
@@ -228,6 +258,12 @@ export interface SandboxCreateSpec {
    * `CoreCapabilities.agents[].verified`.
    */
   agent?: string;
+  /**
+   * A2, additive: 1..=128 chars of `[A-Za-z0-9._-]`. Sent ONLY when Core
+   * advertises the `idempotency-keys` feature (an older Core would drop it and
+   * the key would promise a safety that does not exist).
+   */
+  idempotencyKey?: string;
 }
 
 /**
@@ -279,6 +315,12 @@ export interface SandboxSummary {
    * never a verification claim. Absent when sbx did not report one.
    */
   agent?: string | null;
+  /**
+   * A2: `true` when this is the STORED first response to an earlier identical
+   * keyed `sandbox.create` — not current state (the sandbox may since have been
+   * stopped or removed). Clients re-read `sandbox.list`. Absent on first responses.
+   */
+  replayed?: boolean | null;
 }
 
 /** `sandbox.stop` params (A1). Not destructive: no confirmation token. */
@@ -370,6 +412,8 @@ export interface ConversationSendParams {
   conversationId: string;
   content: string;
   attachments: ContextRef[];
+  /** A2: see `SandboxCreateSpec.idempotencyKey`; same rule, same gating. */
+  idempotencyKey?: string;
 }
 
 /**
@@ -462,6 +506,12 @@ export interface TaskSummary {
   sandboxName?: string | null;
   taskBranch?: string | null;
   baseCommit?: string | null;
+  /**
+   * A2: `true` when this is the STORED first response to an earlier identical
+   * keyed `conversation.send`. Its `status` is NOT current (the task may since
+   * have been reconciled, e.g. to `interrupted`); clients re-read `task.list`.
+   */
+  replayed?: boolean | null;
 }
 
 /** `git.review` result (`ChangeSet`) — the actual change set vs the task base. */

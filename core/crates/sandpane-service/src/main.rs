@@ -93,7 +93,11 @@ fn main() {
             None
         }
     };
-    let inner = ServerInner::with_config(
+    // FAIL CLOSED (A2 review W3): restart reconciliation (tasks ->
+    // interrupted, pending idempotency keys -> unknown) must be durable
+    // before anything is served. If it is not, remove the socket we bound
+    // (no client may connect to unreconciled state) and exit non-zero.
+    let inner = match ServerInner::try_with_config(
         db,
         locator,
         CoreConfig {
@@ -101,7 +105,18 @@ fn main() {
             user_excludes_file,
             ..CoreConfig::default()
         },
-    );
+    ) {
+        Ok(inner) => inner,
+        Err(e) => {
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+            eprintln!(
+                "sandpane-service: refusing to start: {e}; nothing was served (database {})",
+                db_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
     eprintln!(
         "sandpane-service: listening on {} (protocol v{}, core v{}, db {})",
         socket_path.display(),

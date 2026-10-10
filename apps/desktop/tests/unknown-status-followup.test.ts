@@ -165,7 +165,7 @@ describe("planApply with a path Core listed twice", () => {
   });
 
   it("the plan always carries Core's raw path, never a display form", () => {
-    const raw = "src/‮evil.ts";
+    const raw = "src/\u202Eevil.ts";
     const plan = planApply(
       { ...changeSet, changes: [{ path: raw, status: "modified" }] },
       new Set([raw]),
@@ -190,12 +190,12 @@ describe("planApply with a path Core listed twice", () => {
 
 describe("sanitizeHint strips every invisible / reordering character", () => {
   const hidden = [
-    "؜", // Arabic letter mark
-    "­", // soft hyphen
-    "᠎", // Mongolian vowel separator
-    "⁠", "⁡", "⁢", "⁣", "⁤",
-    "￹", "￺", "￻",
-    "‮", "⁦", "‏", "﻿",
+    "\u061C", // Arabic letter mark
+    "\u00AD", // soft hyphen
+    "\u180E", // Mongolian vowel separator
+    "\u2060", "\u2061", "\u2062", "\u2063", "\u2064",
+    "\uFFF9", "\uFFFA", "\uFFFB",
+    "\u202E", "\u2066", "\u200F", "\uFEFF",
   ];
 
   for (const ch of hidden) {
@@ -227,7 +227,7 @@ describe("sanitizeHint strips every invisible / reordering character", () => {
 
 describe("displayPath escapes hidden characters visibly instead of removing them", () => {
   it("a bidi override is shown as an escape and flagged unusual", () => {
-    const shown = displayPath("src/‮gnp.exe");
+    const shown = displayPath("src/\u202Egnp.exe");
     expect(shown.text).toBe("src/\\u202Egnp.exe");
     expect(shown.unusual).toBe(true);
   });
@@ -258,7 +258,7 @@ describe("displayPath escapes hidden characters visibly instead of removing them
         taskId: "t1",
         baseCommit: "b",
         hostDirty: false,
-        changes: [{ path: "a‮b", status: "unknown", unrecognizedStatus: "x" }],
+        changes: [{ path: "a\u202Eb", status: "unknown", unrecognizedStatus: "x" }],
       },
       new Set(),
     );

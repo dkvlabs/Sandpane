@@ -41,7 +41,14 @@ blind (`sandbox-create-spec`, `change-set`) have their own files. Params for
 `task.list` / `conversation.list` / `conversation.history`, and the A1
 `sandbox.stop` / `sandbox.remove` params and results (`SandboxStopParams`,
 `SandboxStopResult`, `SandboxRemoveParams`, `SandboxRemoveResult`,
-`ConfirmationRequest`) are defined by the Rust types, pinned by the value-set gate and by each client's wire-parity test;
-their `docs/specs/02 §2` contract block is the human-readable form. Adding a
+`ConfirmationRequest`) are defined by the Rust types, pinned by the
+value-set gate and by each client's wire-parity test. The A2 additions
+defined only by the Rust types — the `conversation.send` `idempotencyKey`
+(`ConversationSendParams`; `rpc-request`'s `params` stays a bare object) and
+the `replayed: true` marker on a replayed `SandboxSummary` / `TaskSummary`
+(absent on a first response; a replay is the FIRST response, not current
+state) — are pinned by the Rust protocol tests only: client adoption pending
+(A2 client step). The `docs/specs/02 §2` contract blocks are the
+human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7
 generated-bindings deliverable, not here.

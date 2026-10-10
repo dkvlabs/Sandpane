@@ -236,11 +236,11 @@ function registrations(
           );
           if (acknowledged !== 'I understand, continue') return undefined;
         }
-        // A1 agent choice — offered only when this Core accepts the field (a
-        // pre-A1 Core would silently ignore it). Default: provider-free shell,
-        // sent as an absent field.
+        // A1 agent choice — offered only when this Core advertises the
+        // "sandbox-create-agent" feature (A2; an older Core would silently
+        // ignore the field). Default: provider-free shell, sent as an absent field.
         let agent: SbxAgent | undefined;
-        if (session.coreAdvertises('sandbox.remove')) {
+        if (session.coreHasFeature('sandbox-create-agent')) {
           const picked = await vscode.window.showQuickPick(agentPickItems(), {
             title: 'Agent inside the sandbox (sbx built-in)',
             placeHolder: 'shell is provider-free; any other agent is not verified by Sandpane',
@@ -248,7 +248,7 @@ function registrations(
           if (!picked) return undefined;
           agent = picked.agent;
         } else {
-          log('agent choice not offered: this Core does not advertise the A1 methods (default shell is used)');
+          log('agent choice not offered: this Core does not advertise the "sandbox-create-agent" feature (default shell is used)');
         }
         const folder = vscode.workspace.workspaceFolders?.[0];
         const repoPath =

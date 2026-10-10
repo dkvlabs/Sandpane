@@ -119,6 +119,15 @@ impl Validator {
         }
     }
 
+    /// A client-chosen idempotency key (A2, design 2026-10-09 §3.1):
+    /// 1..=128 chars of `[A-Za-z0-9._-]` — enough for 128-bit random hex or
+    /// base64url, nothing that could be mistaken for markup or a path.
+    pub fn idempotency_key(key: &str) -> Result<&str, ValidationError> {
+        Self::reported_token(key, 128, |c| {
+            c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+        })
+    }
+
     /// An sbx sandbox `id` as printed by `ls --json`, restricted to the
     /// captured shape (a UUID: `[A-Za-z0-9-]{1,64}`). It is echoed to clients
     /// as the confirmation target identity, so anything else (newlines,
@@ -420,6 +429,33 @@ mod tests {
         }
         for bad in ["", "Shell", "./my-kit", "../kit.zip", "--clone", "oci://x"] {
             assert!(Validator::sbx_agent(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn idempotency_key_charset_and_bounds() {
+        let max = "a".repeat(128);
+        for ok in [
+            "k",
+            "AZaz09._-",
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            max.as_str(),
+        ] {
+            assert_eq!(Validator::idempotency_key(ok), Ok(ok), "{ok:?}");
+        }
+        let long = "a".repeat(129);
+        for bad in [
+            "",
+            long.as_str(),
+            "a b",
+            "a/b",
+            "a+b",
+            "a=",
+            "ä",
+            "k\n",
+            "a;rm",
+        ] {
+            assert!(Validator::idempotency_key(bad).is_err(), "{bad:?}");
         }
     }
 

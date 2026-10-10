@@ -16,6 +16,7 @@
 
 import {
   CONFIRM_TOKEN_PATTERN,
+  IDEMPOTENCY_KEY_PATTERN,
   MAX_CURSOR_KEY_LEN,
   MAX_LIST_LIMIT,
   MAX_SCOPING_ID_LEN,
@@ -397,4 +398,32 @@ export function buildSandboxRemoveConfirmParams(
     );
   }
   return { name: checked, confirmToken };
+}
+
+// ---------------------------------------------------------------------------
+// A2 idempotency key
+// ---------------------------------------------------------------------------
+
+/**
+ * Params carrying an OPTIONAL `idempotencyKey`, checked with Core's exact rule
+ * (1..=128 of `[A-Za-z0-9._-]`) before the frame is written. Absent stays
+ * absent; a present key is never rewritten. The key never appears in the
+ * refusal text.
+ */
+export function checkIdempotencyKey<P extends { idempotencyKey?: string }>(params: P): P {
+  if (!Object.prototype.hasOwnProperty.call(params, "idempotencyKey")) return params;
+  const key = params.idempotencyKey;
+  if (key === undefined) {
+    // An explicit `undefined` would serialize away anyway; drop the key so the
+    // payload is exactly "no key".
+    const { idempotencyKey: _dropped, ...rest } = params;
+    return rest as P;
+  }
+  if (typeof key !== "string" || !IDEMPOTENCY_KEY_PATTERN.test(key)) {
+    throw new CoreValidationError(
+      "idempotencyKey",
+      "must be 1..=128 characters of A-Z, a-z, 0-9, '.', '_' or '-'",
+    );
+  }
+  return params;
 }

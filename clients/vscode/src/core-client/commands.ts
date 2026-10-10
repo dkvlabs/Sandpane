@@ -121,6 +121,24 @@ export function validateAddressableSandboxName(name: string, field = 'name'): st
   return name;
 }
 
+/** Core's `Validator::idempotency_key` bound (A2). */
+export const MAX_IDEMPOTENCY_KEY_LEN = 128;
+
+/**
+ * `Validator::idempotency_key` — exactly Core's rule, never stricter: 1..=128
+ * chars of `[A-Za-z0-9._-]` (ASCII, so chars = bytes = UTF-16 units).
+ */
+export function validateIdempotencyKey(value: unknown, field = 'idempotencyKey'): string {
+  if (typeof value !== 'string' || value.length === 0) throw new CoreValidationError(field, 'value is empty');
+  if (value.length > MAX_IDEMPOTENCY_KEY_LEN) {
+    throw new CoreValidationError(field, `value exceeds max length ${MAX_IDEMPOTENCY_KEY_LEN}`);
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new CoreValidationError(field, 'only ASCII letters, digits, ".", "_" and "-" are allowed');
+  }
+  return value;
+}
+
 /** `Validator::git_ref` — hex object id (>=7) or a conservative branch name. */
 export function validateGitRef(value: string, field = 'expectedBase'): string {
   if (value.length === 0) throw new CoreValidationError(field, 'value is empty');
@@ -431,6 +449,9 @@ export class CoreCommands {
       // A1: sent exactly when the caller chose one (absent = Core's `shell`).
       // Only an exact built-in leaves this client; Core re-validates.
       if (spec.agent !== undefined) payload['agent'] = validateSbxAgent(spec.agent);
+      // A2: present only when the caller passed one (callers pass one only
+      // when Core advertises `idempotency-keys`).
+      if (spec.idempotencyKey !== undefined) payload['idempotencyKey'] = validateIdempotencyKey(spec.idempotencyKey);
       return this.connection.request<SandboxSummary>('sandbox.create', payload, {
         timeoutMs: SANDBOX_CREATE_TIMEOUT_MS,
       });
@@ -516,11 +537,11 @@ export class CoreCommands {
         kind: ref.kind,
         target: validateDisplayText(ref.target, 4096, 'attachments.target'),
       }));
-      return this.connection.request<TaskSummary>('conversation.send', {
-        conversationId,
-        content,
-        attachments,
-      });
+      const payload: Record<string, unknown> = { conversationId, content, attachments };
+      if (params.idempotencyKey !== undefined) {
+        payload['idempotencyKey'] = validateIdempotencyKey(params.idempotencyKey);
+      }
+      return this.connection.request<TaskSummary>('conversation.send', payload);
     });
   }
 

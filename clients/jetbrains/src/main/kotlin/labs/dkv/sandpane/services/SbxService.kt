@@ -2,7 +2,11 @@ package labs.dkv.sandpane.services
 
 import com.intellij.openapi.project.Project
 import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.CoreValidationException
 import labs.dkv.sandpane.core.ErrorAttribution
+import labs.dkv.sandpane.core.KeyedCall
+import labs.dkv.sandpane.core.KeyedRequests
+import labs.dkv.sandpane.core.KeyedWrites
 import labs.dkv.sandpane.model.Conversation
 import labs.dkv.sandpane.model.ConversationCreateParams
 import labs.dkv.sandpane.model.CoreJson
@@ -218,19 +222,43 @@ class SbxService(private val project: Project) {
     /**
      * `direct_mount` is live-writable and every surface rendering the result must label it as
      * such (docs/specs/02 §7); this method only refuses an invalid spec.
+     *
+     * One call = one user action (A2): the agent is honoured only when Core advertises
+     * `sandbox-create-agent` (otherwise refused locally — never silently ignored), and a fresh
+     * idempotency key is attached only when Core advertises `idempotency-keys`. A `replayed: true`
+     * answer is Core's stored earlier result, not current state: [KeyedWrites.replayNotice] words it
+     * and the post-call re-probe re-reads `sandbox.list`. No UI calls this yet.
      */
-    fun createSandbox(spec: SandboxCreateSpec): CompletableFuture<SandboxSummary> {
+    fun createSandbox(spec: SandboxCreateSpec): KeyedCall<SandboxCreateSpec, SandboxSummary> =
+        dispatchCreate(spec, KeyedRequests.newCreate(spec, connection.capabilities))
+
+    /** A2 "Retry safely" of an unknown-outcome create: identical spec, same key, explicit only. */
+    fun retryCreateSafely(previous: SandboxCreateSpec): KeyedCall<SandboxCreateSpec, SandboxSummary> =
+        dispatchCreate(previous, KeyedRequests.retryCreate(previous, connection.capabilities))
+
+    private fun dispatchCreate(
+        original: SandboxCreateSpec,
+        prepared: KeyedRequests.Prepared<SandboxCreateSpec>,
+    ): KeyedCall<SandboxCreateSpec, SandboxSummary> {
+        val spec = when (prepared) {
+            is KeyedRequests.Prepared.Refused -> return KeyedCall(
+                original,
+                null,
+                CompletableFuture.failedFuture(CoreValidationException("sandbox.create", prepared.reason)),
+            )
+            is KeyedRequests.Prepared.Ready -> prepared.params
+        }
         SbxClientValidation.requireSandboxName(spec.name)
         SbxClientValidation.requireOpaqueId(spec.projectId, "projectId")
         spec.repoPath?.let { SbxClientValidation.requireAbsolutePath(it, "repoPath") }
         // A1: absent stays absent (Core defaults to the provider-free `shell`); a present value must
         // be an exact built-in sbx agent — nothing outside the allowlist is ever sent.
         spec.agent?.let { SbxClientValidation.requireSbxAgent(it) }
-        return connection.call(
+        val future = connection.callJson(
             CoreMethods.SANDBOX_CREATE,
             CoreJson.encodeToJsonElement(SandboxCreateSpec.serializer(), spec),
-            SandboxSummary.serializer(),
-        ).also { afterMutation(it) }
+        ).thenApply(KeyedWrites::decodeCreateAnswer).also { afterMutation(it) }
+        return KeyedCall(spec, spec.idempotencyKey, future)
     }
 
     /**

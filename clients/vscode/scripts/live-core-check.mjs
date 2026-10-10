@@ -94,7 +94,7 @@ async function main() {
   const { CoreConnection, FrameTooLargeError } = await import(
     pathToFileURL(join(clientRoot, 'out', 'core-client', 'connection.js')).href
   );
-  const { MAX_FRAME_BYTES, CORE_METHODS, coreAdvertisesMethod } = await import(
+  const { MAX_FRAME_BYTES, CORE_METHODS, coreAdvertisesMethod, KNOWN_FEATURES, coreAdvertisesFeature } = await import(
     pathToFileURL(join(clientRoot, 'out', 'core-client', 'protocol.js')).href
   );
   const { createSocketTransport } = await import(
@@ -167,6 +167,15 @@ async function main() {
       coreAdvertisesMethod(caps, 'sandbox.remove') &&
       !(caps.methods ?? []).includes('sandbox.start'),
     (caps.methods ?? []).filter((m) => m.startsWith('sandbox.')).join(','),
+  );
+  // A2: advertisement only. This harness never sends a keyed sandbox.create
+  // (it would drive the real sbx); keyed sends are not exercised here either.
+  check(
+    'A2: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent)',
+    Array.isArray(caps.features) &&
+      KNOWN_FEATURES.every((f) => caps.features.includes(f)) &&
+      KNOWN_FEATURES.every((f) => coreAdvertisesFeature(caps, f)),
+    JSON.stringify(caps.features ?? null),
   );
 
   // ---- two clients, one core (specs/03 §6.3) ---------------------------

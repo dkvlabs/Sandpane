@@ -53,7 +53,32 @@ export interface FakeCoreOptions {
    * also refused when called, as a Core that does not dispatch them would.
    */
   advertisedMethods?: readonly string[];
+  /**
+   * `system.probe` `features` (A2). Default: every feature the A2 Core
+   * advertises plus one unknown string (clients must ignore it). `null` omits
+   * the field entirely, like a pre-A2 Core.
+   */
+  features?: readonly string[] | null;
 }
+
+/** What the A2 Core advertises (Rust `FEATURES`), plus a future unknown one. */
+export const A2_CORE_FEATURES: readonly string[] = [
+  "idempotency-keys",
+  "sandbox-create-agent",
+  "some-future-feature",
+];
+
+/**
+ * A2 CONFLICT messages, verbatim from `sandpane-service` (`IDEM_MSG_*`). The
+ * idempotency behaviour of `sandbox.create` / `conversation.send` below is
+ * MODELED on the service source (design §3.1), NOT captured from a live Core.
+ */
+export const FAKE_IDEM_MSG_MISMATCH =
+  "idempotency key was already used with different parameters; nothing was run";
+export const FAKE_IDEM_MSG_PENDING =
+  "an operation with this idempotency key is still in progress; nothing was run";
+export const FAKE_IDEM_MSG_UNKNOWN =
+  "the outcome of the earlier request with this idempotency key is unknown (Core restarted or sbx failed while it ran); re-read state before retrying with a new key";
 
 /** Every method the A1 Core dispatches, in `Method::ALL` order. */
 export const A1_CORE_METHODS: readonly string[] = [
@@ -118,6 +143,18 @@ export class FakeCore {
   public stopRequeryFails = false;
   /** Extra impact lines appended to every confirmation (hostile-content tests). */
   public extraImpact: string[] = [];
+  /**
+   * MODELED A2 key store: `${method}\u0000${key}` → state. `done` holds the
+   * FIRST response and the params fingerprint (params minus the key).
+   */
+  readonly idempotency = new Map<
+    string,
+    { state: "done"; hash: string; result: unknown } | { state: "pending" | "unknown" }
+  >();
+  /** Answers for the next N keyed writes are dropped AFTER storing (lost answer). */
+  public dropAnswersAfterApply = 0;
+  /** How many times each keyed write actually RAN (not replayed). */
+  readonly ran: Record<string, number> = {};
   /** Every request frame the client sent, decoded. */
   readonly requests: { v: number; id: string; method: string; params: unknown }[] = [];
   /** Params of every frame per method, for cursor/wire-shape assertions. */
@@ -244,7 +281,17 @@ export class FakeCore {
       return; // no answer: the client must time out
     }
     const respond = () => {
-      this.send(encodeFrame(this.answer(request)));
+      const answer = this.answer(request);
+      // MODELED lost answer: Core applied (and stored) the write, the reply
+      // never arrives — the client must time out with an unknown outcome.
+      if (
+        this.dropAnswersAfterApply > 0 &&
+        (request.method === "sandbox.create" || request.method === "conversation.send")
+      ) {
+        this.dropAnswersAfterApply -= 1;
+        return;
+      }
+      this.send(encodeFrame(answer));
     };
     if (this.options.latencyMs) setTimeout(respond, this.options.latencyMs);
     else respond();
@@ -309,6 +356,9 @@ export class FakeCore {
         if (!this.options.legacyCore) {
           capabilities.methods = [...(this.options.advertisedMethods ?? A1_CORE_METHODS)];
         }
+        const features =
+          this.options.features === undefined ? A2_CORE_FEATURES : this.options.features;
+        if (features !== null && !this.options.legacyCore) capabilities.features = [...features];
         return ok(capabilities);
       }
       case "project.list":
@@ -415,6 +465,37 @@ export class FakeCore {
       case "task.cancel":
         return ok({ requested: true });
 
+      // -- A2 keyed writes (MODELED on the service source, see header) ---------
+
+      case "sandbox.create":
+        return this.keyed(request.method, params, ok, err, () => {
+          const name = String(params.name ?? "");
+          this.sandboxes.push({
+            name,
+            id: `id-${name}`,
+            status: "running",
+            bound: true,
+            ...(typeof params.agent === "string" ? { agent: params.agent } : {}),
+          });
+          return {
+            name,
+            probedState: "running",
+            boundProjectId: params.projectId ?? null,
+            workspaceMode: params.workspaceMode ?? null,
+          };
+        });
+      case "conversation.send":
+        return this.keyed(request.method, params, ok, err, () => {
+          const id = `task-${this.requestCount}`;
+          const task: TaskSummary = {
+            id,
+            conversationId: String(params.conversationId ?? ""),
+            status: "queued",
+          };
+          this.tasks.push(task);
+          return { ...task };
+        });
+
       // -- A1 lifecycle (modeled on the service source, see header) -----------
 
       case "sandbox.stop": {
@@ -491,6 +572,50 @@ export class FakeCore {
       default:
         return err("VALIDATION_FAILED", `unknown method ${request.method}`);
     }
+  }
+
+  /**
+   * MODELED §3.1 item 5: a stored `done` key with the same fingerprint answers
+   * the FIRST response plus `replayed: true` and runs nothing; a different
+   * fingerprint, a `pending` or an `unknown` key is the matching CONFLICT.
+   * Without a key the write simply runs.
+   */
+  private keyed(
+    method: string,
+    params: Record<string, unknown>,
+    ok: (payload: unknown) => Record<string, unknown>,
+    err: (code: string, message: string) => Record<string, unknown>,
+    run: () => Record<string, unknown>,
+  ): Record<string, unknown> {
+    const key = params.idempotencyKey;
+    if (key !== undefined && (typeof key !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(key))) {
+      return err("VALIDATION_FAILED", "idempotencyKey: invalid");
+    }
+    const { idempotencyKey: _key, ...rest } = params;
+    const hash = JSON.stringify(rest);
+    const slot = typeof key === "string" ? `${method}\u0000${key}` : null;
+    if (slot !== null) {
+      const stored = this.idempotency.get(slot);
+      if (stored !== undefined) {
+        if (stored.state !== "done") {
+          return err(
+            "CONFLICT",
+            stored.state === "pending" ? FAKE_IDEM_MSG_PENDING : FAKE_IDEM_MSG_UNKNOWN,
+          );
+        }
+        if (stored.hash !== hash) return err("CONFLICT", FAKE_IDEM_MSG_MISMATCH);
+        return ok({ ...(stored.result as Record<string, unknown>), replayed: true });
+      }
+    }
+    this.ran[method] = (this.ran[method] ?? 0) + 1;
+    const result = run();
+    if (slot !== null) this.idempotency.set(slot, { state: "done", hash, result });
+    return ok(result);
+  }
+
+  /** Mark a stored key `pending` / `unknown` (models in-flight / restart). */
+  setKeyState(method: string, key: string, state: "pending" | "unknown"): void {
+    this.idempotency.set(`${method}\u0000${key}`, { state });
   }
 
   /**

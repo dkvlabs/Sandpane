@@ -20,16 +20,16 @@ an earlier revision of this README claimed that while the crate did not compile 
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A1 lifecycle pass, 2026-10-10
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A2 idempotency review-fix pass, 2026-10-10
 
-Run fresh after the A1 sandbox-lifecycle client work (protocol design 2026-10-09 §3 row A1) and its
-security/phase review fixes. Every row below is a command that was actually run, with its actual
+Run fresh after the combined A2 client review fixes (W1–W4, I4, I5), on top of the A2
+idempotency-key client work (protocol design 2026-10-09 §3 row A2, §3.1) and the A1 sandbox-lifecycle work and its review fixes. Every row below is a command that was actually run, with its actual
 result, except where a row says it was not re-run:
 
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **15 files, 401 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm test` (`vitest run`) | OK — **16 files, 429 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
 | `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
 | `cd src-tauri && cargo check --offline` | OK — `Finished dev profile` |
 | `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
@@ -49,9 +49,51 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 | Stop (confirmed; shows re-queried state, UNKNOWN when `requeried` is absent) | Functional headless: unit-tested against an in-memory FakeCore. **UNVERIFIED live** — never run against a real Core + sbx |
 | Remove (Core two-step token; dialog shows impact, sbx id, expiry, "NOT CONFIRMED AS CREATED BY SANDPANE"; cancel sends nothing) | Functional headless, same tests. **UNVERIFIED live** — never run against real sbx |
 | Stop dialog active-task count | Reads `task.list`; today's Core never records `sandboxName` on tasks, so the dialog says the count cannot be checked instead of showing 0 |
-| sbx agent in the create wizard (default `shell`) | Functional headless; non-shell agents only when the Core advertises A1. **UNVERIFIED live** |
+| sbx agent in the create wizard (default `shell`) | Functional headless; non-shell agents only when the Core advertises the `sandbox-create-agent` feature (A2; replaced the earlier "`sandbox.remove` is advertised" inference). **UNVERIFIED live** |
 | FakeCore `sandbox.stop` / `sandbox.remove` handlers | **Modeled** on `sandpane-service` source (`sandbox_stop`, `sandbox_remove`, `confirm.rs`), **not captured** from a live run |
 | The hook that sends `sandbox.stop` / step 2 after the dialog confirms (`useSandboxLifecycle`) | No DOM test (no jsdom in this suite); the pure controllers are tested, and the dialogs are checked as SSR markup only. Focus trap / Escape / focus return in a real webview are unverified |
+
+### A2 idempotency keys — what the desktop does, and status
+
+- **Features.** `system.probe` `features` is decoded absent-tolerantly (absent = nothing
+  advertised; unknown strings are kept but never acted on). The known set is drift-tested
+  against Rust `FEATURES` and the schema's `features.items.examples`.
+- **Keys.** Only when Core advertises `idempotency-keys`, each user action — one wizard
+  **Create**, one chat **Send** — carries one fresh `idempotencyKey`: 32 lowercase hex characters
+  from `crypto.getRandomValues`, never derived from content. Without the feature no key is sent.
+  A key is checked against Core's exact rule (1..=128 of `[A-Za-z0-9._-]`) before the frame is
+  written.
+- **Retry safely.** When a keyed Create/Send ends with an UNKNOWN outcome (a timeout or transport
+  drop after the write, or a Core `INTERNAL`), the error panel offers **Retry safely**, which
+  resends the identical params with the same key. Nothing retries automatically. On click it
+  first re-probes the connected Core (`system.probe`): if `idempotency-keys` is no longer
+  advertised nothing is sent ("Not retried: the connected Core does not advertise idempotency
+  keys, so a retry could run it twice. Nothing was sent — check state first."); if the re-probe
+  cannot reach Core nothing is sent and Retry safely stays offered. A retry that provably never
+  reached Core (`CORE_UNREACHABLE`, not maybe-applied) keeps the original unknown outcome and
+  key, offers Retry safely again, and shows the unreachable reason as secondary text. A double
+  click sends once. An answer to Create/Send that this build cannot decode is reported as an
+  unknown outcome (maybe applied), never echoing the payload. Without a key, an unknown outcome —
+  including a Core `INTERNAL` on Create/Send — says "Check state before trying again (this Core
+  does not advertise idempotency keys, so a retry could run it twice)." `REPLAY_SAFE_METHODS`
+  and the Rust `replay_safe` are unchanged.
+- **Replays.** A response with `replayed: true` shows "Core returned the result of your earlier
+  identical request (replayed). It may be out of date; refreshing from Core." and the view
+  re-reads `sandbox.list` / `task.list` + history; a replayed task's status is not shown as
+  current. A present but non-boolean `replayed` is read as "may be a replay": the same
+  re-read happens and the status is not shown as current.
+- **CONFLICTs.** The three A2 messages are matched on Core's exact text (drift-tested against
+  `sandpane-service`): "key used with different parameters" and "still in progress" say nothing
+  was run; "outcome unknown" says to re-read state and that a retry needs a new request — never
+  "nothing was run". A1's per-sandbox name-lock CONFLICT is titled "Nothing was run — another
+  operation on this sandbox is in progress". Core's own message is always shown, revealed and
+  capped.
+
+| Item | Status |
+| --- | --- |
+| Features, keys, Retry safely, replay notice, CONFLICT copy | Functional headless: unit-tested against an in-memory FakeCore (`tests/idempotency.test.ts`). **UNVERIFIED live** — never run against a real Core + sbx, never in the running desktop app |
+| FakeCore `features`, `sandbox.create` / `conversation.send` idempotency, `replayed`, CONFLICTs, lost-answer drop | **Modeled** on the `sandpane-service` source (§3.1), **not captured** from a live run |
+| The Retry safely button and replay notices in the wizard and chat | No DOM test (no jsdom); the pure decision functions are tested |
 
 ### Live Core run (earlier evidence — NOT re-run in the review-fix pass)
 

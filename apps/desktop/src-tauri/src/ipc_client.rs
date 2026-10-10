@@ -64,8 +64,17 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
 /// written, Core may already have executed it — retrying `conversation.send`
 /// would append a second message row and queue a second task, and retrying
 /// `git.apply` would re-run an apply the user only confirmed once
-/// (docs/specs/06 §10). Core has no idempotency keys yet (a P1 item in
-/// docs/specs/02 §2), so the proxy is the only place this can be prevented.
+/// (docs/specs/06 §10).
+///
+/// A2 added optional idempotency keys to `sandbox.create` and
+/// `conversation.send` (advertised as the `idempotency-keys` feature): within
+/// 24 h a keyed request Core already finished is answered from its stored
+/// result, never run twice. Auto-replay still stays OFF here (design
+/// 2026-10-09 §3.1 item 10): this proxy cannot tell whether a frame carries a
+/// key, a pre-A2 Core silently drops the field, and a pruned key would run
+/// again. The webview offers an explicit "Retry safely" with the same key
+/// instead; making keyed writes auto-replayable is a later, separately
+/// reviewed step.
 ///
 /// `task.cancel` is deliberately excluded even though it is idempotent in effect:
 /// Core answers the second cancel with `CONFLICT`, which would surface to the user

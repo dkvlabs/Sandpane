@@ -28,7 +28,7 @@ pub struct Database {
 }
 
 /// Newest schema version this build understands.
-pub const LATEST_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
 
 /// Schema v1: the entity set from specs/02 §3.
 const MIGRATION_V1: &str = r#"
@@ -205,6 +205,28 @@ ALTER TABLE sandbox_bindings ADD COLUMN removed_at TEXT;
 ALTER TABLE sandbox_bindings ADD COLUMN sbx_id TEXT;
 "#;
 
+/// Schema v5 (A2, design 2026-10-09 §3.1): durable idempotency keys.
+/// One row per (method, key) — keys are namespaced by method. `params_hash`
+/// is the SHA-256 fingerprint of the typed params (never the params: prompt
+/// text is not stored twice). `state` is `pending` (claimed, running),
+/// `done` (succeeded; `result_json` holds the exact result) or `unknown`
+/// (Core restarted, or sbx failed, while it ran — refused with that key
+/// within the 24 h retention window). Timestamps are fixed-width RFC 3339 UTC, so text order is time
+/// order for the 24 h retention prune.
+const MIGRATION_V5: &str = r#"
+CREATE TABLE idempotency_keys (
+    method       TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    params_hash  TEXT NOT NULL,
+    state        TEXT NOT NULL CHECK (state IN ('pending', 'done', 'unknown')),
+    result_json  TEXT CHECK (state <> 'done' OR result_json IS NOT NULL),
+    created_at   TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (method, key)
+);
+CREATE INDEX idx_idempotency_keys_created ON idempotency_keys(created_at);
+"#;
+
 impl Database {
     /// Open (or create) the database at `path` and migrate to the latest
     /// schema. Refuses databases from a newer schema version.
@@ -272,6 +294,9 @@ impl Database {
         }
         if current < 4 {
             self.apply_migration(4, MIGRATION_V4)?;
+        }
+        if current < 5 {
+            self.apply_migration(5, MIGRATION_V5)?;
         }
         Ok(())
     }
@@ -364,6 +389,8 @@ mod tests {
             "idx_task_events_task_seq",
             "idx_messages_conversation_seq",
             "idx_tasks_worktree_path",
+            "idempotency_keys",
+            "idx_idempotency_keys_created",
         ] {
             assert!(names.iter().any(|n| n == expected), "missing {expected}");
         }
@@ -570,7 +597,7 @@ mod tests {
             .unwrap();
         }
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let row: (String, String, Option<String>) = db
             .conn()
             .query_row(
@@ -610,8 +637,88 @@ mod tests {
         assert_eq!(kept, 1, "a removed binding is marked, never deleted");
         drop(db);
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         assert!(!dir.path().join("core.sqlite3.pre-v4.bak.1").exists());
+    }
+
+    /// A2 migration: a REAL v4 file (v1..v4 SQL, a binding row) upgrades
+    /// forward to v5: existing rows intact, the `idempotency_keys` table
+    /// present and empty, a consistent `.pre-v5.bak` of the v4 file taken,
+    /// keys unique per (method, key), and the state/result invariants
+    /// enforced by CHECK constraints.
+    #[test]
+    fn v4_database_migrates_forward_to_v5_with_idempotency_keys_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in [MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO sandbox_bindings (id,project_id,sandbox_name,workspace_mode,created_at,sbx_id)
+                     VALUES ('b1','p1','atlas-auth','mountless','t','b5ebec73');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 5);
+        let binding: String = db
+            .conn()
+            .query_row(
+                "SELECT sbx_id FROM sandbox_bindings WHERE id='b1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding, "b5ebec73");
+        let n: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM idempotency_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        let backup = dir.path().join("core.sqlite3.pre-v5.bak");
+        assert!(backup.exists());
+        let b = Connection::open(&backup).unwrap();
+        let v: i64 = b
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 4);
+        let c = db.conn();
+        c.execute(
+            "INSERT INTO idempotency_keys (method,key,params_hash,state,created_at)
+             VALUES ('sandbox.create','k1','h','pending','t')",
+            [],
+        )
+        .unwrap();
+        // Same key under ANOTHER method is a separate row (namespaced).
+        c.execute(
+            "INSERT INTO idempotency_keys (method,key,params_hash,state,result_json,created_at)
+             VALUES ('conversation.send','k1','h','done','{}','t')",
+            [],
+        )
+        .unwrap();
+        // Same (method, key) twice is refused.
+        assert!(c
+            .execute(
+                "INSERT INTO idempotency_keys (method,key,params_hash,state,created_at)
+                 VALUES ('sandbox.create','k1','h2','pending','t')",
+                [],
+            )
+            .is_err());
+        // Unknown state, and `done` without a result, are refused.
+        for bad in [
+            "INSERT INTO idempotency_keys (method,key,params_hash,state,created_at) VALUES ('m','k2','h','running','t')",
+            "INSERT INTO idempotency_keys (method,key,params_hash,state,created_at) VALUES ('m','k3','h','done','t')",
+        ] {
+            assert!(c.execute(bad, []).is_err(), "{bad}");
+        }
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 5);
+        assert!(!dir.path().join("core.sqlite3.pre-v5.bak.1").exists());
     }
 
     #[test]

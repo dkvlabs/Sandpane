@@ -54,6 +54,14 @@ export const stub = {
   errors: [] as string[],
   /** Every warning call with its options (modal/detail) — what a modal SHOWED. */
   warningCalls: [] as RecordedMessage[],
+  /** Every error call with the buttons it offered. */
+  errorCalls: [] as RecordedMessage[],
+  /**
+   * Buttons the TEST clicks by hand: a prompt offering one of these labels
+   * stays open until the test calls `clicks.shift()?.(label)`.
+   */
+  manual: new Set<string>(),
+  clicks: [] as ((value: string | undefined) => void)[],
   /** Next answers for modal prompts, by button label the code offers. */
   answers: new Map<string, string | undefined>(),
   reset(): void {
@@ -65,11 +73,17 @@ export const stub = {
     this.infos.length = 0;
     this.errors.length = 0;
     this.warningCalls.length = 0;
+    this.errorCalls.length = 0;
     this.answers.clear();
+    this.manual.clear();
+    this.clicks.length = 0;
   },
 };
 
 function answer(items: unknown[]): Promise<string | undefined> {
+  if (items.some((item) => typeof item === 'string' && stub.manual.has(item))) {
+    return new Promise((resolve) => stub.clicks.push(resolve));
+  }
   for (const item of items) {
     if (typeof item === 'string' && stub.answers.has(item)) return Promise.resolve(stub.answers.get(item));
   }
@@ -122,6 +136,11 @@ export const window = {
   },
   showErrorMessage: (message: string, ...items: unknown[]) => {
     stub.errors.push(message);
+    stub.errorCalls.push({
+      message,
+      options: undefined,
+      items: items.filter((item): item is string => typeof item === 'string'),
+    });
     return answer(items);
   },
 };

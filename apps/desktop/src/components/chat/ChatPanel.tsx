@@ -1,11 +1,11 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   capabilitiesOf,
   useCoreConversations,
   useCoreLink,
   useCreateConversation,
   useSessionConversations,
-  useSendMessage,
+  useKeyedSend,
 } from "../../lib/hooks";
 import { clearSentDraft, foldAgentView, taskStatusView, withDraft } from "../../lib/reducers";
 import type { Conversation } from "../../lib/protocol";
@@ -21,6 +21,13 @@ import {
   Warning,
 } from "../ui/primitives";
 import { ErrorPanel } from "../../features/projects/ProjectsView";
+import {
+  REPLAY_NOTICE,
+  REPLAY_UNCERTAIN_NOTICE,
+  forNewAction,
+  idempotencyKeysAdvertised,
+} from "../../lib/idempotency";
+import { KeyedWriteFailure } from "../ui/keyed-write";
 
 /**
  * Chat tab list + composer for one project.
@@ -56,7 +63,8 @@ export function ChatPanel({
     return out;
   }, [coreChats.conversations, session, projectId]);
   const createConversation = useCreateConversation();
-  const send = useSendMessage();
+  const { write: sendWrite, state: send } = useKeyedSend();
+  const keysAdvertised = idempotencyKeysAdvertised(capabilities);
 
   const agents = capabilities?.agents ?? [];
   const [agentId, setAgentId] = useState<string>("");
@@ -64,6 +72,14 @@ export function ChatPanel({
   // One draft per conversation: switching tabs never carries text into
   // another chat, and switching back restores what was typed there.
   const [drafts, setDrafts] = useState<Readonly<Record<string, string>>>({});
+  // Clear the draft of the chat that was SENT once Core accepted it (a first
+  // send or an explicit Retry safely), and only if it still holds the sent
+  // text — the user may have kept typing.
+  useEffect(() => {
+    if (send.kind !== "succeeded") return;
+    const { conversationId, content } = send.params;
+    setDrafts((current) => clearSentDraft(current, conversationId, content));
+  }, [send]);
 
   if (link.kind !== "attached") {
     return (
@@ -82,7 +98,8 @@ export function ChatPanel({
   // The single send mutation outlives tab switches; its result is shown only
   // under the conversation it was actually sent from.
   const sendIsForSelected =
-    selected !== null && send.variables?.conversationId === selected.id;
+    selected !== null && send.kind !== "idle" && send.params.conversationId === selected.id;
+  const sending = send.kind === "sending";
 
   return (
     <Panel
@@ -195,17 +212,12 @@ export function ChatPanel({
           className="composer"
           onSubmit={(event) => {
             event.preventDefault();
-            if (draft.trim().length === 0 || send.isPending) return;
+            if (draft.trim().length === 0 || sending) return;
             const conversationId = selected.id;
             const content = draft;
-            send.mutate(
-              { conversationId, content },
-              {
-                // Clear the draft of the chat that was SENT, and only if it
-                // still holds the sent text (the user may have kept typing).
-                onSuccess: () => setDrafts((current) => clearSentDraft(current, conversationId, content)),
-              },
-            );
+            // One Send = one user action = one fresh key (A2), and no key at all
+            // when this Core does not advertise the feature.
+            void sendWrite.submit(forNewAction({ conversationId, content }, keysAdvertised));
           }}
         >
           <label className="field">
@@ -226,7 +238,7 @@ export function ChatPanel({
             <Button
               variant="primary"
               type="submit"
-              disabled={draft.trim().length === 0 || send.isPending}
+              disabled={draft.trim().length === 0 || sending}
             >
               Send
             </Button>
@@ -234,14 +246,40 @@ export function ChatPanel({
               Creates a task in Core (conversation.send). Closing this tab never cancels it.
             </span>
           </div>
-          {sendIsForSelected && send.isError && <ErrorPanel error={send.error} />}
-          {sendIsForSelected && send.isSuccess && (
-            <Warning tone="info" title="Task accepted by Core">
-              <Mono>{send.data.id.slice(0, 8)}</Mono> · status{" "}
-              <Mono>{taskStatusView(send.data.status, send.data.unrecognizedStatus).label}</Mono>.
-              The timeline below is the only place progress is reported, from durable events.
-            </Warning>
+          {sendIsForSelected && send.kind === "sending" && send.retry && (
+            <p className="muted" role="status">
+              Retrying safely — re-checking Core, then resending the identical message with the same
+              key…
+            </p>
           )}
+          {sendIsForSelected && send.kind === "failed" && (
+            <KeyedWriteFailure state={send} write={sendWrite} />
+          )}
+          {sendIsForSelected &&
+            send.kind === "succeeded" &&
+            (send.result.replayed === true || send.result.replayedUncertain === true) && (
+              // A replay is the task as FIRST created — its status is not current,
+              // so none is shown; task.list and the history are being re-read.
+              <Warning tone="attention" title="Replayed result">
+                {send.result.replayed === true
+                  ? REPLAY_NOTICE
+                  : REPLAY_UNCERTAIN_NOTICE}{" "}
+                Task <Mono>{send.result.id.slice(0, 8)}</Mono>; see the timeline for its current
+                state.
+              </Warning>
+            )}
+          {sendIsForSelected &&
+            send.kind === "succeeded" &&
+            send.result.replayed !== true &&
+            send.result.replayedUncertain !== true && (
+              <Warning tone="info" title="Task accepted by Core">
+                <Mono>{send.result.id.slice(0, 8)}</Mono> · status{" "}
+                <Mono>
+                  {taskStatusView(send.result.status, send.result.unrecognizedStatus).label}
+                </Mono>
+                . The timeline below is the only place progress is reported, from durable events.
+              </Warning>
+            )}
         </form>
       )}
     </Panel>

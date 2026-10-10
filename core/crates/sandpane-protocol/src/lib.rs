@@ -228,6 +228,23 @@ impl Method {
     }
 }
 
+/// Optional protocol features this Core implements, advertised in
+/// `CoreCapabilities.features` (design 2026-10-09 §3.1 item 9). Feature
+/// strings name ADDITIVE behaviour a client cannot infer from the method list
+/// (a new optional request field is silently dropped by a Core that predates
+/// it). Additive only: never renamed, removed or reused. Clients must ignore
+/// strings they do not know.
+///
+/// * `idempotency-keys` — `sandbox.create` / `conversation.send` honour
+///   `idempotencyKey` (A2).
+/// * `sandbox-create-agent` — `sandbox.create` honours `agent` (A1).
+pub const FEATURES: [&str; 2] = ["idempotency-keys", "sandbox-create-agent"];
+
+/// [`FEATURES`] as owned strings — the one derivation `system.probe` uses.
+pub fn feature_names() -> Vec<String> {
+    FEATURES.iter().map(|f| f.to_string()).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Payloads
 // ---------------------------------------------------------------------------
@@ -251,6 +268,10 @@ pub struct CoreCapabilities {
     /// from a pre-discovery core still deserializes).
     #[serde(default)]
     pub methods: Vec<String>,
+    /// Optional features this Core implements, from [`FEATURES`] (A2,
+    /// additive; `#[serde(default)]`: absent from a pre-A2 Core = none).
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +347,15 @@ pub struct SandboxCreateSpec {
     /// `CoreCapabilities.agents`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Retry-safety key (A2, additive): 1..=128 chars of `[A-Za-z0-9._-]`.
+    /// Core stores key → result durably for 24 h, namespaced by method; a
+    /// replay with the same params runs nothing and returns the FIRST
+    /// response unchanged plus `replayed: true` — it is not current state;
+    /// re-read with `task.list` / `sandbox.list`. The same key with different
+    /// params is `CONFLICT`. Send it only when `system.probe` advertises the
+    /// `idempotency-keys` feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +381,13 @@ pub struct SandboxSummary {
     /// `CoreCapabilities.agents[].verified`. Absent when sbx did not report one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// A2 (additive): `true` ONLY when this response is a REPLAY of an
+    /// earlier keyed request. A replay returns the FIRST response unchanged
+    /// plus `replayed: true`; it is not current state — re-read with
+    /// `task.list` / `sandbox.list`. Absent on every first response (and
+    /// never stored as part of the remembered result).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
 }
 
 /// `sandbox.stop` params (A1). Not destructive: no confirmation token.
@@ -468,6 +505,12 @@ pub struct ConversationSendParams {
     pub content: String,
     #[serde(default)]
     pub attachments: Vec<ContextRef>,
+    /// Retry-safety key (A2, additive) — same rules as
+    /// [`SandboxCreateSpec::idempotency_key`]: a replay returns the FIRST
+    /// response (the `TaskSummary` the first request created) unchanged plus
+    /// `replayed: true`; it is not current state — re-read with `task.list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -680,6 +723,13 @@ pub struct TaskSummary {
     pub task_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// A2 (additive): `true` ONLY when this response is a REPLAY of an
+    /// earlier keyed request. A replay returns the FIRST response unchanged
+    /// plus `replayed: true`; it is not current state — re-read with
+    /// `task.list` / `sandbox.list`. Absent on every first response (and
+    /// never stored as part of the remembered result).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
 }
 
 /// `git.review` response: the ACTUAL change set vs the task base revision.
@@ -836,6 +886,93 @@ mod tests {
         );
     }
 
+    /// A2: the single source of `CoreCapabilities.features`. Pinned here and,
+    /// as a value set, against `core-capabilities.schema.json` by the drift
+    /// gate. Additive only: a feature string is never renamed or reused.
+    #[test]
+    fn features_list_is_pinned() {
+        assert_eq!(FEATURES, ["idempotency-keys", "sandbox-create-agent"]);
+        assert_eq!(
+            feature_names(),
+            vec![
+                "idempotency-keys".to_string(),
+                "sandbox-create-agent".to_string()
+            ]
+        );
+        // A pre-A2 Core omits `features`: still parses, as "nothing advertised".
+        let old = r#"{"protocolVersion":1,"coreVersion":"0.1.0","instanceId":"i","sbx":null,"agents":[],"platform":"macos","methods":[]}"#;
+        let c: CoreCapabilities = serde_json::from_str(old).unwrap();
+        assert!(c.features.is_empty());
+        let c = CoreCapabilities {
+            features: feature_names(),
+            ..c
+        };
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["features"],
+            serde_json::json!(["idempotency-keys", "sandbox-create-agent"])
+        );
+    }
+
+    /// A2 review W1: a replay is marked, the first response never is.
+    #[test]
+    fn replayed_is_absent_tolerant_on_both_keyed_results() {
+        let s: SandboxSummary =
+            serde_json::from_str(r#"{"name":"a1","probedState":null,"boundProjectId":null}"#)
+                .unwrap();
+        assert_eq!(s.replayed, None);
+        assert!(!serde_json::to_string(&s).unwrap().contains("replayed"));
+        let r = SandboxSummary {
+            replayed: Some(true),
+            ..s
+        };
+        assert_eq!(serde_json::to_value(&r).unwrap()["replayed"], true);
+        let t: TaskSummary =
+            serde_json::from_str(r#"{"id":"t1","conversationId":"c1","status":"queued"}"#).unwrap();
+        assert_eq!(t.replayed, None);
+        assert!(!serde_json::to_string(&t).unwrap().contains("replayed"));
+        let r = TaskSummary {
+            replayed: Some(true),
+            ..t
+        };
+        assert_eq!(serde_json::to_value(&r).unwrap()["replayed"], true);
+    }
+
+    #[test]
+    fn idempotency_key_is_optional_on_create_and_send() {
+        let spec: SandboxCreateSpec = serde_json::from_value(serde_json::json!({
+            "name": "atlas-auth", "projectId": "p1", "workspaceMode": "mountless"
+        }))
+        .unwrap();
+        assert_eq!(spec.idempotency_key, None);
+        assert!(!serde_json::to_string(&spec)
+            .unwrap()
+            .contains("idempotencyKey"));
+        let keyed: SandboxCreateSpec = serde_json::from_value(serde_json::json!({
+            "name": "atlas-auth", "projectId": "p1", "workspaceMode": "mountless",
+            "idempotencyKey": "k-1"
+        }))
+        .unwrap();
+        assert_eq!(keyed.idempotency_key.as_deref(), Some("k-1"));
+        assert_eq!(
+            serde_json::to_value(&keyed).unwrap()["idempotencyKey"],
+            "k-1"
+        );
+
+        let send: ConversationSendParams = serde_json::from_value(serde_json::json!({
+            "conversationId": "c1", "content": "hi"
+        }))
+        .unwrap();
+        assert_eq!(send.idempotency_key, None);
+        assert!(!serde_json::to_string(&send)
+            .unwrap()
+            .contains("idempotencyKey"));
+        let keyed: ConversationSendParams = serde_json::from_value(serde_json::json!({
+            "conversationId": "c1", "content": "hi", "idempotencyKey": "k-2"
+        }))
+        .unwrap();
+        assert_eq!(keyed.idempotency_key.as_deref(), Some("k-2"));
+    }
+
     #[test]
     fn sandbox_create_spec_agent_is_optional_and_additive() {
         // A pre-A1 client omits `agent` entirely: still a valid spec.
@@ -891,6 +1028,7 @@ mod tests {
                 bound_project_id: None,
                 workspace_mode: None,
                 agent: Some("shell".into()),
+                replayed: None,
             }),
         };
         let v = serde_json::to_value(&still).unwrap();
@@ -1063,6 +1201,7 @@ mod tests {
             bound_project_id: Some("p1".into()),
             workspace_mode: Some(WorkspaceMode::DirectMount),
             agent: None,
+            replayed: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         // Reuses the established snake_case enum names (specs/02 §7).

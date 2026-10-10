@@ -216,6 +216,12 @@ export function decodeCoreCapabilities(value: unknown): CoreCapabilities {
     // reads that as "not advertised", which is the only safe interpretation of a
     // response from a Core that predates method advertisement.
     methods: optStrArray(rec, "methods", "CoreCapabilities"),
+    // A2 features: absent stays absent (= nothing advertised). Tolerant on
+    // purpose — a capability list never fails the probe: non-string entries
+    // and a non-array value are dropped, which can only DISABLE a feature.
+    ...(Array.isArray(rec.features)
+      ? { features: rec.features.filter((f): f is string => typeof f === "string") }
+      : {}),
   };
 }
 
@@ -277,7 +283,21 @@ export function decodeSandboxSummary(item: unknown): SandboxSummary {
     workspaceMode: mode === null || mode.value === "unknown" ? null : mode.value,
     ...(mode !== null && "raw" in mode ? { unrecognizedWorkspaceMode: mode.raw } : {}),
     ...(agent === null ? {} : { agent }),
+    ...(replayedMarker(s) ?? {}),
   };
+}
+
+/**
+ * A2 `replayed`: an explicit `true` marks a replay; absent/null/false mean a
+ * first response. A present NON-boolean does not fail the whole reply (Core
+ * answered, and may have applied the write): it reads as "maybe replayed",
+ * which the UI treats like a replay — re-read state, status not current.
+ */
+function replayedMarker(rec: Rec): { replayed: true } | { replayedUncertain: true } | null {
+  const v = rec.replayed;
+  if (v === true) return { replayed: true };
+  if (v === undefined || v === null || v === false) return null;
+  return { replayedUncertain: true };
 }
 
 /**
@@ -441,6 +461,7 @@ export function decodeTaskSummary(value: unknown): TaskSummary {
     sandboxName: optStr(t, "sandboxName", "TaskSummary"),
     taskBranch: optStr(t, "taskBranch", "TaskSummary"),
     baseCommit: optStr(t, "baseCommit", "TaskSummary"),
+    ...(replayedMarker(t) ?? {}),
   };
 }
 

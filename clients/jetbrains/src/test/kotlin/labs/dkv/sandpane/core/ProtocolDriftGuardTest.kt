@@ -536,6 +536,63 @@ class ProtocolDriftGuardTest {
         assertTrue(MethodDeadlines.SANDBOX_REMOVE_MS > query + mutation + query, "remove floor no longer outlasts Core")
     }
 
+    /** A2: the features this build knows equal Rust `FEATURES` and the schema's `items.examples`. */
+    @Test
+    fun knownFeaturesMatchRustAndSchema() {
+        val decl = Regex("""pub const FEATURES: \[&str; (\d+)\] = \[([^\]]*)\];""").find(rust)
+            ?: fail("sandpane-protocol has no `pub const FEATURES: [&str; N] = [...]`")
+        val rustFeatures = Regex(""""([^"]+)"""").findAll(decl.groupValues[2]).map { it.groupValues[1] }.toList()
+        assertEquals(decl.groupValues[1].toInt(), rustFeatures.size)
+        assertEquals(labs.dkv.sandpane.model.CoreFeatures.KNOWN, rustFeatures, "CoreFeatures drifted from Rust FEATURES")
+
+        val featuresBlock = capabilitiesSchema.substring(indexInPropertyBlock(capabilitiesSchema, "features"))
+        val examplesAt = featuresBlock.indexOf("\"examples\"")
+        if (examplesAt < 0) fail("core-capabilities features.items has no examples")
+        val open = featuresBlock.indexOf('[', examplesAt)
+        val close = featuresBlock.indexOf(']', open)
+        val examples = Regex(""""([^"]+)"""").findAll(featuresBlock.substring(open + 1, close)).map { it.groupValues[1] }.toList()
+        assertEquals(labs.dkv.sandpane.model.CoreFeatures.KNOWN, examples, "schema features.items.examples drifted")
+        assertFalse(requiredOf(capabilitiesSchema, root).contains("features"), "features became required — not additive")
+        assertTrue(rust.contains("pub features: Vec<String>"))
+        assertTrue(kotlinMirror.contains("val features: List<String> = emptyList()"))
+    }
+
+    /** Joins a Rust string literal that uses `\`-newline continuations, as rustc does. */
+    private fun rustStringConst(source: String, name: String): String {
+        val m = Regex("""pub const $name: &str =\s*"((?:[^"\\]|\\[\s\S])*)";""").find(source)
+            ?: fail("no `pub const $name: &str = \"...\";`")
+        return m.groupValues[1].replace(Regex("""\\\n\s*"""), "")
+    }
+
+    /** A2: the CONFLICT texts the client matches are exactly the ones Core sends. */
+    @Test
+    fun keyedConflictMessagesMatchCore() {
+        assertEquals(rustStringConst(service, "IDEM_MSG_MISMATCH"), KeyedWrites.CONFLICT_MISMATCH)
+        assertEquals(rustStringConst(service, "IDEM_MSG_PENDING"), KeyedWrites.CONFLICT_PENDING)
+        val unknown = rustStringConst(service, "IDEM_MSG_UNKNOWN")
+        assertTrue(unknown.startsWith(KeyedWrites.CONFLICT_UNKNOWN_PREFIX), unknown)
+        assertFalse(unknown.contains("nothing was run"), "Core's unknown-outcome CONFLICT must not claim nothing ran")
+        assertTrue(
+            service.contains(
+                "format!(\"${KeyedWrites.NAME_LOCK_PREFIX}{name:?}${KeyedWrites.NAME_LOCK_SUFFIX}\")",
+            ),
+            "A1's name-lock CONFLICT text changed",
+        )
+        assertTrue(KeyedWrites.CONFLICT_MISMATCH.endsWith("nothing was run"))
+        assertTrue(KeyedWrites.CONFLICT_PENDING.endsWith("nothing was run"))
+    }
+
+    /** A2: the client key validator is exactly Core's (never stricter), and so is the schema pattern. */
+    @Test
+    fun idempotencyKeyRuleMatchesCore() {
+        val fn = Regex("""pub fn idempotency_key\(key: &str\)[\s\S]*?\n    \}""").find(validation)?.value
+            ?: fail("Validator::idempotency_key not found")
+        assertTrue(fn.contains("Self::reported_token(key, 128,"), "Core's key length bound changed")
+        assertTrue(fn.contains("c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'"), "Core's key charset changed")
+        assertEquals(128, IdempotencyKeys.MAX_LEN)
+        assertTrue(sandboxSpecSchema.contains("\"pattern\": \"^[A-Za-z0-9._-]{1,128}$\""), "schema key pattern changed")
+    }
+
     // ------------------------------------------------------------------
     // enum-block helpers
     // ------------------------------------------------------------------

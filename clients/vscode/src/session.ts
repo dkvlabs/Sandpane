@@ -35,14 +35,26 @@ import type {
   ChangeSet,
   ConfirmationRequest,
   Conversation,
+  ConversationSendParams,
   CoreCapabilities,
+  CoreFeature,
   CoreMethodName,
   Project,
+  SandboxCreateSpec,
   SandboxStopResult,
   SandboxSummary,
   SbxAgent,
 } from './core-client/protocol';
-import { coreAdvertisesMethod, MAX_LIST_LIMIT } from './core-client/protocol';
+import { coreAdvertisesFeature, coreAdvertisesMethod, MAX_LIST_LIMIT } from './core-client/protocol';
+import {
+  REPLAY_NOTICE,
+  RETRY_SAFELY,
+  classifyKeyedConflict,
+  isProvablyUnsent,
+  isUnknownOutcome,
+  keyedConflictCopy,
+  newIdempotencyKey,
+} from './core-client/idempotency';
 import { TASK_STATUSES, isTerminalStatus } from './core-client/events';
 import { EMPTY_STATE, reduceTaskView, selectTasks, type TaskViewState } from './state/reducer';
 import {
@@ -447,33 +459,53 @@ export class SandpaneSession {
     /** A1: absent = Core's provider-free `shell` (works with every Core). */
     agent?: SbxAgent;
   }): Promise<SandboxSummary | undefined> {
-    // A pre-A1 Core would silently IGNORE an `agent` field and create a shell
-    // sandbox while the UI said otherwise. `sandbox.remove` is advertised from
-    // the same A1 build that accepts `agent`, so it is the marker.
-    if (input.agent !== undefined && !this.coreAdvertises('sandbox.remove')) {
+    // A Core without the `sandbox-create-agent` feature would silently IGNORE
+    // an `agent` field and create a shell sandbox while the UI said otherwise.
+    if (input.agent !== undefined && !this.coreHasFeature('sandbox-create-agent')) {
       const text =
-        `Agent "${input.agent}" cannot be requested: the attached Core predates agent selection ` +
-        '(it does not advertise the A1 methods). Nothing was sent; create without choosing an agent ' +
-        'to get the default shell.';
+        `Agent "${input.agent}" cannot be requested: the attached Core does not advertise the ` +
+        '"sandbox-create-agent" feature. Nothing was sent; create without choosing an agent to get ' +
+        'the default shell.';
       void vscode.window.showWarningMessage(text);
       this.setStatus('error', text);
       this.emit();
       return undefined;
     }
+    // A2: one fresh key for THIS user action, only when Core honours keys.
+    const key = this.coreHasFeature('idempotency-keys') ? newIdempotencyKey() : undefined;
+    const spec: SandboxCreateSpec = {
+      name: input.name,
+      projectId: input.projectId,
+      workspaceMode: input.workspaceMode,
+      ...(input.repoPath ? { repoPath: input.repoPath } : {}),
+      ...(input.agent !== undefined ? { agent: input.agent } : {}),
+      ...(key !== undefined ? { idempotencyKey: key } : {}),
+    };
+    return this.runCreate(spec);
+  }
+
+  /**
+   * One `sandbox.create` attempt with fixed params. "Retry safely" calls this
+   * again with the IDENTICAL spec (same key); nothing calls it automatically.
+   */
+  private async runCreate(spec: SandboxCreateSpec, priorUnknown = false): Promise<SandboxSummary | undefined> {
     try {
-      const summary = await this.commands.sandboxCreate({
-        name: input.name,
-        projectId: input.projectId,
-        workspaceMode: input.workspaceMode,
-        ...(input.repoPath ? { repoPath: input.repoPath } : {}),
-        ...(input.agent !== undefined ? { agent: input.agent } : {}),
-      });
+      const summary = await this.commands.sandboxCreate(spec);
+      if (summary.replayed === true) {
+        // The stored FIRST response — not current state. Re-read instead of
+        // painting it, and never call it a fresh creation.
+        await this.refreshSandboxList();
+        if (this.sandboxes.some((s) => s.name === spec.name)) this.selectSandbox(spec.name);
+        this.setStatus('info', REPLAY_NOTICE);
+        this.emit();
+        return summary;
+      }
       this.sandboxes = [...this.sandboxes.filter((s) => s.name !== summary.name), summary];
       // The header/gate read the mode from Core's returned summary; if Core
       // returned none, it shows UNVERIFIED rather than the requested mode.
       this.selectSandbox(summary.name);
-      const view = workspaceModeView(input.workspaceMode);
-      const requestedAgent = input.agent ?? 'shell';
+      const view = workspaceModeView(spec.workspaceMode);
+      const requestedAgent = spec.agent ?? 'shell';
       const reportedAgent = typeof summary.agent === 'string' && summary.agent.length > 0 ? summary.agent : null;
       const agentNote =
         reportedAgent === null
@@ -488,9 +520,121 @@ export class SandpaneSession {
       this.emit();
       return summary;
     } catch (error) {
-      this.reportError(error, 'sandbox.create');
+      this.reportKeyedFailure(
+        error,
+        'sandbox.create',
+        spec.idempotencyKey !== undefined,
+        priorUnknown,
+        () => this.runCreate(spec, true),
+        () => this.refreshSandboxList(),
+      );
       return undefined;
     }
+  }
+
+  /** Whether the attached Core advertised `feature` in its last probe (A2). */
+  coreHasFeature(feature: CoreFeature): boolean {
+    return coreAdvertisesFeature(this.capabilities, feature);
+  }
+
+  /**
+   * Failure of a (possibly) keyed create/send (A2, design §3.1):
+   *  - a keyed CONFLICT is mapped to plain copy next to Core's own message;
+   *    for "outcome unknown" the state is re-read, and NOTHING claims that
+   *    nothing ran;
+   *  - an UNKNOWN outcome on a keyed request offers "Retry safely", which
+   *    resends the identical params with the same key — only on that click;
+   *  - an unknown outcome WITHOUT a key keeps the honest "check before trying
+   *    again" copy and offers no retry.
+   * Nothing here retries or mints a new key on its own.
+   */
+  private reportKeyedFailure(
+    error: unknown,
+    operation: string,
+    keyed: boolean,
+    priorUnknown: boolean,
+    attempt: () => Promise<unknown>,
+    reread: () => Promise<unknown>,
+  ): void {
+    const conflict = classifyKeyedConflict(error);
+    if (conflict !== null) {
+      this.reportError(error, operation, keyedConflictCopy(conflict));
+      if (conflict === 'unknown') void reread();
+      return;
+    }
+    // A "Retry safely" attempt that provably never left keeps the ORIGINAL
+    // unknown outcome: a generic "not attached" would invite a fresh-key send.
+    const unsentRetry = keyed && priorUnknown && isProvablyUnsent(error);
+    if (!isUnknownOutcome(error) && !unsentRetry) {
+      this.reportError(error, operation);
+      return;
+    }
+    if (!keyed) {
+      this.reportError(
+        error,
+        operation,
+        'Outcome unknown — Core did not confirm whether this ran. Check before trying again ' +
+          '(this Core does not advertise idempotency keys, so a retry could run it twice).',
+      );
+      return;
+    }
+    this.offerSafeRetry(operation, error, unsentRetry, attempt);
+  }
+
+  /**
+   * The unknown-outcome notification with the "Retry safely" button. Only the
+   * click resends, and only through `retryKeyed`'s click-time gate.
+   */
+  private offerSafeRetry(
+    operation: string,
+    error: unknown,
+    retryUnsent: boolean,
+    attempt: () => Promise<unknown>,
+  ): void {
+    const coreSaid = error instanceof Error ? plainText(error.message, 2_000) : '';
+    const text =
+      `${operation} — outcome UNKNOWN: Core did not confirm whether this request ran.\n\n` +
+      (retryUnsent
+        ? 'The retry could not reach Core, so nothing new was sent; the earlier attempt\'s outcome is still unknown.\n\n'
+        : '') +
+      `"${RETRY_SAFELY}" resends the identical request with the same idempotency key: Core runs it at ` +
+      'most once; otherwise it returns the earlier result or refuses. Core keeps keys for 24 h; after ' +
+      'that the same request would run again, so check state first if much time has passed.' +
+      (coreSaid ? `\n\nDetail: ${coreSaid}` : '');
+    this.log(`${operation} outcome unknown (keyed): ${coreSaid}`);
+    this.setStatus('error', `${operation}: outcome unknown — use "${RETRY_SAFELY}" or refresh to check.`);
+    this.emit();
+    void vscode.window.showErrorMessage(text, RETRY_SAFELY).then((choice) => {
+      if (choice === RETRY_SAFELY) void this.retryKeyed(operation, attempt);
+    });
+  }
+
+  /**
+   * Click-time gate for "Retry safely" (security review W1/W2; mirrors
+   * JetBrains `KeyedRequests.retryGate`): attach if needed, re-probe THIS Core,
+   * and resend only if it advertises `idempotency-keys` now — a background
+   * reconnect may have reached another Core build whose features the cache
+   * does not know yet. If Core cannot be reached, nothing was sent and the
+   * original unknown outcome (with the same key) is offered again.
+   */
+  private async retryKeyed(operation: string, attempt: () => Promise<unknown>): Promise<void> {
+    try {
+      if (this.connection.connectionState !== 'online') await this.connection.connect();
+      this.capabilities = await this.commands.systemProbe();
+    } catch (error) {
+      this.offerSafeRetry(operation, error, true, attempt);
+      return;
+    }
+    if (!this.coreHasFeature('idempotency-keys')) {
+      const text =
+        'Not retried: the connected Core does not advertise idempotency keys, so a retry could run it ' +
+        'twice. Nothing was sent — check state first.';
+      void vscode.window.showErrorMessage(text);
+      this.setStatus('error', text);
+      this.emit();
+      return;
+    }
+    await attempt();
   }
 
   /** Whether the attached Core advertised `method` in its last probe. */
@@ -778,13 +922,17 @@ export class SandpaneSession {
     }
     this.sending = true;
     this.emit();
-    try {
-      await this.sendGuarded(text, writable, planId, origin);
-    } finally {
+    const run = this.sendGuarded(text, writable, planId, origin).finally(() => {
       this.sending = false;
+      if (this.sendInFlight === run) this.sendInFlight = null;
       this.emit();
-    }
+    });
+    this.sendInFlight = run;
+    await run;
   }
+
+  /** The send currently holding the one-send guard, if any. */
+  private sendInFlight: Promise<void> | null = null;
 
   private async sendGuarded(
     text: string,
@@ -821,6 +969,7 @@ export class SandpaneSession {
         return;
       }
     }
+    let conversationId: string;
     try {
       if (this.connection.connectionState !== 'online') await this.attach();
       this.dropConversationOutOfScope();
@@ -852,27 +1001,89 @@ export class SandpaneSession {
         };
         await this.context.workspaceState.update(UI_KEYS.conversation, preference);
       }
-      const summary = await this.commands.conversationSend({
-        conversationId: this.conversation.id,
+      conversationId = this.conversation.id;
+    } catch (error) {
+      this.reportError(error, 'conversation.create');
+      return;
+    }
+    // A2: one fresh key for THIS send, only when Core honours keys.
+    const key = this.coreHasFeature('idempotency-keys') ? newIdempotencyKey() : undefined;
+    await this.deliverSend(
+      {
+        conversationId,
         content: text,
         attachments: plan?.refs ?? [],
-      });
+        ...(key !== undefined ? { idempotencyKey: key } : {}),
+      },
+      { scopeProjectId, sentPlanId, origin },
+    );
+  }
+
+  /**
+   * One `conversation.send` attempt with fixed params. "Retry safely" calls it
+   * again with the IDENTICAL params (same key); nothing calls it automatically.
+   */
+  private async deliverSend(
+    params: ConversationSendParams,
+    ctx: { scopeProjectId: string | null; sentPlanId: number; origin: 'sidebar' | 'command' },
+    priorUnknown = false,
+  ): Promise<void> {
+    try {
+      const summary = await this.commands.conversationSend(params);
+      // Discard the plan only if it is still the one that was sent: a list the
+      // user reviewed while this send was in flight stays (review S4).
+      if (this.contextPlanId === ctx.sentPlanId) this.contextPlan = null;
+      if (ctx.origin === 'sidebar') this.acceptedSends += 1;
+      if (summary.replayed === true) {
+        // The stored FIRST response: its status is not current. Re-read Core's
+        // task list instead of painting it, and never call it a fresh send.
+        await this.reloadScope();
+        this.setStatus('info', REPLAY_NOTICE);
+        this.emit();
+        return;
+      }
       // Only paint the accepted task if the user is still on that project.
-      if (this.selectedProjectId === scopeProjectId) {
+      if (this.selectedProjectId === ctx.scopeProjectId) {
         this.view = reduceTaskView(this.view, { kind: 'taskSummary', summary });
       }
       // No local echo: Core appends `message.user` durably itself, and the
       // catch-up below brings it back. Inventing the line here would paint a
       // transcript the durable log does not contain (AGENTS.md rule 3).
-      // Discard the plan only if it is still the one that was sent: a list the
-      // user reviewed while this send was in flight stays (review S4).
-      if (this.contextPlanId === sentPlanId) this.contextPlan = null;
-      if (origin === 'sidebar') this.acceptedSends += 1;
       this.setStatus('ok', `Core accepted task ${summary.id.slice(0, 8)} (status: ${summary.status})`);
       await this.catchUpNow();
       this.emit();
     } catch (error) {
-      this.reportError(error, 'conversation.send');
+      this.reportKeyedFailure(
+        error,
+        'conversation.send',
+        params.idempotencyKey !== undefined,
+        priorUnknown,
+        () => this.retrySend(params, ctx),
+        () => this.reloadScope(),
+      );
+    }
+  }
+
+  /** "Retry safely" for a send: same params and key, under the one-send guard. */
+  private async retrySend(
+    params: ConversationSendParams,
+    ctx: { scopeProjectId: string | null; sentPlanId: number; origin: 'sidebar' | 'command' },
+  ): Promise<void> {
+    // The failed send's own guard is released a few microtasks after its
+    // notification appears; a click that lands first waits for that release.
+    if (this.sendInFlight) await this.sendInFlight.catch(() => undefined);
+    if (this.sending) {
+      this.setStatus('info', 'A send is already in progress; wait for Core to answer.');
+      this.emit();
+      return;
+    }
+    this.sending = true;
+    this.emit();
+    try {
+      await this.deliverSend(params, ctx, true);
+    } finally {
+      this.sending = false;
+      this.emit();
     }
   }
 

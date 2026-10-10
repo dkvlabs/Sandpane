@@ -13,9 +13,17 @@ import {
   PROTOCOL_VERSION,
   SBX_AGENTS,
   DEFAULT_SBX_AGENT,
+  KNOWN_FEATURES,
   coreAdvertisesMethod,
 } from '../src/core-client/protocol';
-import { MAX_ADDRESSABLE_SANDBOX_NAME_LEN } from '../src/core-client/commands';
+import { MAX_ADDRESSABLE_SANDBOX_NAME_LEN, MAX_IDEMPOTENCY_KEY_LEN } from '../src/core-client/commands';
+import {
+  IDEM_CONFLICT_MISMATCH,
+  IDEM_CONFLICT_PENDING,
+  IDEM_CONFLICT_UNKNOWN,
+  NAME_LOCK_CONFLICT_PREFIX,
+  NAME_LOCK_CONFLICT_SUFFIX,
+} from '../src/core-client/idempotency';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -210,6 +218,51 @@ describe('wire names match the Rust protocol crate', () => {
     expect(fn, "Core's two-character minimum").toContain('name.chars().count() < 2');
     expect(fn, "Core's leading-character rule").toContain('.is_some_and(|c| c.is_ascii_alphanumeric())');
     expect(fn, "Core's reserved name").toContain('eq_ignore_ascii_case("default")');
+  });
+
+  it('A2: known features equal Rust FEATURES and the schema examples', () => {
+    const decl = /pub const FEATURES: \[&str; (\d+)\] = \[([^\]]*)\];/.exec(rustProtocol);
+    if (!decl?.[1] || decl[2] === undefined) throw new Error('sandpane-protocol has no `pub const FEATURES`');
+    const rust = [...decl[2].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect(rust).toHaveLength(Number(decl[1]));
+    expect(rust).toEqual([...KNOWN_FEATURES]);
+    const caps = JSON.parse(read('schemas/core-capabilities.schema.json')) as {
+      properties: { features?: { items: { examples: string[] } } };
+      required: string[];
+    };
+    expect(caps.properties.features?.items.examples).toEqual([...KNOWN_FEATURES]);
+    expect(caps.required).not.toContain('features');
+    expect(rustProtocol).toMatch(/#\[serde\(default\)\]\s+pub features: Vec<String>/);
+  });
+
+  it('A2: wire fields and the key rule match Rust', () => {
+    expect(rustProtocol).toContain('pub idempotency_key: Option<String>');
+    expect(rustProtocol).toContain('pub replayed: Option<bool>');
+    const tsClient = read('clients/vscode/src/core-client/protocol.ts');
+    for (const wire of ['idempotencyKey?: string', 'replayed?: boolean | null', 'features?: string[]']) {
+      expect(tsClient).toContain(wire);
+    }
+    const validation = read('core/crates/sandpane-core/src/validation.rs');
+    const fn = /pub fn idempotency_key\(key: &str\)[\s\S]*?\n    \}/.exec(validation)?.[0] ?? '';
+    expect(fn).toContain(`Self::reported_token(key, ${MAX_IDEMPOTENCY_KEY_LEN}, |c| {`);
+    expect(fn).toContain("c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'");
+  });
+
+  it('A2: the keyed CONFLICT messages the client matches are Core\'s exact strings', () => {
+    /** A Rust `pub const NAME: &str = "...";`, with `\`-newline continuations folded. */
+    const rustStr = (name: string): string => {
+      const m = new RegExp(`pub const ${name}: &str =\\s*"((?:[^"\\\\]|\\\\[\\s\\S])*)";`).exec(serviceLib);
+      if (!m?.[1]) throw new Error(`sandpane-service has no \`pub const ${name}\``);
+      return m[1].replace(/\\\n\s*/g, '');
+    };
+    expect(rustStr('IDEM_MSG_MISMATCH')).toBe(IDEM_CONFLICT_MISMATCH);
+    expect(rustStr('IDEM_MSG_PENDING')).toBe(IDEM_CONFLICT_PENDING);
+    expect(rustStr('IDEM_MSG_UNKNOWN')).toBe(IDEM_CONFLICT_UNKNOWN);
+    expect(IDEM_CONFLICT_UNKNOWN).not.toMatch(/nothing was run/);
+    // A1's name lock (`claim_sandbox_name`), which a concurrent same-key create may get.
+    expect(serviceLib).toContain(
+      `"${NAME_LOCK_CONFLICT_PREFIX}{name:?}${NAME_LOCK_CONFLICT_SUFFIX}"`,
+    );
   });
 
   it('pins the sbx agent allowlist to the create-spec schema', () => {

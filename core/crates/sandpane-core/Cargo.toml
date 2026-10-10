@@ -13,6 +13,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
+# SHA-256 fingerprint of idempotency-keyed params (A2). RustCrypto, MIT OR
+# Apache-2.0; pinned exactly like getrandom. No default features (alloc/oid
+# are not needed for a one-shot digest).
+sha2 = { version = "=0.11.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
