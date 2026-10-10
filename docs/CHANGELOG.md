@@ -640,4 +640,39 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0032 — Protocol A2: durable idempotency keys and feature advertisement
+
+- **date:** 2026-10-10
+- **phase:** C6 (idempotency part) / protocol v1 addition A2 ([design §3.1](plans/2026-10-09-protocol-v1-additions.md)), with all three clients.
+- **commit:** `af8858d` (feat(protocol): durable idempotency keys and feature advertisement (A2))
+- **details:**
+  - **Core keys:**
+    - `idempotencyKey?` on `sandbox.create` / `conversation.send`, stored in SQLite (schema v5).
+    - Fingerprint: SHA-256 of the tagged typed params; params are never stored.
+    - Send writes the key in the same transaction as its rows. Create claims the key before `sbx` runs.
+    - A replay returns the first response plus `replayed: true`. Mismatch, pending or unknown give CONFLICT with exact strings, and nothing runs.
+    - Startup marks pending keys unknown, and a failed reconcile makes Core refuse to start (tasks too).
+    - Retention is 24 h with a 10 000-row cap.
+  - **Feature advertisement:** `features` = `["idempotency-keys", "sandbox-create-agent"]`, drift-gated against the schema.
+  - **Clients:**
+    - The A1 agent inference is replaced by the feature check.
+    - One CSPRNG key per user action, sent only when advertised.
+    - "Retry safely" only on unknown outcomes, re-checking the live Core at click time; never automatic.
+    - Replay notice plus a re-read.
+    - CONFLICT copy pinned to Core's strings.
+  - **Process change:** the design was decided first. Core was reviewed and frozen, then the clients were dispatched from one shared brief, then one combined client review.
+  - **Also:** 18 raw invisible characters in an older desktop test file were rewritten as escapes.
+- **files:**
+  - `core/crates/**` (new `idempotency.rs`), `core/Cargo.lock`, `schemas/*`, `scripts/schema_drift.py`
+  - `clients/vscode/**`, `clients/jetbrains/**`, `apps/desktop/**`
+  - `docs/plans/*`, `docs/specs/02_ARCHITECTURE_AND_DATA.md`, `docs/compatibility.md`, `README.md`
+- **verification:**
+  - `make check` exit 0: Core 288, VS Code 367, desktop 429 + 8 opt-in skipped, Tauri 32.
+  - JetBrains 265; `verifyPlugin` Compatible.
+  - Live, isolated Core with no `sbx`: VS Code 58/58, desktop 8/8.
+  - UNVERIFIED: never run against real `sbx` or in a real editor, app or IDE. `cargo-audit` and `cargo-deny` are not installed.
+- **review:** [audit/0032-protocol-a2-idempotency-keys-review.md](audit/0032-protocol-a2-idempotency-keys-review.md) — `security-reviewer` on Core plus one combined security/phase pass on the clients; no Critical; every Warning fixed pre-commit
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
