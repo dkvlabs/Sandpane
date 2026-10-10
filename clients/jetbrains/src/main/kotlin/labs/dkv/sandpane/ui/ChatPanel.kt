@@ -1,5 +1,6 @@
 package labs.dkv.sandpane.ui
 
+import labs.dkv.sandpane.text.DisplayCap
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.DefaultActionGroup
@@ -14,6 +15,7 @@ import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.core.KeyedCall
 import labs.dkv.sandpane.core.KeyedWrites
+import labs.dkv.sandpane.core.ProjectUiState
 import labs.dkv.sandpane.core.RenderedEvent
 import labs.dkv.sandpane.model.AgentEvent
 import labs.dkv.sandpane.model.Conversation
@@ -217,6 +219,7 @@ class ChatPanel(
     private var removeStateListener: (() -> Unit)? = null
     private var removeSnapshotListener: (() -> Unit)? = null
     private var removeViewListener: (() -> Unit)? = null
+    private var removeDeletedListener: (() -> Unit)? = null
 
     private var hostMapping: SandpaneContextProvider.HostMapping =
         SandpaneContextProvider.HostMapping.Unsupported("host/path mapping not resolved yet")
@@ -465,8 +468,13 @@ class ChatPanel(
 
         projectPicker.renderer = PlainTextListRenderer { value ->
             val project = value as? SandpaneProject
-            if (project == null) "no project" to null
-            else project.name to "Core project ${project.id}"
+            if (project == null) {
+                "no project" to null
+            } else {
+                // A3a: archived projects (listed only with "Show Archived Projects") are labeled.
+                DisplayCap.cap(ProjectUiState.label(project)) to
+                    DisplayCap.cap("Core project ${project.id}" + (project.archivedAt?.let { "\narchived at $it (Core)" } ?: ""))
+            }
         }
         agentPicker.renderer = PlainTextListRenderer { value -> (value?.toString() ?: "") to null }
 
@@ -584,13 +592,31 @@ class ChatPanel(
                     // A refresh re-asks Core; it does not reuse a cached conversation list. The
                     // selection is preserved by id when Core still reports that project.
                     projectModel.selectedItem =
-                        projects.firstOrNull { it.id == previouslySelected } ?: projects.firstOrNull()
+                        projects.firstOrNull { it.id == previouslySelected }
+                            ?: projects.firstOrNull { !it.isArchived } ?: projects.firstOrNull()
                 }
                 banner.text = snapshot.failure
                     ?.let { "Core problem: $it (${snapshot.describeAge()})" }
                     ?: "projects and sandboxes ${snapshot.describeAge()}"
                 onSelectedProjectChanged()
                 refreshGateUI()
+            }
+        }
+
+        // A3a: Core confirmed a project delete — drop this window's in-memory state for it. The
+        // snapshot re-read that follows removes it from the picker; nothing is persisted per project.
+        removeDeletedListener = sbx.addProjectDeletedListener { deletedId ->
+            onEdt {
+                if (conversationsProjectId == deletedId) {
+                    val ids = (0 until conversationModel.size).map { conversationModel.getElementAt(it).id }
+                    val dropped = tasks.forgetConversations(ids)
+                    repopulate { conversationModel.removeAllElements() }
+                    conversationsProjectId = null
+                    addSystemRow(
+                        "The selected project was deleted in Core (deleted: true); this window dropped its " +
+                            "conversation list and $dropped tracked task row(s) for it.",
+                    )
+                }
             }
         }
 
@@ -644,6 +670,7 @@ class ChatPanel(
         val blocker: String? = problem
             ?: (mapping as? SandpaneContextProvider.HostMapping.Unsupported)?.reason
             ?: gate.reasonForUser().takeUnless { gate.chatEnabled }
+            ?: archivedBlocker()
 
         val blocked = blocker != null
         composer.isEnabled = !blocked
@@ -897,9 +924,21 @@ class ChatPanel(
         }
     }
 
+    /**
+     * A3a: Core refuses conversation.create / conversation.send on an ARCHIVED project, so the
+     * composer says so up front (Core's own reason) instead of sending a request Core will refuse.
+     */
+    private fun archivedBlocker(): String? {
+        val selected = projectModel.selectedItem as? SandpaneProject ?: return null
+        val archivedAt = selected.archivedAt ?: return null
+        // This plugin's decision, from Core's archivedAt: nothing was sent, so it is not worded as Core's.
+        return "This project is archived (Core reports archivedAt ${VisibleText.reveal(archivedAt)}); Core refuses new " +
+            "messages until it is unarchived. Nothing was sent."
+    }
+
     private fun onComposerChanged() {
         val gateAllows = connection.connectionProblem() == null && connection.agentGate().chatEnabled &&
-            hostMapping is SandpaneContextProvider.HostMapping.Supported
+            hostMapping is SandpaneContextProvider.HostMapping.Supported && archivedBlocker() == null
         sendButton.isEnabled = gateAllows && composer.text.isNotBlank()
     }
 
@@ -959,6 +998,8 @@ class ChatPanel(
         removeStateListener?.invoke()
         removeSnapshotListener?.invoke()
         removeViewListener?.invoke()
+        removeDeletedListener?.invoke()
+        removeDeletedListener = null
         removeStateListener = null
         removeSnapshotListener = null
         removeViewListener = null

@@ -25,16 +25,22 @@ interface Frame {
   params: Record<string, unknown>;
 }
 
-/** `Method::ALL` order — what an A1 Core advertises (16 methods). */
+/** `Method::ALL` order — what an A3a Core advertises (22 methods). */
 const ALL_METHODS = [
-  'system.probe', 'project.create', 'project.list', 'sandbox.list', 'sandbox.create',
+  'system.probe', 'project.create', 'project.list',
+  'project.update', 'project.archive', 'project.unarchive', 'project.delete',
+  'project.add_repository', 'project.remove_repository',
+  'sandbox.list', 'sandbox.create',
   'sandbox.stop', 'sandbox.remove',
   'conversation.create', 'conversation.send', 'conversation.list', 'conversation.history',
   'task.cancel', 'task.list', 'task.subscribe', 'git.review', 'git.apply',
 ];
 
+/** A pre-A3a Core: the 16 methods before the project lifecycle. */
+const PRE_A3A_METHODS = ALL_METHODS.filter((m) => !/^project\.(update|archive|unarchive|delete|add_repository|remove_repository)$/.test(m));
+
 /** A pre-A1 Core: the 14 methods before sandbox.stop / sandbox.remove. */
-const PRE_A1_METHODS = ALL_METHODS.filter((m) => m !== 'sandbox.stop' && m !== 'sandbox.remove');
+const PRE_A1_METHODS = PRE_A3A_METHODS.filter((m) => m !== 'sandbox.stop' && m !== 'sandbox.remove');
 
 const TOKEN = '0123456789abcdef'.repeat(4);
 
@@ -44,6 +50,23 @@ class ScriptedCore {
   refuseConnect = false;
   /** What system.probe advertises. */
   methods: string[] = ALL_METHODS;
+  /** A3a project lifecycle state of this fake. */
+  readonly archived = new Set<string>();
+  readonly deletedProjects = new Set<string>();
+  readonly projectNames = new Map<string, string>();
+  p3Exists = false;
+  /** When set, step 1 answers for this project id instead of echoing the requested one. */
+  confirmationTargetId: string | null = null;
+  /** Step 2 deletes the project and THEN answers the forced error (lost answer). */
+  deleteBeforeForcedError = false;
+  projectConfirmation: Record<string, unknown> = {
+    token: TOKEN,
+    expiresAt: '2026-10-10T12:02:00Z',
+    action: 'project.delete',
+    target: { name: 'Atlas Demo', id: 'p1' },
+    impact: ['deletes 1 conversation(s), 3 message(s) and 1 task(s)', 'task branches in the host repositories are left in place'],
+    external: false,
+  };
   /** Future-Core shape: task.list rows carry `sandboxName`. Today's Core never sets it. */
   taskSandboxNames = false;
   /** `sandbox.stop` answer. */
@@ -169,10 +192,40 @@ class ScriptedCore {
       case 'project.list':
         return {
           ok: [
-            { id: 'p1', name: 'Atlas Demo', description: '', createdAt: '', repositories: this.p1Repositories },
+            { id: 'p1', name: this.projectNames.get('p1') ?? 'Atlas Demo', description: '', createdAt: '', repositories: this.p1Repositories },
             { id: 'p2', name: 'Nova Demo', description: '', createdAt: '' },
-          ],
+            { id: 'p3', name: 'Orbit Demo', description: '', createdAt: '' },
+          ]
+            .filter((proj) => !this.deletedProjects.has(proj.id))
+            .filter((proj) => proj.id !== 'p3' || this.p3Exists)
+            .map((proj) => (this.archived.has(proj.id) ? { ...proj, archivedAt: '2026-10-10T11:00:00Z' } : proj))
+            .filter((proj) => p['includeArchived'] === true || !('archivedAt' in proj)),
         };
+      case 'project.update':
+      case 'project.archive':
+      case 'project.unarchive':
+      case 'project.add_repository':
+      case 'project.remove_repository': {
+        const forced = this.takeForced(frame.method);
+        if (forced) return forced;
+        const id = String(p['projectId']);
+        if (frame.method === 'project.archive') this.archived.add(id);
+        if (frame.method === 'project.unarchive') this.archived.delete(id);
+        if (typeof p['name'] === 'string') this.projectNames.set(id, p['name']);
+        return { ok: { id, name: this.projectNames.get(id) ?? 'Atlas Demo', description: String(p['description'] ?? ''), createdAt: '' } };
+      }
+      case 'project.delete': {
+        if (p['confirmToken'] === undefined) {
+          const forced = this.takeForced('project.delete.step1');
+          if (forced) return forced;
+          return { ok: { confirmation: { ...this.projectConfirmation, target: { name: 'Atlas Demo', id: this.confirmationTargetId ?? p['projectId'] } } } };
+        }
+        if (this.deleteBeforeForcedError) this.deletedProjects.add(String(p['projectId']));
+        const forced = this.takeForced('project.delete');
+        if (forced) return forced;
+        this.deletedProjects.add(String(p['projectId']));
+        return { ok: { deleted: true } };
+      }
       case 'sandbox.list':
         if (this.sandboxListError) return { err: this.sandboxListError };
         return {
@@ -1239,6 +1292,354 @@ describe('A2 idempotency keys: create / send', () => {
     expect(shown?.items).not.toContain('Retry safely');
     expect(core.calls('conversation.send')).toHaveLength(1);
     expect(core.calls('task.list').length).toBeGreaterThan(taskLists);
+    session.dispose();
+  });
+});
+
+describe('A3a project lifecycle', () => {
+  async function online(core = new ScriptedCore(), state = new MemoryState()) {
+    const made = makeSession(core, state);
+    await made.session.attach();
+    await settle();
+    return { core, ...made };
+  }
+  const atlas = { id: 'p1', name: 'Atlas Demo', description: '', createdAt: '' };
+  const archivedAtlas = { ...atlas, archivedAt: '2026-10-10T11:00:00Z' };
+
+  it('every action is refused visibly — no frame — when this Core does not advertise it', async () => {
+    const core = new ScriptedCore();
+    core.methods = PRE_A3A_METHODS;
+    const { session } = await online(core);
+    await session.renameProject(atlas, 'Atlas Renamed');
+    await session.archiveProject(atlas);
+    await session.addRepository(atlas, '/repo/atlas');
+    await session.deleteProject(atlas);
+    await session.toggleShowArchived();
+    for (const m of ['project.update', 'project.archive', 'project.add_repository', 'project.delete']) {
+      expect(core.calls(m), m).toHaveLength(0);
+    }
+    expect(stub.warnings.filter((w) => /not supported by the attached Sandpane Core/.test(w))).toHaveLength(5);
+    expect(session.showingArchivedProjects).toBe(false);
+    session.dispose();
+  });
+
+  it('rename / description / archive / unarchive / repositories send exact frames, then re-read project.list', async () => {
+    const { core, session } = await online();
+    const lists = (): number => core.calls('project.list').length;
+    let before = lists();
+    await session.renameProject(atlas, 'Atlas Renamed');
+    expect(core.calls('project.update').at(-1)?.params).toEqual({ projectId: 'p1', name: 'Atlas Renamed' });
+    expect(lists()).toBe(before + 1);
+    await session.editProjectDescription(atlas, 'line one\nline two');
+    expect(core.calls('project.update').at(-1)?.params).toEqual({ projectId: 'p1', description: 'line one\nline two' });
+    await session.editProjectDescription(atlas, '');
+    expect(core.calls('project.update').at(-1)?.params).toEqual({ projectId: 'p1', description: '' });
+    expect(session.snapshot().status?.text).toMatch(/cleared/);
+    await session.addRepository(atlas, '/repo/atlas');
+    expect(core.calls('project.add_repository').at(-1)?.params).toEqual({ projectId: 'p1', path: '/repo/atlas' });
+    await session.removeRepository(atlas, '/repo/atlas');
+    expect(core.calls('project.remove_repository').at(-1)?.params).toEqual({ projectId: 'p1', path: '/repo/atlas' });
+    before = lists();
+    await session.archiveProject(atlas);
+    expect(core.calls('project.archive').at(-1)?.params).toEqual({ projectId: 'p1' });
+    expect(lists()).toBe(before + 1);
+    await session.unarchiveProject(archivedAtlas);
+    expect(core.calls('project.unarchive').at(-1)?.params).toEqual({ projectId: 'p1' });
+    session.dispose();
+  });
+
+  it('an archived project: edits are disabled with Core\'s reason (nothing sent); unarchive and delete stay available', async () => {
+    const { core, session } = await online();
+    await session.renameProject(archivedAtlas, 'x1');
+    await session.editProjectDescription(archivedAtlas, 'x');
+    await session.addRepository(archivedAtlas, '/repo/atlas');
+    await session.removeRepository(archivedAtlas, '/repo/atlas');
+    expect(core.calls('project.update')).toHaveLength(0);
+    expect(core.calls('project.add_repository')).toHaveLength(0);
+    expect(core.calls('project.remove_repository')).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toContain('"project is archived; unarchive it first; nothing was changed"');
+    expect(stub.warnings.at(-1)).toContain('Nothing was sent.');
+    await session.unarchiveProject(archivedAtlas);
+    expect(core.calls('project.unarchive')).toHaveLength(1);
+    await session.deleteProject(archivedAtlas);
+    expect(core.calls('project.delete')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it('"show archived" sends includeArchived:true only when on, persists as a UI preference, and labels archived projects', async () => {
+    const core = new ScriptedCore();
+    core.archived.add('p1');
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const { session } = await online(core, state);
+    expect(core.calls('project.list').every((f) => f.params['includeArchived'] === undefined)).toBe(true);
+    await session.toggleShowArchived();
+    expect(core.calls('project.list').at(-1)?.params).toEqual({ includeArchived: true });
+    expect(state.values.get('sandpane.ui.showArchivedProjects')).toBe(true);
+    expect(session.snapshot().header.project).toBe('Atlas Demo · ARCHIVED');
+    const options = await session.listProjectOptions();
+    expect(options.find((o) => o.id === 'p1')?.description).toMatch(/^ARCHIVED · /);
+    await session.toggleShowArchived();
+    expect(core.calls('project.list').at(-1)?.params).toEqual({});
+    session.dispose();
+  });
+
+  it('delete: step 1 {projectId} → native modal; confirm sends step 2 with that token; state is forgotten', async () => {
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    state.values.set('sandpane.ui.conversation', { id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', sandboxName: null });
+    const { core, session } = await online(new ScriptedCore(), state);
+    stub.answers.set('Delete project', 'Delete project');
+    expect(await session.deleteProject(atlas)).toBe(true);
+    expect(core.calls('project.delete').map((f) => f.params)).toEqual([
+      { projectId: 'p1' },
+      { projectId: 'p1', confirmToken: TOKEN },
+    ]);
+    const modal = stub.warningCalls.find((c) => c.items.includes('Delete project'));
+    expect(modal?.options?.modal).toBe(true);
+    expect(modal?.message).toBe('Delete project "Atlas Demo"?');
+    expect(modal?.options?.detail).toContain('Project id: p1');
+    expect(modal?.options?.detail).toContain('• task branches in the host repositories are left in place');
+    expect(modal?.options?.detail).toContain('(in about 120 s)');
+    expect(modal?.options?.detail).not.toContain(TOKEN);
+    expect(modal?.options?.detail).not.toContain('NOT CONFIRMED AS CREATED');
+    const snap = session.snapshot();
+    expect(snap.header.project).not.toBe('Atlas Demo');
+    expect(state.values.has('sandpane.ui.selectedProject')).toBe(false);
+    expect(state.values.has('sandpane.ui.conversation')).toBe(false);
+    expect(snap.conversation).toBeNull();
+    expect(snap.status?.text).toMatch(/^Core deleted project "Atlas Demo" \(its Core records only/);
+    session.dispose();
+  });
+
+  it('delete cancelled sends step 1 only; an expired confirmation at click time sends nothing more', async () => {
+    const { core, session } = await online();
+    expect(await session.deleteProject(atlas)).toBe(false);
+    expect(core.calls('project.delete')).toHaveLength(1);
+    expect(session.snapshot().status?.text).toMatch(/nothing was sent/);
+
+    stub.answers.set('Delete project', 'Delete project');
+    clock.after = { reads: clock.reads.length + 1, now: Date.parse('2026-10-10T12:02:00Z') };
+    expect(await session.deleteProject(atlas)).toBe(false);
+    expect(core.calls('project.delete').filter((f) => f.params['confirmToken'] !== undefined)).toHaveLength(0);
+    expect(session.snapshot().status?.text).toBe('Confirmation expired — nothing was sent; run Delete Project again.');
+    session.dispose();
+  });
+
+  it('a step-1 confirmation for another project id is never presented and never confirmed', async () => {
+    const core = new ScriptedCore();
+    core.confirmationTargetId = 'p2';
+    const { session } = await online(core);
+    stub.answers.set('Delete project', 'Delete project');
+    expect(await session.deleteProject(atlas)).toBe(false);
+    expect(core.calls('project.delete').map((f) => f.params)).toEqual([{ projectId: 'p1' }]);
+    expect(stub.warningCalls.some((c) => c.items.includes('Delete project'))).toBe(false);
+    expect(stub.errors.at(-1)).toMatch(/Nothing was deleted/);
+    session.dispose();
+  });
+
+  it.each([
+    ['CONFLICT', 'project has tasks that are not finished; cancel or finish them first; nothing was deleted', 'The project has unfinished tasks. Cancel or finish them first; nothing was deleted.'],
+    ['CONFLICT', 'project has sandboxes; remove them first; nothing was deleted', 'The project still has sandboxes. Remove them first; nothing was deleted.'],
+    ['CONFLICT', 'a sandbox is being created for this project; try again when it finishes; nothing was deleted', 'A sandbox is being created for this project. Try again when it finishes; nothing was deleted.'],
+    ['VALIDATION_FAILED', 'confirmation token is invalid, expired, already used, or not for this action and target; request a new confirmation', 'Core refused the confirmation (invalid, expired or already used). Nothing was deleted — run Delete Project again for a fresh confirmation.'],
+    ['NOT_FOUND', 'project not found', 'Core has no such project (it may have been deleted); nothing was changed.'],
+  ])('delete step 2 %s "%s" → honest copy, no retry', async (code, message, copy) => {
+    const core = new ScriptedCore();
+    core.forced.set('project.delete', { code, message });
+    const { session } = await online(core);
+    stub.answers.set('Delete project', 'Delete project');
+    expect(await session.deleteProject(atlas)).toBe(false);
+    expect(core.calls('project.delete')).toHaveLength(2);
+    expect(stub.errors.at(-1)).toContain(copy);
+    expect(stub.errors.at(-1)).toContain(`Core said: ${code}: ${message}`);
+    session.dispose();
+  });
+
+  it('delete step 2 INTERNAL is UNKNOWN (never "nothing was deleted"); Core\'s list then settles it', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('project.delete', { code: 'INTERNAL', message: 'database is locked' });
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const { session } = await online(core, state);
+    stub.answers.set('Delete project', 'Delete project');
+    expect(await session.deleteProject(atlas)).toBe(false);
+    const shown = stub.errors.at(-1) ?? '';
+    expect(shown).toContain('Outcome UNKNOWN');
+    expect(shown).not.toMatch(/nothing was deleted/i);
+    expect(core.calls('project.list').at(-2)?.params).toEqual({ includeArchived: true });
+    expect(core.calls('project.delete')).toHaveLength(2);
+    // The fake did not delete it. Core ANSWERED (INTERNAL), so that request
+    // finished: "not deleted" is earned.
+    expect(session.snapshot().status?.text).toBe(
+      'Core still lists the project as of this re-read — it was not deleted (Core answered the delete request, so that request has finished).',
+    );
+    expect(state.values.get('sandpane.ui.selectedProject')).toBe('p1');
+    session.dispose();
+  });
+
+  it.each([
+    ['project.update', 'VALIDATION_FAILED', 'project is archived; unarchive it first; nothing was changed', 'This project is archived. Unarchive it first; nothing was changed.'],
+    ['project.remove_repository', 'CONFLICT', 'repository is used by a task or sandbox of this project; nothing was removed', 'A task or sandbox of this project uses that repository; nothing was removed.'],
+    ['project.remove_repository', 'CONFLICT', 'a sandbox is being created for this project; try again when it finishes; nothing was removed', 'A sandbox is being created for this project. Try again when it finishes; nothing was removed.'],
+    ['project.remove_repository', 'NOT_FOUND', 'repository is not registered with this project; nothing was removed', 'That repository is not registered with this project; nothing was removed.'],
+  ])('%s %s "%s" → honest copy', async (method, code, message, copy) => {
+    const core = new ScriptedCore();
+    core.forced.set(method, { code, message });
+    const { session } = await online(core);
+    if (method === 'project.update') await session.renameProject(atlas, 'Atlas Renamed');
+    else await session.removeRepository(atlas, '/repo/atlas');
+    expect(stub.errors.at(-1)).toContain(copy);
+    session.dispose();
+  });
+
+  it('W1: delete step 2 with no answer (timeout): "still lists as of this re-read", never "not deleted"', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('project.delete', { code: 'INTERNAL', message: 'never delivered' });
+    core.hold = (f) => f.method === 'project.delete' && f.params['confirmToken'] !== undefined;
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const made = makeSession(core, state);
+    await made.session.attach();
+    await settle();
+    stub.answers.set('Delete project', 'Delete project');
+    const pending = made.session.deleteProject(atlas);
+    await settle();
+    const timer = made.timers.pending.find((t) => t.ms === 15_000);
+    if (!timer) throw new Error('no pending 15 s timer');
+    made.timers.clear(timer.id);
+    timer.fn();
+    expect(await pending).toBe(false);
+    await settle();
+    expect(stub.errors.at(-1)).toContain('Outcome UNKNOWN');
+    const text = made.session.snapshot().status?.text ?? '';
+    expect(text).toBe(
+      'Core still lists the project as of this re-read. Core never answered the delete request, so it may still finish — re-read before acting; not retried.',
+    );
+    expect(text).not.toMatch(/not deleted/);
+    expect(core.calls('project.delete')).toHaveLength(2);
+    expect(state.values.get('sandpane.ui.selectedProject')).toBe('p1');
+    made.session.dispose();
+  });
+
+  it('W1: delete step 2 connection closed and no re-read possible: the outcome stays UNKNOWN', async () => {
+    const core = new ScriptedCore();
+    core.hold = (f) => f.method === 'project.delete' && f.params['confirmToken'] !== undefined;
+    core.refuseConnect = false;
+    const { session } = await online(core);
+    stub.answers.set('Delete project', 'Delete project');
+    const pending = session.deleteProject(atlas);
+    await settle();
+    core.refuseConnect = true;
+    core.drop();
+    expect(await pending).toBe(false);
+    await settle();
+    expect(stub.errors.at(-1)).toContain('Outcome UNKNOWN');
+    const text = session.snapshot().status?.text ?? '';
+    expect(text).toBe('The project list could not be re-read after the unknown outcome; whether the project was deleted is UNKNOWN.');
+    expect(text).not.toMatch(/not deleted/);
+    session.dispose();
+  });
+
+  it('Info: delete step 2 NOT_FOUND (deleted elsewhere) forgets the project like deleted:true', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('project.delete', { code: 'NOT_FOUND', message: 'project not found' });
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    state.values.set('sandpane.ui.conversation', { id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', sandboxName: null });
+    const { session } = await online(core, state);
+    stub.answers.set('Delete project', 'Delete project');
+    expect(await session.deleteProject(atlas)).toBe(false);
+    expect(stub.errors.at(-1)).toContain('Core has no such project (it may have been deleted); nothing was changed.');
+    expect(state.values.has('sandpane.ui.selectedProject')).toBe(false);
+    expect(state.values.has('sandpane.ui.conversation')).toBe(false);
+    expect(session.snapshot().conversation).toBeNull();
+    expect(core.calls('project.delete')).toHaveLength(2);
+    session.dispose();
+  });
+
+  it('delete step 2 INTERNAL after Core did delete: the re-read settles it and client state is dropped, no retry', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('project.delete', { code: 'INTERNAL', message: 'database is locked' });
+    core.deleteBeforeForcedError = true;
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    state.values.set('sandpane.ui.conversation', { id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', sandboxName: null });
+    const { session } = await online(core, state);
+    stub.answers.set('Delete project', 'Delete project');
+    expect(await session.deleteProject(atlas)).toBe(false);
+    expect(stub.errors.at(-1)).toContain('Outcome UNKNOWN');
+    expect(stub.errors.at(-1)).not.toMatch(/nothing was deleted/i);
+    expect(core.calls('project.delete')).toHaveLength(2);
+    const snap = session.snapshot();
+    expect(snap.status?.text).toBe('Core no longer lists the project after the unknown outcome — the delete took effect.');
+    expect(state.values.has('sandpane.ui.selectedProject')).toBe(false);
+    expect(state.values.has('sandpane.ui.conversation')).toBe(false);
+    expect(snap.conversation).toBeNull();
+    expect(snap.header.project).not.toMatch(/Atlas Demo/);
+    session.dispose();
+  });
+
+  it('archiving the selected project while archived ones are hidden deselects it (never a stale unlabeled header)', async () => {
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const { session } = await online(new ScriptedCore(), state);
+    expect(session.snapshot().header.project).toBe('Atlas Demo');
+    await session.archiveProject(atlas);
+    const snap = session.snapshot();
+    expect(snap.header.project).not.toMatch(/^Atlas Demo$/);
+    expect(state.values.has('sandpane.ui.selectedProject')).toBe(false);
+    expect(snap.status?.text).toContain('It is hidden from lists and was deselected');
+    session.dispose();
+  });
+
+  it('archiving the selected project while archived ones are shown keeps it selected, labeled ARCHIVED', async () => {
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const { session } = await online(new ScriptedCore(), state);
+    await session.toggleShowArchived();
+    await session.archiveProject(atlas);
+    expect(session.snapshot().header.project).toBe('Atlas Demo · ARCHIVED');
+    session.dispose();
+  });
+
+  it('refuseIfArchived (the command pre-check): archived → refusal with Core\'s reason, nothing sent; live → false', async () => {
+    const { core, session } = await online();
+    const before = core.requests.length;
+    expect(session.refuseIfArchived(atlas, 'Rename project')).toBe(false);
+    expect(session.refuseIfArchived(archivedAtlas, 'Rename project')).toBe(true);
+    expect(stub.warnings.at(-1)).toBe(
+      'Rename project is not available: Core refuses changes to an archived project ("project is archived; unarchive it first; nothing was changed"). Unarchive it first. Nothing was sent.',
+    );
+    expect(core.requests.length).toBe(before);
+    session.dispose();
+  });
+
+  it('a project mutation with no answer is UNKNOWN and re-reads, never "nothing was changed"', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('project.archive', { code: 'INTERNAL', message: 'disk I/O error' });
+    const { session } = await online(core);
+    const lists = core.calls('project.list').length;
+    await session.archiveProject(atlas);
+    await settle();
+    expect(stub.errors.at(-1)).toContain('Outcome UNKNOWN');
+    expect(stub.errors.at(-1)).not.toMatch(/nothing was changed/i);
+    expect(core.calls('project.list').length).toBeGreaterThan(lists);
+    session.dispose();
+  });
+
+  it('sandbox.create refused because the repository was unregistered mid-create gets plain copy', async () => {
+    const core = new ScriptedCore();
+    core.features = undefined;
+    core.forced.set('sandbox.create', {
+      code: 'CONFLICT',
+      message: 'the repository was unregistered from this project while the sandbox was being prepared; nothing was run',
+    });
+    const { session } = await online(core);
+    await session.createSandbox({ name: 'atlas-new', projectId: 'p1', workspaceMode: 'mountless' });
+    expect(stub.errors.at(-1)).toContain(
+      'The repository was unregistered from the project while the sandbox was being prepared; nothing was run.',
+    );
     session.dispose();
   });
 });

@@ -186,10 +186,50 @@ class SandboxLifecycleTest {
     }
 
     @Test
-    fun unparseableExpiryIsLeftToCore() {
-        val rpc = ScriptedRpc(ok(step1Json(expiresAt = "soon")), ok("""{"removed":true}"""))
-        val outcome = SandboxRemoveFlow(commands(rpc), FakeUi(answer = true)).run(name).get()
-        assertIs<RemoveOutcome.Removed>(outcome)
+    fun unparseableExpiryFailsClosed() {
+        // Like the VS Code and desktop clients: an expiry this client cannot check is not acted on.
+        val rpc = ScriptedRpc(ok(step1Json(expiresAt = "soon")))
+        val ui = FakeUi(answer = true)
+        val outcome = SandboxRemoveFlow(commands(rpc), ui).run(name).get()
+        assertIs<RemoveOutcome.Refused>(outcome)
+        assertTrue(outcome.reason.contains("cannot be used; run Remove Sandbox again"), outcome.reason)
+        assertEquals(1, rpc.sent.size, "step 2 is never sent")
+        assertTrue(ui.shown.isEmpty(), "no dialog for an unusable confirmation")
+    }
+
+    @Test
+    fun stepTwoIsSentFromTheBackgroundNeverFromTheUiThread() {
+        var inUi = false
+        val sentInUi = ArrayList<Boolean>()
+        val rpc = object : CoreRpc {
+            val replies = ArrayDeque(listOf(step1Json(), """{"removed":true}"""))
+            override fun request(method: String, params: JsonElement): CompletableFuture<JsonElement> {
+                sentInUi += inUi
+                return CompletableFuture.completedFuture(CoreJson.parseToJsonElement(replies.removeFirst()))
+            }
+        }
+        val ui = object : SandboxRemoveFlow.Ui {
+            override fun onUiThread(block: () -> Unit) {
+                inUi = true
+                try { block() } finally { inUi = false }
+            }
+            override fun confirm(issued: IssuedRemoval) = true
+        }
+        val queued = ArrayList<() -> Unit>()
+        val done = SandboxRemoveFlow(commands(rpc), ui, background = { queued += it }).run(name)
+        assertEquals(listOf(false), sentInUi, "only step 1 so far: step 2 waits for the background")
+        assertFalse(done.isDone)
+        queued.forEach { it() }
+        assertEquals(listOf(false, false), sentInUi, "step 2 was not written on the UI thread")
+        assertIs<RemoveOutcome.Removed>(done.get())
+    }
+
+    @Test
+    fun aStepTwoThatCannotBeScheduledIsNotSent() {
+        val rpc = ScriptedRpc(ok(step1Json()))
+        val outcome = SandboxRemoveFlow(commands(rpc), FakeUi(answer = true), background = { error("pool shut down") }).run(name).get()
+        assertIs<RemoveOutcome.Refused>(outcome)
+        assertEquals(1, rpc.sent.size)
     }
 
     @Test

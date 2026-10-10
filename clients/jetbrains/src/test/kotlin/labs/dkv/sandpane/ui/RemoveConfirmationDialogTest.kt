@@ -99,4 +99,18 @@ class RemoveConfirmationDialogTest {
         assertEquals("Cancel", RemoveConfirmation.CANCEL_LABEL)
         assertFalse(RemoveConfirmation.TITLE.contains('<'))
     }
+
+    @Test
+    fun longImpactLinesAndChooserRowsAreCapped() {
+        val long = "y".repeat(450)
+        val html = RemoveConfirmation.message(issued(listOf(long), external = false)).build()
+        assertTrue(html.contains("y".repeat(200) + "…"), "impact line capped at 200 code points")
+        assertFalse(html.contains("y".repeat(201)))
+
+        val sandbox = labs.dkv.sandpane.model.SandboxSummary(name = "z".repeat(300))
+        val (row, tip) = SandboxChooserDialog.describe(sandbox)
+        assertFalse(row.contains("z".repeat(201)), row)
+        assertTrue(row.endsWith("…"))
+        assertTrue((tip ?: "").codePointCount(0, (tip ?: "").length) <= 201)
+    }
 }

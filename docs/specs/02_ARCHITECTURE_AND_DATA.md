@@ -58,7 +58,13 @@ Implemented contract (protocol v1, additively revised — see the revision note 
 interface SandpaneRpc {
   'system.probe': { request: {}; response: CoreCapabilities /* + methods: string[] (feature discovery); + features: string[] (A2: "idempotency-keys", "sandbox-create-agent"; unknown strings are ignored) */ };
   'project.create': { request: { name: string; repositories: string[] }; response: Project /* + repositories: string[] */ };
-  'project.list': { request: {}; response: Project[] };
+  'project.list': { request: { includeArchived?: boolean /* A3a; default false */ }; response: Project[] /* + archivedAt? (A3a) */ };
+  'project.update': { request: { projectId: string; name?: string; description?: string }; response: Project };
+  'project.archive': { request: { projectId: string }; response: Project };
+  'project.unarchive': { request: { projectId: string }; response: Project };
+  'project.delete': { request: { projectId: string; confirmToken?: string }; response: { confirmation?: ConfirmationRequest; deleted?: true } /* §2 token flow; never touches host files, branches or sandboxes */ };
+  'project.add_repository': { request: { projectId: string; path: string }; response: Project };
+  'project.remove_repository': { request: { projectId: string; path: string }; response: Project };
   'sandbox.list': { request: {}; response: SandboxSummary[] /* each may carry workspaceMode; ABSENT when unbound */ };
   'sandbox.create': { request: SandboxCreateSpec /* + agent?: built-in sbx agent, default "shell"; + idempotencyKey?: 1..=128 [A-Za-z0-9._-] (A2) */; response: SandboxSummary /* + agent?: as sbx reports it; + replayed?: true on a keyed replay */ };
   'sandbox.stop': { request: { name: string }; response: { stopped: true; requeried?: SandboxSummary /* ABSENT = not listed or re-query failed: state unknown */ } };
@@ -77,7 +83,7 @@ interface SandpaneRpc {
 
 Neither prompts nor file paths are executable commands. CLI operations are implemented as specific backend methods with strictly constructed argument arrays.
 
-**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 16-method v1 surface (`docs/CHANGELOG.md` 0010; `sandbox.stop` and `sandbox.remove` added by A1 of `docs/plans/2026-10-09-protocol-v1-additions.md`; there is no `sandbox.start` because sbx v0.47 has none). Rules that keep it honest:
+**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 22-method v1 surface (`docs/CHANGELOG.md` 0010; `sandbox.stop` and `sandbox.remove` added by A1 and the six project lifecycle methods by A3a of `docs/plans/2026-10-09-protocol-v1-additions.md`; there is no `sandbox.start` because sbx v0.47 has none). Rules that keep it honest:
 
 - **Idempotency keys (A2).** A keyed `sandbox.create` / `conversation.send` is stored durably for 24 h; a replay with identical params returns the first response plus `replayed: true` (not current state), different params or an unfinished/unknown earlier attempt give `CONFLICT` and run nothing new. Decisions: `docs/plans/2026-10-09-protocol-v1-additions.md` §3.1.
 - **`PROTOCOL_VERSION` stays `1`** — the revision is additive only: new methods, new optional request fields, new response fields that are absent-tolerant (`#[serde(default)]`). Nothing was renamed or removed, so an older client's frames still parse.

@@ -11,6 +11,13 @@
 
 pub mod confirm;
 pub mod inflight;
+mod project_lifecycle;
+pub use project_lifecycle::{
+    MSG_PROJECT_ARCHIVED, MSG_PROJECT_CREATE_IN_FLIGHT, MSG_PROJECT_HAS_SANDBOXES,
+    MSG_PROJECT_HAS_TASKS, MSG_PROJECT_NOT_FOUND, MSG_REPOSITORY_IN_USE,
+    MSG_REPOSITORY_NOT_REGISTERED, MSG_REPOSITORY_REMOVE_WHILE_CREATING,
+    MSG_REPOSITORY_UNREGISTERED_DURING_CREATE, MSG_UPDATE_NEEDS_A_FIELD, PROJECT_DELETE_ACTION,
+};
 pub mod runtime;
 
 use std::collections::HashMap;
@@ -18,7 +25,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use sandpane_core::idempotency::{self, Lookup};
 use sandpane_core::process::RunLimits;
 use sandpane_core::sbx::{
@@ -35,9 +42,10 @@ use sandpane_protocol::{
     Conversation, ConversationCreateParams, ConversationHistoryParams, ConversationHistoryResult,
     ConversationListParams, ConversationSendParams, CoreCapabilities, ErrorCode, FileChange,
     FileChangeStatus, GitApplyParams, MessageRecord, Method, Project, ProjectCreateParams,
-    RpcRequest, RpcResponse, SandboxCreateSpec, SandboxRemoveParams, SandboxRemoveResult,
-    SandboxStopParams, SandboxStopResult, SandboxSummary, SbxStatus, TaskEvent, TaskListParams,
-    TaskStatus, TaskSubscribeParams, TaskSummary, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
+    ProjectDeleteParams, ProjectIdParams, ProjectRepositoryParams, ProjectUpdateParams, RpcRequest,
+    RpcResponse, SandboxCreateSpec, SandboxRemoveParams, SandboxRemoveResult, SandboxStopParams,
+    SandboxStopResult, SandboxSummary, SbxStatus, TaskEvent, TaskListParams, TaskStatus,
+    TaskSubscribeParams, TaskSummary, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
 };
 
 /// Bounded frame size: refuse oversized input instead of buffering forever
@@ -103,6 +111,21 @@ impl Default for SbxLimits {
 }
 
 /// Construction-time configuration for [`ServerInner`].
+/// TEST SEAM (review C1): called by `sandbox.create` right after its key
+/// claim commits and BEFORE the per-project in-flight guard is taken — the
+/// window in which a concurrent `project.archive` / `project.delete` /
+/// `project.remove_repository` can land, forcing the post-claim re-check to
+/// refuse. No Core lock is held when it runs, so it may issue requests.
+/// Production (`main.rs`) never sets it.
+#[derive(Clone)]
+pub struct CreateClaimHook(pub Arc<dyn Fn(&ServerInner) + Send + Sync>);
+
+impl std::fmt::Debug for CreateClaimHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CreateClaimHook(..)")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CoreConfig {
     pub sbx_limits: SbxLimits,
@@ -124,6 +147,9 @@ pub struct CoreConfig {
     /// most that, so configuration can only shorten it (tests use zero to
     /// prove expiry without sleeping out the full window).
     pub confirmation_ttl: Option<std::time::Duration>,
+    /// Test seam only — see [`CreateClaimHook`]. `None` in production.
+    #[doc(hidden)]
+    pub test_after_create_claim: Option<CreateClaimHook>,
 }
 
 pub struct ServerInner {
@@ -140,6 +166,11 @@ pub struct ServerInner {
     pub confirmation_ttl: std::time::Duration,
     /// Sandbox names with a create / confirmed remove in flight (review W2).
     pub sandbox_ops: inflight::SandboxOpLocks,
+    /// `sandbox.create` calls in flight per project (A3a §3.2 item 4):
+    /// `project.delete` refuses while a project's count is above zero.
+    pub project_creates: inflight::ProjectCreates,
+    /// Test seam ([`CreateClaimHook`]); `None` in production.
+    test_after_create_claim: Option<CreateClaimHook>,
 }
 
 impl ServerInner {
@@ -208,6 +239,8 @@ impl ServerInner {
             worktrees_root: config.worktrees_root,
             confirmations: Mutex::new(confirm::ConfirmationStore::new()),
             sandbox_ops: inflight::SandboxOpLocks::new(),
+            project_creates: inflight::ProjectCreates::new(),
+            test_after_create_claim: config.test_after_create_claim,
             confirmation_ttl: config
                 .confirmation_ttl
                 .unwrap_or(confirm::CONFIRMATION_TTL)
@@ -807,7 +840,25 @@ fn dispatch(
         Method::ProjectCreate => parse_params::<ProjectCreateParams>(params)
             .and_then(|p| project_create(inner, p))
             .map_err(Into::into),
-        Method::ProjectList => project_list(inner).map_err(Into::into),
+        Method::ProjectList => project_lifecycle::project_list(inner, params).map_err(Into::into),
+        Method::ProjectUpdate => parse_params::<ProjectUpdateParams>(params)
+            .and_then(|p| project_lifecycle::project_update(inner, p))
+            .map_err(Into::into),
+        Method::ProjectArchive => parse_params::<ProjectIdParams>(params)
+            .and_then(|p| project_lifecycle::project_set_archived(inner, p, true))
+            .map_err(Into::into),
+        Method::ProjectUnarchive => parse_params::<ProjectIdParams>(params)
+            .and_then(|p| project_lifecycle::project_set_archived(inner, p, false))
+            .map_err(Into::into),
+        Method::ProjectDelete => parse_params::<ProjectDeleteParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| project_lifecycle::project_delete(inner, p)),
+        Method::ProjectAddRepository => parse_params::<ProjectRepositoryParams>(params)
+            .and_then(|p| project_lifecycle::project_add_repository(inner, p))
+            .map_err(Into::into),
+        Method::ProjectRemoveRepository => parse_params::<ProjectRepositoryParams>(params)
+            .and_then(|p| project_lifecycle::project_remove_repository(inner, p))
+            .map_err(Into::into),
         Method::SandboxList => sandbox_list(inner),
         Method::SandboxCreate => parse_params::<SandboxCreateSpec>(params)
             .map_err(SvcFailure::from)
@@ -1156,7 +1207,7 @@ fn project_create(
     inner: &ServerInner,
     p: ProjectCreateParams,
 ) -> Result<serde_json::Value, SvcError> {
-    Validator::display_text(&p.name, 120)
+    Validator::project_name(&p.name)
         .map_err(|e| (ErrorCode::ValidationFailed, format!("project name: {e}")))?;
     // Resolve every repository BEFORE taking the DB lock (git subprocesses).
     let home = runtime::home_dir();
@@ -1195,47 +1246,9 @@ fn project_create(
         created_at: now,
         // The canonical paths Core actually stored (W1), not the raw input.
         repositories,
+        archived_at: None,
     };
     serde_json::to_value(project).map_err(internal)
-}
-
-fn project_list(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
-    let db = inner.lock_db();
-    // One extra pass over `repositories` grouped in Rust, rather than a
-    // correlated subquery per project row: the table holds a handful of paths
-    // per project (specs/02 §3) and this keeps the read to two prepared
-    // statements. It is a full scan of that small table — no index on
-    // repositories.project_id exists in schema v1.
-    let repos = project_repository_paths(&db)?;
-    let mut stmt = db
-        .conn()
-        .prepare(
-            "SELECT id, name, description, created_at FROM projects
-             WHERE archived_at IS NULL ORDER BY created_at",
-        )
-        .map_err(internal)?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(internal)?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (id, name, description, created_at) = row.map_err(internal)?;
-        out.push(Project {
-            repositories: repos.get(&id).cloned().unwrap_or_default(),
-            id,
-            name,
-            description,
-            created_at,
-        });
-    }
-    serde_json::to_value(out).map_err(internal)
 }
 
 /// `repositories.canonical_path` grouped by project id, in insertion order
@@ -1433,75 +1446,88 @@ fn sandbox_create(
     // Registered paths are themselves canonical Git top levels that passed the
     // W1 denylist at project.create; they are re-canonicalized here so a row
     // written before W1 is still compared canonically.
-    let mount: Option<PathBuf> = if matches!(spec.workspace_mode, WorkspaceMode::Mountless) {
-        if spec.repo_path.is_some() {
-            return Err(SvcFailure::from((
-                ErrorCode::ValidationFailed,
-                "mountless workspace takes no repository path".to_string(),
-            )));
-        }
-        None
-    } else {
-        let Some(raw) = &spec.repo_path else {
-            return Err(SvcFailure::from((
-                ErrorCode::ValidationFailed,
-                format!(
-                    "{} workspace requires a registered repoPath",
-                    workspace_mode_wire(&spec.workspace_mode)
-                ),
-            )));
-        };
-        let candidate = std::fs::canonicalize(raw).map_err(|e| {
-            SvcFailure::from((
-                ErrorCode::ValidationFailed,
-                format!("repoPath not usable: {e}"),
-            ))
-        })?;
-        let registered: Vec<PathBuf> = {
-            let db = inner.lock_db();
-            let mut stmt = db
-                .conn()
-                .prepare("SELECT canonical_path FROM repositories WHERE project_id = ?1")
-                .map_err(internal)?;
-            let rows = stmt
-                .query_map(params![spec.project_id], |r| r.get::<_, String>(0))
-                .map_err(internal)?;
-            let paths: Vec<PathBuf> = rows
-                .filter_map(|row| row.ok())
-                .filter_map(|p| std::fs::canonicalize(&p).ok())
+    let mount: Option<(PathBuf, String)> =
+        if matches!(spec.workspace_mode, WorkspaceMode::Mountless) {
+            if spec.repo_path.is_some() {
+                return Err(SvcFailure::from((
+                    ErrorCode::ValidationFailed,
+                    "mountless workspace takes no repository path".to_string(),
+                )));
+            }
+            None
+        } else {
+            let Some(raw) = &spec.repo_path else {
+                return Err(SvcFailure::from((
+                    ErrorCode::ValidationFailed,
+                    format!(
+                        "{} workspace requires a registered repoPath",
+                        workspace_mode_wire(&spec.workspace_mode)
+                    ),
+                )));
+            };
+            let candidate = std::fs::canonicalize(raw).map_err(|e| {
+                SvcFailure::from((
+                    ErrorCode::ValidationFailed,
+                    format!("repoPath not usable: {e}"),
+                ))
+            })?;
+            // (repository row id, canonical root) — the id is recorded on the
+            // binding (review W1(a)) so remove_repository can see the mount.
+            let rows: Vec<(String, String)> = {
+                let db = inner.lock_db();
+                let mut stmt = db
+                    .conn()
+                    .prepare("SELECT id, canonical_path FROM repositories WHERE project_id = ?1")
+                    .map_err(internal)?;
+                let rows = stmt
+                    .query_map(params![spec.project_id], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(internal)?
+                    .filter_map(|row| row.ok())
+                    .collect();
+                rows
+            };
+            // Canonicalized with the DB lock released (filesystem only).
+            let registered: Vec<(String, PathBuf)> = rows
+                .into_iter()
+                .filter_map(|(id, p)| std::fs::canonicalize(&p).ok().map(|c| (id, c)))
                 .collect();
-            paths
-        };
-        if registered.is_empty() {
-            return Err(SvcFailure::from((
-                ErrorCode::ValidationFailed,
-                "project has no registered repositories to mount".to_string(),
-            )));
-        }
-        // EXACT ROOT ONLY (review S-g): the canonical candidate must EQUAL a
-        // registered repository root, not merely lie beneath it. sbx resolves
-        // the path again on its own; with a subdirectory, an agent with write
-        // access inside the repo could swap a path component for a symlink
-        // between Core's canonicalize and sbx's resolve. The root's own
-        // components are outside the repository's contents. (A residual
-        // remains if the root's PARENT chain is attacker-writable — it is the
-        // user's own directory tree, not a sandbox mount.)
-        // The W1 denylist is RE-APPLIED to every stored root: a row written
-        // before registration was hardened (e.g. `$HOME` itself) never
-        // authorizes a mount.
-        let home = runtime::home_dir();
-        let home_c = std::fs::canonicalize(&home).unwrap_or(home);
-        if !registered.iter().any(|root| {
-            candidate == *root && Validator::registrable_repository(root, &home_c).is_ok()
-        }) {
-            return Err(SvcFailure::from((
-                ErrorCode::PermissionDenied,
-                "repoPath must be exactly a repository root registered with this project (an \
+            if registered.is_empty() {
+                return Err(SvcFailure::from((
+                    ErrorCode::ValidationFailed,
+                    "project has no registered repositories to mount".to_string(),
+                )));
+            }
+            // EXACT ROOT ONLY (review S-g): the canonical candidate must EQUAL a
+            // registered repository root, not merely lie beneath it. sbx resolves
+            // the path again on its own; with a subdirectory, an agent with write
+            // access inside the repo could swap a path component for a symlink
+            // between Core's canonicalize and sbx's resolve. The root's own
+            // components are outside the repository's contents. (A residual
+            // remains if the root's PARENT chain is attacker-writable — it is the
+            // user's own directory tree, not a sandbox mount.)
+            // The W1 denylist is RE-APPLIED to every stored root: a row written
+            // before registration was hardened (e.g. `$HOME` itself) never
+            // authorizes a mount.
+            let home = runtime::home_dir();
+            let home_c = std::fs::canonicalize(&home).unwrap_or(home);
+            let Some((repo_id, _)) = registered.iter().find(|(_, root)| {
+                candidate == *root && Validator::registrable_repository(root, &home_c).is_ok()
+            }) else {
+                return Err(SvcFailure::from((
+                    ErrorCode::PermissionDenied,
+                    "repoPath must be exactly a repository root registered with this project (an \
                  allowed repository location); subdirectories are not mountable"
-                    .to_string(),
-            )));
-        }
-        Some(candidate)
+                        .to_string(),
+                )));
+            };
+            Some((candidate, repo_id.clone()))
+        };
+    // The host path sbx mounts, and the registered repository row it is.
+    let (mount, mount_repo_id): (Option<PathBuf>, Option<String>) = match mount {
+        Some((path, repo_id)) => (Some(path), Some(repo_id)),
+        None => (None, None),
     };
     {
         let db = inner.lock_db();
@@ -1522,11 +1548,24 @@ fn sandbox_create(
     }
     // Step 2: look the key up BEFORE the name lock, so a replay of a finished
     // create returns the stored result rather than CONFLICT (and runs nothing).
+    //
+    // DOCUMENTED ASYMMETRY (A3a review I3, design §3.2): the project-exists
+    // check in step 1 runs BEFORE this lookup, so a replay after
+    // `project.delete` is NOT_FOUND; a replay after `project.archive` is
+    // still answered from the stored row (the archived check comes after
+    // this lookup). `conversation.send` looks its key up first, so its
+    // replay is answered even after delete.
     if let Some(kc) = &keyed {
         if let Some(answer) = kc.stored_answer(inner) {
             return answer;
         }
     }
+    // A3a §3.2 item 3: an archived project refuses — AFTER the lookup, so a
+    // replay of a create that finished before archiving is still answered
+    // from its stored result; BEFORE the claim, so no key row is written and
+    // sbx never runs.
+    project_lifecycle::require_live_project(inner.lock_db().conn(), &spec.project_id)
+        .map_err(SvcFailure::from)?;
     // Step 3: held until this function returns (through the binding insert),
     // so a confirmed remove of the same name cannot interleave (review W2).
     //
@@ -1545,9 +1584,50 @@ fn sandbox_create(
             ClaimOutcome::Answered(answer) => return answer,
         },
     };
+    // A3a §3.2 item 4: count this create against its project from here (the
+    // committed claim; for an unkeyed create, the same point — before sbx
+    // runs) until this function returns: binding written, failure, or
+    // unwind (the guard's Drop). INCREMENT FIRST, THEN RE-CHECK under the DB
+    // mutex: either `project.delete` (which reads the count under the DB
+    // mutex inside its delete transaction) sees this create and refuses, or
+    // this re-check sees the project gone and nothing runs. The count's
+    // mutex is a leaf (see `inflight::ProjectCreates`); no other Core lock is
+    // held while it is taken here.
+    if let Some(hook) = &inner.test_after_create_claim {
+        (hook.0)(inner);
+    }
+    let _in_flight = inner.project_creates.enter(&spec.project_id);
+    // REVIEW C1: the re-check's result is bound FIRST, in its own statement,
+    // so the DB guard is dropped before the refusal path runs —
+    // `PendingClaim::release` locks the DB mutex again, and an `if let`
+    // scrutinee's temporary guard (edition 2021) would live through the
+    // body: a self-deadlock that wedged every later request.
+    let recheck = {
+        let db = inner.lock_db();
+        project_lifecycle::recheck_create_target(
+            db.conn(),
+            &spec.project_id,
+            mount_repo_id.as_deref(),
+        )
+    };
+    if let Err(e) = recheck {
+        // Deleted, archived, or its repository unregistered since the first
+        // checks: nothing ran, so the claim is released (key reusable).
+        if let Some(p) = pending {
+            p.release();
+        }
+        return Err(e.into());
+    }
     // Steps 5-6: run `sbx create`, then bind + complete the claim together.
     let completion = keyed.as_ref().map(|kc| (kc.method, kc.key.as_str()));
-    match create_and_bind(inner, &spec, agent, mount.as_deref(), completion) {
+    match create_and_bind(
+        inner,
+        &spec,
+        agent,
+        mount.as_deref(),
+        mount_repo_id.as_deref(),
+        completion,
+    ) {
         Ok(v) => {
             if let Some(p) = pending {
                 p.disarm();
@@ -1588,6 +1668,7 @@ fn create_and_bind(
     spec: &SandboxCreateSpec,
     agent: &str,
     mount: Option<&Path>,
+    mount_repo_id: Option<&str>,
     completion: Option<(&str, &str)>,
 ) -> Result<serde_json::Value, CreateFailure> {
     use CreateFailure::{AfterStart, BeforeStart};
@@ -1675,8 +1756,8 @@ fn create_and_bind(
         let mode_str = workspace_mode_wire(&spec.workspace_mode).to_string();
         tx.execute(
             "INSERT INTO sandbox_bindings
-                 (id, project_id, sandbox_name, workspace_mode, created_at, sbx_id)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+                 (id, project_id, sandbox_name, workspace_mode, created_at, sbx_id, repo_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
                 uuid::Uuid::new_v4().to_string(),
                 spec.project_id,
@@ -1686,7 +1767,10 @@ fn create_and_bind(
                 // The identity sbx reports on the re-query (shape-checked at
                 // parse). NULL when it could not be probed: such a row is then
                 // treated like a pre-A1 one, never as a match.
-                probed.as_ref().and_then(|e| e.id.clone())
+                probed.as_ref().and_then(|e| e.id.clone()),
+                // Review W1(a): the registered repository this sandbox mounts
+                // (direct_mount / sbx_clone); NULL for mountless.
+                mount_repo_id
             ],
         )
         .map_err(internal)?;
@@ -2109,17 +2193,9 @@ fn conversation_create(
     let now = now_rfc3339();
     {
         let db = inner.lock_db();
-        let exists: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM projects WHERE id = ?1",
-                params![p.project_id],
-                |r| r.get(0),
-            )
-            .map_err(internal)?;
-        if exists == 0 {
-            return Err((ErrorCode::NotFound, "project not found".into()));
-        }
+        // A3a: exists AND not archived, in the same critical section as the
+        // insert (cannot race project.archive / project.delete).
+        project_lifecycle::require_live_project(db.conn(), &p.project_id)?;
         db.conn()
             .execute(
                 "INSERT INTO conversations (id, project_id, title, agent_id, created_at)
@@ -2208,7 +2284,8 @@ fn create_task_keyed(
         .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, format!("content: {e}"))))?;
     let (project_id, agent_id) = {
         let db = inner.lock_db();
-        db.conn()
+        let found = db
+            .conn()
             .query_row(
                 "SELECT project_id, agent_id FROM conversations
                  WHERE id = ?1 AND archived_at IS NULL",
@@ -2217,7 +2294,11 @@ fn create_task_keyed(
             )
             .map_err(|_| {
                 SvcFailure::from((ErrorCode::NotFound, "conversation not found".to_string()))
-            })?
+            })?;
+        // A3a: refuse an archived project BEFORE any worktree is allocated.
+        // `write_new_task` re-checks inside its transaction (authoritative).
+        project_lifecycle::require_live_project(db.conn(), &found.0).map_err(SvcFailure::from)?;
+        found
     };
 
     let task_id = uuid::Uuid::new_v4().to_string();
@@ -2555,6 +2636,20 @@ fn write_new_task(
     }
     let db = inner.lock_db();
     let tx = db.conn().unchecked_transaction().map_err(internal)?;
+    // A3a (authoritative, same transaction as every write below): the
+    // conversation still exists — a project.delete that landed since the
+    // early check is NOT_FOUND, never an FK INTERNAL — and its project is not
+    // archived (cannot race project.archive). Nothing is written otherwise.
+    let project_id: String = tx
+        .query_row(
+            "SELECT project_id FROM conversations WHERE id = ?1 AND archived_at IS NULL",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .ok_or_else(|| (ErrorCode::NotFound, "conversation not found".to_string()))?;
+    project_lifecycle::require_live_project(&tx, &project_id)?;
     {
         let log = EventLog::from_conn(&tx);
         tx.execute(
@@ -2718,7 +2813,13 @@ pub fn discard_task_worktree(
     // means something may still be writing there (precondition 2 in
     // `sandpane_core::workspace`). Core does not yet stop/unmount a bound
     // sandbox — none can be bound to a worktree in protocol v1.
-    if let Some(holder) = inner.lock_scheduler().writer_lock_holder(&worktree) {
+    // Bound first so the scheduler guard is dropped before the body (review
+    // C1 audit: no lock guard lives in an `if let` scrutinee).
+    let holder = inner
+        .lock_scheduler()
+        .writer_lock_holder(&worktree)
+        .map(ToOwned::to_owned);
+    if let Some(holder) = holder {
         return Err(SvcFailure::from((
             ErrorCode::Conflict,
             format!("task {holder} holds the writer lock on {worktree}; refusing to discard it"),
@@ -2888,6 +2989,14 @@ fn conversation_send(
         )?
     };
     // A replay is answered from the key row alone: nothing is written.
+    //
+    // DOCUMENTED ASYMMETRY (A3a review I3, design §3.2): this lookup runs
+    // BEFORE any project check, so a keyed replay of a send that completed
+    // earlier returns its stored result (`replayed: true`) even after the
+    // project was archived or deleted — the stored result is history, not
+    // current state. `sandbox.create` instead checks that the project exists
+    // BEFORE its lookup, so its replay after `project.delete` is NOT_FOUND
+    // (after `project.archive` it is still answered from the row).
     if let Some(kc) = &keyed {
         if let Some(answer) = kc.stored_answer(inner) {
             return answer;

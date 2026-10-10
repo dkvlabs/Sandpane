@@ -168,7 +168,12 @@ class RemoveSandboxAction : SandboxLifecycleAction(
         val project = event.project ?: return
         val picked = pickSandbox(project, "Sandpane: Remove Sandbox", "Continue…") ?: return
         val connection = ConnectionManager.instance()
-        val flow = SandboxRemoveFlow(connection.commands, DialogUi(project))
+        val flow = SandboxRemoveFlow(
+            connection.commands,
+            DialogUi(project),
+            // Step 2 is built and sent on the io pool, never on the EDT the dialog returned on.
+            background = { task -> connection.background("sandbox.remove step 2") { task() } },
+        )
         flow.run(picked.name).whenComplete { outcome, error ->
             if (outcome == null) {
                 notify(

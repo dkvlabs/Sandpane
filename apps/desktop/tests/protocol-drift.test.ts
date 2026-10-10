@@ -40,7 +40,7 @@ describe("method surface is derived from the Rust crate, not copied", () => {
   it("the TS allowlist is exactly Method::ALL, in the same order", () => {
     const all = rustMethodAll();
     expect(METHODS).toEqual(all.names);
-    expect(all.names.length).toBe(16);
+    expect(all.names.length).toBe(22);
     // The array's own declared length must agree with its contents — a stale
     // `[Method; N]` would be a compile error in Rust, and is caught here too.
     expect(all.declaredLength).toBe(all.names.length);
@@ -49,7 +49,7 @@ describe("method surface is derived from the Rust crate, not copied", () => {
 
   it("the shipped schema enumerates the same set", () => {
     expect(schemaMethodEnum()).toEqual([...METHODS]);
-    expect(schemaMethodEnum().length).toBe(16);
+    expect(schemaMethodEnum().length).toBe(22);
   });
 
   it("the enum's serde renames and ALL agree as sets", () => {

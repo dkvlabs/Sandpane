@@ -40,6 +40,7 @@ import type {
   CoreFeature,
   CoreMethodName,
   Project,
+  ProjectListParams,
   SandboxCreateSpec,
   SandboxStopResult,
   SandboxSummary,
@@ -79,6 +80,16 @@ import {
 } from './vscode/sandboxActions';
 import { plainText } from './text/visibleText';
 import {
+  ARCHIVED_LABEL,
+  DELETE_PROJECT_BUTTON,
+  MSG_PROJECT_ARCHIVED,
+  MSG_PROJECT_NOT_FOUND,
+  isArchived,
+  projectDeleteView,
+  projectErrorCopy,
+  projectPickItem,
+} from './vscode/projectActions';
+import {
   DEFAULT_CONTEXT_POLICY,
   planContextAttachments,
   type ContextPlan,
@@ -97,6 +108,8 @@ const UI_KEYS = {
   selectedProject: 'sandpane.ui.selectedProject',
   selectedSandbox: 'sandpane.ui.selectedSandbox',
   conversation: 'sandpane.ui.conversation',
+  /** A3a UI preference: include archived projects in lists (`includeArchived`). */
+  showArchived: 'sandpane.ui.showArchivedProjects',
 } as const;
 
 /** `task.subscribe` re-pull interval while a task is non-terminal (Core never pushes). */
@@ -168,6 +181,7 @@ export class SandpaneSession {
     this.lastSocketPath = this.resolveSocketPath();
     this.selectedProjectId = context.workspaceState.get<string>(UI_KEYS.selectedProject) ?? null;
     this.selectedSandbox = context.workspaceState.get<string>(UI_KEYS.selectedSandbox) ?? null;
+    this.showArchived = context.workspaceState.get<boolean>(UI_KEYS.showArchived) === true;
     const storedConversation = context.workspaceState.get<ConversationPreference>(UI_KEYS.conversation);
     if (storedConversation) {
       // A restored selection is a UI preference; it is re-pointed at Core's
@@ -275,17 +289,295 @@ export class SandpaneSession {
   async listProjectOptions(): Promise<{ label: string; description?: string; id: string }[]> {
     let projects = this.projects;
     try {
-      projects = await this.commands.projectList();
+      projects = await this.commands.projectList(this.projectListParams());
       this.projects = projects;
     } catch (error) {
       this.log(`project.list failed while picking: ${describe(error)} — using the last snapshot`);
     }
-    return projects.map((project) => ({
-      label: project.name,
-      description: `id ${project.id.slice(0, 8)}`,
-      id: project.id,
-    }));
+    return projects.map((project) => {
+      const row = projectPickItem(project);
+      return { label: row.label, description: row.description, id: row.id };
+    });
   }
+
+  /**
+   * `project.list` params for this window's lists: `includeArchived: true`
+   * only when the user turned "show archived" on AND this Core has the A3a
+   * project lifecycle (an older Core would ignore the flag silently).
+   */
+  private projectListParams(): ProjectListParams {
+    return this.showArchived && this.coreAdvertises('project.archive') ? { includeArchived: true } : {};
+  }
+
+  /** UI preference (workspaceState): include archived projects in lists. */
+  private showArchived = false;
+
+  get showingArchivedProjects(): boolean {
+    return this.showArchived;
+  }
+
+  /**
+   * Fresh projects for the project-settings commands: archived ones included
+   * (labeled) when Core supports it, so unarchive/delete can reach them.
+   */
+  async listProjectsForSettings(): Promise<Project[]> {
+    return this.commands.projectList(this.coreAdvertises('project.archive') ? { includeArchived: true } : {});
+  }
+
+  /** Re-read `project.list` after a mutation. Returns false when it failed. */
+  private async refreshProjects(params: ProjectListParams = this.projectListParams()): Promise<boolean> {
+    try {
+      this.projects = await this.commands.projectList(params);
+    } catch (error) {
+      this.log(`project.list after a project change failed: ${describe(error)} — the list may be stale`);
+      return false;
+    }
+    this.emit();
+    return true;
+  }
+
+  /**
+   * Pre-flight for a contributed A3a command, before any picker is shown: the
+   * same gate the action applies (host supported, attached, fresh probe
+   * advertises `method`). The action re-checks it when it runs.
+   */
+  async offers(method: CoreMethodName, action: string): Promise<boolean> {
+    return this.ensureAdvertised(method, action);
+  }
+
+  /** "Show archived projects" toggle (A3a): gated on the lifecycle methods. */
+  async toggleShowArchived(): Promise<void> {
+    if (!(await this.ensureAdvertised('project.archive', 'Show archived projects'))) return;
+    this.showArchived = !this.showArchived;
+    void this.context.workspaceState.update(UI_KEYS.showArchived, this.showArchived);
+    const listed = await this.refreshProjects();
+    this.setStatus(
+      'info',
+      (this.showArchived
+        ? 'Archived projects are shown (labeled ARCHIVED).'
+        : 'Archived projects are hidden.') + (listed ? '' : ' The project list could not be re-read.'),
+    );
+    this.emit();
+  }
+
+  /**
+   * One A3a project mutation: gated on the probe; on an archived project every
+   * mutation except unarchive/delete is refused HERE with Core's own reason
+   * (nothing is sent); afterwards `project.list` is re-read.
+   */
+  private async projectMutation(
+    method: CoreMethodName,
+    action: string,
+    project: Project,
+    allowArchived: boolean,
+    run: () => Promise<Project>,
+    done: (updated: Project) => string,
+  ): Promise<Project | undefined> {
+    if (!(await this.ensureAdvertised(method, action))) return undefined;
+    if (!allowArchived && this.refuseIfArchived(project, action)) return undefined;
+    try {
+      const updated = await run();
+      const listed = await this.refreshProjects();
+      this.setStatus('ok', done(updated) + (listed ? '' : ' (the project list could not be re-read; it may be stale)'));
+      this.emit();
+      return updated;
+    } catch (error) {
+      this.reportProjectError(error, method);
+      return undefined;
+    }
+  }
+
+  /**
+   * Edits of an archived project are disabled with Core's own reason: when
+   * `project` is archived this shows the refusal (nothing is sent) and returns
+   * true. Commands call it right after the project pick, before asking for a
+   * name, folder or repository; the mutation itself checks it again.
+   */
+  refuseIfArchived(project: Project, action: string): boolean {
+    if (!isArchived(project)) return false;
+    const text =
+      `${action} is not available: Core refuses changes to an archived project ("${MSG_PROJECT_ARCHIVED}"). ` +
+      'Unarchive it first. Nothing was sent.';
+    void vscode.window.showWarningMessage(text);
+    this.setStatus('error', text);
+    this.emit();
+    return true;
+  }
+
+  /** Core's exact A3a refusals get honest copy; no answer = UNKNOWN + re-read. */
+  private reportProjectError(error: unknown, operation: string): void {
+    if (isUnknownOutcome(error)) {
+      this.reportError(
+        error,
+        operation,
+        'Outcome UNKNOWN: Core did not confirm whether this changed anything. Re-reading the project list from Core; not retried.',
+      );
+      void this.refreshProjects({ ...(this.coreAdvertises('project.archive') ? { includeArchived: true } : {}) });
+      return;
+    }
+    this.reportError(error, operation);
+  }
+
+  async renameProject(project: Project, name: string): Promise<Project | undefined> {
+    return this.projectMutation('project.update', 'Rename project', project, false,
+      () => this.commands.projectUpdate({ projectId: project.id, name }),
+      (p) => `Project renamed to "${plainText(p.name, 120)}" in Core.`);
+  }
+
+  /** An empty description clears it (Core's rule). */
+  async editProjectDescription(project: Project, description: string): Promise<Project | undefined> {
+    return this.projectMutation('project.update', 'Edit project description', project, false,
+      () => this.commands.projectUpdate({ projectId: project.id, description }),
+      (p) => (description.length === 0 ? `Description of "${plainText(p.name, 120)}" cleared in Core.` : `Description of "${plainText(p.name, 120)}" updated in Core.`));
+  }
+
+  async archiveProject(project: Project): Promise<Project | undefined> {
+    return this.projectMutation('project.archive', 'Archive project', project, true,
+      () => this.commands.projectArchive(project.id),
+      (p) => {
+        const base = `Project "${plainText(p.name, 120)}" archived in Core — Core now refuses new chats, sends, sandboxes and edits for it until it is unarchived.`;
+        if (this.showArchived) return base;
+        // Hidden from the re-read list: never keep it selected as an unlabeled,
+        // seemingly usable project.
+        const deselected = this.selectedProjectId === p.id && this.setProject(null);
+        return `${base} It is hidden from lists${deselected ? ' and was deselected' : ''}; use "Show / Hide Archived Projects" to see it.`;
+      });
+  }
+
+  async unarchiveProject(project: Project): Promise<Project | undefined> {
+    return this.projectMutation('project.unarchive', 'Unarchive project', project, true,
+      () => this.commands.projectUnarchive(project.id),
+      (p) => `Project "${plainText(p.name, 120)}" unarchived in Core.`);
+  }
+
+  async addRepository(project: Project, path: string): Promise<Project | undefined> {
+    return this.projectMutation('project.add_repository', 'Add repository', project, false,
+      () => this.commands.projectAddRepository({ projectId: project.id, path }),
+      (p) => `Core registered the repository with "${plainText(p.name, 120)}" (${(p.repositories ?? []).length} repository(ies) now).`);
+  }
+
+  async removeRepository(project: Project, path: string): Promise<Project | undefined> {
+    return this.projectMutation('project.remove_repository', 'Remove repository', project, false,
+      () => this.commands.projectRemoveRepository({ projectId: project.id, path }),
+      (p) => `Core unregistered the repository from "${plainText(p.name, 120)}"; the host repository was not touched.`);
+  }
+
+  /** Forget every client-side reference to a deleted project (UI state only). */
+  private forgetProject(projectId: string): void {
+    this.projects = this.projects.filter((p) => p.id !== projectId);
+    if (this.conversation?.projectId === projectId) {
+      this.conversation = null;
+      this.conversationSandbox = null;
+      void this.context.workspaceState.update(UI_KEYS.conversation, undefined);
+    }
+    if (this.selectedProjectId === projectId) {
+      this.setProject(null);
+    }
+  }
+
+  /**
+   * `project.delete` (A3a) with the A1 two-step pattern: step 1 → native modal
+   * (name, id, capped impact, expiry) → only "Delete project", re-checked for
+   * expiry at click time, sends step 2 with the token. Cancel sends nothing.
+   * Neither step is retried; the token is never logged or shown.
+   */
+  async deleteProject(project: Project): Promise<boolean> {
+    if (!(await this.ensureAdvertised('project.delete', 'Delete project'))) return false;
+    let confirmation: ConfirmationRequest;
+    try {
+      confirmation = await this.commands.projectDeleteRequest(project.id);
+    } catch (error) {
+      // Step 1 changes nothing in Core, whatever happened.
+      this.reportError(error, 'project.delete (confirmation request)', projectErrorCopy(error) ?? 'Nothing was deleted.');
+      return false;
+    }
+    const view = projectDeleteView(confirmation, this.now());
+    const answer = await vscode.window.showWarningMessage(view.message, { modal: true, detail: view.detail }, DELETE_PROJECT_BUTTON);
+    if (answer !== DELETE_PROJECT_BUTTON) {
+      this.setStatus('info', 'Delete not confirmed — nothing was sent; the confirmation expires on its own.');
+      this.emit();
+      return false;
+    }
+    const expiresAt = Date.parse(confirmation.expiresAt);
+    if (!Number.isFinite(expiresAt) || this.now() >= expiresAt) {
+      this.setStatus('info', 'Confirmation expired — nothing was sent; run Delete Project again.');
+      this.emit();
+      return false;
+    }
+    let deleted: boolean;
+    try {
+      const result = await this.commands.projectDeleteConfirm(project.id, confirmation.token);
+      deleted = result.deleted === true;
+    } catch (error) {
+      if (isUnknownOutcome(error)) {
+        this.reportError(error, 'project.delete', 'Outcome UNKNOWN: Core did not confirm whether the project was deleted. Re-reading the project list (including archived) from Core; not retried.');
+        // A Core-answered INTERNAL means Core finished that request; a
+        // timeout / closed / failed write means it may still be running.
+        await this.settleDeleteFromCore(project, error instanceof CoreRpcError);
+        return false;
+      }
+      this.reportError(error, 'project.delete', projectErrorCopy(error) ?? undefined);
+      // Core says the project no longer exists (e.g. deleted from another
+      // window): drop it from UI state exactly as a confirmed delete does.
+      if (error instanceof CoreRpcError && error.message === `NOT_FOUND: ${MSG_PROJECT_NOT_FOUND}`) {
+        this.forgetProject(project.id);
+      }
+      await this.refreshProjects();
+      this.emit();
+      return false;
+    }
+    if (deleted) {
+      this.forgetProject(project.id);
+      const listed = await this.refreshProjects();
+      this.setStatus(
+        'ok',
+        `Core deleted project "${plainText(confirmation.target.name, 120)}" (its Core records only; host files, branches and sandboxes were not touched).` +
+          (listed ? '' : ' (the project list could not be re-read; it may be stale)'),
+      );
+    } else {
+      this.setStatus('error', 'Core did not report the deletion — its state is unknown; re-reading the project list.');
+      await this.settleDeleteFromCore(project, true);
+    }
+    this.emit();
+    return deleted;
+  }
+
+  /**
+   * After an unknown delete outcome, let Core's own list say what it shows NOW.
+   * "It was not deleted" is said only when Core answered the step-2 request
+   * (`coreFinished`): without an answer the request may still be running.
+   */
+  private async settleDeleteFromCore(project: Project, coreFinished: boolean): Promise<void> {
+    let all: Project[];
+    try {
+      all = await this.listProjectsForSettings();
+    } catch (error) {
+      this.log(`project.list after an unknown delete failed: ${describe(error)}`);
+      this.setStatus(
+        'error',
+        'The project list could not be re-read after the unknown outcome; whether the project was deleted is UNKNOWN.',
+      );
+      this.emit();
+      return;
+    }
+    if (all.some((p) => p.id === project.id)) {
+      this.setStatus(
+        'info',
+        coreFinished
+          ? 'Core still lists the project as of this re-read — it was not deleted (Core answered the delete request, so that request has finished).'
+          : 'Core still lists the project as of this re-read. Core never answered the delete request, so it may still finish — re-read before acting; not retried.',
+      );
+    } else {
+      this.forgetProject(project.id);
+      this.setStatus('info', 'Core no longer lists the project after the unknown outcome — the delete took effect.');
+    }
+    await this.refreshProjects();
+    this.emit();
+  }
+
+  // -----------------------------------------------------------------------
+  // Core operations (each is a typed RPC)
+  // -----------------------------------------------------------------------
 
   // -----------------------------------------------------------------------
   // Core operations (each is a typed RPC)
@@ -321,7 +613,10 @@ export class SandpaneSession {
       this.reportError(error, 'system.probe');
       return;
     }
-    const results = await Promise.allSettled([this.commands.projectList(), this.commands.sandboxList()]);
+    const results = await Promise.allSettled([
+      this.commands.projectList(this.projectListParams()),
+      this.commands.sandboxList(),
+    ]);
     const projects = results[0];
     if (projects.status === 'fulfilled') {
       this.projects = projects.value;
@@ -1314,7 +1609,11 @@ export class SandpaneSession {
     return {
       connection: this.tone(),
       header: {
-        project: project?.name ?? (this.projects.length > 0 ? `${this.projects.length} project(s), none selected` : null),
+        project: project
+          ? `${project.name}${isArchived(project) ? ` · ${ARCHIVED_LABEL}` : ''}`
+          : this.projects.length > 0
+            ? `${this.projects.length} project(s), none selected`
+            : null,
         agent,
         sandbox: sandbox?.name ?? this.selectedSandbox,
         workspaceMode: mode.raw,
@@ -1572,7 +1871,10 @@ export class SandpaneSession {
    * shown as plain text: hidden/bidi/control characters are escaped visibly and
    * notification link syntax is neutralized (anti-spoofing, `plainText`).
    */
-  reportError(error: unknown, operation: string, context?: string): void {
+  reportError(error: unknown, operation: string, contextArg?: string): void {
+    // Core's exact A3a refusals (archived project, unregistered repository …)
+    // get their honest copy wherever they surface.
+    const context = contextArg ?? projectErrorCopy(error) ?? undefined;
     const failure = toFailure(error);
     const guidance = explainFailure(error);
     const coreMessage =

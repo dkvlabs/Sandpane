@@ -1354,3 +1354,11 @@ button.chip {
   font-weight: 600;
   color: var(--danger);
 }
+
+/* A3a project settings: section headings inside the settings panel. */
+.section-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}

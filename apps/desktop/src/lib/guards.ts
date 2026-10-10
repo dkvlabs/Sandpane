@@ -28,6 +28,8 @@ import {
   type TaskStatus,
   type TaskSubscribeParams,
 } from "./protocol";
+import { validateProjectDescription, validateProjectName } from "./wizard";
+import type { ProjectUpdateParams } from "./protocol";
 
 /** A refusal raised by this client. It is NOT a Core verdict and never claims one. */
 export class CoreValidationError extends Error {
@@ -426,4 +428,92 @@ export function checkIdempotencyKey<P extends { idempotencyKey?: string }>(param
     );
   }
   return params;
+}
+
+// ---------------------------------------------------------------------------
+// A3a project lifecycle (design 2026-10-09 §3.2)
+// ---------------------------------------------------------------------------
+
+function requireProjectId(projectId: string): string {
+  return requiredId(projectId, "projectId");
+}
+
+/**
+ * `project.list` params: `{}` (live projects only — exactly what every pre-A3a
+ * build sent) unless archived projects are explicitly asked for.
+ */
+export function buildProjectListParams(includeArchived: boolean): Record<string, unknown> {
+  return includeArchived ? { includeArchived: true } : {};
+}
+
+/**
+ * `project.update` params: only the fields being changed, each checked with
+ * Core's exact rule first. At least one field (Core refuses an empty update).
+ * The refusal text names the problem, never the rejected value.
+ */
+export function buildProjectUpdateParams(
+  projectId: string,
+  changes: { name?: string; description?: string },
+): ProjectUpdateParams {
+  const params: ProjectUpdateParams = { projectId: requireProjectId(projectId) };
+  if (changes.name !== undefined) {
+    const problem = validateProjectName(changes.name);
+    if (problem !== null) throw new CoreValidationError("name", problem);
+    params.name = changes.name;
+  }
+  if (changes.description !== undefined) {
+    const problem = validateProjectDescription(changes.description);
+    if (problem !== null) throw new CoreValidationError("description", problem);
+    params.description = changes.description;
+  }
+  if (params.name === undefined && params.description === undefined) {
+    throw new CoreValidationError("project", "change the name or the description first");
+  }
+  return params;
+}
+
+/** `project.archive` / `project.unarchive` params: exactly `{ projectId }`. */
+export function buildProjectIdParams(projectId: string): { projectId: string } {
+  return { projectId: requireProjectId(projectId) };
+}
+
+/** `project.delete` STEP 1: exactly `{ projectId }` — no `confirmToken` key. */
+export function buildProjectDeleteRequestParams(projectId: string): { projectId: string } {
+  return { projectId: requireProjectId(projectId) };
+}
+
+/** `project.delete` STEP 2: `{ projectId, confirmToken }`; token shape checked, never echoed. */
+export function buildProjectDeleteConfirmParams(
+  projectId: string,
+  confirmToken: string,
+): { projectId: string; confirmToken: string } {
+  const checked = requireProjectId(projectId);
+  if (typeof confirmToken !== "string" || !CONFIRM_TOKEN_PATTERN.test(confirmToken)) {
+    throw new CoreValidationError(
+      "confirmToken",
+      "must be the 64-character lowercase hex token Core issued in step 1",
+    );
+  }
+  return { projectId: checked, confirmToken };
+}
+
+/**
+ * `project.add_repository` / `project.remove_repository` params. Core requires
+ * an absolute path for both (`Path::is_absolute`) and does every other check
+ * itself (canonical Git top level, denylist, registration); this client checks
+ * only that much, so it is never stricter than Core. The path is sent exactly
+ * as typed — never trimmed or rewritten.
+ */
+export function buildProjectRepositoryParams(
+  projectId: string,
+  path: string,
+): { projectId: string; path: string } {
+  const checked = requireProjectId(projectId);
+  if (typeof path !== "string" || path.length === 0) {
+    throw new CoreValidationError("path", "a repository path is required");
+  }
+  if (!path.startsWith("/")) {
+    throw new CoreValidationError("path", "repository path must be absolute (start with /)");
+  }
+  return { projectId: checked, path };
 }

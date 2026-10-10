@@ -2,7 +2,7 @@
  * Extension entry point (specs/03 §2).
  *
  * activate(): attach to Core, register the sidebar webview, the task tree, the
- * twelve commands (each one is a progress-wrapped call into the typed Core
+ * twenty commands (each one is a progress-wrapped call into the typed Core
  * client, or an honest explanation of what is not offered) and the status bar
  * item.
  *
@@ -22,10 +22,14 @@ import { isKnownWorkspaceMode } from './vscode/workspaces';
 import {
   validateSandboxName,
   validateAddressableSandboxName,
+  validateProjectDescription,
+  validateProjectName,
   CoreValidationError,
 } from './core-client/commands';
-import { agentPickItems, sandboxPickItem, startUnsupportedMessage } from './vscode/sandboxActions';
-import type { SbxAgent } from './core-client/protocol';
+import { agentPickItems, pickText, sandboxPickItem, startUnsupportedMessage } from './vscode/sandboxActions';
+import { isArchived, projectPickItem } from './vscode/projectActions';
+import type { Project, SbxAgent } from './core-client/protocol';
+import { plainText } from './text/visibleText';
 
 const CORE_AVAILABLE_CONTEXT = 'sandpane.coreAvailable';
 
@@ -131,7 +135,7 @@ export function deactivate(): void {
 /** Printed and copied for the user; the extension never runs it (ADR 1). */
 const START_SERVICE_COMMAND = 'cd core && cargo run -p sandpane-service';
 
-/** The twelve contributed commands, each wrapped in a progress notification. */
+/** The twenty contributed commands, each wrapped in a progress notification. */
 function registrations(
   session: SandpaneSession,
   output: vscode.OutputChannel,
@@ -171,14 +175,7 @@ function registrations(
       guard('Sandpane: new project', async () => {
         const name = await vscode.window.showInputBox({
           prompt: 'Project name (stored by Core)',
-          validateInput: (value) =>
-            value.trim().length === 0
-              ? 'required'
-              : value.length > 120
-                ? 'Core limits a project name to 120 characters'
-                : /[\u0000-\u0008\u000b-\u001f\u007f]/.test(value)
-                  ? 'control characters are rejected by Core'
-                  : undefined,
+          validateInput: projectNameProblem,
         });
         if (!name) return undefined;
         const folders = vscode.workspace.workspaceFolders ?? [];
@@ -196,7 +193,7 @@ function registrations(
                   },
                 )
               ) ?? []).map((item) => item.label);
-        return session.createProject(name.trim(), chosen);
+        return session.createProject(name, chosen);
       }),
     ),
 
@@ -362,6 +359,110 @@ function registrations(
       return Promise.resolve(undefined);
     }),
 
+    // --- A3a project lifecycle (each gated on Core's probe before any picker) ---
+    vscode.commands.registerCommand('sandpane.renameProject', () =>
+      guard('Sandpane: rename project', async () => {
+        if (!(await session.offers('project.update', 'Rename project'))) return undefined;
+        const project = await pickProjectForSettings(session, 'Rename which project?', 'all');
+        if (!project || session.refuseIfArchived(project, 'Rename project')) return undefined;
+        const name = await vscode.window.showInputBox({
+          title: `Rename "${pickText(project.name, 120)}"`,
+          prompt: 'New project name (Core stores it exactly as typed; at most 120 characters, one line)',
+          value: project.name,
+          validateInput: projectNameProblem,
+        });
+        if (name === undefined || name === project.name) return undefined;
+        return session.renameProject(project, name);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.editProjectDescription', () =>
+      guard('Sandpane: edit project description', async () => {
+        if (!(await session.offers('project.update', 'Edit project description'))) return undefined;
+        const project = await pickProjectForSettings(session, 'Edit the description of which project?', 'all');
+        if (!project || session.refuseIfArchived(project, 'Edit project description')) return undefined;
+        return editDescriptionInEditor(session, project);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.archiveProject', () =>
+      guard('Sandpane: archive project', async () => {
+        if (!(await session.offers('project.archive', 'Archive project'))) return undefined;
+        const project = await pickProjectForSettings(session, 'Archive which project?', 'live');
+        if (!project) return undefined;
+        return session.archiveProject(project);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.unarchiveProject', () =>
+      guard('Sandpane: unarchive project', async () => {
+        if (!(await session.offers('project.unarchive', 'Unarchive project'))) return undefined;
+        const project = await pickProjectForSettings(session, 'Unarchive which project?', 'archived');
+        if (!project) return undefined;
+        return session.unarchiveProject(project);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.toggleArchivedProjects', () =>
+      guard('Sandpane: show / hide archived projects', () => session.toggleShowArchived()),
+    ),
+
+    vscode.commands.registerCommand('sandpane.addRepository', () =>
+      guard('Sandpane: add repository to project', async () => {
+        if (!(await session.offers('project.add_repository', 'Add repository'))) return undefined;
+        const project = await pickProjectForSettings(session, 'Add a repository to which project?', 'all');
+        if (!project || session.refuseIfArchived(project, 'Add repository')) return undefined;
+        const picked = await vscode.window.showOpenDialog({
+          canSelectFiles: false,
+          canSelectFolders: true,
+          canSelectMany: false,
+          openLabel: 'Register with project',
+          title: `Repository for "${pickText(project.name, 120)}" — a git repository's top-level folder`,
+        });
+        const folder = picked?.[0];
+        if (!folder) return undefined;
+        if (folder.scheme !== 'file') {
+          void vscode.window.showWarningMessage(
+            `Only local folders can be registered (this one is "${plainText(folder.scheme, 32)}:"). Nothing was sent.`,
+          );
+          return undefined;
+        }
+        return session.addRepository(project, folder.fsPath);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.removeRepository', () =>
+      guard('Sandpane: remove repository from project', async () => {
+        if (!(await session.offers('project.remove_repository', 'Remove repository'))) return undefined;
+        const project = await pickProjectForSettings(session, 'Remove a repository from which project?', 'all');
+        if (!project || session.refuseIfArchived(project, 'Remove repository')) return undefined;
+        const repositories = project.repositories ?? [];
+        if (repositories.length === 0) {
+          void vscode.window.showInformationMessage(
+            `Core lists no repository for "${plainText(project.name, 120)}". Nothing was sent.`,
+          );
+          return undefined;
+        }
+        const picked = await vscode.window.showQuickPick(
+          repositories.map((path) => ({ label: pickText(path, 200), path })),
+          {
+            title: 'Unregister which repository? (Core only forgets it; the folder on disk is not touched)',
+          },
+        );
+        if (!picked) return undefined;
+        return session.removeRepository(project, picked.path);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.deleteProject', () =>
+      guard('Sandpane: delete project', async () => {
+        if (!(await session.offers('project.delete', 'Delete project'))) return undefined;
+        const project = await pickProjectForSettings(session, 'Delete which project? (a confirmation from Core follows)', 'all');
+        if (!project) return undefined;
+        return session.deleteProject(project);
+      }),
+    ),
+
     vscode.commands.registerCommand('sandpane.refreshSandboxes', () =>
       guard('Sandpane: refresh from Core', () => session.refresh()),
     ),
@@ -435,6 +536,112 @@ function registrations(
     }),
   ];
 }
+
+/** `validateInput` for a project name: Core's exact rule, or undefined when valid. */
+function projectNameProblem(value: string): string | undefined {
+  try {
+    validateProjectName(value);
+    return undefined;
+  } catch (error) {
+    return error instanceof CoreValidationError
+      ? `Core would refuse this name: ${error.message.replace(/^name: /, '')}`
+      : 'Core would refuse this name';
+  }
+}
+
+type ProjectFilter = 'all' | 'live' | 'archived';
+
+/**
+ * A project for an A3a command, re-read from Core (archived projects included
+ * and labeled ARCHIVED). `live` / `archived` narrow the list for archive /
+ * unarchive. Labels are plain text.
+ */
+async function pickProjectForSettings(
+  session: SandpaneSession,
+  title: string,
+  filter: ProjectFilter,
+): Promise<Project | undefined> {
+  let projects: Project[];
+  try {
+    projects = await session.listProjectsForSettings();
+  } catch (error) {
+    session.reportError(error, 'project.list');
+    return undefined;
+  }
+  const shown = projects.filter((p) => filter === 'all' || (filter === 'archived') === isArchived(p));
+  if (shown.length === 0) {
+    void vscode.window.showInformationMessage(
+      filter === 'archived'
+        ? 'Core lists no archived project. Nothing was sent.'
+        : filter === 'live'
+          ? 'Core lists no project that is not archived. Nothing was sent.'
+          : 'Core has no projects yet. Create one with "Sandpane: New Project".',
+    );
+    return undefined;
+  }
+  const items = shown.map((project) => {
+    const item = projectPickItem(project);
+    return {
+      ...item,
+      ...(item.archived && filter === 'all'
+        ? { description: `${item.description} — unarchive to edit; only Unarchive and Delete apply` }
+        : {}),
+      project,
+    };
+  });
+  const picked = await vscode.window.showQuickPick(items, { title, matchOnDescription: true });
+  return picked?.project;
+}
+
+const SAVE_DESCRIPTION = 'Save as description';
+const DISCARD_DESCRIPTION = 'Discard';
+
+/**
+ * Multi-line description editing: VS Code's input box is single-line, so the
+ * current description opens in an untitled plain-text editor and nothing is
+ * sent until "Save as description" is clicked. The editor's text is read at
+ * click time; CRLF line ends are sent as LF (Core allows only \n). An empty
+ * editor clears the description (Core's rule). Discard / dismiss sends nothing.
+ */
+async function editDescriptionInEditor(
+  session: SandpaneSession,
+  project: Project,
+): Promise<Project | undefined> {
+  const doc = await vscode.workspace.openTextDocument({ content: project.description, language: 'plaintext' });
+  await vscode.window.showTextDocument(doc, { preview: false });
+  const name = plainText(project.name, 120);
+  for (;;) {
+    const choice = await vscode.window.showInformationMessage(
+      `Editing the description of "${name}" (at most 2000 characters; an empty editor clears it). ` +
+        'Nothing is sent until you choose "Save as description".',
+      SAVE_DESCRIPTION,
+      DISCARD_DESCRIPTION,
+    );
+    if (choice !== SAVE_DESCRIPTION) {
+      void vscode.window.showInformationMessage(
+        'Description not changed — nothing was sent. You can close the untitled editor without saving.',
+      );
+      return undefined;
+    }
+    const text = doc.getText().replace(/\r\n/g, '\n');
+    try {
+      validateProjectDescription(text);
+    } catch (error) {
+      void vscode.window.showErrorMessage(
+        `Core would refuse this description (${error instanceof Error ? error.message : String(error)}). ` +
+          'Nothing was sent; fix it in the editor and choose again.',
+      );
+      continue;
+    }
+    const updated = await session.editProjectDescription(project, text);
+    if (updated && vscode.window.activeTextEditor?.document === doc) {
+      // Close only that untitled scratch editor, without a save prompt.
+      await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+    }
+    return updated;
+  }
+}
+
 
 async function pickProject(session: SandpaneSession): Promise<string | undefined> {
   // Project ids belong to Core: re-read them instead of trusting a cached list.

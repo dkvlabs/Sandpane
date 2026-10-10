@@ -29,10 +29,17 @@ object MethodDeadlines {
     /** `sandbox.remove` floor: step 2 worst case ≈ 30 + 300 + 30 s, plus margin (both steps share it). */
     const val SANDBOX_REMOVE_MS: Int = 400_000
 
+    /**
+     * `project.add_repository` floor (A3a): Core resolves the folder with one QUERY-class
+     * `git rev-parse --show-toplevel` (≈ 30 s worst case) before a short DB write; plus margin.
+     */
+    const val PROJECT_ADD_REPOSITORY_MS: Int = 45_000
+
     /** The deadline for [method] given the user's [configuredMs]; never shorter than [configuredMs]. */
     fun forMethod(method: String, configuredMs: Int): Int = when (method) {
         CoreMethods.SANDBOX_STOP -> maxOf(configuredMs, SANDBOX_STOP_MS)
         CoreMethods.SANDBOX_REMOVE -> maxOf(configuredMs, SANDBOX_REMOVE_MS)
+        CoreMethods.PROJECT_ADD_REPOSITORY -> maxOf(configuredMs, PROJECT_ADD_REPOSITORY_MS)
         else -> configuredMs
     }
 }

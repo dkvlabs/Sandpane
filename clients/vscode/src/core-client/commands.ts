@@ -1,9 +1,10 @@
 /**
- * Typed wrappers for **exactly** the 16 Core methods (`sandpane_protocol::Method`
+ * Typed wrappers for **exactly** the 22 Core methods (`sandpane_protocol::Method`
  * / `Method::ALL`). Every wrapper maps to one Core method; `sandbox.remove` has
  * two wrappers because its two confirmation steps are deliberately separate
  * calls (`sandboxRemoveRequest` never carries a token, `sandboxRemoveConfirm`
- * always does).
+ * always does); `project.delete` likewise (`projectDeleteRequest` /
+ * `projectDeleteConfirm`).
  *
  * Every payload key is written in the wire spelling (camelCase), every enum in
  * its wire spelling (snake_case / SCREAMING_SNAKE). Unknown methods are
@@ -41,6 +42,10 @@ import type {
   GitApplyParams,
   Project,
   ProjectCreateParams,
+  ProjectDeleteResult,
+  ProjectListParams,
+  ProjectRepositoryParams,
+  ProjectUpdateParams,
   SandboxCreateSpec,
   SandboxRemoveResult,
   SandboxStopResult,
@@ -119,6 +124,88 @@ export function validateAddressableSandboxName(name: string, field = 'name'): st
   }
   if (name.toLowerCase() === 'default') throw new CoreValidationError(field, "'default' is a reserved sandbox name");
   return name;
+}
+
+/** `MAX_PROJECT_NAME_CHARS` / `MAX_PROJECT_DESCRIPTION_CHARS` in sandpane-core (A3a). */
+export const MAX_PROJECT_NAME_CHARS = 120;
+export const MAX_PROJECT_DESCRIPTION_CHARS = 2000;
+
+/**
+ * Rust `char::is_control()` = general category Cc (C0, DEL, C1).
+ */
+function isRustControl(cp: number): boolean {
+  return cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f);
+}
+
+/**
+ * `is_spoofing_format_char` in sandpane-core: line/paragraph separators, LRM,
+ * RLM, ALM, the embeddings/overrides U+202A..=U+202E and the isolates
+ * U+2066..=U+2069. Nothing else (Core does NOT refuse e.g. U+200B).
+ */
+function isSpoofingFormatChar(cp: number): boolean {
+  return (
+    cp === 0x2028 ||
+    cp === 0x2029 ||
+    cp === 0x200e ||
+    cp === 0x200f ||
+    cp === 0x061c ||
+    (cp >= 0x202a && cp <= 0x202e) ||
+    (cp >= 0x2066 && cp <= 0x2069)
+  );
+}
+
+/**
+ * A lone UTF-16 surrogate is not a Unicode scalar value: Core's JSON decoder
+ * cannot turn it into a Rust `String`, so Core refuses the whole frame. Refusing
+ * it here is the same outcome, never stricter.
+ */
+function isLoneSurrogate(cp: number): boolean {
+  return cp >= 0xd800 && cp <= 0xdfff;
+}
+
+function hex(cp: number): string {
+  return `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
+}
+
+/**
+ * `Validator::project_name` exactly (A3a; `project.create` and
+ * `project.update`): non-empty, at most 120 chars (Unicode scalar values), no
+ * Cc at all (incl. `\n`, `\t`, DEL, C1), no spoofing format character.
+ * Not trimmed: Core does not trim either.
+ */
+export function validateProjectName(value: string, field = 'name'): string {
+  if (typeof value !== 'string' || value.length === 0) throw new CoreValidationError(field, 'value is empty');
+  const points = Array.from(value);
+  if (points.length > MAX_PROJECT_NAME_CHARS) {
+    throw new CoreValidationError(field, `value exceeds max length ${MAX_PROJECT_NAME_CHARS}`);
+  }
+  for (const ch of points) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (isRustControl(cp) || isSpoofingFormatChar(cp) || isLoneSurrogate(cp)) {
+      throw new CoreValidationError(field, `contains a disallowed character ${hex(cp)}`);
+    }
+  }
+  return value;
+}
+
+/**
+ * `Validator::project_description` exactly (A3a): at most 2000 chars, `\n` is
+ * the ONLY allowed control character, no spoofing format character. Empty is
+ * allowed and clears the description.
+ */
+export function validateProjectDescription(value: string, field = 'description'): string {
+  if (typeof value !== 'string') throw new CoreValidationError(field, 'value must be a string');
+  const points = Array.from(value);
+  if (points.length > MAX_PROJECT_DESCRIPTION_CHARS) {
+    throw new CoreValidationError(field, `value exceeds max length ${MAX_PROJECT_DESCRIPTION_CHARS}`);
+  }
+  for (const ch of points) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if ((isRustControl(cp) && cp !== 0x0a) || isSpoofingFormatChar(cp) || isLoneSurrogate(cp)) {
+      throw new CoreValidationError(field, `contains a disallowed character ${hex(cp)}`);
+    }
+  }
+  return value;
 }
 
 /** Core's `Validator::idempotency_key` bound (A2). */
@@ -336,6 +423,15 @@ export const SANDBOX_CREATE_TIMEOUT_MS = 330_000;
 export const SANDBOX_STOP_TIMEOUT_MS = 360_000;
 
 /**
+ * Client deadline for `project.add_repository` and `project.create`: Core
+ * resolves each repository's git top level with `RunLimits::QUERY` (30 s per
+ * git call), longer than the 15 s default. 45 s leaves headroom for ONE such
+ * call; a `project.create` with several slow repositories can still exceed it
+ * (the outcome is then reported UNKNOWN, never as a failure).
+ */
+export const PROJECT_GIT_TIMEOUT_MS = 45_000;
+
+/**
  * `sandbox.remove` (either step) — step 1 probes the target, step 2 runs
  * `sbx rm --force` after the token check. Client deadline 400 s. NOT replay-safe:
  * never retried automatically.
@@ -370,7 +466,7 @@ export function validateConfirmToken(value: unknown, field = 'confirmToken'): st
  */
 export function parseConfirmationRequest(
   raw: unknown,
-  expected: { action: string; name: string },
+  expected: { action: string; name?: string; id?: string },
 ): ConfirmationRequest {
   const refuse = (why: string): never => {
     throw new CoreValidationError(
@@ -379,8 +475,8 @@ export function parseConfirmationRequest(
     );
   };
   if (!raw || typeof raw !== 'object') refuse('the answer is not an object');
-  const outer = raw as SandboxRemoveResult;
-  if (outer.removed === true) refuse('step 1 claimed the action already happened');
+  const outer = raw as SandboxRemoveResult & { deleted?: unknown };
+  if (outer.removed === true || outer.deleted === true) refuse('step 1 claimed the action already happened');
   const c = outer.confirmation;
   if (!c || typeof c !== 'object') refuse('no confirmation in the answer');
   const conf = c as Partial<ConfirmationRequest>;
@@ -392,7 +488,12 @@ export function parseConfirmationRequest(
   if (!target || typeof target.name !== 'string' || typeof target.id !== 'string') {
     refuse('no target identity');
   }
-  if (target?.name !== expected.name) refuse('it names a different sandbox than the one requested');
+  if (expected.name !== undefined && target?.name !== expected.name) {
+    refuse('it names a different target than the one requested');
+  }
+  if (expected.id !== undefined && target?.id !== expected.id) {
+    refuse('it is for a different target id than the one requested');
+  }
   if (typeof conf.expiresAt !== 'string') refuse('no expiry');
   if (!Array.isArray(conf.impact) || !conf.impact.every((line) => typeof line === 'string')) {
     refuse('impact is not a list of lines');
@@ -416,16 +517,102 @@ export class CoreCommands {
     return guarded(() => this.connection.request<CoreCapabilities>('system.probe', {}));
   }
 
-  projectList(): Promise<Project[]> {
-    return guarded(() => this.connection.request<Project[]>('project.list', {}));
+  /**
+   * `{includeArchived?}` → `Project[]`. Absent / false = live projects only
+   * (`{}` on the wire, exactly as before A3a); `includeArchived: true` is sent
+   * only when asked for.
+   */
+  projectList(params: ProjectListParams = {}): Promise<Project[]> {
+    return guarded(() =>
+      this.connection.request<Project[]>(
+        'project.list',
+        params.includeArchived === true ? { includeArchived: true } : {},
+      ),
+    );
+  }
+
+  /** A3a: `{projectId, name?, description?}` → `Project`. At least one field. */
+  projectUpdate(params: ProjectUpdateParams): Promise<Project> {
+    return guarded(() => {
+      const payload: Record<string, unknown> = { projectId: validateScopingId(params.projectId, 'projectId') };
+      if (params.name !== undefined) payload['name'] = validateProjectName(params.name);
+      if (params.description !== undefined) payload['description'] = validateProjectDescription(params.description);
+      if (params.name === undefined && params.description === undefined) {
+        throw new CoreValidationError('project.update', 'needs name or description');
+      }
+      return this.connection.request<Project>('project.update', payload);
+    });
+  }
+
+  /** A3a: `{projectId}` → `Project`. Idempotent. */
+  projectArchive(projectId: string): Promise<Project> {
+    return guarded(() =>
+      this.connection.request<Project>('project.archive', { projectId: validateScopingId(projectId, 'projectId') }),
+    );
+  }
+
+  /** A3a: `{projectId}` → `Project`. Idempotent. */
+  projectUnarchive(projectId: string): Promise<Project> {
+    return guarded(() =>
+      this.connection.request<Project>('project.unarchive', { projectId: validateScopingId(projectId, 'projectId') }),
+    );
+  }
+
+  /**
+   * `project.delete` STEP 1: `{projectId}` (never a token) → a checked
+   * `ConfirmationRequest` bound to this project id. Core changes nothing.
+   */
+  projectDeleteRequest(projectId: string): Promise<ConfirmationRequest> {
+    return guarded(async () => {
+      const id = validateScopingId(projectId, 'projectId');
+      const raw = await this.connection.request<unknown>('project.delete', { projectId: id });
+      return parseConfirmationRequest(raw, { action: 'project.delete', id });
+    });
+  }
+
+  /**
+   * `project.delete` STEP 2: `{projectId, confirmToken}` → `{deleted: true}`.
+   * Only after the user explicitly confirmed step 1. Never retried.
+   */
+  projectDeleteConfirm(projectId: string, confirmToken: string): Promise<ProjectDeleteResult> {
+    return guarded(() =>
+      this.connection.request<ProjectDeleteResult>('project.delete', {
+        projectId: validateScopingId(projectId, 'projectId'),
+        confirmToken: validateConfirmToken(confirmToken),
+      }),
+    );
+  }
+
+  /** A3a: `{projectId, path}` → `Project`. Core canonicalizes and vets the git root. */
+  projectAddRepository(params: ProjectRepositoryParams): Promise<Project> {
+    return guarded(() =>
+      this.connection.request<Project>(
+        'project.add_repository',
+        {
+          projectId: validateScopingId(params.projectId, 'projectId'),
+          path: validateAbsoluteRepoPath(params.path, 'path'),
+        },
+        { timeoutMs: PROJECT_GIT_TIMEOUT_MS },
+      ),
+    );
+  }
+
+  /** A3a: `{projectId, path}` (absolute) → `Project`. Never touches the host repository. */
+  projectRemoveRepository(params: ProjectRepositoryParams): Promise<Project> {
+    return guarded(() =>
+      this.connection.request<Project>('project.remove_repository', {
+        projectId: validateScopingId(params.projectId, 'projectId'),
+        path: validateAbsoluteRepoPath(params.path, 'path'),
+      }),
+    );
   }
 
   /** Repositories must be absolute: Core rejects anything else with VALIDATION_FAILED. */
   projectCreate(params: ProjectCreateParams): Promise<Project> {
     return guarded(() => {
-      const name = validateDisplayText(params.name, 120, 'name');
+      const name = validateProjectName(params.name);
       const repositories = params.repositories.map((repo) => validateAbsoluteRepoPath(repo, 'repositories'));
-      return this.connection.request<Project>('project.create', { name, repositories });
+      return this.connection.request<Project>('project.create', { name, repositories }, { timeoutMs: PROJECT_GIT_TIMEOUT_MS });
     });
   }
 

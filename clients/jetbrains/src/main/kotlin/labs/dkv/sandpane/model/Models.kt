@@ -115,8 +115,9 @@ val CoreJson: Json = Json {
  * [ALL] is an ORDERED list mirroring `Method::ALL` in Rust — the single list `CoreCapabilities.methods`
  * is derived from — because [labs.dkv.sandpane.core.ProtocolDriftGuardTest] compares order as well as
  * membership. The three additive protocol-v1 discovery methods (`conversation.list`,
- * `conversation.history`, `task.list`) and the two A1 sandbox-lifecycle methods (`sandbox.stop`,
- * `sandbox.remove`) sit at their Rust positions; nothing existing was renamed or removed.
+ * `conversation.history`, `task.list`), the two A1 sandbox-lifecycle methods (`sandbox.stop`,
+ * `sandbox.remove`) and the six A3a project-lifecycle methods (`project.update` …
+ * `project.remove_repository`) sit at their Rust positions; nothing existing was renamed or removed.
  *
  * There is deliberately NO `sandbox.start`: sbx v0.47 has no `start` command (restart is the
  * interactive `sbx run --name`), so Core does not dispatch one and this client never sends one —
@@ -126,6 +127,16 @@ object CoreMethods {
     const val SYSTEM_PROBE: String = "system.probe"
     const val PROJECT_CREATE: String = "project.create"
     const val PROJECT_LIST: String = "project.list"
+
+    // A3a project lifecycle (design 2026-10-09 §3.2). Lowercase snake_case segments on the wire.
+    const val PROJECT_UPDATE: String = "project.update"
+    const val PROJECT_ARCHIVE: String = "project.archive"
+    const val PROJECT_UNARCHIVE: String = "project.unarchive"
+
+    /** Two-step server-side confirmation (design §2), like `sandbox.remove`. */
+    const val PROJECT_DELETE: String = "project.delete"
+    const val PROJECT_ADD_REPOSITORY: String = "project.add_repository"
+    const val PROJECT_REMOVE_REPOSITORY: String = "project.remove_repository"
     const val SANDBOX_LIST: String = "sandbox.list"
     const val SANDBOX_CREATE: String = "sandbox.create"
 
@@ -144,9 +155,12 @@ object CoreMethods {
     const val GIT_REVIEW: String = "git.review"
     const val GIT_APPLY: String = "git.apply"
 
-    /** Wire order of `Method::ALL` — 16 methods as of protocol-v1 addition A1. */
+    /** Wire order of `Method::ALL` — 22 methods as of protocol-v1 addition A3a. */
     val ALL: List<String> = listOf(
-        SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST, SANDBOX_LIST, SANDBOX_CREATE,
+        SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST,
+        PROJECT_UPDATE, PROJECT_ARCHIVE, PROJECT_UNARCHIVE, PROJECT_DELETE,
+        PROJECT_ADD_REPOSITORY, PROJECT_REMOVE_REPOSITORY,
+        SANDBOX_LIST, SANDBOX_CREATE,
         SANDBOX_STOP, SANDBOX_REMOVE,
         CONVERSATION_CREATE, CONVERSATION_SEND, CONVERSATION_LIST, CONVERSATION_HISTORY,
         TASK_CANCEL, TASK_LIST, TASK_SUBSCRIBE, GIT_REVIEW, GIT_APPLY,
@@ -161,12 +175,18 @@ object CoreMethods {
     /** The methods addition A1 ADDED (design 2026-10-09 §3); a pre-A1 Core does NOT dispatch them. */
     val ADDITIVE_A1: Set<String> = setOf(SANDBOX_STOP, SANDBOX_REMOVE)
 
+    /** The methods addition A3a ADDED (design §3.2); a pre-A3a Core does NOT dispatch them. */
+    val ADDITIVE_A3A: Set<String> = setOf(
+        PROJECT_UPDATE, PROJECT_ARCHIVE, PROJECT_UNARCHIVE, PROJECT_DELETE,
+        PROJECT_ADD_REPOSITORY, PROJECT_REMOVE_REPOSITORY,
+    )
+
     /**
      * Every method beyond the eleven-method v1 baseline. Feature detection is mandatory for exactly
      * these — see [CoreCapabilities.advertises]: a call is refused locally, before a byte is written,
      * when the connected Core's `system.probe` does not list it (design 2026-10-09 §1 rule 3).
      */
-    val REQUIRES_ADVERTISEMENT: Set<String> = ADDITIVE_IN_V1 + ADDITIVE_A1
+    val REQUIRES_ADVERTISEMENT: Set<String> = ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A
 
     /**
      * The honest unsupported state for starting a sandbox (design 2026-10-09 §3 row A1). Shown to the
@@ -340,6 +360,56 @@ data class Project(
      * plain string-compare. See [labs.dkv.sandpane.services.SbxService.associateFolder].
      */
     val repositories: List<String> = emptyList(),
+    /**
+     * A3a, additive: RFC 3339 time the project was archived; ABSENT when the project is live (and on
+     * every pre-A3a Core, which never lists archived projects). Archiving is reversible and changes
+     * nothing outside Core; while archived, Core refuses edits, repository changes and new work.
+     */
+    @SerialName("archivedAt") val archivedAt: String? = null,
+) {
+    val isArchived: Boolean get() = archivedAt != null
+}
+
+/** `project.list` params (A3a). NULL keeps the key off the wire: Core then lists live projects only. */
+@Serializable
+data class ProjectListParams(@SerialName("includeArchived") val includeArchived: Boolean? = null)
+
+/** `project.update` (A3a): at least one of [name] / [description]; an absent field is unchanged. */
+@Serializable
+data class ProjectUpdateParams(
+    @SerialName("projectId") val projectId: String,
+    val name: String? = null,
+    /** An EMPTY string clears the description; NULL leaves it unchanged. */
+    val description: String? = null,
+)
+
+/** `project.archive` / `project.unarchive` params. */
+@Serializable
+data class ProjectIdParams(@SerialName("projectId") val projectId: String)
+
+/** `project.delete` (A3a, two-step confirmation): no token at step 1, Core's token at step 2. */
+@Serializable
+data class ProjectDeleteParams(
+    @SerialName("projectId") val projectId: String,
+    @SerialName("confirmToken") val confirmToken: String? = null,
+) {
+    /** The token is a single-use secret: never printed, even from a debug or error path. */
+    override fun toString(): String =
+        "ProjectDeleteParams(projectId=$projectId, confirmToken=${if (confirmToken == null) "absent" else "<redacted>"})"
+}
+
+/** `project.delete` result: [confirmation] at step 1 (nothing changed), [deleted] at step 2. */
+@Serializable
+data class ProjectDeleteResult(
+    val confirmation: ConfirmationRequest? = null,
+    val deleted: Boolean? = null,
+)
+
+/** `project.add_repository` / `project.remove_repository` params; [path] must be absolute. */
+@Serializable
+data class ProjectRepositoryParams(
+    @SerialName("projectId") val projectId: String,
+    val path: String,
 )
 
 @Serializable

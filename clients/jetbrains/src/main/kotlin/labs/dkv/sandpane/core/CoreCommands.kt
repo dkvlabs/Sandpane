@@ -4,7 +4,8 @@
 //   * NOTHING is sent that the guards in [CoreGuards] refuse — an invalid id, limit or cursor
 //     map never reaches the socket, and the returned future fails with [CoreValidationException],
 //     which is this client's word, never a Core verdict (AGENTS.md rule 5).
-//   * The additive methods (the three v1 reads and the A1 sandbox lifecycle) are gated on
+//   * The additive methods (the three v1 reads, the A1 sandbox lifecycle and the A3a project
+//     lifecycle) are gated on
 //     ADVERTISEMENT (`CoreCapabilities.methods`), not on a version number: `protocolVersion` stayed
 //     1 across these revisions, so assuming a method from it would send a request an older Core
 //     answers with VALIDATION_FAILED.
@@ -20,6 +21,13 @@ import labs.dkv.sandpane.model.CoreCapabilities
 import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.model.CoreErrorCodes
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.model.Project
+import labs.dkv.sandpane.model.ProjectDeleteParams
+import labs.dkv.sandpane.model.ProjectDeleteResult
+import labs.dkv.sandpane.model.ProjectIdParams
+import labs.dkv.sandpane.model.ProjectListParams
+import labs.dkv.sandpane.model.ProjectRepositoryParams
+import labs.dkv.sandpane.model.ProjectUpdateParams
 import labs.dkv.sandpane.model.SandboxRemoveParams
 import labs.dkv.sandpane.model.SandboxRemoveResult
 import labs.dkv.sandpane.model.SandboxStopParams
@@ -36,6 +44,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.io.File
 import java.util.concurrent.CompletableFuture
 
 /** The minimum transport a [CoreCommands] needs; [ConnectionManager] satisfies it. */
@@ -69,7 +78,8 @@ class CoreCommands(
      * Refusing locally keeps a pre-revision Core from answering for a surface it never promised,
      * and keeps the refusal out of the wire entirely. The eleven original methods need no gate —
      * they are the protocol-v1 baseline every Core dispatches; everything in
-     * [CoreMethods.REQUIRES_ADVERTISEMENT] (the discovery reads and the A1 sandbox lifecycle) does.
+     * [CoreMethods.REQUIRES_ADVERTISEMENT] (the discovery reads, the A1 sandbox lifecycle and the A3a
+     * project lifecycle) does.
      */
     fun advertisementGap(method: String): MethodNotSupportedException? {
         if (!CoreMethods.REQUIRES_ADVERTISEMENT.contains(method)) return null
@@ -254,6 +264,159 @@ class CoreCommands(
             SandboxRemoveParams.serializer(),
             SandboxRemoveParams(name = checked, confirmToken = token),
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // project lifecycle (A3a)
+    // -----------------------------------------------------------------------
+
+    /**
+     * `project.list`. With [includeArchived] the request carries `{"includeArchived":true}` and is
+     * GATED on `project.archive` being advertised: a pre-A3a Core silently ignores the flag, so
+     * sending it there would present a live-only list as "including archived". Without it the
+     * frame is `{}` (live projects only) — the baseline every Core answers.
+     */
+    fun projectList(includeArchived: Boolean = false): CompletableFuture<List<Project>> {
+        if (includeArchived) {
+            advertisementGap(CoreMethods.PROJECT_ARCHIVE)?.let {
+                return CompletableFuture.failedFuture(
+                    MethodNotSupportedException(
+                        CoreMethods.PROJECT_LIST,
+                        "listing archived projects needs ${CoreMethods.PROJECT_ARCHIVE}, which this Core does not advertise. Nothing was sent.",
+                    ),
+                )
+            }
+        }
+        return rpc.request(CoreMethods.PROJECT_LIST, buildProjectListPayload(includeArchived))
+            .thenApply { ok ->
+                decodeOrFixed(CoreMethods.PROJECT_LIST) { CoreJson.decodeFromJsonElement(ListSerializer(Project.serializer()), ok) }
+            }
+    }
+
+    /** `project.update {projectId, name?, description?}`: only the given fields; at least one. */
+    fun projectUpdate(projectId: String, name: String?, description: String?): CompletableFuture<Project> =
+        projectCall(CoreMethods.PROJECT_UPDATE) { buildProjectUpdatePayload(projectId, name, description) }
+
+    /** `project.archive {projectId}` (idempotent in Core). */
+    fun projectArchive(projectId: String): CompletableFuture<Project> =
+        projectCall(CoreMethods.PROJECT_ARCHIVE) { buildProjectIdPayload(projectId) }
+
+    /** `project.unarchive {projectId}` (idempotent in Core). */
+    fun projectUnarchive(projectId: String): CompletableFuture<Project> =
+        projectCall(CoreMethods.PROJECT_UNARCHIVE) { buildProjectIdPayload(projectId) }
+
+    /** `project.add_repository {projectId, path}`; Core resolves and validates the folder. */
+    fun projectAddRepository(projectId: String, path: String): CompletableFuture<Project> =
+        projectCall(CoreMethods.PROJECT_ADD_REPOSITORY) { buildProjectRepositoryPayload(projectId, path) }
+
+    /** `project.remove_repository {projectId, path}`; the path should be one Core listed. */
+    fun projectRemoveRepository(projectId: String, path: String): CompletableFuture<Project> =
+        projectCall(CoreMethods.PROJECT_REMOVE_REPOSITORY) { buildProjectRepositoryPayload(projectId, path) }
+
+    /**
+     * Step 1 of `project.delete`: `{projectId}` with NO `confirmToken` key. Core changes nothing and
+     * answers a confirmation, which must pass [ProjectDeleteCheck.decide] before anything else.
+     */
+    fun projectDeleteRequest(projectId: String): CompletableFuture<ProjectDeleteResult> {
+        advertisementGap(CoreMethods.PROJECT_DELETE)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildProjectDeletePayload(projectId, token = null)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.PROJECT_DELETE, payload).thenApply(::decodeDeleteAnswer)
+    }
+
+    /**
+     * Step 2 of `project.delete`. Takes an [IssuedProjectDelete] — which only
+     * [ProjectDeleteCheck.decide] can make — so no token that did not come from step 1 for this
+     * project id can be sent.
+     */
+    fun projectDeleteConfirm(issued: IssuedProjectDelete): CompletableFuture<ProjectDeleteResult> {
+        advertisementGap(CoreMethods.PROJECT_DELETE)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildProjectDeletePayload(issued.projectId, token = issued.token)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.PROJECT_DELETE, payload).thenApply(::decodeDeleteAnswer)
+    }
+
+    private fun projectCall(method: String, build: () -> JsonElement): CompletableFuture<Project> {
+        advertisementGap(method)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            build()
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(method, payload)
+            .thenApply { ok -> decodeOrFixed(method) { CoreJson.decodeFromJsonElement(Project.serializer(), ok) } }
+    }
+
+    /** A shape mismatch becomes fixed text raised by THIS plugin; Core's payload is never echoed. */
+    private fun <T> decodeOrFixed(method: String, decode: () -> T): T = try {
+        decode()
+    } catch (_: Exception) {
+        throw CoreRpcException(
+            CoreErrorCodes.INTERNAL,
+            "Core's $method answer did not have the expected shape; its content is not shown",
+            raisedByCore = false,
+        )
+    }
+
+    /** As [decodeRemoveAnswer]: a delete answer can carry a token, so it is never echoed. */
+    private fun decodeDeleteAnswer(ok: JsonElement): ProjectDeleteResult = try {
+        CoreJson.decodeFromJsonElement(ProjectDeleteResult.serializer(), ok)
+    } catch (_: Exception) {
+        throw CoreRpcException(
+            CoreErrorCodes.INTERNAL,
+            "Core's ${CoreMethods.PROJECT_DELETE} answer did not have the expected shape; its content " +
+                "is not shown because it may carry a confirmation token",
+            raisedByCore = false,
+        )
+    }
+
+    /** `{}` or `{"includeArchived":true}` — never `false` on the wire (absent already means live-only). */
+    internal fun buildProjectListPayload(includeArchived: Boolean): JsonElement =
+        CoreJson.encodeToJsonElement(
+            ProjectListParams.serializer(),
+            ProjectListParams(includeArchived = if (includeArchived) true else null),
+        )
+
+    /** Mirrors Core: at least one field; the name/description rules of [ProjectGuards] exactly. */
+    internal fun buildProjectUpdatePayload(projectId: String, name: String?, description: String?): JsonElement {
+        val id = CoreGuards.requireId(projectId, "projectId")
+        if (name == null && description == null) {
+            throw CoreValidationException("project.update", "neither a name nor a description was given; nothing was sent")
+        }
+        name?.let { n -> ProjectGuards.nameProblem(n)?.let { throw CoreValidationException("name", it) } }
+        description?.let { d -> ProjectGuards.descriptionProblem(d)?.let { throw CoreValidationException("description", it) } }
+        return CoreJson.encodeToJsonElement(
+            ProjectUpdateParams.serializer(),
+            ProjectUpdateParams(projectId = id, name = name, description = description),
+        )
+    }
+
+    internal fun buildProjectIdPayload(projectId: String): JsonElement =
+        CoreJson.encodeToJsonElement(ProjectIdParams.serializer(), ProjectIdParams(CoreGuards.requireId(projectId, "projectId")))
+
+    /** Core requires an absolute path for both repository methods; a NUL can never be a path. */
+    internal fun buildProjectRepositoryPayload(projectId: String, path: String): JsonElement {
+        val id = CoreGuards.requireId(projectId, "projectId")
+        if (path.isEmpty() || !File(path).isAbsolute) {
+            throw CoreValidationException("path", "the repository path must be absolute; nothing was sent")
+        }
+        if (path.indexOf('\u0000') >= 0) throw CoreValidationException("path", "the path contains a NUL byte; nothing was sent")
+        return CoreJson.encodeToJsonElement(ProjectRepositoryParams.serializer(), ProjectRepositoryParams(id, path))
+    }
+
+    /** `{projectId}` (step 1, key ABSENT) or `{projectId, confirmToken}` (step 2, Core's shape only). */
+    internal fun buildProjectDeletePayload(projectId: String, token: String?): JsonElement {
+        val id = CoreGuards.requireId(projectId, "projectId")
+        if (token != null && !CoreGuards.isConfirmTokenShape(token)) {
+            throw CoreValidationException("confirmToken", "not the shape Core issues; nothing was sent")
+        }
+        return CoreJson.encodeToJsonElement(ProjectDeleteParams.serializer(), ProjectDeleteParams(id, token))
     }
 
     // -----------------------------------------------------------------------

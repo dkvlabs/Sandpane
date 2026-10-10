@@ -43,10 +43,16 @@ export function ChatPanel({
   projectId,
   selectedConversationId,
   onSelectConversation,
+  archivedReason = null,
 }: {
   projectId: string;
   selectedConversationId: string | null;
   onSelectConversation: (id: string) => void;
+  /**
+   * A3a: set when Core reports this project archived. New chats and sends are
+   * disabled with Core's reason (Core refuses both); reading stays available.
+   */
+  archivedReason?: string | null;
 }) {
   const link = useCoreLink();
   const capabilities = capabilitiesOf(link);
@@ -115,10 +121,12 @@ export function ChatPanel({
           <Button
           variant="primary"
           disabled={
+            archivedReason !== null ||
             agents.length === 0 ||
             effectiveAgent.length === 0 ||
             createConversation.isPending
           }
+          title={archivedReason ?? undefined}
           onClick={() =>
             createConversation.mutate({
               projectId,
@@ -132,6 +140,7 @@ export function ChatPanel({
         </div>
       }
     >
+      {archivedReason !== null && <p className="muted">{archivedReason}</p>}
       {agents.length === 0 && (
         <Warning tone="danger" title="Core reported no agent adapters">
           No <Mono>agents</Mono> capability came back from <Mono>system.probe</Mono>, so a chat
@@ -238,7 +247,8 @@ export function ChatPanel({
             <Button
               variant="primary"
               type="submit"
-              disabled={draft.trim().length === 0 || sending}
+              disabled={archivedReason !== null || draft.trim().length === 0 || sending}
+              title={archivedReason ?? undefined}
             >
               Send
             </Button>

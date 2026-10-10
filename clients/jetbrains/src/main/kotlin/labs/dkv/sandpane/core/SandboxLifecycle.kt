@@ -62,11 +62,14 @@ class IssuedRemoval private constructor(
     val external: Boolean,
     internal val token: String,
 ) {
-    /** [expiresAt] as an instant, or null when Core's string does not parse (then Core alone decides). */
+    /** [expiresAt] as an instant, or null when Core's string does not parse. */
     val expiresAtInstant: Instant? = parseRfc3339(expiresAt)
 
-    /** True only when the expiry parsed and has passed; an unparseable expiry is never "expired" here. */
-    fun isExpired(now: Instant): Boolean = expiresAtInstant?.let { !now.isBefore(it) } ?: false
+    /**
+     * True when the expiry has passed — or cannot be read: fail CLOSED, like the VS Code and desktop
+     * clients ([RemoveConfirmationCheck.decide] already refuses an unreadable expiry; second net).
+     */
+    fun isExpired(now: Instant): Boolean = expiresAtInstant?.let { !now.isBefore(it) } ?: true
 
     override fun toString(): String =
         "IssuedRemoval(name=$name, target=$target, expiresAt=$expiresAt, impact=${impact.size} line(s), " +
@@ -76,7 +79,7 @@ class IssuedRemoval private constructor(
         fun of(name: String, target: ConfirmationTarget, expiresAt: String, impact: List<String>, external: Boolean, token: String) =
             IssuedRemoval(name, target, expiresAt, impact, external, token)
 
-        private fun parseRfc3339(value: String): Instant? = try {
+        fun parseRfc3339(value: String): Instant? = try {
             OffsetDateTime.parse(value).toInstant()
         } catch (_: DateTimeParseException) {
             null
@@ -127,6 +130,13 @@ object RemoveConfirmationCheck {
         if (!CoreGuards.isConfirmTokenShape(confirmation.token)) {
             // The token's value is never quoted: it is a secret even when malformed.
             return Decision.Refused("the confirmation token does not have the shape Core issues (64 lowercase hex)")
+        }
+        if (IssuedRemoval.parseRfc3339(confirmation.expiresAt) == null) {
+            // Fail closed: an expiry that cannot be checked at click time is not acted on.
+            return Decision.Refused(
+                "its expiry '${VisibleText.reveal(confirmation.expiresAt).take(64)}' cannot be read, so the confirmation " +
+                    "cannot be used; run Remove Sandbox again",
+            )
         }
         return Decision.Ready(
             IssuedRemoval.of(
@@ -398,6 +408,11 @@ class SandboxRemoveFlow(
     private val commands: CoreCommands,
     private val ui: Ui,
     private val clock: () -> Instant = Instant::now,
+    /**
+     * Where step 2 is sent from once the dialog has returned: never the UI thread. The IDE passes
+     * ConnectionManager's io pool; the default is the common pool.
+     */
+    private val background: (() -> Unit) -> Unit = { task -> CompletableFuture.runAsync(task) },
 ) {
     interface Ui {
         /** Run [block] on the UI thread (the EDT in the IDE; inline in tests). */
@@ -440,7 +455,24 @@ class SandboxRemoveFlow(
                     done.complete(RemoveOutcome.Expired(issued.name, issued.expiresAt))
                     return@onUiThread
                 }
-                commands.sandboxRemoveConfirm(issued).whenComplete { result, error ->
+                sendStep2(issued, done)
+            }
+        } catch (_: Throwable) {
+            // The UI hop itself was refused (e.g. the application is shutting down): not a yes.
+            done.complete(RemoveOutcome.Cancelled(issued.name))
+        }
+    }
+
+    /** Step 2, handed off the UI thread first: the frame is built and written on [background]. */
+    private fun sendStep2(issued: IssuedRemoval, done: CompletableFuture<RemoveOutcome>) {
+        try {
+            background {
+                val sent = try {
+                    commands.sandboxRemoveConfirm(issued)
+                } catch (t: Throwable) {
+                    CompletableFuture.failedFuture(t)
+                }
+                sent.whenComplete { result, error ->
                     done.complete(
                         when {
                             error != null -> RemoveOutcome.Step2Failed(issued.name, error)
@@ -451,8 +483,8 @@ class SandboxRemoveFlow(
                 }
             }
         } catch (_: Throwable) {
-            // The UI hop itself was refused (e.g. the application is shutting down): not a yes.
-            done.complete(RemoveOutcome.Cancelled(issued.name))
+            // Could not even be scheduled: the confirming request was never written.
+            done.complete(RemoveOutcome.Refused(issued.name, "the confirming request could not be scheduled"))
         }
     }
 }

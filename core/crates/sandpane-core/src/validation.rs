@@ -27,6 +27,24 @@ pub enum ValidationError {
 
 pub struct Validator;
 
+/// `project.update` description cap (A3a §3.2 item 1), in characters.
+pub const MAX_PROJECT_DESCRIPTION_CHARS: usize = 2000;
+
+/// Project name cap (`project.create` / `project.update`), in characters.
+pub const MAX_PROJECT_NAME_CHARS: usize = 120;
+
+/// Unicode format characters that can hide or reorder displayed text
+/// (review I1): line/paragraph separators (Zl/Zp) and the bidi controls —
+/// LRM/RLM, ALM, the embeddings/overrides U+202A-202E and the isolates
+/// U+2066-2069.
+fn is_spoofing_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}' | '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'
+            ..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// System trees that are never registrable as repositories (security W1).
 /// `/private/var` (macOS temp dirs) is deliberately NOT listed.
 pub const SYSTEM_TREES: &[&str] = &[
@@ -288,8 +306,49 @@ impl Validator {
         Self::branch_name(value)
     }
 
-    /// Project/conversation titles and other human text destined for storage
-    /// (not for CLI args). Rejects only control characters; Unicode allowed.
+    /// A project description (A3a §3.2 item 1), stored, never a CLI arg.
+    /// At most [`MAX_PROJECT_DESCRIPTION_CHARS`] characters; `\n` is the ONLY
+    /// control character allowed (tab, CR, DEL and the C1 range are refused,
+    /// unlike [`Self::display_text`]); line/paragraph separators and bidi
+    /// controls are refused too (review I1); empty is allowed and clears it.
+    pub fn project_description(value: &str) -> Result<&str, ValidationError> {
+        if value.chars().count() > MAX_PROJECT_DESCRIPTION_CHARS {
+            return Err(ValidationError::TooLong {
+                max: MAX_PROJECT_DESCRIPTION_CHARS,
+            });
+        }
+        if let Some(c) = value
+            .chars()
+            .find(|c| (c.is_control() && *c != '\n') || is_spoofing_format_char(*c))
+        {
+            return Err(ValidationError::DisallowedChar { found: c });
+        }
+        Ok(value)
+    }
+
+    /// A project name (`project.create` and `project.update`, review I1):
+    /// non-empty, at most [`MAX_PROJECT_NAME_CHARS`] characters, and NO
+    /// control character at all (every Cc: C0 including `\n` and `\t`, DEL,
+    /// C1), no line/paragraph separator and no bidi control — a name is shown
+    /// on one line in every client and in confirmation dialogs. Names stored
+    /// before this rule are not rewritten.
+    pub fn project_name(value: &str) -> Result<&str, ValidationError> {
+        Self::bounded(value, MAX_PROJECT_NAME_CHARS)?;
+        if let Some(c) = value
+            .chars()
+            .find(|c| c.is_control() || is_spoofing_format_char(*c))
+        {
+            return Err(ValidationError::DisallowedChar { found: c });
+        }
+        Ok(value)
+    }
+
+    /// Conversation titles, message content and other human text destined
+    /// for storage (not for CLI args). Non-empty, at most `max` characters.
+    /// Refuses the C0 controls EXCEPT `\n` and `\t`, and DEL; it does NOT
+    /// refuse C1 controls, line/paragraph separators or bidi controls (use
+    /// [`Self::project_name`] / [`Self::project_description`] where those
+    /// matter). Other Unicode is allowed.
     pub fn display_text(value: &str, max: usize) -> Result<&str, ValidationError> {
         Self::bounded(value, max)?;
         for c in value.chars() {
@@ -630,6 +689,98 @@ mod tests {
         // Short all-hex values are ambiguous abbreviations, not names (W3).
         for short in ["3", "abc", "abc123"] {
             assert!(Validator::git_ref(short).is_err(), "{short}");
+        }
+    }
+
+    /// A3a §3.2 item 1: ≤ 2000 CHARACTERS, newlines allowed, every other
+    /// control character refused (tab, CR, DEL, C1), empty allowed (clears).
+    #[test]
+    fn project_description_allows_newlines_and_empty_refuses_other_controls() {
+        assert_eq!(Validator::project_description("").unwrap(), "");
+        assert!(Validator::project_description("line one\nline two — ü 漢字").is_ok());
+        let max = "é".repeat(MAX_PROJECT_DESCRIPTION_CHARS);
+        assert!(
+            Validator::project_description(&max).is_ok(),
+            "chars, not bytes"
+        );
+        assert!(matches!(
+            Validator::project_description(&format!("{max}x")),
+            Err(ValidationError::TooLong {
+                max: MAX_PROJECT_DESCRIPTION_CHARS
+            })
+        ));
+        for bad in [
+            "a\tb",
+            "a\rb",
+            "a\u{0}b",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{9b}b",
+            "a\u{1b}[31m",
+        ] {
+            assert!(
+                matches!(
+                    Validator::project_description(bad),
+                    Err(ValidationError::DisallowedChar { .. })
+                ),
+                "accepted: {bad:?}"
+            );
+        }
+    }
+
+    /// Review I1: characters that can hide or reorder what a user is shown.
+    const SPOOFING: [char; 13] = [
+        '\u{2028}', '\u{2029}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{202A}', '\u{202B}',
+        '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2069}',
+    ];
+
+    /// Review I1: project names refuse every Cc (newline and tab included),
+    /// C1, line/paragraph separators and bidi controls; ≤ 120 chars, non-empty.
+    #[test]
+    fn project_name_refuses_controls_separators_and_bidi() {
+        assert_eq!(
+            Validator::project_name("Atlas Demo — ü 漢字").unwrap(),
+            "Atlas Demo — ü 漢字"
+        );
+        assert!(Validator::project_name(&"é".repeat(MAX_PROJECT_NAME_CHARS)).is_ok());
+        assert!(matches!(
+            Validator::project_name(&"é".repeat(MAX_PROJECT_NAME_CHARS + 1)),
+            Err(ValidationError::TooLong { .. })
+        ));
+        assert!(matches!(
+            Validator::project_name(""),
+            Err(ValidationError::Empty)
+        ));
+        let mut bad: Vec<String> = ["\n", "\t", "\r", "\u{0}", "\u{7f}", "\u{85}", "\u{9b}"]
+            .iter()
+            .map(|c| format!("a{c}b"))
+            .collect();
+        bad.extend(SPOOFING.iter().map(|c| format!("a{c}b")));
+        bad.push("a\u{2068}b".into()); // FSI, U+2066-2069 range
+        for v in &bad {
+            assert!(
+                matches!(
+                    Validator::project_name(v),
+                    Err(ValidationError::DisallowedChar { .. })
+                ),
+                "accepted: {v:?}"
+            );
+        }
+    }
+
+    /// Review I1: descriptions keep `\n` but also refuse separators and bidi.
+    #[test]
+    fn project_description_refuses_separators_and_bidi() {
+        assert!(Validator::project_description("one\ntwo").is_ok());
+        for c in SPOOFING.iter().chain(['\u{2068}'].iter()) {
+            let v = format!("a{c}b");
+            assert!(
+                matches!(
+                    Validator::project_description(&v),
+                    Err(ValidationError::DisallowedChar { .. })
+                ),
+                "accepted: {v:?}"
+            );
         }
     }
 

@@ -20,20 +20,21 @@ an earlier revision of this README claimed that while the crate did not compile 
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A2 idempotency review-fix pass, 2026-10-10
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A3a project-lifecycle pass, 2026-10-10
 
-Run fresh after the combined A2 client review fixes (W1–W4, I4, I5), on top of the A2
-idempotency-key client work (protocol design 2026-10-09 §3 row A2, §3.1) and the A1 sandbox-lifecycle work and its review fixes. Every row below is a command that was actually run, with its actual
+Run fresh after the A3a project-lifecycle client work (protocol design 2026-10-09 §3.2), against
+the A3a Core + schema in the working tree, on top of the A2 idempotency work and its review fixes
+(W1–W4, I4, I5) and the A1 sandbox-lifecycle work and its review fixes. Every row below is a command that was actually run, with its actual
 result, except where a row says it was not re-run:
 
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **16 files, 429 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm test` (`vitest run`) | OK — **17 files, 484 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
 | `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
 | `cd src-tauri && cargo check --offline` | OK — `Finished dev profile` |
 | `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
-| `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF) |
+| `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 22 and the six A3a project methods are allowlisted, never replay-safe, and on the default 12 s budget except `project.create` / `project.add_repository` at 43 s) |
 | `make desktop-check` (repo root) | OK — runs all of the above except `npm run build`; now includes `cargo fmt --check`, `check`, `clippy`, `test` for `src-tauri` |
 
 **Correction of an earlier claim.** A previous revision of this table reported `cargo check` OK
@@ -95,6 +96,64 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 | FakeCore `features`, `sandbox.create` / `conversation.send` idempotency, `replayed`, CONFLICTs, lost-answer drop | **Modeled** on the `sandpane-service` source (§3.1), **not captured** from a live run |
 | The Retry safely button and replay notices in the wizard and chat | No DOM test (no jsdom); the pure decision functions are tested |
 
+### A3a project lifecycle — what the desktop does, and status
+
+- **Methods.** `METHODS` is the 22 names of `Method::ALL`, in order (drift-tested against the
+  Rust crate and `schemas/rpc-request.schema.json`). The six new ones — `project.update`,
+  `project.archive`, `project.unarchive`, `project.delete`, `project.add_repository`,
+  `project.remove_repository` — are NOT replay-safe (TS `REPLAY_SAFE_METHODS` and the Rust
+  `replay_safe` are unchanged). They use the default deadlines (webview 15 s, proxy 12 s) except
+  `project.add_repository`, which — like `project.create` (a pre-existing gap fixed here) — runs
+  Core's git canonicalization of a path (up to 30 s): webview 45 s, proxy 43 s (drift-tested,
+  proxy ≥ 2 s below the webview).
+- **Gating.** Every control is gated on `system.probe` `methods`, per method: not probed yet →
+  "Core not probed yet"; not advertised → disabled "not supported by this Core" with the reason.
+  "Show archived" is offered only when `project.archive` is advertised; otherwise
+  `project.list` is sent exactly as before (`{}`).
+- **Projects view → Settings** (per row): rename and a multi-line description (only CHANGED
+  fields are sent; validators mirror `Validator::project_name` / `project_description` exactly
+  — characters counted as Rust counts them, drift-tested against `validation.rs` — and also
+  refuse a lone UTF-16 surrogate, which has no UTF-8 form and which Core refuses at the frame); archive /
+  unarchive; repositories list with a two-click "Remove… → Unregister from Core"; "Add a
+  repository" as a **typed absolute path** — the Tauri dialog plugin is not a dependency of this
+  app, so there is no native folder picker; Core validates the path (Git top level, denylist).
+- **Archived.** Rows carry an "archived <instant>" badge. On an archived project the name,
+  description and repository controls are disabled with Core's own reason ("project is archived;
+  unarchive it first; nothing was changed"); Unarchive and Delete stay available. The project
+  workspace reads the project with `includeArchived` (when supported), shows an archived banner,
+  and disables New chat and Send with the same reason. The sandbox wizard lists live projects
+  only (Core's default), so an archived project cannot be picked there; a project archived after
+  the list was read is refused by Core with the honest "Nothing was changed — the project is
+  archived" copy.
+- **Delete** uses the A1 two-step pattern: step 1 sends `{projectId}`; the dialog shows Core's
+  target name + id, impact lines (revealed, capped at 20 with the rest disclosed), and the
+  expiry; Cancel is the default and sends nothing; expiry is re-checked at click time; step 2 is
+  sent once and never retried. A confirmation for another project id, or with
+  `external: true`, is refused. "Deleted" is shown only on `deleted: true`; after it the
+  remembered selection, this window's chats of that project, its cached conversation / task /
+  history reads and its tasks' replay projections in the event store are dropped, and the global
+  task list is re-read. (Replay cursors for the deleted tasks stay in the subscription; Core
+  replays only tasks it still has, so they are ignored.) If step 2's outcome is UNKNOWN, the
+  desktop re-reads `project.list {includeArchived: true}`: when Core no longer lists the project
+  it says exactly that ("Core no longer lists this project", not "deleted by this request") and
+  forgets it locally the same way; if it is still listed, or the read fails, the outcome stays
+  unknown. A step-2 `NOT_FOUND` also forgets it locally.
+- **Honest copy.** Each exact Core refusal (archived, unfinished tasks, sandboxes, create in
+  flight, repository in use, not registered, not found, token rejected) maps to "Nothing was
+  changed / deleted / removed — …" with Core's text shown, matched on code AND text
+  (drift-tested against `project_lifecycle.rs` and `confirm.rs`). A Core `INTERNAL`, a lost
+  answer, or an answer this build cannot read on any of these writes is an UNKNOWN outcome
+  ("re-read the project list") — never "nothing was …". Payloads are never echoed; the token is
+  never logged, displayed or persisted. After every write `project.list` is re-read.
+
+| Item | Status |
+| --- | --- |
+| Wire frames, gating, delete flow, copy, validators, archived UI state | Functional headless: unit-tested against an in-memory FakeCore (`tests/project-lifecycle.test.ts`, 55 tests, incl. SSR markup of the settings panel and the delete dialog). **UNVERIFIED live** — never run against a real A3a Core, never in the running desktop app |
+| FakeCore `project.update` / `archive` / `unarchive` / `delete` / `add_repository` / `remove_repository`, `includeArchived`, faults | **Modeled** on `sandpane-service/src/project_lifecycle.rs` (working tree, §3.2), **not captured** from a live run |
+| Native folder picker for "Add a repository" | **Not implemented — accepted deviation**: `@tauri-apps/plugin-dialog` is not a dependency; a typed path is used and Core validates it |
+| Click handlers, focus, the dialog's countdown in a real webview | No DOM test (no jsdom); the pure controllers and SSR markup are tested |
+| New chat / Send disabled on an archived project (`ChatPanel` `archivedReason`) | The reason string is tested; `ChatPanel` itself cannot be SSR-rendered in this suite (its external-store hooks have no server snapshot), so the disabled buttons are **UNVERIFIED** |
+
 ### Live Core run (earlier evidence — NOT re-run in the review-fix pass)
 
 This section records an earlier run and was not repeated after the fixes above. The prebuilt `core/target/debug/sandpane-service` (built 15:09, never rebuilt or edited here)
@@ -155,6 +214,10 @@ What that run measured (not asserted from prose):
 - `workspaceMode` end-to-end: decoding, clamping and the UNVERIFIED rendering are unit-tested;
   no sandbox with a recorded binding row was read on this host because `sbx` is absent.
 - Native notifications, the native folder picker, installers.
+- **Deviation (A3a, accepted): no native folder picker for "Add a repository".** The design asks
+  for each client's native folder picker; `@tauri-apps/plugin-dialog` is not a dependency of
+  this app, so the path is a typed absolute path that Core validates (Git top level, denylist).
+  Adding the plugin (and its capability) is a separate, reviewed change.
 - Performance targets (idle CPU/memory, 30-chat retention): never measured.
 - **App icon:** `src-tauri/icons/*.png` are minimal generated placeholders created to satisfy
   `tauri::generate_context!`, which refuses to compile without them. Brand artwork is a design
@@ -219,7 +282,8 @@ React view  →  CoreClient (src/lib/core-client.ts)      ← framing, id correl
 - **Wire contract is shared, not re-invented.** `src/lib/protocol.ts` mirrors
   `core/crates/sandpane-protocol` exactly: camelCase payload fields, `snake_case` statuses and
   workspace modes, `SCREAMING_SNAKE_CASE` error codes, `{v,id,…}` frames, the `AgentEvent`
-  tagged union, and the same 16-name `Method` surface as `clients/vscode`. `schemas/*.json` is
+  tagged union, and the 22-name `Method` surface of Rust `Method::ALL` (A3a added six project
+  methods). `schemas/*.json` is
   the third copy; they move together, and `tests/protocol-drift.test.ts` reads the Rust crate and
   the schemas to prove it.
 - **Feature detection, never assumption.** Every additive read is gated on

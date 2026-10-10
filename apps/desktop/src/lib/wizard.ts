@@ -295,17 +295,96 @@ export function reviewWarnings(
 // absolute-path check in `project_create`.
 // ---------------------------------------------------------------------------
 
+/** `MAX_PROJECT_NAME_CHARS` in `sandpane_core::validation` (drift-tested). */
 export const PROJECT_NAME_MAX = 120;
+/** `MAX_PROJECT_DESCRIPTION_CHARS` in `sandpane_core::validation` (drift-tested). */
+export const PROJECT_DESCRIPTION_MAX = 2000;
 
+/** Rust `char::is_control()`: general category Cc (C0, DEL, C1). */
+function isRustControl(codePoint: number): boolean {
+  return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+}
+
+/**
+ * `is_spoofing_format_char` in `sandpane_core::validation`: line/paragraph
+ * separators, LRM/RLM, ALM, the bidi embeddings/overrides and the isolates.
+ */
+export function isSpoofingFormatChar(codePoint: number): boolean {
+  return (
+    codePoint === 0x2028 ||
+    codePoint === 0x2029 ||
+    codePoint === 0x200e ||
+    codePoint === 0x200f ||
+    codePoint === 0x061c ||
+    (codePoint >= 0x202a && codePoint <= 0x202e) ||
+    (codePoint >= 0x2066 && codePoint <= 0x2069)
+  );
+}
+
+/**
+ * A lone UTF-16 surrogate (`Array.from` yields it as its own element). It has
+ * no UTF-8 encoding, so the frame cannot carry it as typed and Core refuses
+ * the request; refusing it here keeps the user's text from being silently
+ * altered. A proper pair is one character and is never matched.
+ */
+function isLoneSurrogate(codePoint: number): boolean {
+  return codePoint >= 0xd800 && codePoint <= 0xdfff;
+}
+
+function codePointLabel(codePoint: number): string {
+  return `U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+/**
+ * `Validator::project_name` (`project.create` and `project.update`), exactly:
+ * non-empty, at most 120 CHARACTERS (Unicode scalar values, as Rust counts —
+ * not UTF-16 units), no control character at all (every Cc including `\n` and
+ * `\t`, DEL, C1) and no line/paragraph separator or bidi control. The refusal
+ * names the code point; it never echoes the character itself.
+ */
 export function validateProjectName(name: string): string | null {
   if (name.length === 0) return "Project name is required.";
-  if (name.length > PROJECT_NAME_MAX) {
+  const chars = Array.from(name);
+  if (chars.length > PROJECT_NAME_MAX) {
     return `Project name must be at most ${PROJECT_NAME_MAX} characters.`;
   }
-  // Control characters other than \n and \t are rejected by Core.
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(name)) {
-    return "Project name contains control characters.";
+  for (const ch of chars) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (isLoneSurrogate(code)) {
+      return `Project name contains an unpaired surrogate (${codePointLabel(code)}), which is not valid text.`;
+    }
+    if (isRustControl(code)) {
+      return `Project name contains a control character (${codePointLabel(code)}); names are one line.`;
+    }
+    if (isSpoofingFormatChar(code)) {
+      return `Project name contains a hidden or direction-changing character (${codePointLabel(code)}).`;
+    }
+  }
+  return null;
+}
+
+/**
+ * `Validator::project_description`, exactly: at most 2000 characters; `\n` is
+ * the ONLY control character allowed (tab, CR, DEL and C1 are refused); line/
+ * paragraph separators and bidi controls are refused; empty is allowed and
+ * clears the description.
+ */
+export function validateProjectDescription(description: string): string | null {
+  const chars = Array.from(description);
+  if (chars.length > PROJECT_DESCRIPTION_MAX) {
+    return `Description must be at most ${PROJECT_DESCRIPTION_MAX} characters.`;
+  }
+  for (const ch of chars) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (isLoneSurrogate(code)) {
+      return `Description contains an unpaired surrogate (${codePointLabel(code)}), which is not valid text.`;
+    }
+    if (isRustControl(code) && code !== 0x0a) {
+      return `Description contains a control character (${codePointLabel(code)}); only line breaks are allowed.`;
+    }
+    if (isSpoofingFormatChar(code)) {
+      return `Description contains a hidden or direction-changing character (${codePointLabel(code)}).`;
+    }
   }
   return null;
 }

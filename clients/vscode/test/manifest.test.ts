@@ -23,3 +23,30 @@ describe('workspace-proof settings (W4)', () => {
     expect(settings[key]?.scope).toBe('machine');
   });
 });
+
+describe('contributed commands match the registered ones', () => {
+  const contributed = (
+    JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')) as {
+      contributes: { commands: Array<{ command: string }> };
+    }
+  ).contributes.commands.map((c) => c.command);
+  const extension = readFileSync(join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
+  const registered = [...extension.matchAll(/registerCommand\('(sandpane\.[A-Za-z]+)'/g)].map((m) => m[1]);
+
+  it('every contributed command is registered and vice versa (20, incl. the 8 A3a project commands)', () => {
+    expect([...contributed].sort()).toEqual([...registered].sort());
+    expect(contributed).toHaveLength(20);
+    for (const id of [
+      'sandpane.renameProject',
+      'sandpane.editProjectDescription',
+      'sandpane.archiveProject',
+      'sandpane.unarchiveProject',
+      'sandpane.toggleArchivedProjects',
+      'sandpane.addRepository',
+      'sandpane.removeRepository',
+      'sandpane.deleteProject',
+    ]) {
+      expect(contributed).toContain(id);
+    }
+  });
+});

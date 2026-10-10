@@ -96,7 +96,9 @@
          Apply Task (confirmed Git operation), Stop Sandbox (explicit pick; not destructive) and
          Remove Sandbox (Core's two-step server-side confirmation token, design 2026-10-09 §2).
          Stop/Remove are gated on system.probe advertising the method. Start Sandbox sends
-         nothing: sbx v0.47 has no start, so it only explains the unsupported state. -->
+         nothing: sbx v0.47 has no start, so it only explains the unsupported state. The A3a
+         project actions (edit, archive/unarchive, repositories, two-step delete) follow the
+         same rules. -->
     <actions>
         <group id="labs.dkv.sandpane.Toolwindow"
                text="Sandpane"
@@ -139,6 +141,44 @@
                     class="labs.dkv.sandpane.actions.StartSandboxAction"
                     text="Sandpane: Start Sandbox (not supported)"
                     description="Start: not supported by sbx v0.47 (use `sbx run --name &lt;name&gt;` in a terminal)"/>
+
+            <!-- A3a project lifecycle: each gated on system.probe advertising its method; every
+                 mutation re-reads project.list; Delete uses Core's two-step confirmation. -->
+            <separator/>
+            <action id="labs.dkv.sandpane.EditProject"
+                    class="labs.dkv.sandpane.actions.EditProjectAction"
+                    text="Sandpane: Edit Project…"
+                    description="Rename a Core project or edit its description"/>
+
+            <action id="labs.dkv.sandpane.ArchiveProject"
+                    class="labs.dkv.sandpane.actions.ArchiveProjectAction"
+                    text="Sandpane: Archive Project…"
+                    description="Archive a Core project (reversible; Core then refuses new work on it)"/>
+
+            <action id="labs.dkv.sandpane.UnarchiveProject"
+                    class="labs.dkv.sandpane.actions.UnarchiveProjectAction"
+                    text="Sandpane: Unarchive Project…"
+                    description="Return an archived Core project to the live list"/>
+
+            <action id="labs.dkv.sandpane.ShowArchivedProjects"
+                    class="labs.dkv.sandpane.actions.ShowArchivedProjectsAction"
+                    text="Sandpane: Show Archived Projects"
+                    description="Also list archived projects, labeled [archived]"/>
+
+            <action id="labs.dkv.sandpane.AddRepository"
+                    class="labs.dkv.sandpane.actions.AddRepositoryAction"
+                    text="Sandpane: Add Repository…"
+                    description="Register a Git folder with a Core project"/>
+
+            <action id="labs.dkv.sandpane.RemoveRepository"
+                    class="labs.dkv.sandpane.actions.RemoveRepositoryAction"
+                    text="Sandpane: Remove Repository…"
+                    description="Unregister a folder from a Core project (no file is touched)"/>
+
+            <action id="labs.dkv.sandpane.DeleteProject"
+                    class="labs.dkv.sandpane.actions.DeleteProjectAction"
+                    text="Sandpane: Delete Project…"
+                    description="Delete a Core project after Core's own confirmation (host files, branches and sandboxes are not touched)"/>
         </group>
     </actions>
 </idea-plugin>

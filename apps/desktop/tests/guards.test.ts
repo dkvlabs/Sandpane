@@ -61,7 +61,7 @@ describe("scoping ids mirror Core's validate_scoping_id", () => {
     expect(() => validateScopingId("a\u0000b", "conversationId")).toThrow(
       "contains a disallowed control character",
     );
-    expect(() => validateScopingId("ab", "conversationId")).toThrow("U+007f");
+    expect(() => validateScopingId("a\u007Fb", "conversationId")).toThrow("U+007f");
     expect(() => validateScopingId("a\nb", "conversationId")).not.toThrow();
     expect(() => validateScopingId("a\tb", "conversationId")).not.toThrow();
   });

@@ -57,6 +57,38 @@
         "title": "Sandpane: New Project"
       },
       {
+        "command": "sandpane.renameProject",
+        "title": "Sandpane: Rename Project"
+      },
+      {
+        "command": "sandpane.editProjectDescription",
+        "title": "Sandpane: Edit Project Description"
+      },
+      {
+        "command": "sandpane.archiveProject",
+        "title": "Sandpane: Archive Project"
+      },
+      {
+        "command": "sandpane.unarchiveProject",
+        "title": "Sandpane: Unarchive Project"
+      },
+      {
+        "command": "sandpane.toggleArchivedProjects",
+        "title": "Sandpane: Show / Hide Archived Projects"
+      },
+      {
+        "command": "sandpane.addRepository",
+        "title": "Sandpane: Add Repository to Project"
+      },
+      {
+        "command": "sandpane.removeRepository",
+        "title": "Sandpane: Remove Repository from Project"
+      },
+      {
+        "command": "sandpane.deleteProject",
+        "title": "Sandpane: Delete Project"
+      },
+      {
         "command": "sandpane.newSandbox",
         "title": "Sandpane: New Sandbox"
       },

@@ -139,8 +139,8 @@ async function main() {
 
   // ---- method advertisement (the discovery revision) --------------------
   check(
-    'system.probe advertises exactly the 16 methods the client allowlists',
-    Array.isArray(caps.methods) && caps.methods.length === 16 && caps.methods.join(',') === CORE_METHODS.join(','),
+    'system.probe advertises exactly the 22 methods the client allowlists',
+    Array.isArray(caps.methods) && caps.methods.length === 22 && caps.methods.join(',') === CORE_METHODS.join(','),
     (caps.methods ?? []).join(','),
   );
   const schemaMethods = JSON.parse(
@@ -167,6 +167,14 @@ async function main() {
       coreAdvertisesMethod(caps, 'sandbox.remove') &&
       !(caps.methods ?? []).includes('sandbox.start'),
     (caps.methods ?? []).filter((m) => m.startsWith('sandbox.')).join(','),
+  );
+  // A3a: advertisement only here; this harness does not exercise the project
+  // lifecycle calls (they would need their own temp-DB scenario).
+  check(
+    'A3a: Core advertises the six project lifecycle methods',
+    ['project.update', 'project.archive', 'project.unarchive', 'project.delete', 'project.add_repository', 'project.remove_repository']
+      .every((m) => coreAdvertisesMethod(caps, m)),
+    (caps.methods ?? []).filter((m) => m.startsWith('project.')).join(','),
   );
   // A2: advertisement only. This harness never sends a keyed sandbox.create
   // (it would drive the real sbx); keyed sends are not exercised here either.

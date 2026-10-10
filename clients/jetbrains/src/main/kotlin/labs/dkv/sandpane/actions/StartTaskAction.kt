@@ -32,10 +32,19 @@ object ActionIds {
     const val STOP_SANDBOX = "labs.dkv.sandpane.StopSandbox"
     const val REMOVE_SANDBOX = "labs.dkv.sandpane.RemoveSandbox"
     const val START_SANDBOX = "labs.dkv.sandpane.StartSandbox"
+    const val EDIT_PROJECT = "labs.dkv.sandpane.EditProject"
+    const val ARCHIVE_PROJECT = "labs.dkv.sandpane.ArchiveProject"
+    const val UNARCHIVE_PROJECT = "labs.dkv.sandpane.UnarchiveProject"
+    const val SHOW_ARCHIVED_PROJECTS = "labs.dkv.sandpane.ShowArchivedProjects"
+    const val ADD_REPOSITORY = "labs.dkv.sandpane.AddRepository"
+    const val REMOVE_REPOSITORY = "labs.dkv.sandpane.RemoveRepository"
+    const val DELETE_PROJECT = "labs.dkv.sandpane.DeleteProject"
 
     val ALL: List<String> = listOf(
         START_TASK, REVIEW_CHANGES, APPLY_TASK, REFRESH_SANDBOXES,
         STOP_SANDBOX, REMOVE_SANDBOX, START_SANDBOX,
+        EDIT_PROJECT, ARCHIVE_PROJECT, UNARCHIVE_PROJECT, SHOW_ARCHIVED_PROJECTS,
+        ADD_REPOSITORY, REMOVE_REPOSITORY, DELETE_PROJECT,
     )
 }
 
@@ -215,7 +224,9 @@ class StartTaskAction : AnAction() {
                     "Sandpane: task creation is not wired up in this build",
                     "Resolved '${VisibleText.reveal(association.matchedRepository)}' to Core project " +
                         "'${VisibleText.reveal(association.project.name)}' " +
-                        "(${VisibleText.reveal(association.project.id)}) — that mapping is " +
+                        "(${VisibleText.reveal(association.project.id)})" +
+                        (if (association.project.isArchived) " — an ARCHIVED project, on which Core refuses new work until it is unarchived" else "") +
+                        " — that mapping is " +
                         "Core's own, not a guess. Stopping here is this plugin's decision: the " +
                         "editor-side `conversation.send` path is JB3 work and is unimplemented, so " +
                         "nothing was sent and no conversation id is invented.\n\n$JB3_GAP_MESSAGE",

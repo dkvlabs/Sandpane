@@ -28,6 +28,15 @@ import {
 } from "./core-client";
 import { TaskEventStore } from "./event-store";
 import {
+  ProjectDeletionFlow,
+  forgetProjectLocally,
+  projectCacheIds,
+  projectLifecycleGates,
+  type DeletionState,
+  type ProjectLifecycleGates,
+} from "./project-lifecycle";
+import { uiPreferences } from "../stores/ui";
+import {
   KeyedWrite,
   keyRecheckFromProbe,
   type KeyedWriteState,
@@ -43,6 +52,7 @@ import {
 } from "./sandbox-lifecycle";
 import {
   addConversation,
+  forgetProjectConversations,
   listConversations,
   subscribeConversations,
 } from "./conversation-store";
@@ -50,7 +60,6 @@ import {
   decodeApplyResult,
   decodeConversation,
   decodeProject,
-  decodeProjects,
 } from "./decode";
 import {
   foldCoreLink,
@@ -174,15 +183,18 @@ export function capabilitiesOf(link: CoreLinkState) {
 // Reads
 // ---------------------------------------------------------------------------
 
-export function useProjects(): {
+export function useProjects(options: { includeArchived?: boolean } = {}): {
   projects: Project[];
   isLoading: boolean;
   error: CoreRequestError | null;
 } {
   const deps = useDeps();
+  const includeArchived = options.includeArchived === true;
   const query = useQuery<Project[]>({
-    queryKey: queryKeys.projects,
-    queryFn: async () => decodeProjects(await deps.client.listProjects()),
+    // The live-only key is unchanged; the archived read is a child key, so
+    // invalidating `queryKeys.projects` re-reads both.
+    queryKey: includeArchived ? [...queryKeys.projects, "with-archived"] : queryKeys.projects,
+    queryFn: () => deps.client.listProjectRows(includeArchived),
     enabled: deps.transportAvailable,
     refetchInterval: 20_000,
     staleTime: 5_000,
@@ -724,4 +736,100 @@ export function statusOf(
 ): TaskStatus | undefined {
   if (projection === null || projection.status === null) return undefined;
   return projection.status === "unknown" ? undefined : projection.status;
+}
+
+// ---------------------------------------------------------------------------
+// A3a project lifecycle
+// ---------------------------------------------------------------------------
+
+/** Every A3a action's gate, folded from the probe (`unprobed` ≠ `unsupported`). */
+export function useProjectLifecycleGates(): ProjectLifecycleGates {
+  const link = useCoreLink();
+  return projectLifecycleGates(capabilitiesOf(link));
+}
+
+/** One A3a project write (each is one RPC answering a `Project`). */
+export type ProjectAction =
+  | { kind: "update"; projectId: string; changes: { name?: string; description?: string } }
+  | { kind: "archive"; projectId: string }
+  | { kind: "unarchive"; projectId: string }
+  | { kind: "add_repository"; projectId: string; path: string }
+  | { kind: "remove_repository"; projectId: string; path: string };
+
+/**
+ * Project writes. Never retried (none is replay-safe). The project list is
+ * re-read on SETTLED — success or failure — because a lost answer may still
+ * have been applied; the UI never patches the list locally.
+ */
+export function useProjectAction() {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  return useMutation<Project, CoreRequestError, ProjectAction>({
+    mutationFn: (action) => {
+      switch (action.kind) {
+        case "update":
+          return deps.client.updateProject(action.projectId, action.changes);
+        case "archive":
+          return deps.client.archiveProject(action.projectId);
+        case "unarchive":
+          return deps.client.unarchiveProject(action.projectId);
+        case "add_repository":
+          return deps.client.addProjectRepository(action.projectId, action.path);
+        case "remove_repository":
+          return deps.client.removeProjectRepository(action.projectId, action.path);
+      }
+    },
+    retry: false,
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.projects });
+    },
+  });
+}
+
+/**
+ * The two-step `project.delete` flow. Re-reads the project list after every
+ * exchange; on `deleted: true` only, forgets the project locally (remembered
+ * selection, this window's chats of it, its cached reads).
+ */
+export function useProjectDeletionFlow(): { flow: ProjectDeletionFlow; state: DeletionState } {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  const ref = useRef<ProjectDeletionFlow | null>(null);
+  if (ref.current === null) {
+    const forget = (projectId: string) =>
+      forgetProjectLocally(projectId, {
+        lastProjectId: () => uiPreferences.get().lastProjectId,
+        clearLastProjectId: () => uiPreferences.set({ lastProjectId: null }),
+        forgetConversations: forgetProjectConversations,
+        dropCachedReads: (id) => {
+          const { conversationIds, taskIds } = projectCacheIds(id, {
+            conversations: qc.getQueryData(queryKeys.conversations(id)),
+            sessionConversations: listConversations(),
+            projectTasks: qc.getQueryData(queryKeys.coreTasks(id)),
+            allTasks: qc.getQueryData(queryKeys.coreTasks(null)),
+          });
+          for (const conversationId of conversationIds) {
+            qc.removeQueries({ queryKey: queryKeys.history(conversationId) });
+          }
+          deps.store.forgetTasks(taskIds);
+          qc.removeQueries({ queryKey: queryKeys.conversations(id) });
+          qc.removeQueries({ queryKey: queryKeys.coreTasks(id) });
+          // The global task list still names the deleted tasks: re-read it.
+          void qc.invalidateQueries({ queryKey: queryKeys.coreTasks(null) });
+        },
+      });
+    ref.current = new ProjectDeletionFlow(deps.client, {
+      onSettled: () => {
+        void qc.invalidateQueries({ queryKey: queryKeys.projects });
+      },
+      onDeleted: forget,
+      onGone: forget,
+      // `project.delete` exists only on an A3a Core, which accepts includeArchived.
+      recheckListed: async (projectId) =>
+        (await deps.client.listProjectRows(true)).some((p) => p.id === projectId),
+    });
+  }
+  const flow = ref.current;
+  const state = useSyncExternalStore(flow.subscribe, flow.getState);
+  return { flow, state };
 }

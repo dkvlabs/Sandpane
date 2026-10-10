@@ -1,5 +1,6 @@
 package labs.dkv.sandpane.core
 
+import labs.dkv.sandpane.model.CoreErrorCodes
 import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.ConversationHistoryResult
 import labs.dkv.sandpane.model.DEFAULT_LIST_LIMIT
@@ -84,6 +85,7 @@ class ProtocolDriftGuardTest {
     private val service by lazy { read("core/crates/sandpane-service/src/lib.rs") }
     private val validation by lazy { read("core/crates/sandpane-core/src/validation.rs") }
     private val confirm by lazy { read("core/crates/sandpane-service/src/confirm.rs") }
+    private val projectLifecycle by lazy { read("core/crates/sandpane-service/src/project_lifecycle.rs") }
     private val requestSchema by lazy { read("schemas/rpc-request.schema.json") }
     private val capabilitiesSchema by lazy { read("schemas/core-capabilities.schema.json") }
     private val sandboxSpecSchema by lazy { read("schemas/sandbox-create-spec.schema.json") }
@@ -117,7 +119,7 @@ class ProtocolDriftGuardTest {
 
     /** `"a.b" =>` arms of `Method::parse`. */
     private fun parseArms(): List<String> =
-        Regex(""""([a-z]+\.[a-z]+)" =>""").findAll(rust).map { it.groupValues[1] }.toList()
+        Regex(""""([a-z][a-z_]*\.[a-z][a-z_]*)" =>""").findAll(rust).map { it.groupValues[1] }.toList()
 
     /** `pub const NAME: <type> = <expr>;` from the service crate (raw right-hand side). */
     private fun serviceConst(name: String): String {
@@ -203,7 +205,7 @@ class ProtocolDriftGuardTest {
     fun kotlinMethodsMatchRustMethodAllExactlyIncludingOrder() {
         val fromAll = methodAllWireNames()
         assertEquals(CoreMethods.ALL, fromAll, "CoreMethods.ALL drifted from Method::ALL (order included)")
-        assertEquals(16, fromAll.size, "addition A1 advertises 16 methods")
+        assertEquals(22, fromAll.size, "addition A3a advertises 22 methods")
 
         // parse() must accept every advertised name, and the schema enum must carry the same set.
         val parsed = parseArms().toSet()
@@ -217,7 +219,11 @@ class ProtocolDriftGuardTest {
 
         // A rename must break THIS test, not ship silently: the names the plugin sends are taken
         // from the same list Core dispatches, and no invented name is ever allowlisted.
-        listOf("task.list", "conversation.list", "conversation.history", "sandbox.stop", "sandbox.remove").forEach { added ->
+        listOf(
+            "task.list", "conversation.list", "conversation.history", "sandbox.stop", "sandbox.remove",
+            "project.update", "project.archive", "project.unarchive", "project.delete",
+            "project.add_repository", "project.remove_repository",
+        ).forEach { added ->
             assertTrue(fromAll.contains(added), "Rust no longer advertises $added")
             assertTrue(CoreMethods.ALL.contains(added), "the Kotlin mirror dropped $added")
             assertTrue(rust.contains("=> \"$added\""), "as_str has no arm for $added")
@@ -233,7 +239,7 @@ class ProtocolDriftGuardTest {
     @Test
     fun methodAdvertisementIsDerivedNotHandWritten() {
         assertTrue(
-            rust.contains("pub const ALL: [Method; 16]"),
+            rust.contains("pub const ALL: [Method; 22]"),
             "Method::ALL's declared length changed — update CoreMethods.ALL and this gate",
         )
         assertTrue(
@@ -314,6 +320,10 @@ class ProtocolDriftGuardTest {
             "pub messages: Vec<MessageRecord>" to "messages",
             "pub statuses: Vec<TaskStatus>" to "statuses",
             "pub limit: Option<u32>" to "limit",
+            // A3a
+            "pub archived_at: Option<String>" to "@SerialName(\"archivedAt\")",
+            "pub include_archived: Option<bool>" to "@SerialName(\"includeArchived\")",
+            "pub deleted: Option<bool>" to "val deleted: Boolean? = null",
             // A1
             "pub agent: Option<String>" to "val agent: String? = null",
             "pub confirm_token: Option<String>" to "confirmToken",
@@ -340,6 +350,12 @@ class ProtocolDriftGuardTest {
             "pub struct SandboxRemoveResult",
             "pub struct ConfirmationRequest",
             "pub struct ConfirmationTarget",
+            "pub struct ProjectListParams",
+            "pub struct ProjectUpdateParams",
+            "pub struct ProjectIdParams",
+            "pub struct ProjectDeleteParams",
+            "pub struct ProjectDeleteResult",
+            "pub struct ProjectRepositoryParams",
         )) {
             assertTrue(rust.contains(struct), "Rust no longer defines $struct")
         }
@@ -534,6 +550,139 @@ class ProtocolDriftGuardTest {
         val mutation = secs("MUTATION") * 1000
         assertTrue(MethodDeadlines.SANDBOX_STOP_MS > mutation + query, "stop floor no longer outlasts Core")
         assertTrue(MethodDeadlines.SANDBOX_REMOVE_MS > query + mutation + query, "remove floor no longer outlasts Core")
+        // A3a: add_repository runs one QUERY-class `git rev-parse --show-toplevel` before its DB write.
+        assertTrue(MethodDeadlines.PROJECT_ADD_REPOSITORY_MS > query, "add_repository floor no longer outlasts Core's git query")
+        assertTrue(
+            Regex("""pub fn show_toplevel[\s\S]{0,120}self\.run\(""").containsMatchIn(read("core/crates/sandpane-core/src/git.rs")),
+            "show_toplevel no longer goes through the QUERY-bounded runner",
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // A3a: project lifecycle — exact messages, validators, wire shapes
+    // ------------------------------------------------------------------
+
+    /** Every exact message the client words is Core's constant, byte for byte. */
+    @Test
+    fun projectLifecycleMessagesMatchCore() {
+        val pairs = listOf(
+            "MSG_PROJECT_ARCHIVED" to ProjectOutcomes.MSG_PROJECT_ARCHIVED,
+            "MSG_PROJECT_HAS_TASKS" to ProjectOutcomes.MSG_PROJECT_HAS_TASKS,
+            "MSG_PROJECT_HAS_SANDBOXES" to ProjectOutcomes.MSG_PROJECT_HAS_SANDBOXES,
+            "MSG_REPOSITORY_IN_USE" to ProjectOutcomes.MSG_REPOSITORY_IN_USE,
+            "MSG_PROJECT_CREATE_IN_FLIGHT" to ProjectOutcomes.MSG_PROJECT_CREATE_IN_FLIGHT,
+            "MSG_REPOSITORY_REMOVE_WHILE_CREATING" to ProjectOutcomes.MSG_REPOSITORY_REMOVE_WHILE_CREATING,
+            "MSG_REPOSITORY_UNREGISTERED_DURING_CREATE" to ProjectOutcomes.MSG_REPOSITORY_UNREGISTERED_DURING_CREATE,
+            "MSG_PROJECT_NOT_FOUND" to ProjectOutcomes.MSG_PROJECT_NOT_FOUND,
+            "MSG_REPOSITORY_NOT_REGISTERED" to ProjectOutcomes.MSG_REPOSITORY_NOT_REGISTERED,
+            "MSG_UPDATE_NEEDS_A_FIELD" to ProjectOutcomes.MSG_UPDATE_NEEDS_A_FIELD,
+        )
+        for ((name, kotlin) in pairs) {
+            assertEquals(rustStringConst(projectLifecycle, name), kotlin, "$name drifted from project_lifecycle.rs")
+        }
+        assertEquals(pairs.map { it.second }.toSet(), ProjectOutcomes.KNOWN_MESSAGES, "a worded message is not drift-checked")
+        // Every `pub const MSG_*` Core declares there is mirrored (a new refusal must not ship unworded).
+        val rustNames = Regex("""pub const (MSG_[A-Z_]+): &str""").findAll(projectLifecycle).map { it.groupValues[1] }.toSet()
+        assertEquals(pairs.map { it.first }.toSet(), rustNames, "project_lifecycle.rs gained or lost a message const")
+        assertEquals(rustStringConst(projectLifecycle, "PROJECT_DELETE_ACTION"), CoreMethods.PROJECT_DELETE)
+        // The step-2 token rejection is A1's message (confirm.rs) and still starts with the matched prefix.
+        assertTrue(
+            rustStringConst(confirm, "TOKEN_REJECTED_MESSAGE").startsWith(CoreRemoveRefusals.TOKEN_REJECTED_PREFIX),
+            "Core's token-rejection text no longer starts with the matched prefix",
+        )
+        // The code the client pairs with each message (ProjectOutcomes matches code AND text) is the one
+        // Core raises it under — read from every use site, so a wrong pairing cannot silently drop the copy.
+        val expectedCode = mapOf(
+            "MSG_PROJECT_ARCHIVED" to "ValidationFailed",
+            "MSG_REPOSITORY_IN_USE" to "Conflict",
+            "MSG_REPOSITORY_REMOVE_WHILE_CREATING" to "Conflict",
+            "MSG_REPOSITORY_UNREGISTERED_DURING_CREATE" to "Conflict",
+            "MSG_REPOSITORY_NOT_REGISTERED" to "NotFound",
+            "MSG_UPDATE_NEEDS_A_FIELD" to "ValidationFailed",
+        )
+        val sources = listOf(projectLifecycle, service)
+        for ((const, code) in expectedCode) {
+            val sites = sources.flatMap { src -> Regex("""\b$const\.to_string\(\)""").findAll(src).map { src to it.range.first }.toList() }
+            assertTrue(sites.isNotEmpty(), "$const is never raised")
+            for ((src, at) in sites) {
+                val before = src.substring(maxOf(0, at - 150), at)
+                assertTrue(before.contains("ErrorCode::$code"), "$const is raised without ErrorCode::$code nearby: …${before.takeLast(80)}")
+            }
+            val known = ProjectOutcomes.describeFailure(CoreMethods.PROJECT_UPDATE, CoreRpcException(wireCode(code), rustStringConst(projectLifecycle, const)), true)
+            assertTrue(known.body.contains("nothing was"), "the client does not word $const under ${wireCode(code)}")
+        }
+        // The three delete blockers come back from delete_blocker() and are raised through conflict().
+        val blocker = Regex("""fn delete_blocker\([\s\S]*?\n\}""").find(projectLifecycle)?.value ?: fail("delete_blocker not found")
+        for (const in listOf("MSG_PROJECT_HAS_TASKS", "MSG_PROJECT_HAS_SANDBOXES", "MSG_PROJECT_CREATE_IN_FLIGHT")) {
+            assertTrue(blocker.contains("return Ok(Some($const))"), "$const is no longer a delete blocker")
+            val known = ProjectOutcomes.describeFailure(CoreMethods.PROJECT_DELETE, CoreRpcException(CoreErrorCodes.CONFLICT, rustStringConst(projectLifecycle, const)), true)
+            assertTrue(known.body.contains("nothing was deleted"), const)
+        }
+        assertEquals(2, Regex("""delete_blocker\(inner, [^\n]*\)\? \{\s*return Err\(conflict\(m\)\);""").findAll(projectLifecycle).count(), "a delete blocker is no longer raised as conflict(m)")
+        assertTrue(Regex("""fn conflict\([^)]*\)[^{]*\{[\s\S]{0,120}ErrorCode::Conflict""").containsMatchIn(projectLifecycle), "conflict() no longer raises CONFLICT")
+        assertTrue(Regex("""fn not_found\(\)[\s\S]{0,160}ErrorCode::NotFound[\s\S]{0,80}MSG_PROJECT_NOT_FOUND""").containsMatchIn(projectLifecycle))
+    }
+
+    private fun wireCode(rustVariant: String): String = when (rustVariant) {
+        "ValidationFailed" -> CoreErrorCodes.VALIDATION_FAILED
+        "Conflict" -> CoreErrorCodes.CONFLICT
+        "NotFound" -> CoreErrorCodes.NOT_FOUND
+        else -> fail("unmapped ErrorCode::$rustVariant")
+    }
+
+    /** `Validator::project_name` / `project_description` mirrored exactly (never stricter, never looser). */
+    @Test
+    fun projectValidatorsMirrorCoreExactly() {
+        fun usizeConst(name: String): Int =
+            Regex("""pub const $name: usize = (\d+);""").find(validation)?.groupValues?.get(1)?.toInt()
+                ?: fail("validation.rs has no `pub const $name: usize`")
+        assertEquals(usizeConst("MAX_PROJECT_NAME_CHARS"), ProjectGuards.MAX_NAME_CHARS)
+        assertEquals(usizeConst("MAX_PROJECT_DESCRIPTION_CHARS"), ProjectGuards.MAX_DESCRIPTION_CHARS)
+
+        val name = Regex("""pub fn project_name\(value: &str\)[\s\S]*?\n    \}""").find(validation)?.value
+            ?: fail("Validator::project_name not found")
+        assertTrue(name.contains("Self::bounded(value, MAX_PROJECT_NAME_CHARS)?"), "project_name's bound changed")
+        assertTrue(name.contains(".find(|c| c.is_control() || is_spoofing_format_char(*c))"), "project_name's char rule changed")
+        assertFalse(name.contains("trim"), "Core started trimming names — the client must follow")
+        val bounded = Regex("""fn bounded\(value: &str, max: usize\)[\s\S]*?\n    \}""").find(validation)?.value
+            ?: fail("Validator::bounded not found")
+        assertTrue(bounded.contains("value.is_empty()") && bounded.contains("value.chars().count() > max"), "bounded() changed")
+
+        val desc = Regex("""pub fn project_description\(value: &str\)[\s\S]*?\n    \}""").find(validation)?.value
+            ?: fail("Validator::project_description not found")
+        assertTrue(desc.contains("value.chars().count() > MAX_PROJECT_DESCRIPTION_CHARS"), "project_description's bound changed")
+        assertTrue(
+            desc.contains(".find(|c| (c.is_control() && *c != '\\n') || is_spoofing_format_char(*c))"),
+            "project_description's char rule changed",
+        )
+        assertFalse(desc.contains("is_empty"), "Core started refusing an empty description — the client must follow")
+
+        // is_spoofing_format_char: parse Core's exact set and compare over the whole BMP.
+        val spoof = Regex("""fn is_spoofing_format_char\(c: char\) -> bool \{([\s\S]*?)\n\}""").find(validation)?.groupValues?.get(1)
+            ?: fail("is_spoofing_format_char not found")
+        val rustSet = HashSet<Int>()
+        Regex("""'\\u\{([0-9A-Fa-f]+)\}'(\s*\.\.=\s*'\\u\{([0-9A-Fa-f]+)\}')?""").findAll(spoof).forEach { m ->
+            val lo = m.groupValues[1].toInt(16)
+            val hi = m.groupValues[3].takeIf { it.isNotEmpty() }?.toInt(16) ?: lo
+            (lo..hi).forEach { rustSet += it }
+        }
+        assertEquals(14, rustSet.size, "Core's spoofing set changed size: ${rustSet.sorted().map { "%04X".format(it) }}")
+        for (cp in 0..0xFFFF) {
+            assertEquals(rustSet.contains(cp), ProjectGuards.isSpoofingFormatChar(cp), "U+%04X".format(cp))
+        }
+    }
+
+    /** A3a wire shapes: Kotlin encodes the same camelCase keys Rust (rename_all) expects. */
+    @Test
+    fun projectLifecycleParamsUseCoresWireNames() {
+        assertTrue(Regex("""rename_all = "camelCase"\)\]\s*pub struct ProjectListParams \{\s*#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\s*pub include_archived""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ProjectUpdateParams \{\s*pub project_id: String,""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ProjectDeleteParams \{\s*pub project_id: String,[\s\S]{0,120}pub confirm_token: Option<String>""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ProjectRepositoryParams \{\s*pub project_id: String,\s*pub path: String,""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ProjectIdParams \{\s*pub project_id: String,\s*\}""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ProjectDeleteResult \{[\s\S]{0,120}pub confirmation: Option<ConfirmationRequest>,[\s\S]{0,120}pub deleted: Option<bool>""").containsMatchIn(rust))
+        // includeArchived defaults to live-only: absent/false keep today's behaviour.
+        assertTrue(rust.contains("self.include_archived.unwrap_or(false)"))
     }
 
     /** A2: the features this build knows equal Rust `FEATURES` and the schema's `items.examples`. */

@@ -8,8 +8,8 @@ import com.intellij.openapi.components.Storage
 /**
  * Client-side UI settings ONLY (docs/specs/04 §2).
  *
- * Deliberately absent: selected project / selected conversation / task state. Those are
- * shared multi-client state; they live in Sandpane Core (`client_state`, `projects`,
+ * Deliberately absent: selected project / selected conversation / task state — and therefore
+ * any per-project entry a deleted project could leave behind (A3a). Those are shared multi-client state; they live in Sandpane Core (`client_state`, `projects`,
  * `conversations`, `tasks`) and this plugin re-reads them, so two IDE windows and VS Code
  * cannot drift apart (AGENTS.md rule 2: no authoritative client-side database).
  *
@@ -49,6 +49,13 @@ class SandpaneSettings : PersistentStateComponent<SandpaneSettings.State> {
          * does the clamp that reads this value.
          */
         var maxContentBytes: Int = DEFAULT_MAX_CONTENT_BYTES
+
+        /**
+         * A3a view setting: also list ARCHIVED projects (`project.list {includeArchived:true}`), each
+         * labeled archived. Only honoured when the connected Core advertises `project.archive`; a
+         * pre-A3a Core cannot list archived projects, and the toggle then says so.
+         */
+        var showArchivedProjects: Boolean = false
     }
 
     private var state = State()
@@ -72,6 +79,12 @@ class SandpaneSettings : PersistentStateComponent<SandpaneSettings.State> {
         state.autoConnect = value
     }
 
+    val showArchivedProjects: Boolean get() = state.showArchivedProjects
+
+    fun setShowArchivedProjects(value: Boolean) {
+        state.showArchivedProjects = value
+    }
+
     /** Clamped so a bad persisted value can never stall the UI or blow up memory. */
     val streamFlushIntervalMs: Int get() = state.streamFlushIntervalMs.coerceIn(MIN_STREAM_FLUSH_MS, MAX_STREAM_FLUSH_MS)
 
@@ -86,6 +99,7 @@ class SandpaneSettings : PersistentStateComponent<SandpaneSettings.State> {
     private fun State.sanitized(): State = State().also { clean ->
         clean.socketPathOverride = socketPathOverride.trim()
         clean.autoConnect = autoConnect
+        clean.showArchivedProjects = showArchivedProjects
         clean.streamFlushIntervalMs = streamFlushIntervalMs.orDefault(DEFAULT_STREAM_FLUSH_MS).coerceIn(MIN_STREAM_FLUSH_MS, MAX_STREAM_FLUSH_MS)
         clean.eventPollIntervalMs = eventPollIntervalMs.orDefault(DEFAULT_EVENT_POLL_MS).coerceIn(MIN_EVENT_POLL_MS, MAX_EVENT_POLL_MS)
         clean.retainedEventCap = retainedEventCap.orDefault(DEFAULT_RETAINED_EVENTS).coerceIn(MIN_RETAINED_EVENTS, MAX_RETAINED_EVENTS)

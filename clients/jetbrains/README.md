@@ -30,6 +30,25 @@ client) implementing the JB0/JB1 surface of
 > deprecated/experimental/internal usage reports). A2 is UNVERIFIED end to end: never run in an IDE,
 > never against a running Core, never against a real `sbx`.
 >
+> Re-run on 11.10.2026 after the A3a client work (project lifecycle: 22-method pin, `project.update` /
+> `archive` / `unarchive` / two-step `delete` / `add_repository` / `remove_repository`,
+> `includeArchived`, `archivedAt`): `./gradlew test --rerun buildPlugin verifyPluginStructure --offline
+> --no-build-cache` passes with **303 tests, 0 failures, 0 errors, 0 skipped** across 32 test classes,
+> and `./gradlew verifyPlugin --offline --rerun` (the plain command was up-to-date after the rebuild and
+> printed no verdict) reports **`Compatible`** against IU-262.10968.63 (report dir holds
+> only verdict/telemetry/dependencies — no deprecated/experimental/internal usage files). A3a is
+> UNVERIFIED end to end: the seven new actions and dialogs were never shown in an IDE and never run
+> against a running Core.
+>
+> Re-run on 11.10.2026 after the A3a combined-review fixes (both two-step flows fail CLOSED on an
+> unreadable `expiresAt`; step 2 is built and written on the io pool, not the EDT; Core lines in the
+> confirmation dialogs and chooser rows capped at 200 code points with "…"; the post-delete cleanup also
+> runs on a step-2 NOT_FOUND or when an unknown outcome's re-read no longer lists the project):
+> the same gate passes with **311 tests, 0 failures, 0 errors, 0 skipped** across 32 test classes
+> (stable over five consecutive test runs; one earlier run during the fixes ended `:test FAILED` with no
+> result files and was not reproduced), and `./gradlew verifyPlugin --offline --rerun` reports
+> **`Compatible`** with no deprecated/experimental/internal usage files.
+>
 > **Proven on this host** (exact commands and outputs in "Checks actually run" below):
 > `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
 > (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
@@ -218,30 +237,35 @@ clients/jetbrains/
     │   │   ├── core/ReplayCursors.kt         # per-task cursor seam behind task.subscribe's afterSequences
     │   │   ├── core/ErrorAttribution.kt      # provenance of a failure: this plugin refused vs Core answered
     │   │   ├── core/EventStream.kt           # per-task checkpoint, bounded window, fan-out
-    │   │   ├── model/Models.kt               # kotlinx mirrors of sandpane-protocol (wire names, 16 methods)
+    │   │   ├── model/Models.kt               # kotlinx mirrors of sandpane-protocol (wire names, 22 methods)
     │   │   ├── model/WorkspaceModeView.kt    # workspaceMode rendering; absence => UNVERIFIED/live-writable
     │   │   ├── ui/ChatPanel.kt               # Swing list/composer/pickers/attachments/status + 50 ms flush
     │   │   ├── actions/{StartTask,ReviewChanges,ApplyTask,RefreshSandboxes}Action.kt
     │   │   ├── actions/SandboxLifecycleActions.kt # Stop / Remove (two-step token) / Start (unsupported)
     │   │   ├── core/SandboxLifecycle.kt      # step-1 check, IssuedRemoval, remove flow, stop report
     │   │   ├── core/Idempotency.kt           # A2: keys, keyed requests, CONFLICT/unknown copy, replay notice
-    │   │   ├── core/MethodDeadlines.kt       # per-method read deadlines (stop 360 s, remove 400 s)
+    │   │   ├── core/MethodDeadlines.kt       # per-method read deadlines (stop 360 s, remove 400 s, add_repository 45 s)
+    │   │   ├── core/ProjectLifecycle.kt      # A3a: validators, delete check/flow, honest copy, archived rules
+    │   │   ├── actions/ProjectLifecycleActions.kt # A3a: edit, (un)archive, show archived, repositories, delete
     │   │   ├── ui/SandboxDialogs.kt          # remove confirmation content + sandbox chooser
+    │   │   ├── ui/ProjectDialogs.kt          # A3a: delete confirmation, project/repository choosers, edit dialog
     │   │   ├── services/{SandpaneContextProvider,EditorDiffProvider,SbxService,TaskMonitorService}.kt
     │   │   ├── services/FolderMatching.kt    # folder → Core project, pure and canonicalized on both sides
     │   │   └── settings/{SandpaneSettings,SandpaneConfigurable}.kt
     │   └── resources/META-INF/plugin.xml
     └── test/kotlin/labs/dkv/sandpane/
         ├── core/CoreClientFramingTest.kt     # byte-level framing + wire names        (29 tests)
+        ├── core/ProjectLifecycleTest.kt      # A3a frames, gating, delete flow, copy, validators (39 tests)
         ├── core/CoreCommandsTest.kt          # guards, gates, the three cursor shapes  (30 tests)
-        ├── core/SandboxLifecycleTest.kt      # A1 frames, token flow, stop report       (25 tests)
+        ├── core/SandboxLifecycleTest.kt      # A1 frames, token flow, stop report       (27 tests)
         ├── core/IdempotencyTest.kt           # A2 keys, features, CONFLICT copy, replay (19 tests)
         ├── core/ErrorAttributionTest.kt      # failure provenance sentences             (13 tests)
-        ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (17 tests)
+        ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (20 tests)
         ├── core/ReplayCursorSemanticsTest.kt # per-task vs shared-scalar replay         (7 tests)
         ├── services/FolderMatchingTest.kt    # folder matching + workspace-mode views  (12 tests)
         ├── services/SnapshotGapTest.kt       # why the sandbox list is missing          (3 tests)
-        └── ui/RemoveConfirmationDialogTest.kt # hostile impact lines, external header    (5 tests)
+        ├── ui/RemoveConfirmationDialogTest.kt # hostile impact lines, external header    (6 tests)
+        └── actions/ActionRegistrationTest.kt # every toolbar action id ↔ plugin.xml class (1 test)
 ```
 
 Module layout deviates from specs/04 §2's sketch in two deliberate ways: models live in one
@@ -287,16 +311,18 @@ truth; `schemas/*.json` is hand-synced with it): camelCase payload fields, snake
 dotted `AgentEvent` discriminators, `v/id/method/params` frames with flattened `ok`/`err`, and
 `MAX_FRAME_BYTES = 4 MiB` from `sandpane-service`.
 
-The method surface is **16** (`Method::ALL` in Rust), of which **11** are the original protocol-v1
+The method surface is **22** (`Method::ALL` in Rust), of which **11** are the original protocol-v1
 baseline, **3** are the additive discovery reads (`task.list`, `conversation.list`,
-`conversation.history`) and **2** are addition A1 (`sandbox.stop`, `sandbox.remove`). All five
+`conversation.history`), **2** are addition A1 (`sandbox.stop`, `sandbox.remove`) and **6** are
+addition A3a (`project.update`, `project.archive`, `project.unarchive`, `project.delete`,
+`project.add_repository`, `project.remove_repository`). All eleven
 additive methods are gated on `system.probe`'s `methods` (`CoreMethods.REQUIRES_ADVERTISEMENT`):
 not advertised ⇒ the action is visibly disabled and nothing is sent. There is deliberately **no**
 `sandbox.start` (sbx v0.47 has none); the Start Sandbox action only shows that unsupported state. The additive fields are `CoreCapabilities.methods`,
 `Project.repositories`, `SandboxSummary.workspaceMode` and the optional
 `TaskSubscribeParams.afterSequences`.
 
-This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (17 tests), which
+This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (20 tests), which
 reads the Rust sources and the schemas out of the working tree and compares them against the
 Kotlin mirror: method names **and their order**, the `Method::parse` arms, the
 `rpc-request.schema.json` `method` enum, every `pub const` numeric bound (evaluated, not copied), the
@@ -463,7 +489,43 @@ discovery revision this client is now synced to**):
   source); any other is "not known". A malformed remove answer is never echoed (it may hold a token). Neither step is retried; a
   step-2 timeout/transport failure is "outcome unknown". The list is re-probed afterwards. Create has
   no UI in this plugin: `SandboxCreateSpec.agent` is typed and allowlisted (sbx v0.47 built-ins) only.
-- **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **16** protocol
+- **Project lifecycle (A3a).** Seven actions in the Sandpane group, each gated on its method being
+  advertised (visible but disabled, saying why, when not): **Edit Project** (`DialogWrapper` with a
+  one-line name and a multi-line description; `doValidate` mirrors `Validator::project_name` /
+  `project_description` exactly — 1..=120 / ≤ 2000 code points, every Cc refused in a name, `\n` the only
+  control allowed in a description, the 14 spoofing format characters refused, no trimming, empty
+  description clears it; only changed fields are sent), **Archive** / **Unarchive** (Unarchive reads
+  `project.list {includeArchived:true}` itself), **Show Archived Projects** (a `ToggleAction` stored as a
+  UI setting; honoured only when Core advertises `project.archive`, because a pre-A3a Core ignores
+  `includeArchived` — the flag is never sent there), **Add Repository** (native
+  `FileChooserDescriptorFactory.createSingleFolderDescriptor()`; refused with an explicit state when
+  the project folder or the chosen folder is not visible to this process — cross-host mapping is
+  unsupported; Core validates the folder), **Remove Repository** (picked from Core's own
+  `repositories`), **Delete Project** (the A1 two-step pattern: step 1 `{projectId}` with no token key;
+  the answer must be a `project.delete` confirmation for the same project id with a 64-hex token, not
+  `external`, with no `deleted` flag — the name may differ after a rename and Core's current name is
+  shown; native `Messages.showDialog` with name, id, expiry and up to 20 revealed impact lines, "Delete
+  Project" vs Cancel with Cancel default and focused; the expiry is re-checked at click time; step 2
+  `{projectId, confirmToken}` only on "Delete Project", built and written on the io pool after the
+  dialog returns (never on the EDT); an `expiresAt` that does not parse fails CLOSED — no dialog, no
+  step 2, "the confirmation cannot be used; run Delete Project again" (A1 Remove Sandbox now does the
+  same); neither step is retried; the token is never shown, logged or persisted). Every Core line in
+  the delete/remove dialogs and every project/sandbox/repository chooser row is capped at 200 code
+  points with "…" (`text/DisplayCap`). The chooser lists archived projects labeled `[archived]` and keeps OK
+  disabled with Core's reason ("project is archived; unarchive it first; nothing was changed") for
+  edit / repository changes; unarchive and delete stay allowed. The chat composer is disabled for an
+  archived project (Core refuses conversation.send there). Copy: only Core's **exact** refusals (code
+  and text, pinned against `project_lifecycle.rs`) and the step-2 token rejection say "nothing was
+  deleted / removed / added / changed"; any other refusal shows Core's code and text with no claim;
+  INTERNAL, an unusable reply, a timeout or a lost connection is "outcome UNKNOWN", and the follow-up
+  re-read asks for archived projects too (the copy says so only when Core can list them). "Deleted" is
+  said only on `deleted: true`; a step-1 failure always says the project was not deleted. Every
+  mutation re-reads `project.list`. When Core says the project is gone — `deleted: true`, a step-2
+  `NOT_FOUND` raised by Core, or an unknown outcome whose re-read (successful, archived included) no
+  longer lists it (`ProjectDeleteFollowUp`) — each window drops its in-memory state for the project
+  (conversation list, tracked task rows); `SandpaneSettings` holds no per-project entry by
+  design, so nothing on disk needed clearing.
+- **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **22** protocol
   method names before writing a byte; there is no free-form RPC. The refusal is a
   `CoreValidationException` — this client's own word — and not a `CoreRpcException`, because Core
   never saw the request.
@@ -539,6 +601,8 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Gate after the anti-spoofing + enum-tolerance hardening, with the table-layout fix (10.10.2026; an intermediate 09.10.2026 run of the same command had 196 tests) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache --console=plain`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 17s`; **205 tests, 0 failures, 0 errors, 0 skipped**, 26 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; 55 source files (32 main, 23 test) |
 | Gate after the A1 sandbox-lifecycle client work (10.10.2026) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 16s`; **243 tests, 0 failures, 0 errors, 0 skipped**, 29 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (report dir holds only verdict/telemetry/dependencies — no deprecated/experimental/internal usage files); 62 source files (36 main, 26 test) — re-run after the A1 security/phase-review fixes |
 | Gate after the A2 client work (idempotency keys + features, 10.10.2026) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 15s`; **265 tests, 0 failures, 0 errors, 0 skipped**, 30 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 64 source files (37 main, 27 test) |
+| Gate after the A3a client work (project lifecycle, 11.10.2026) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache` (after deleting `build/test-results` and `build/distributions`); `./gradlew verifyPlugin --offline --rerun` | `BUILD SUCCESSFUL`; **303 tests, 0 failures, 0 errors, 0 skipped**, 32 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 69 source files (40 main, 29 test) |
+| Gate after the A3a combined-review fixes (11.10.2026) | same two commands (`verifyPlugin --offline --rerun`) | `BUILD SUCCESSFUL in 15s`; **311 tests, 0 failures, 0 errors, 0 skipped**, 32 result files (two fresh gate runs and three further `test --rerun` runs all green); verifier `Compatible` (no deprecated/experimental/internal usage files); 70 source files (41 main, 29 test) |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |
@@ -547,7 +611,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Toolchain actually used | `./gradlew --version`, `./gradlew javaToolchains` | Gradle 9.8.1, Launcher JVM 23 (GraalVM CE); toolchain 25 = `Eclipse Temurin JDK 25 (25.0.3+9-LTS)`, `Detected by: Auto-provisioned by Gradle` |
 | Wrapper integrity | `shasum -a 256 gradle/wrapper/gradle-wrapper.jar` | `3b8a2577…8e98` = the published `gradle-9.8.1-wrapper.jar.sha256` |
 | Drift gate can fail (negative control) | mutated Kotlin mirror, then a mutated **copy** of the Rust sources via `-PsandpaneRepoRoot` | red in both directions with a message naming the drifted wire string; green after restore — see "Drift gate and its negative control" (recorded before U4; the gate ran green again in the suite above) |
-| Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 16 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
+| Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 22 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
 | Subprocess misuse (`ProcessBuilder`, `Runtime.exec`, `sh -c`, `bash -lc`) | grep over `src/main/kotlin` | **none** — no subprocess surface exists in this module |
 | Internal/private API references (`com.intellij.internal`, JetBrains AI, `setAccessible`, `Unsafe`, reflection) | grep, plus Plugin Verifier | none |
 | TCP / network surface | grep | none — every `TCP` hit is prose stating it is never used |
@@ -580,6 +644,13 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
   they delegate to (`CoreCommands`, `CoreGuards`, `ReplayCursors`, `FolderMatching`,
   `WorkspaceModeView`, `NdjsonFramer`, `ErrorAttribution`) are what the 161 tests cover, so wiring
   bugs inside those classes remain possible.
+- **A3a project lifecycle** (11.10.2026): the seven actions, the edit/chooser/delete dialogs, the
+  archived label in the chat picker, the composer's archived gate and the post-delete cleanup were
+  never shown or run in an IDE; no A3a request has reached a running Core. The Add Repository
+  cross-host refusal is the existing "visible to this process" heuristic (`hostMapping`), not a
+  verified remote-development API — with a split-mode/remote backend it is UNVERIFIED which host's
+  folders the chooser shows. `ProjectChooserDialog`'s live `initValidation()` and `ToggleAction`
+  state on a BGT update are written against the documentation only.
 - **Older/newer Core compatibility** (testing this client against an older and a newer Core within
   the compatibility policy) has not been done; advertisement gating is tested against fabricated
   capability lists only.

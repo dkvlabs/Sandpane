@@ -47,14 +47,19 @@ const RETRY_DELAY: Duration = Duration::from_millis(150);
 /// Per-method proxy budget. Core's `sandbox.create` may legitimately run up to
 /// 300 s (image pull) and `sandbox.list` up to 30 s; `sandbox.stop` (stop plus
 /// the `ls --json` re-query) up to about 330 s, and `sandbox.remove` step 2
-/// (identity re-check plus `rm --force`) a little longer. Everything else
-/// answers well inside the default.
+/// (identity re-check plus `rm --force`) a little longer. `project.create` and
+/// `project.add_repository` canonicalize a repository path with git, which may
+/// take up to 30 s. Everything else answers well inside the default.
 pub fn proxy_deadline_ms(method: Method) -> u64 {
     match method {
         Method::SandboxCreate => 320_000,
         Method::SandboxList => 40_000,
         Method::SandboxStop => 350_000,
         Method::SandboxRemove => 390_000,
+        // A repository path goes through Core's git canonicalization, which may
+        // take up to 30 s (`project.create`, A3a `project.add_repository`).
+        Method::ProjectCreate => 43_000,
+        Method::ProjectAddRepository => 43_000,
         _ => PROXY_DEADLINE_MS,
     }
 }
@@ -83,6 +88,13 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
 /// `sandbox.stop` and `sandbox.remove` (A1) are excluded too. Stop changes the
 /// sandbox; remove's step 1 mints a single-use confirmation token in Core and
 /// step 2 removes the sandbox, so neither step may ever be re-sent blindly.
+///
+/// The six A3a project-lifecycle methods (`project.update`, `project.archive`,
+/// `project.unarchive`, `project.delete`, `project.add_repository`,
+/// `project.remove_repository`) are excluded too: each writes Core's database,
+/// and `project.delete`'s step 1 mints a single-use token while step 2 deletes.
+/// Archive/unarchive are idempotent in effect, but a blind re-send would still
+/// hide a lost answer from the user, so they follow the same rule.
 ///
 /// `src/lib/core-client.ts` mirrors this list as `REPLAY_SAFE_METHODS`; the
 /// drift test parses this `matches!` and fails if the two ever differ.
@@ -678,13 +690,26 @@ mod tests {
             "conversation.history",
             "sandbox.stop",
             "sandbox.remove",
+            "project.update",
+            "project.archive",
+            "project.unarchive",
+            "project.delete",
+            "project.add_repository",
+            "project.remove_repository",
         ] {
             assert!(
                 validate_frame(&frame(method)).is_ok(),
                 "{method} must be allowlisted because Core's crate parses it"
             );
         }
-        assert_eq!(Method::ALL.len(), 16);
+        assert_eq!(Method::ALL.len(), 22);
+        // Wire names are lowercase snake_case segments; camelCase is not a method.
+        assert_eq!(
+            validate_frame(&frame("project.addRepository"))
+                .unwrap_err()
+                .code,
+            "METHOD_NOT_ALLOWED"
+        );
         // sbx v0.47 has no `start`; the crate does not parse one, so neither does the proxy.
         assert_eq!(
             validate_frame(&frame("sandbox.start")).unwrap_err().code,
@@ -777,6 +802,12 @@ mod tests {
             Method::TaskCancel,
             Method::SandboxStop,
             Method::SandboxRemove,
+            Method::ProjectUpdate,
+            Method::ProjectArchive,
+            Method::ProjectUnarchive,
+            Method::ProjectDelete,
+            Method::ProjectAddRepository,
+            Method::ProjectRemoveRepository,
         ] {
             assert!(!replay_safe(m), "{m:?} must never be re-sent");
         }
@@ -837,6 +868,20 @@ mod tests {
         assert_eq!(proxy_deadline_ms(Method::SandboxRemove), 390_000);
         assert_eq!(proxy_deadline_ms(Method::GitApply), PROXY_DEADLINE_MS);
         assert_eq!(proxy_deadline_ms(Method::SystemProbe), PROXY_DEADLINE_MS);
+        // A3a: the project-lifecycle DB writes keep the default budget …
+        for m in [
+            Method::ProjectUpdate,
+            Method::ProjectArchive,
+            Method::ProjectUnarchive,
+            Method::ProjectDelete,
+            Method::ProjectRemoveRepository,
+        ] {
+            assert_eq!(proxy_deadline_ms(m), PROXY_DEADLINE_MS, "{m:?}");
+        }
+        // … but a repository path goes through Core's git canonicalization (up
+        // to 30 s), for project.create and project.add_repository alike.
+        assert_eq!(proxy_deadline_ms(Method::ProjectCreate), 43_000);
+        assert_eq!(proxy_deadline_ms(Method::ProjectAddRepository), 43_000);
     }
 
     #[test]

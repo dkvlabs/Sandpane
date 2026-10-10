@@ -100,6 +100,12 @@ describe("proxy budget vs webview timeout (drift-gated)", () => {
     expect(proxy.get("sandbox.list")).toBe(40_000);
     expect(requestTimeoutFor("sandbox.list")).toBe(45_000);
     expect(requestTimeoutFor("git.apply")).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
+    // Core's git canonicalization of a repository path may take up to 30 s
+    // (project.create and A3a project.add_repository share that path).
+    for (const method of ["project.create", "project.add_repository"] as const) {
+      expect(proxy.get(method), method).toBe(43_000);
+      expect(requestTimeoutFor(method), method).toBe(45_000);
+    }
     const c = new CoreClient(new FakeCore().transport);
     expect(c.timeoutFor("sandbox.create")).toBe(330_000);
     expect(c.timeoutFor("project.list")).toBe(DEFAULT_REQUEST_TIMEOUT_MS);

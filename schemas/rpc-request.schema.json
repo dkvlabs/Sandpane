@@ -19,12 +19,18 @@
       "maxLength": 128
     },
     "method": {
-      "description": "Allowlisted dotted method name. There is deliberately no free-form execution method. The set is additive for protocol v1: discovery revision 1 adds conversation.list, conversation.history and task.list; addition A1 adds sandbox.stop and sandbox.remove (two-step server-side confirmation token). There is deliberately no sandbox.start: sbx v0.47 has none. A Core advertises exactly what it handles via core-capabilities.methods.",
+      "description": "Allowlisted dotted method name. There is deliberately no free-form execution method. The set is additive for protocol v1: discovery revision 1 adds conversation.list, conversation.history and task.list; addition A1 adds sandbox.stop and sandbox.remove (two-step server-side confirmation token). Addition A3a adds project.update, project.archive, project.unarchive, project.delete (two-step confirmation token bound to the project id), project.add_repository and project.remove_repository; method segments are lowercase snake_case. There is deliberately no sandbox.start: sbx v0.47 has none. A Core advertises exactly what it handles via core-capabilities.methods.",
       "type": "string",
       "enum": [
         "system.probe",
         "project.create",
         "project.list",
+        "project.update",
+        "project.archive",
+        "project.unarchive",
+        "project.delete",
+        "project.add_repository",
+        "project.remove_repository",
         "sandbox.list",
         "sandbox.create",
         "sandbox.stop",

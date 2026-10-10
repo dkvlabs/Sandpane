@@ -31,6 +31,17 @@ export function addConversation(conversation: Conversation): void {
   for (const listener of [...listeners]) listener();
 }
 
+/**
+ * A3a: after Core confirms `project.delete`, drop this window's in-memory
+ * conversations of that project so no view keeps offering a deleted chat.
+ */
+export function forgetProjectConversations(projectId: string): void {
+  const kept = snapshot.filter((c) => c.projectId !== projectId);
+  if (kept.length === snapshot.length) return;
+  snapshot = kept;
+  for (const listener of [...listeners]) listener();
+}
+
 /** Test/reload seam: a window restart drops this in-memory view by design. */
 export function clearConversations(): void {
   snapshot = [];

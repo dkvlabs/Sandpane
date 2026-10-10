@@ -71,7 +71,7 @@ Each row is one commit, plus its `docs(audit)` log entry. Status is tracked in t
 | A1 | `sandbox.start` | **not added** | sbx v0.47.0 has no `start`; restart is the interactive `sbx run --name`. Clients show "Start: not supported by sbx v0.47 (use `sbx run` in a terminal)". |
 | A1 | `SandboxCreateSpec.agent?: string` | default `"shell"` (provider-free) | Exact match against the built-in agents in captured `sbx create --help`: `claude, codex, copilot, cursor, devin, docker-agent, droid, gemini, kiro, opencode, shell`. Sandbox **kit references are refused**: local dirs, ZIPs, git repos and OCI refs all run third-party code. `--cloud` is never passed, because it is billable and outside local scope. Provider agents are accepted, but the sandbox is labeled "agent not verified". |
 | A2 | `SandboxCreateSpec.idempotencyKey?`, `ConversationSendParams.idempotencyKey?` | string ≤ 128, `[A-Za-z0-9._-]` | Core stores key → result for 24 h. A replay returns the stored result. The same key with different params gives `CONFLICT`. Decisions in §3.1 (durable storage, claim before execution, restart → `unknown`, `features` advertisement). |
-| A3 | `project.update` (name, description), `project.archive` / `project.unarchive`, `project.delete` (token), `project.addRepository` / `project.removeRepository` | `Project` gains `description?`, `archivedAt?` | Repositories still pass the canonical git-root + denylist check. Removing a repository is refused while tasks reference it. |
+| A3 | `project.update` (name, description), `project.archive` / `project.unarchive`, `project.delete` (token), `project.add_repository` / `project.remove_repository` | `Project` gains `description?`, `archivedAt?` | Repositories still pass the canonical git-root + denylist check. Removing a repository is refused while tasks reference it. |
 | A3 | `conversation.rename`, `conversation.archive` / `unarchive`, `conversation.delete` (token), `conversation.export` | `Conversation` gains `sandboxId?`, `archivedAt?` | `sandboxId` from create is persisted (it was previously discarded). Export returns redacted JSON within the frame cap, and `truncated` is disclosed. |
 | A4 | `ConversationSendParams.mode?: "task" \| "discuss"` | default `"task"` | `discuss` never gets a writable workspace. With no verified adapter, both still answer `PERMISSION_DENIED` (honest). Follow-up from A1: once tasks carry sandbox names, `sandbox.stop` / `sandbox.remove` must refuse, or describe in `impact`, active tasks bound to the sandbox. |
 | A5 | `ChangeSet.repoPath?`, `ChangeSet.uninspected?: string[]`, `FileChange.oldPath?` | response fields | `oldPath` comes from `--name-status -M`. `uninspected` lets a future review return a flagged partial list for submodules instead of refusing; today it is always refused. |
@@ -135,6 +135,58 @@ Each row is one commit, plus its `docs(audit)` log entry. Status is tracked in t
     - Each user action (one Create click, one Send) gets one fresh random key of 128 bits, base64url or hex, within the allowed charset.
     - Only an explicit user "Retry" of that same action reuses it.
     - Automatic-replay sets (desktop `REPLAY_SAFE_METHODS`, the Rust `replay_safe`) are **unchanged** in A2. Making keyed writes auto-replayable is a later, separately reviewed step.
+
+### 3.2 A3a decisions (project lifecycle), fixed before implementation
+
+A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversations, §3.3).
+
+1. **Methods (6 new, 22 total).**
+   - `project.update {projectId, name?, description?}` → `Project`. The name is at most 120 characters, using the `Validator::project_name` rule that `project.create` now applies too. It refuses every control character (including newline and tab), line and paragraph separators, and bidi controls. The description is at most 2000 characters; newlines are allowed; every other control character, line and paragraph separators, and bidi controls are refused; and an empty description clears it. At least one of the two fields must be present. Method segments stay lowercase snake_case: the method-name pattern in `core-capabilities.schema.json` and every drift test require it.
+   - `project.archive {projectId}` / `project.unarchive {projectId}` → `Project`. Both are idempotent: archiving an archived project returns it unchanged.
+   - `project.delete {projectId, confirmToken?}` uses the §2 token flow:
+     - action `project.delete`;
+     - target `{name: <project name>, id: <project id>}`, where a rename between the two steps does not invalidate the token, but a different id does;
+     - step 2 returns `{deleted: true}`.
+   - `project.add_repository {projectId, path}` → `Project`.
+   - `project.remove_repository {projectId, path}` → `Project`.
+2. **Wire additions.**
+   - `Project` gains `archivedAt?` (absent when not archived). `description` is already present.
+   - `project.list` gains an optional `includeArchived?: boolean`, default false. That keeps today's behaviour for older clients, which never see archived projects.
+3. **What archived means.** Archiving is reversible and changes nothing outside Core.
+   - While a project is archived, Core refuses `conversation.create`, `conversation.send`, `sandbox.create`, `project.update` and the repository methods with `VALIDATION_FAILED` ("project is archived; unarchive it first; nothing was changed").
+   - Tasks that are already running keep running. Reads keep working.
+4. **Delete preconditions, checked at step 1 and again at step 2.** Step 2 re-checks under the DB lock in the same transaction as the delete. Each failure is `CONFLICT`, and nothing is deleted:
+   - the project has a non-terminal task ("cancel or finish its tasks first");
+   - the project has a live sandbox binding, meaning `removed_at IS NULL` ("remove its sandboxes first"). Core never removes an sbx sandbox as a side effect.
+   - a `sandbox.create` for this project is in flight. Core keeps a per-project in-flight count, held from the create's claim until its binding is written or it fails, and delete refuses while that count is above zero. This prevents an sbx sandbox being created for a project that is deleted underneath it. Archive is not blocked, because it is reversible.
+5. **What delete does.**
+   - It removes the project's rows: project, repositories, conversations, messages, agent sessions, tasks, task events, artifacts and verification rows, the `removed_at` binding rows, `project_context`, `client_state` and workflows. Deletes run in an explicit order (tasks, then conversations, bindings, repositories, project), and existing `ON DELETE CASCADE` acts only as a backstop.
+   - It runs in one transaction.
+   - It **never touches host files, branches or sandboxes.** The impact lines say:
+     - how many conversations, messages and tasks are deleted;
+     - that audit rows of removed sandboxes are deleted with the project;
+     - that Core-allocated worktree directories (if any) and task branches in the host repositories are **left in place**, with their count when Core knows it.
+   - Rows in `idempotency_keys` are not touched: they hold results only and expire within 24 h.
+   - A keyed replay after a delete differs by method. A `conversation.send` replay returns the stored first response (`replayed: true`) for a task that no longer exists, consistent with "a replay is not current state". A `sandbox.create` replay answers NOT_FOUND, because create checks that the project exists before the key lookup.
+6. **Repository add.**
+   - Same canonical git-root and denylist rules as `project.create`: `canonical_repository`, dedupe, then `revet_excludes_for_new_repositories` before the insert, as in entry 0028.
+   - A path already registered in this project returns the project unchanged.
+7. **Repository remove.**
+   - The repository is matched by its stored canonical path, or by the canonicalized form of the input.
+   - Core refuses with `CONFLICT` while any task (`tasks.repo_id`) or live binding (`sandbox_bindings.repo_id`) references it.
+   - From A3a on, `sandbox.create` records `sandbox_bindings.repo_id`: the registered repository whose root contains the mount path (NULL for mountless). The create's post-claim re-check also confirms that repository is still registered.
+   - Removal is also refused in two more cases. One is while any live `direct_mount`/`sbx_clone` binding of the project has a NULL `repo_id`; these are pre-A3a rows, and the refusal is deliberately conservative. The other is while a `sandbox.create` for the project is in flight, with the message `a sandbox is being created for this project; try again when it finishes; nothing was removed`. Otherwise a repository a live sandbox writes to could drop out of the excludes-file forbidden roots (entry 0028).
+   - The path must be absolute. An exact stored match is preferred over a canonicalized one.
+   - It never touches the host repository. No token is needed, because nothing outside Core changes.
+8. **Exact user-facing messages** (clients match on them):
+   - `project is archived; unarchive it first; nothing was changed`
+   - `project has tasks that are not finished; cancel or finish them first; nothing was deleted`
+   - `project has sandboxes; remove them first; nothing was deleted`
+   - `repository is used by a task or sandbox of this project; nothing was removed`
+   - `a sandbox is being created for this project; try again when it finishes; nothing was deleted`
+9. **Clients.**
+   - Each new method is gated on `system.probe` `methods`.
+   - Project settings get: rename and description; an archive/unarchive toggle; a "show archived" filter (`includeArchived: true`); add repository (each client's native folder picker, with Core validating the path); remove repository; and delete through the shared two-step dialog pattern from A1 (impact lines revealed and capped, Cancel default, expiry re-checked at click time, no retry).
 
 ## 4. Client obligations per addition
 

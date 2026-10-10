@@ -27,6 +27,7 @@ import {
   type ApplyResult,
   type ChangeSet,
   type ConfirmationRequest,
+  type ProjectDeleteResult,
   type Conversation,
   type ConversationHistoryResult,
   type CoreCapabilities,
@@ -238,12 +239,16 @@ export function decodeProject(value: unknown): Project {
 
 function decodeProjectRow(p: Rec): Project {
   const repositories = optStrArray(p, "repositories", "Project");
+  // A3a, additive: absent/null = live (and every pre-A3a Core). A present
+  // non-string is malformed like any other mistyped field.
+  const archivedAt = optStr(p, "archivedAt", "Project");
   return {
     id: str(p, "id", "Project"),
     name: str(p, "name", "Project"),
     description: optStr(p, "description", "Project") ?? "",
     createdAt: str(p, "createdAt", "Project"),
     ...(repositories === undefined ? {} : { repositories }),
+    ...(archivedAt === null ? {} : { archivedAt }),
   };
 }
 
@@ -387,6 +392,35 @@ export function decodeSandboxRemoveResult(value: unknown): SandboxRemoveResult {
     kind: "confirmation",
     confirmation: decodeConfirmationRequest(r.confirmation, "sandbox.remove"),
   };
+}
+
+/**
+ * `project.delete` result (A3a): exactly one of `confirmation` (step 1) or
+ * `deleted: true` (step 2). `deleted` with any other value is malformed and
+ * never shown as a success. A project confirmation is always
+ * `external: false` (a project exists only in Core); anything else is refused
+ * rather than rendered, because no client copy exists for it.
+ */
+export function decodeProjectDeleteResult(value: unknown): ProjectDeleteResult {
+  const r = asRecord(value, "ProjectDeleteResult");
+  const hasConfirmation = r.confirmation !== undefined && r.confirmation !== null;
+  const hasDeleted = r.deleted !== undefined && r.deleted !== null;
+  if (hasConfirmation === hasDeleted) {
+    throw new MalformedFrameError("project.delete must answer exactly one of confirmation / deleted");
+  }
+  if (hasDeleted) {
+    if (r.deleted !== true) {
+      throw new MalformedFrameError("ProjectDeleteResult.deleted must be true when present");
+    }
+    return { kind: "deleted" };
+  }
+  const confirmation = decodeConfirmationRequest(r.confirmation, "project.delete");
+  if (confirmation.external) {
+    throw new MalformedFrameError(
+      "a project.delete confirmation must have external: false; refusing to use this token",
+    );
+  }
+  return { kind: "confirmation", confirmation };
 }
 
 export function decodeConversations(value: unknown): Conversation[] {

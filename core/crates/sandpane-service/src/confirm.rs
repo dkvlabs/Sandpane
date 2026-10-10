@@ -2,7 +2,10 @@
 //! `docs/plans/2026-10-09-protocol-v1-additions.md` §2).
 //!
 //! Step 1 of a destructive method issues a token bound to `(action, target
-//! name, target sbx id)`; step 2 presents it. Rules enforced here:
+//! name, target id)`; step 2 presents it. `sandbox.remove` matches action +
+//! name ([`ConfirmationStore::consume`]) and then re-checks the sbx id;
+//! `project.delete` matches action + project id
+//! ([`ConfirmationStore::consume_by_id`]) — its name is display only. Rules enforced here:
 //!
 //! * 256 bits from the OS RNG (`getrandom`), hex-encoded (64 lowercase chars);
 //! * single-use: a presented token is removed from the store on ANY attempt —
@@ -137,6 +140,31 @@ impl ConfirmationStore {
         let same_action = p.binding.action == action;
         let same_name = p.binding.name == name;
         if in_time & same_action & same_name {
+            Ok(p.binding)
+        } else {
+            Err(TokenRejected)
+        }
+    }
+
+    /// Consume `token` for `action` on the target with identity `id`, the
+    /// NAME NOT COMPARED (A3a `project.delete`: the name is carried for
+    /// display only, so a rename between the steps does not invalidate the
+    /// token, while a different id does). Same rules as [`Self::consume`]:
+    /// removed before it is judged, one uniform rejection.
+    pub fn consume_by_id(
+        &mut self,
+        token: &str,
+        action: &str,
+        id: &str,
+        now: Instant,
+    ) -> Result<ConfirmationBinding, TokenRejected> {
+        let Some(p) = self.pending.remove(token) else {
+            return Err(TokenRejected);
+        };
+        let in_time = now < p.expires;
+        let same_action = p.binding.action == action;
+        let same_id = p.binding.id == id;
+        if in_time & same_action & same_id {
             Ok(p.binding)
         } else {
             Err(TokenRejected)
@@ -336,5 +364,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.len(), 1);
+    }
+
+    /// A3a: `project.delete` binds the project ID; the name is display only,
+    /// so a rename between the steps does not invalidate the token.
+    #[test]
+    fn consume_by_id_ignores_the_name_but_not_the_id_or_action() {
+        let mut s = ConfirmationStore::new();
+        let now = Instant::now();
+        let t = s
+            .issue(
+                binding("project.delete", "Atlas Demo", "p-1"),
+                now,
+                CONFIRMATION_TTL,
+            )
+            .unwrap();
+        let got = s.consume_by_id(&t, "project.delete", "p-1", now).unwrap();
+        assert_eq!(got.name, "Atlas Demo", "name carried for display");
+        assert_eq!(
+            s.consume_by_id(&t, "project.delete", "p-1", now),
+            Err(TokenRejected),
+            "single use"
+        );
+        // Wrong id, wrong action, expired: uniform rejection, token burned.
+        for (action, id, at) in [
+            ("project.delete", "p-2", now),
+            ("sandbox.remove", "p-1", now),
+            ("project.delete", "p-1", now + CONFIRMATION_TTL),
+        ] {
+            let t = s
+                .issue(
+                    binding("project.delete", "Atlas Demo", "p-1"),
+                    now,
+                    CONFIRMATION_TTL,
+                )
+                .unwrap();
+            assert_eq!(s.consume_by_id(&t, action, id, at), Err(TokenRejected));
+            assert_eq!(
+                s.consume_by_id(&t, "project.delete", "p-1", now),
+                Err(TokenRejected),
+                "burned by the failed attempt"
+            );
+        }
+        // A sandbox.remove token is not a project.delete token, even by id.
+        let t = s
+            .issue(
+                binding("sandbox.remove", "atlas-auth", "p-1"),
+                now,
+                CONFIRMATION_TTL,
+            )
+            .unwrap();
+        assert_eq!(
+            s.consume_by_id(&t, "project.delete", "p-1", now),
+            Err(TokenRejected)
+        );
+        assert!(s.is_empty());
     }
 }

@@ -211,6 +211,21 @@ export class TaskEventStore {
     this.notifySoon();
   }
 
+  /**
+   * A3a: drop the projections of tasks Core deleted with their project (called
+   * only after `project.delete` answered `deleted: true`). The replay cursors
+   * held by the subscription are left alone: Core replays only tasks it still
+   * has, so a cursor for a deleted task is ignored there.
+   */
+  forgetTasks(taskIds: Iterable<string>): void {
+    let changed = false;
+    for (const id of taskIds) changed = this.projections.delete(id) || changed;
+    if (changed) {
+      this.rebuildSnapshot();
+      this.notifySoon();
+    }
+  }
+
   /** Test/diagnostic view of a single task projection. */
   peek(taskId: string): TaskProjection | undefined {
     return this.projections.get(taskId);

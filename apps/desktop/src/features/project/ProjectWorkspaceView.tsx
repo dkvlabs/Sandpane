@@ -2,12 +2,14 @@ import { useMemo, useState } from "react";
 import {
   capabilitiesOf,
   useCoreLink,
+  useProjectLifecycleGates,
   useProjects,
   useSandboxes,
   useStoreStatus,
   useTaskIndex,
   useTaskProjection,
 } from "../../lib/hooks";
+import { archivedBlock, archivedLabel, isArchived } from "../../lib/project-lifecycle";
 import {
   foldSbxView,
   resolveSelection,
@@ -46,6 +48,10 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
   const link = useCoreLink();
   const refetch = useProbeRefetch();
   const { projects } = useProjects();
+  // A3a: an archived project is still readable; look it up in the list that
+  // includes archived rows when this Core can give one.
+  const gates = useProjectLifecycleGates();
+  const withArchived = useProjects({ includeArchived: gates.showArchived.state === "supported" });
   const sandboxList = useSandboxes();
   const sandboxes = sandboxList.sandboxes;
   const preferences = useUiPreferences().preferences;
@@ -56,7 +62,8 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
   const [focusedTask, setFocusedTask] = useState<string | null>(null);
   const [focusedSandbox, setFocusedSandbox] = useState<string | null>(null);
 
-  const project = projects.find((p) => p.id === projectId) ?? null;
+  const project = withArchived.projects.find((p) => p.id === projectId) ?? null;
+  const archivedReason = project === null ? null : archivedBlock(project, "chat");
 
   const tasksForProject = useMemo(() => {
     // Scoped by the conversation actually open; otherwise every row Core named
@@ -170,6 +177,13 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
         </Warning>
       )}
 
+      {project !== null && isArchived(project) && (
+        <Warning tone="attention" title={`This project is ${archivedLabel(project) ?? "archived"}`}>
+          Core refuses new chats, messages and sandboxes for it until it is unarchived
+          (Projects → Settings). Reads keep working and running tasks keep running.
+        </Warning>
+      )}
+
       {project === null && (
         <Warning tone="attention" title="This project id is not in the current Core list">
           It may be archived, or created by another client after the last refresh. The workspace
@@ -211,6 +225,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
         onSelectConversation={(id) =>
           navigate("conversation", { projectId, conversationId: id })
         }
+        archivedReason={archivedReason}
       />
 
       <div className="grid grid--workspace">

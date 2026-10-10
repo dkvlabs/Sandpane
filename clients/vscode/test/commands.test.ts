@@ -215,9 +215,9 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
     ).toMatchObject({ params: { taskId: 't1', expectedBase: 'refs/heads/main' } });
   });
 
-  it('exposes exactly the 16 allowlisted methods and nothing else', () => {
-    expect(CORE_METHODS).toHaveLength(16);
-    expect(new Set(CORE_METHODS).size).toBe(16);
+  it('exposes exactly the 22 allowlisted methods and nothing else', () => {
+    expect(CORE_METHODS).toHaveLength(22);
+    expect(new Set(CORE_METHODS).size).toBe(22);
     expect(CORE_METHODS).not.toContain('shell.exec');
     expect(CORE_METHODS).not.toContain('sbx.raw');
     expect(CORE_METHODS).not.toContain('sandbox.start');
@@ -231,6 +231,13 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
       systemProbe: 'system.probe',
       projectCreate: 'project.create',
       projectList: 'project.list',
+      projectUpdate: 'project.update',
+      projectArchive: 'project.archive',
+      projectUnarchive: 'project.unarchive',
+      projectDeleteRequest: 'project.delete',
+      projectDeleteConfirm: 'project.delete',
+      projectAddRepository: 'project.add_repository',
+      projectRemoveRepository: 'project.remove_repository',
       sandboxList: 'sandbox.list',
       sandboxCreate: 'sandbox.create',
       sandboxStop: 'sandbox.stop',

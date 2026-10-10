@@ -58,7 +58,7 @@ describe("constants match the Rust side", () => {
     // would still be self-consistent.
     expect(METHODS).toEqual(rustMethodAll().names);
     expect(METHODS).toEqual(schemaMethodEnum());
-    expect(METHODS.length).toBe(16);
+    expect(METHODS.length).toBe(22);
   });
 
   it("error codes match the schema enum", () => {

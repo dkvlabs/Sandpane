@@ -1,10 +1,18 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   useCoreLink,
   useCreateProject,
+  useProjectDeletionFlow,
+  useProjectLifecycleGates,
   useProjects,
 } from "../../lib/hooks";
-import { describeCoreError } from "../../lib/reducers";
+import { describeCoreError, displayRevealed } from "../../lib/reducers";
+import { archivedLabel, isArchived } from "../../lib/project-lifecycle";
+import {
+  ProjectDeleteDialog,
+  ProjectDeletionNotices,
+  ProjectSettingsPanel,
+} from "./ProjectSettings";
 import { RETRY_SAFELY_EXPLANATION, RETRY_SAFELY_LABEL } from "../../lib/idempotency";
 import {
   validateProjectName,
@@ -32,7 +40,31 @@ import { useProbeRefetch } from "../../components/ui/refresh";
 export function ProjectsView({ route }: { route: Route }) {
   const link = useCoreLink();
   const refetch = useProbeRefetch();
-  const { projects, isLoading, error } = useProjects();
+  const { projects } = useProjects();
+  const gates = useProjectLifecycleGates();
+  const archiveListing = gates.showArchived.state === "supported";
+  const [showArchived, setShowArchived] = useState(false);
+  const listed = useProjects({ includeArchived: archiveListing && showArchived });
+  // Settings look the selected project up in the widest list this Core can
+  // give, so archiving it does not make its settings vanish mid-edit.
+  const everything = useProjects({ includeArchived: archiveListing });
+  const deletion = useProjectDeletionFlow();
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected =
+    selectedId === null ? null : (everything.projects.find((p) => p.id === selectedId) ?? null);
+  // A selection Core no longer lists (deleted here or elsewhere) is dropped,
+  // but only once the list read has settled without error.
+  useEffect(() => {
+    if (
+      selectedId !== null &&
+      !everything.isLoading &&
+      everything.error === null &&
+      !everything.projects.some((p) => p.id === selectedId)
+    ) {
+      setSelectedId(null);
+    }
+  }, [selectedId, everything.isLoading, everything.error, everything.projects]);
+  const { isLoading, error } = listed;
   const create = useCreateProject();
   const [name, setName] = useState("");
   const [repos, setRepos] = useState("");
@@ -70,12 +102,42 @@ export function ProjectsView({ route }: { route: Route }) {
         }
       />
       <ConnectionBanner link={link} onRetry={refetch} />
+      <ProjectDeletionNotices state={deletion.state} flow={deletion.flow} />
+      {deletion.state.kind === "confirming" && (
+        <ProjectDeleteDialog confirmation={deletion.state.confirmation} flow={deletion.flow} />
+      )}
+      {attached && selected !== null && (
+        <ProjectSettingsPanel
+          project={selected}
+          gates={gates}
+          deletion={deletion}
+          onClose={() => setSelectedId(null)}
+        />
+      )}
 
       <div className="grid grid--two">
         <Panel
           title="Core projects"
-          description="project.list, archived projects excluded by Core."
+          description={
+            archiveListing && showArchived
+              ? "project.list with includeArchived: true — archived projects are labelled."
+              : "project.list — Core lists live projects only unless archived ones are asked for."
+          }
+          actions={
+            <label className="row-actions" title={gates.showArchived.note}>
+              <input
+                type="checkbox"
+                checked={archiveListing && showArchived}
+                disabled={!archiveListing}
+                onChange={(event) => setShowArchived(event.target.checked)}
+              />{" "}
+              Show archived
+            </label>
+          }
         >
+          {!archiveListing && attached && (
+            <p className="muted">{gates.showArchived.note}</p>
+          )}
           {!attached ? (
             <EmptyState
               variant="offline"
@@ -91,26 +153,38 @@ export function ProjectsView({ route }: { route: Route }) {
             <Skeleton rows={4} />
           ) : error !== null ? (
             <ErrorPanel error={error} />
-          ) : projects.length === 0 ? (
+          ) : listed.projects.length === 0 ? (
             <EmptyState
               heading="No projects yet"
               body="Create the first project on the right; repository paths can be added now or later."
             />
           ) : (
             <ul className="list">
-              {projects.map((project) => (
+              {listed.projects.map((project) => (
                 <li key={project.id}>
                   <div className="row row--action">
                     <a
                       className="row__main"
                       href={href("project-workspace", { projectId: project.id })}
                     >
-                      <span className="row__title">{project.name}</span>
+                      <span className="row__title">
+                        {displayRevealed(project.name, 200).text}{" "}
+                        {isArchived(project) && (
+                          <Badge tone="attention">{archivedLabel(project)}</Badge>
+                        )}
+                      </span>
                       <span className="row__meta">
                         <Mono>{project.id.slice(0, 8)}</Mono> · created{" "}
                         {project.createdAt}
                       </span>
                     </a>
+                    <Button
+                      variant="ghost"
+                      aria-pressed={selectedId === project.id}
+                      onClick={() => setSelectedId(project.id)}
+                    >
+                      Settings
+                    </Button>
                     <Button onClick={() => navigate("project-workspace", { projectId: project.id })}>
                       Open
                     </Button>
@@ -123,7 +197,7 @@ export function ProjectsView({ route }: { route: Route }) {
 
         <Panel
           title="Create project"
-          description="Core validates the name (120 chars, no control characters) and requires absolute repository paths."
+          description="Core validates the name (one line, at most 120 characters, no control or direction-changing characters) and requires absolute repository paths."
         >
           {!attached ? (
             <Warning tone="danger" title="Disabled while Core is unreachable">
@@ -142,7 +216,7 @@ export function ProjectsView({ route }: { route: Route }) {
               <Field
                 label="Project name"
                 error={name.length === 0 ? undefined : (nameError ?? undefined)}
-                hint="Any Unicode text; control characters are rejected by Core."
+                hint="Any Unicode text on one line; control, separator and direction-changing characters are rejected by Core."
               >
                 {(id) => (
                   <TextInput

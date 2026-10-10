@@ -61,7 +61,7 @@ import kotlin.test.assertTrue
  *     core/crates/sandpane-protocol/src/lib.rs;
  *   - the protocol-v1 additive fields: an OLD frame parses, and an absent value stays absent on
  *     the way out instead of becoming `null`, `{}`, or a benign workspace mode;
- *   - the 16-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
+ *   - the 22-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
  *     compared by [ProtocolDriftGuardTest]).
  *
  * NOT covered here, on purpose: a live socket round trip. `SocketChannel` against
@@ -197,7 +197,12 @@ class CoreClientFramingTest {
         assertTrue(CoreMethods.isAllowlisted("sandbox.stop"))
         assertTrue(CoreMethods.isAllowlisted("sandbox.remove"))
         assertFalse(CoreMethods.isAllowlisted("sandbox.start"))
-        assertEquals(16, CoreMethods.ALL.size)
+        // A3a: the six project-lifecycle methods are allowlisted.
+        listOf(
+            "project.update", "project.archive", "project.unarchive", "project.delete",
+            "project.add_repository", "project.remove_repository",
+        ).forEach { assertTrue(CoreMethods.isAllowlisted(it), it) }
+        assertEquals(22, CoreMethods.ALL.size)
     }
 
     @Test
@@ -207,8 +212,10 @@ class CoreClientFramingTest {
         // fails if this order or any name stops matching, so a rename cannot drift silently.
         assertEquals(
             listOf(
-                "system.probe", "project.create", "project.list", "sandbox.list", "sandbox.create",
-                "sandbox.stop", "sandbox.remove",
+                "system.probe", "project.create", "project.list",
+                "project.update", "project.archive", "project.unarchive", "project.delete",
+                "project.add_repository", "project.remove_repository",
+                "sandbox.list", "sandbox.create", "sandbox.stop", "sandbox.remove",
                 "conversation.create", "conversation.send", "conversation.list", "conversation.history",
                 "task.cancel", "task.list", "task.subscribe", "git.review", "git.apply",
             ),
@@ -217,7 +224,17 @@ class CoreClientFramingTest {
         assertEquals(3, CoreMethods.ADDITIVE_IN_V1.size)
         assertTrue(CoreMethods.ADDITIVE_IN_V1.containsAll(setOf("task.list", "conversation.list", "conversation.history")))
         assertEquals(setOf("sandbox.stop", "sandbox.remove"), CoreMethods.ADDITIVE_A1)
-        assertEquals(CoreMethods.ADDITIVE_IN_V1 + CoreMethods.ADDITIVE_A1, CoreMethods.REQUIRES_ADVERTISEMENT)
+        assertEquals(
+            setOf(
+                "project.update", "project.archive", "project.unarchive", "project.delete",
+                "project.add_repository", "project.remove_repository",
+            ),
+            CoreMethods.ADDITIVE_A3A,
+        )
+        assertEquals(
+            CoreMethods.ADDITIVE_IN_V1 + CoreMethods.ADDITIVE_A1 + CoreMethods.ADDITIVE_A3A,
+            CoreMethods.REQUIRES_ADVERTISEMENT,
+        )
     }
 
     // -----------------------------------------------------------------------

@@ -1,5 +1,6 @@
 package labs.dkv.sandpane.ui
 
+import labs.dkv.sandpane.text.DisplayCap
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import labs.dkv.sandpane.core.IssuedRemoval
@@ -47,16 +48,17 @@ object RemoveConfirmation {
         if (issued.external) html.header(EXTERNAL_HEADER).line(EXTERNAL_TEXT).blank()
         html.line("Remove this sandbox? Core runs `sbx rm --force` for it; this cannot be undone.")
             .fields(
-                "sandbox" to issued.name,
-                "sbx id" to issued.target.id,
-                "confirmation expires" to issued.expiresAt,
+                "sandbox" to DisplayCap.cap(issued.name),
+                "sbx id" to DisplayCap.cap(issued.target.id),
+                "confirmation expires" to DisplayCap.cap(issued.expiresAt),
             )
             .blank()
         if (issued.impact.isEmpty()) {
             html.line("Core reported no impact lines for this removal.")
         } else {
             html.header("Impact, as reported by Core (${issued.impact.size} line(s)):")
-            html.entries("", issued.impact.take(MAX_IMPACT_LINES))
+            // Each line capped at DisplayCap.MAX_CODE_POINTS: Core does not bound a line's length.
+            html.entries("", issued.impact.take(MAX_IMPACT_LINES).map { DisplayCap.cap(it) })
             val more = issued.impact.size - MAX_IMPACT_LINES
             if (more > 0) html.line("… and $more more impact line(s) not shown")
         }
@@ -114,7 +116,8 @@ class SandboxChooserDialog(
             val state = sandbox.probedState ?: "state not probed"
             val binding = if (sandbox.boundProjectId != null) "bound to a Sandpane project" else "no Sandpane binding"
             val agent = sandbox.agent?.let { "agent $it (reported by sbx, not verified)" } ?: "agent not reported"
-            return "${sandbox.name} ● $state · $binding" to "$binding\n$agent\n${sandbox.modeView().badge}"
+            return DisplayCap.cap("${sandbox.name} ● $state · $binding") to
+                DisplayCap.cap("$binding\n$agent\n${sandbox.modeView().badge}")
         }
     }
 }

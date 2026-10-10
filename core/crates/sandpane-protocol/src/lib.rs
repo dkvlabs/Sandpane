@@ -125,6 +125,18 @@ pub enum Method {
     ProjectCreate,
     #[serde(rename = "project.list")]
     ProjectList,
+    #[serde(rename = "project.update")]
+    ProjectUpdate,
+    #[serde(rename = "project.archive")]
+    ProjectArchive,
+    #[serde(rename = "project.unarchive")]
+    ProjectUnarchive,
+    #[serde(rename = "project.delete")]
+    ProjectDelete,
+    #[serde(rename = "project.add_repository")]
+    ProjectAddRepository,
+    #[serde(rename = "project.remove_repository")]
+    ProjectRemoveRepository,
     #[serde(rename = "sandbox.list")]
     SandboxList,
     #[serde(rename = "sandbox.create")]
@@ -159,10 +171,16 @@ impl Method {
     /// from the enum rather than hand-written, and `dispatch` must match
     /// exhaustively over the same enum, so an advertised method always really
     /// exists and a handled method is always advertised.
-    pub const ALL: [Method; 16] = [
+    pub const ALL: [Method; 22] = [
         Self::SystemProbe,
         Self::ProjectCreate,
         Self::ProjectList,
+        Self::ProjectUpdate,
+        Self::ProjectArchive,
+        Self::ProjectUnarchive,
+        Self::ProjectDelete,
+        Self::ProjectAddRepository,
+        Self::ProjectRemoveRepository,
         Self::SandboxList,
         Self::SandboxCreate,
         Self::SandboxStop,
@@ -189,6 +207,12 @@ impl Method {
             "system.probe" => Self::SystemProbe,
             "project.create" => Self::ProjectCreate,
             "project.list" => Self::ProjectList,
+            "project.update" => Self::ProjectUpdate,
+            "project.archive" => Self::ProjectArchive,
+            "project.unarchive" => Self::ProjectUnarchive,
+            "project.delete" => Self::ProjectDelete,
+            "project.add_repository" => Self::ProjectAddRepository,
+            "project.remove_repository" => Self::ProjectRemoveRepository,
             "sandbox.list" => Self::SandboxList,
             "sandbox.create" => Self::SandboxCreate,
             "sandbox.stop" => Self::SandboxStop,
@@ -211,6 +235,12 @@ impl Method {
             Self::SystemProbe => "system.probe",
             Self::ProjectCreate => "project.create",
             Self::ProjectList => "project.list",
+            Self::ProjectUpdate => "project.update",
+            Self::ProjectArchive => "project.archive",
+            Self::ProjectUnarchive => "project.unarchive",
+            Self::ProjectDelete => "project.delete",
+            Self::ProjectAddRepository => "project.add_repository",
+            Self::ProjectRemoveRepository => "project.remove_repository",
             Self::SandboxList => "sandbox.list",
             Self::SandboxCreate => "sandbox.create",
             Self::SandboxStop => "sandbox.stop",
@@ -314,6 +344,94 @@ pub struct Project {
     /// (additive v1 field).
     #[serde(default)]
     pub repositories: Vec<String>,
+    /// A3a (additive): RFC 3339 UTC instant the project was archived; ABSENT
+    /// when it is not archived (and from a Core older than A3a). An archived
+    /// project refuses `conversation.create`, `conversation.send`,
+    /// `sandbox.create`, `project.update` and the repository methods; reads
+    /// keep working. `project.list` returns archived projects only when asked
+    /// with `includeArchived: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+}
+
+/// `project.list` params (A3a, additive). Every field is optional and an
+/// older client sends none at all (params absent → `null`), which means
+/// "live projects only" — today's behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_archived: Option<bool>,
+}
+
+impl ProjectListParams {
+    /// Parse the wire `params`: `null` (absent) is the default.
+    pub fn from_wire(params: serde_json::Value) -> Result<Self, serde_json::Error> {
+        if params.is_null() {
+            return Ok(Self::default());
+        }
+        serde_json::from_value(params)
+    }
+
+    pub fn include_archived(&self) -> bool {
+        self.include_archived.unwrap_or(false)
+    }
+}
+
+/// `project.update` params (A3a). At least one of `name` / `description`.
+/// `name`: display text, at most 120 characters (the `project.create` rule).
+/// `description`: at most 2000 characters, newlines allowed, every other
+/// control character refused; `""` clears it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectUpdateParams {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// `project.archive` / `project.unarchive` params (A3a). Both idempotent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectIdParams {
+    pub project_id: String,
+}
+
+/// `project.delete` params (A3a, two-step confirmation, design §2). Without
+/// `confirmToken` Core deletes nothing and answers a [`ConfirmationRequest`]
+/// (action `project.delete`, target `{name, id}`); with it, Core re-checks the
+/// preconditions and deletes the project's rows. The token is bound to the
+/// project ID: a rename between the steps does not invalidate it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDeleteParams {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_token: Option<String>,
+}
+
+/// `project.delete` result: exactly one field — `confirmation` (step 1,
+/// nothing changed) or `deleted: true` (step 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDeleteResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ConfirmationRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+}
+
+/// `project.add_repository` / `project.remove_repository` params (A3a).
+/// `path` is a host path: add canonicalizes it to a registrable Git top
+/// level (the `project.create` rules); remove matches the stored canonical
+/// path or the canonicalized input. Neither touches the host repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRepositoryParams {
+    pub project_id: String,
+    pub path: String,
 }
 
 /// `project.create` params.
@@ -439,7 +557,10 @@ pub struct ConfirmationTarget {
 /// this sandbox: there is no live binding recorded for THIS sbx id — no
 /// binding at all, a binding that predates sbx-id tracking or has no recorded
 /// id, or a binding for an earlier sandbox with a different id. Every client
-/// must show it prominently together with `impact`. Not a proof of human
+/// must show it prominently together with `impact`. For a PROJECT target
+/// (`project.delete`, A3a) `external` is always `false`: a project exists only
+/// in Core, and `target.id` is the project id (`target.name` is display only —
+/// a rename between the steps does not invalidate the token). Not a proof of human
 /// presence: see design 2026-10-09 §2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -833,13 +954,20 @@ mod tests {
     /// through `parse`, `as_str` and serde, and `Method::ALL` must cover every
     /// one of them exactly once — `CoreCapabilities.methods` is derived from it.
     /// A1 added `sandbox.stop` and `sandbox.remove`; there is deliberately NO
-    /// `sandbox.start` (sbx v0.47 has no `start`).
+    /// `sandbox.start` (sbx v0.47 has no `start`). A3a added the six project
+    /// lifecycle methods (lowercase snake_case segments, design §3.2 item 1).
     #[test]
-    fn all_sixteen_methods_round_trip() {
-        const EXPECTED: [&str; 16] = [
+    fn all_twenty_two_methods_round_trip() {
+        const EXPECTED: [&str; 22] = [
             "system.probe",
             "project.create",
             "project.list",
+            "project.update",
+            "project.archive",
+            "project.unarchive",
+            "project.delete",
+            "project.add_repository",
+            "project.remove_repository",
             "sandbox.list",
             "sandbox.create",
             "sandbox.stop",
@@ -884,6 +1012,68 @@ mod tests {
             None,
             "sbx v0.47 has no start"
         );
+        assert_eq!(
+            Method::parse("project.addRepository"),
+            None,
+            "camelCase segments are not wire names"
+        );
+    }
+
+    /// A3a: `archivedAt` is additive — absent when not archived (and from an
+    /// older Core), present as RFC 3339 when archived.
+    #[test]
+    fn project_archived_at_is_absent_tolerant() {
+        let old: Project = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "Atlas Demo", "createdAt": "t"
+        }))
+        .unwrap();
+        assert_eq!(old.archived_at, None);
+        let live = serde_json::to_value(&old).unwrap();
+        assert!(live.get("archivedAt").is_none(), "{live}");
+        let archived = Project {
+            archived_at: Some("2026-10-10T00:00:00Z".into()),
+            ..old
+        };
+        assert_eq!(
+            serde_json::to_value(&archived).unwrap()["archivedAt"],
+            "2026-10-10T00:00:00Z"
+        );
+    }
+
+    /// A3a: `project.list` params are optional; absent/`{}` = live only.
+    #[test]
+    fn project_list_params_default_to_live_only() {
+        let p: ProjectListParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!p.include_archived());
+        let p = ProjectListParams::from_wire(serde_json::Value::Null).unwrap();
+        assert!(!p.include_archived());
+        let p = ProjectListParams::from_wire(serde_json::json!({"includeArchived": true})).unwrap();
+        assert!(p.include_archived());
+    }
+
+    /// A3a: project.delete result — exactly one of the two fields per step.
+    #[test]
+    fn project_delete_result_shapes() {
+        let step2 = ProjectDeleteResult {
+            confirmation: None,
+            deleted: Some(true),
+        };
+        assert_eq!(
+            serde_json::to_value(&step2).unwrap(),
+            serde_json::json!({"deleted": true})
+        );
+        let params: ProjectDeleteParams =
+            serde_json::from_value(serde_json::json!({"projectId": "p"})).unwrap();
+        assert_eq!(params.confirm_token, None);
+        let upd: ProjectUpdateParams =
+            serde_json::from_value(serde_json::json!({"projectId": "p", "description": ""}))
+                .unwrap();
+        assert_eq!((upd.name, upd.description.as_deref()), (None, Some("")));
+        let repo: ProjectRepositoryParams =
+            serde_json::from_value(serde_json::json!({"projectId": "p", "path": "/r"})).unwrap();
+        assert_eq!(repo.path, "/r");
+        let _: ProjectIdParams =
+            serde_json::from_value(serde_json::json!({"projectId": "p"})).unwrap();
     }
 
     /// A2: the single source of `CoreCapabilities.features`. Pinned here and,
@@ -1189,6 +1379,7 @@ mod tests {
             description: String::new(),
             created_at: "t".into(),
             repositories: vec!["/repos/atlas".into()],
+            archived_at: None,
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["repositories"][0], "/repos/atlas");

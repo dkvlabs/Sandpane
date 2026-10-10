@@ -144,12 +144,13 @@ describe('wire names match the Rust protocol crate', () => {
     expect(serviceLib).toContain('pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;');
   });
 
-  it('declares exactly the 16 method names Core parses, in Method::ALL order', () => {
-    // (1) every `"dotted.name" =>` arm of Rust's `Method::parse`.
-    const fromRust = [...rustProtocol.matchAll(/"([a-z]+\.[a-z]+)" =>/g)].map((m) => m[1]);
+  it('declares exactly the 22 method names Core parses, in Method::ALL order', () => {
+    // (1) every `"dotted.name" =>` arm of Rust's `Method::parse` (segments are
+    // lowercase snake_case since A3a: `project.add_repository`).
+    const fromRust = [...rustProtocol.matchAll(/"([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)" =>/g)].map((m) => m[1]);
     expect(fromRust.sort()).toEqual([...CORE_METHODS].sort());
-    expect(new Set(fromRust).size).toBe(16);
-    expect(CORE_METHODS).toHaveLength(16);
+    expect(new Set(fromRust).size).toBe(22);
+    expect(CORE_METHODS).toHaveLength(22);
     // (2) the advertisement list itself, including ORDER — `CoreCapabilities.methods`
     // is derived from it, and a name that renames in Rust must break here.
     expect(methodAllWireNames()).toEqual([...CORE_METHODS]);
@@ -172,7 +173,17 @@ describe('wire names match the Rust protocol crate', () => {
     }
     // A1: stop/remove sit right after sandbox.create; there is NO sandbox.start
     // (sbx v0.47 has none), on either side of the wire.
-    expect(CORE_METHODS.slice(4, 7)).toEqual(['sandbox.create', 'sandbox.stop', 'sandbox.remove']);
+    expect(CORE_METHODS.slice(10, 13)).toEqual(['sandbox.create', 'sandbox.stop', 'sandbox.remove']);
+    // A3a: the six project lifecycle methods sit right after project.list.
+    expect(CORE_METHODS.slice(2, 9)).toEqual([
+      'project.list',
+      'project.update',
+      'project.archive',
+      'project.unarchive',
+      'project.delete',
+      'project.add_repository',
+      'project.remove_repository',
+    ]);
     expect(CORE_METHODS).not.toContain('sandbox.start');
     expect(rustProtocol).not.toContain('"sandbox.start" =>');
   });
@@ -265,6 +276,37 @@ describe('wire names match the Rust protocol crate', () => {
     );
   });
 
+  it('A3a: project lifecycle wire fields match the Rust structs and the TS client', () => {
+    for (const rust of [
+      'pub archived_at: Option<String>',
+      'pub include_archived: Option<bool>',
+      'pub struct ProjectUpdateParams',
+      'pub struct ProjectIdParams',
+      'pub struct ProjectDeleteParams',
+      'pub confirm_token: Option<String>',
+      'pub struct ProjectDeleteResult',
+    ]) {
+      expect(rustProtocol, rust).toContain(rust);
+    }
+    const update = /pub struct ProjectUpdateParams \{[\s\S]*?\n\}/.exec(rustProtocol)?.[0] ?? '';
+    for (const field of ['pub project_id: String', 'pub name: Option<String>', 'pub description: Option<String>']) {
+      expect(update, field).toContain(field);
+    }
+    const tsClient = read('clients/vscode/src/core-client/protocol.ts');
+    for (const wire of [
+      'archivedAt?: string | null',
+      'includeArchived?: boolean',
+      'export interface ProjectUpdateParams',
+      'export interface ProjectDeleteResult',
+      'export interface ProjectRepositoryParams',
+    ]) {
+      expect(tsClient, wire).toContain(wire);
+    }
+    expect(read('core/crates/sandpane-service/src/project_lifecycle.rs')).toContain(
+      'pub const PROJECT_DELETE_ACTION: &str = "project.delete";',
+    );
+  });
+
   it('pins the sbx agent allowlist to the create-spec schema', () => {
     const specSchema = JSON.parse(read('schemas/sandbox-create-spec.schema.json')) as {
       properties: { agent?: { enum: string[] } };
@@ -278,7 +320,7 @@ describe('wire names match the Rust protocol crate', () => {
   });
 
   it('pins the method advertisement (`Method::ALL` → `CoreCapabilities.methods`)', () => {
-    expect(rustProtocol).toContain('pub const ALL: [Method; 16]');
+    expect(rustProtocol).toContain('pub const ALL: [Method; 22]');
     // Derived, never hand-written: `wire_names()` maps over ALL…
     expect(rustProtocol).toMatch(/pub fn wire_names\(\) -> Vec<&'static str> \{[\s\S]*Self::ALL\.iter\(\)/);
     // …and the probe answers with it.

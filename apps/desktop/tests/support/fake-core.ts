@@ -17,6 +17,24 @@
  */
 
 import { encodeFrame } from "../../src/lib/framing";
+import {
+  MSG_PROJECT_ARCHIVED,
+  MSG_PROJECT_NOT_FOUND,
+  MSG_REPOSITORY_IN_USE,
+  MSG_REPOSITORY_NOT_REGISTERED,
+  MSG_REPOSITORY_REMOVE_WHILE_CREATING,
+  MSG_UPDATE_NEEDS_A_FIELD,
+} from "../../src/lib/project-messages";
+
+/** The A3a writes a `projectFault` applies to. */
+const PROJECT_WRITES = new Set([
+  "project.update",
+  "project.archive",
+  "project.unarchive",
+  "project.delete",
+  "project.add_repository",
+  "project.remove_repository",
+]);
 import type { CoreTransport } from "../../src/lib/core-client";
 import {
   MAX_LIST_LIMIT,
@@ -100,6 +118,37 @@ export const A1_CORE_METHODS: readonly string[] = [
   "git.apply",
 ];
 
+/** Every method the A3a Core dispatches (22), in `Method::ALL` order. */
+export const A3A_CORE_METHODS: readonly string[] = [
+  "system.probe",
+  "project.create",
+  "project.list",
+  "project.update",
+  "project.archive",
+  "project.unarchive",
+  "project.delete",
+  "project.add_repository",
+  "project.remove_repository",
+  ...A1_CORE_METHODS.slice(3),
+];
+
+/**
+ * A project the double's Core holds. The A3a project-lifecycle behaviour below
+ * is MODELED on `sandpane-service/src/project_lifecycle.rs` as read from the
+ * working tree (design §3.2) — NOT captured from a live Core run.
+ */
+export interface FakeProject {
+  id: string;
+  name: string;
+  description: string;
+  createdAt: string;
+  repositories: string[];
+  archivedAt?: string;
+}
+
+/** A fault injected into the NEXT A3a project write, after Core applied it. */
+export type ProjectFault = "drop-after-apply" | "internal-after-apply";
+
 /**
  * Core's verbatim token refusal (`confirm::TOKEN_REJECTED_MESSAGE`). The A1
  * stop/remove behaviour below is MODELED on `sandpane-service/src/lib.rs`
@@ -141,6 +190,19 @@ export class FakeCore {
   public nowMs = Date.parse("2026-10-10T00:00:00Z");
   /** When true, the post-stop re-query "fails" and `requeried` is omitted. */
   public stopRequeryFails = false;
+  /** MODELED A3a project rows (`project.list` answers `[]` while this is empty). */
+  readonly projects: FakeProject[] = [];
+  private readonly projectTokens = new Map<string, { id: string; expiresAtMs: number }>();
+  /** MODELED delete precondition: the CONFLICT message step 1 / step 2 answers, or null. */
+  public projectDeleteBlocker: string | null = null;
+  /** MODELED: repository paths a task or live sandbox of the project uses. */
+  readonly repositoriesInUse = new Set<string>();
+  /** MODELED: a `sandbox.create` for the project is in flight. */
+  public projectCreateInFlight = false;
+  /** MODELED: Core's refusal of the next `project.add_repository` path (git/denylist rules). */
+  public addRepositoryRefusal: { code: string; message: string } | null = null;
+  /** MODELED fault for the next A3a project write (applied first, then the answer is lost / INTERNAL). */
+  public projectFault: ProjectFault | null = null;
   /** Extra impact lines appended to every confirmation (hostile-content tests). */
   public extraImpact: string[] = [];
   /**
@@ -291,10 +353,60 @@ export class FakeCore {
         this.dropAnswersAfterApply -= 1;
         return;
       }
+      if (this.projectFault !== null && PROJECT_WRITES.has(request.method)) {
+        const fault = this.projectFault;
+        this.projectFault = null;
+        if (fault === "drop-after-apply") return;
+        this.send(
+          encodeFrame({
+            v: PROTOCOL_VERSION,
+            id: request.id,
+            err: { code: "INTERNAL", message: "database is locked (test)" },
+          }),
+        );
+        return;
+      }
       this.send(encodeFrame(answer));
     };
     if (this.options.latencyMs) setTimeout(respond, this.options.latencyMs);
     else respond();
+  }
+
+  /** `Project` as Core serializes it: `archivedAt` only when archived. */
+  private projectWire(p: FakeProject): Record<string, unknown> {
+    return {
+      id: p.id,
+      name: p.name,
+      description: p.description,
+      createdAt: p.createdAt,
+      repositories: [...p.repositories],
+      ...(p.archivedAt === undefined ? {} : { archivedAt: p.archivedAt }),
+    };
+  }
+
+  /** `require_live_project`: the row, or why not. */
+  private liveProject(id: unknown): FakeProject | "missing" | "archived" {
+    const project = this.projects.find((p) => p.id === id);
+    if (project === undefined) return "missing";
+    if (project.archivedAt !== undefined) return "archived";
+    return project;
+  }
+
+  private liveError(why: "missing" | "archived"): [string, string] {
+    return why === "missing"
+      ? ["NOT_FOUND", MSG_PROJECT_NOT_FOUND]
+      : ["VALIDATION_FAILED", MSG_PROJECT_ARCHIVED];
+  }
+
+  addProject(project: Partial<FakeProject> & { id: string; name: string }): FakeProject {
+    const row: FakeProject = {
+      description: "",
+      createdAt: "2026-10-10T00:00:00Z",
+      repositories: [],
+      ...project,
+    };
+    this.projects.push(row);
+    return row;
   }
 
   /** The last params object the client sent for `method`, typed for tests. */
@@ -361,8 +473,109 @@ export class FakeCore {
         if (features !== null && !this.options.legacyCore) capabilities.features = [...features];
         return ok(capabilities);
       }
-      case "project.list":
-        return ok([]);
+      case "project.list": {
+        const includeArchived = params.includeArchived === true;
+        return ok(
+          this.projects
+            .filter((p) => includeArchived || p.archivedAt === undefined)
+            .map((p) => this.projectWire(p)),
+        );
+      }
+      case "project.update": {
+        if (params.name === undefined && params.description === undefined) {
+          return err("VALIDATION_FAILED", MSG_UPDATE_NEEDS_A_FIELD);
+        }
+        if (params.name === "") return err("VALIDATION_FAILED", "project name: value is empty");
+        const live = this.liveProject(params.projectId);
+        if (typeof live === "string") return err(...this.liveError(live));
+        if (typeof params.name === "string") live.name = params.name;
+        if (typeof params.description === "string") live.description = params.description;
+        return ok(this.projectWire(live));
+      }
+      case "project.archive":
+      case "project.unarchive": {
+        const project = this.projects.find((p) => p.id === params.projectId);
+        if (project === undefined) return err("NOT_FOUND", MSG_PROJECT_NOT_FOUND);
+        if (request.method === "project.archive" && project.archivedAt === undefined) {
+          project.archivedAt = new Date(this.nowMs).toISOString().replace(".000Z", "Z");
+        }
+        if (request.method === "project.unarchive") delete project.archivedAt;
+        return ok(this.projectWire(project));
+      }
+      case "project.delete": {
+        const id = String(params.projectId ?? "");
+        const token = params.confirmToken;
+        if (token === undefined) {
+          const project = this.projects.find((p) => p.id === id);
+          if (project === undefined) return err("NOT_FOUND", MSG_PROJECT_NOT_FOUND);
+          if (this.projectDeleteBlocker !== null) return err("CONFLICT", this.projectDeleteBlocker);
+          this.tokenSeq += 1;
+          const minted = (0x1000 + this.tokenSeq).toString(16).padStart(64, "0");
+          const expiresAtMs = this.nowMs + 120_000;
+          this.projectTokens.set(minted, { id, expiresAtMs });
+          const repos = project.repositories.length;
+          return ok({
+            confirmation: {
+              token: minted,
+              expiresAt: new Date(Math.floor(expiresAtMs / 1000) * 1000)
+                .toISOString()
+                .replace(".000Z", "Z"),
+              action: "project.delete",
+              target: { name: project.name, id },
+              impact: [
+                `deletes project ${project.name} and all of its Core records; this cannot be undone`,
+                "0 conversations, 0 messages and 0 tasks are deleted, with their events, artifacts and verification records",
+                `${repos} registered ${repos === 1 ? "repository is" : "repositories are"} unregistered; ${repos === 1 ? "its" : "their"} files are not touched`,
+                "0 audit records of removed sandboxes are deleted with the project",
+                "0 Core-allocated worktree directories and 0 task branches in host repositories are left in place; Core never touches host files, branches or sandboxes",
+                ...this.extraImpact,
+              ],
+              external: false,
+            },
+          });
+        }
+        // Step 2: the token is consumed FIRST, whatever happens next.
+        const bound = typeof token === "string" ? this.projectTokens.get(token) : undefined;
+        if (typeof token === "string") this.projectTokens.delete(token);
+        if (bound === undefined || bound.id !== id || this.nowMs >= bound.expiresAtMs) {
+          return err("VALIDATION_FAILED", TOKEN_REJECTED_MESSAGE);
+        }
+        const index = this.projects.findIndex((p) => p.id === id);
+        if (index < 0) return err("NOT_FOUND", MSG_PROJECT_NOT_FOUND);
+        if (this.projectDeleteBlocker !== null) return err("CONFLICT", this.projectDeleteBlocker);
+        this.projects.splice(index, 1);
+        return ok({ deleted: true });
+      }
+      case "project.add_repository": {
+        const live = this.liveProject(params.projectId);
+        if (typeof live === "string") return err(...this.liveError(live));
+        const path = String(params.path ?? "");
+        if (!path.startsWith("/")) {
+          return err("VALIDATION_FAILED", `repository path must be absolute: ${path}`);
+        }
+        if (this.addRepositoryRefusal !== null) {
+          const refusal = this.addRepositoryRefusal;
+          this.addRepositoryRefusal = null;
+          return err(refusal.code, refusal.message);
+        }
+        if (!live.repositories.includes(path)) live.repositories.push(path);
+        return ok(this.projectWire(live));
+      }
+      case "project.remove_repository": {
+        const path = String(params.path ?? "");
+        if (!path.startsWith("/")) {
+          return err("VALIDATION_FAILED", `repository path must be absolute: ${path}`);
+        }
+        const live = this.liveProject(params.projectId);
+        if (typeof live === "string") return err(...this.liveError(live));
+        if (!live.repositories.includes(path)) {
+          return err("NOT_FOUND", MSG_REPOSITORY_NOT_REGISTERED);
+        }
+        if (this.repositoriesInUse.has(path)) return err("CONFLICT", MSG_REPOSITORY_IN_USE);
+        if (this.projectCreateInFlight) return err("CONFLICT", MSG_REPOSITORY_REMOVE_WHILE_CREATING);
+        live.repositories = live.repositories.filter((r) => r !== path);
+        return ok(this.projectWire(live));
+      }
       case "sandbox.list":
         return err("NOT_INSTALLED", "sbx executable not found");
 

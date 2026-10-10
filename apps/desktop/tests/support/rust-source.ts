@@ -220,3 +220,55 @@ export function rustSnakeCaseEnumVariants(name: string): string[] {
   if (names.length === 0) throw new Error(`no variants parsed from pub enum ${name}`);
   return names;
 }
+
+/** Any repository file, read like the protocol sources (throws when absent). */
+export function repoFile(relative: string): string {
+  return read(relative);
+}
+
+export const PROJECT_LIFECYCLE_RUST = "core/crates/sandpane-service/src/project_lifecycle.rs";
+export const CONFIRM_RUST = "core/crates/sandpane-service/src/confirm.rs";
+export const VALIDATION_RUST = "core/crates/sandpane-core/src/validation.rs";
+
+/**
+ * The value of `pub const NAME: &str = "…";` in `relative`, decoded as Rust
+ * would: `\` + newline + leading whitespace is a line continuation, and `\"`,
+ * `\\`, `\n`, `\t`, `\u{…}` are escapes. The literal is SCANNED (not cut at the
+ * first `;`), because Core's messages contain semicolons.
+ */
+export function rustStrConst(relative: string, name: string): string {
+  const source = read(relative);
+  const head = new RegExp(`pub const ${name}: &str =\\s*"`).exec(source);
+  if (head === null) throw new Error(`${relative} has no "pub const ${name}: &str = \\"…\\";"`);
+  let i = head.index + head[0].length;
+  let out = "";
+  for (;;) {
+    const ch = source[i];
+    if (ch === undefined) throw new Error(`unterminated string literal for ${name}`);
+    if (ch === '"') return out;
+    if (ch !== "\\") {
+      out += ch;
+      i += 1;
+      continue;
+    }
+    const next = source[i + 1];
+    if (next === "\n") {
+      i += 2;
+      while (source[i] === " " || source[i] === "\t" || source[i] === "\n") i += 1;
+    } else if (next === "u" && source[i + 2] === "{") {
+      const close = source.indexOf("}", i);
+      out += String.fromCodePoint(parseInt(source.slice(i + 3, close), 16));
+      i = close + 1;
+    } else {
+      out += next === "n" ? "\n" : next === "t" ? "\t" : (next ?? "");
+      i += 2;
+    }
+  }
+}
+
+/** `pub const NAME: usize = N;` from any repo Rust file. */
+export function rustUsizeConst(relative: string, name: string): number {
+  const found = new RegExp(`pub const ${name}: usize = (\\d+);`).exec(read(relative));
+  if (found?.[1] === undefined) throw new Error(`${relative} has no "pub const ${name}: usize = N;"`);
+  return Number(found[1]);
+}

@@ -80,6 +80,8 @@ impl TestServer {
         writeln!(self.client, "{}", frame).unwrap();
         let mut line = String::new();
         self.reader.read_line(&mut line).unwrap();
+        // Shown with --nocapture: the real frames quoted in reports.
+        println!(">> {frame}\n<< {}", line.trim_end());
         let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(resp["id"], id, "response must correlate request id");
         assert_eq!(resp["v"], 1);
@@ -3872,4 +3874,551 @@ fn service_binary_refuses_to_serve_when_reconciliation_fails() {
         assert!(stderr.contains("reconcil"), "{which}: {stderr}");
         assert!(!socket.exists(), "{which}: no socket left to connect to");
     }
+}
+
+// ---------------------------------------------------------------------------
+// A3a (design §3.2): sbx-backed project lifecycle paths
+// ---------------------------------------------------------------------------
+
+const MSG_PROJECT_ARCHIVED: &str = "project is archived; unarchive it first; nothing was changed";
+const MSG_CREATE_IN_FLIGHT: &str =
+    "a sandbox is being created for this project; try again when it finishes; nothing was deleted";
+
+/// `sandbox.create` on an archived project is refused before sbx runs and
+/// before any key is claimed; a keyed replay of a create that finished
+/// before archiving is still answered from its stored result.
+#[test]
+fn sandbox_create_on_an_archived_project_runs_nothing() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    let done = serde_json::json!({"name": "atlas-auth", "projectId": project,
+        "workspaceMode": "mountless", "idempotencyKey": "before"});
+    let first = s.ok("1", "sandbox.create", done.clone());
+    s.ok(
+        "2",
+        "project.archive",
+        serde_json::json!({"projectId": project}),
+    );
+    fake.reset_calls();
+    let replay = s.ok("3", "sandbox.create", done);
+    assert_eq!(replay["replayed"], true, "{replay}");
+    assert_eq!(replay["name"], first["name"]);
+    for (id, params) in [
+        (
+            "4",
+            serde_json::json!({"name": "nova-search", "projectId": project, "workspaceMode": "mountless"}),
+        ),
+        (
+            "5",
+            serde_json::json!({"name": "nova-search", "projectId": project,
+                "workspaceMode": "mountless", "idempotencyKey": "after"}),
+        ),
+    ] {
+        let e = s.err(id, "sandbox.create", params);
+        assert_eq!(e["code"], "VALIDATION_FAILED", "{e}");
+        assert_eq!(e["message"], MSG_PROJECT_ARCHIVED);
+    }
+    assert!(fake.calls().is_empty(), "sbx never ran: {:?}", fake.calls());
+    assert_eq!(
+        key_rows(&s),
+        vec![(
+            "sandbox.create".to_string(),
+            "before".to_string(),
+            "done".to_string()
+        )],
+        "the refused key was never claimed"
+    );
+}
+
+/// The in-flight guard (§3.2 item 4): while `sbx create` runs for a
+/// project, `project.delete` refuses at step 1 AND step 2 with CONFLICT and
+/// deletes nothing; archive is not blocked; once the create finished, delete
+/// is refused for the live binding as usual.
+#[test]
+fn project_delete_refuses_while_a_sandbox_create_is_in_flight() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    let pid = serde_json::json!({"projectId": project});
+    // A token issued while nothing is in flight.
+    let early = s.ok("t", "project.delete", pid.clone())["confirmation"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(fake.dir.path().join("create.sleep"), "").unwrap();
+    let inner = Arc::clone(&s.inner);
+    let frame = serde_json::json!({"v":1,"id":"c","method":"sandbox.create",
+        "params":{"name":"atlas-auth","projectId": project,"workspaceMode":"mountless"}})
+    .to_string();
+    let creator = std::thread::spawn(move || {
+        serde_json::from_str::<serde_json::Value>(&sandpane_service::handle_line(&inner, &frame))
+            .unwrap()
+    });
+    // Wait until the stand-in is really executing `create`.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while create_calls(&fake) == 0 {
+        assert!(Instant::now() < deadline, "create never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let before = write_counts(&s);
+    let e = s.err("1", "project.delete", pid.clone());
+    assert_eq!(e["code"], "CONFLICT", "{e}");
+    assert_eq!(e["message"], MSG_CREATE_IN_FLIGHT);
+    let e = s.err(
+        "2",
+        "project.delete",
+        serde_json::json!({"projectId": project, "confirmToken": early}),
+    );
+    assert_eq!(e["code"], "CONFLICT", "{e}");
+    assert_eq!(e["message"], MSG_CREATE_IN_FLIGHT);
+    // Archive is reversible and not blocked.
+    s.ok("3", "project.archive", pid.clone());
+    s.ok("4", "project.unarchive", pid.clone());
+    assert_eq!(write_counts(&s), before);
+    assert!(std::fs::metadata(fake.dir.path().join("create.sleep")).is_ok());
+    let created = creator.join().unwrap();
+    assert!(
+        created.get("ok").is_some(),
+        "the create completed: {created}"
+    );
+    assert_eq!(binding_rows(&s).len(), 1, "bound to the surviving project");
+    let e = s.err("5", "project.delete", pid);
+    assert_eq!(e["code"], "CONFLICT");
+    assert_eq!(
+        e["message"],
+        "project has sandboxes; remove them first; nothing was deleted"
+    );
+}
+
+/// A `sandbox.remove` token is not a `project.delete` token (wrong action):
+/// refused with the uniform message, burned, and nothing is deleted or run.
+#[test]
+fn a_sandbox_remove_token_never_deletes_a_project() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = new_project(&mut s);
+    let token = s.ok(
+        "1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    )["confirmation"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let e = s.err(
+        "2",
+        "project.delete",
+        serde_json::json!({"projectId": project, "confirmToken": token}),
+    );
+    assert_eq!(e["code"], "VALIDATION_FAILED", "{e}");
+    assert_eq!(
+        e["message"],
+        sandpane_service::confirm::TOKEN_REJECTED_MESSAGE
+    );
+    let listed = s.ok("3", "project.list", serde_json::json!({}));
+    assert_eq!(listed[0]["id"], project.as_str(), "not deleted");
+    let e = s.err(
+        "4",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(
+        e["code"], "VALIDATION_FAILED",
+        "burned by the wrong-action attempt"
+    );
+    assert!(
+        fake.calls()
+            .iter()
+            .all(|c| c.first().map(String::as_str) != Some("rm")),
+        "rm never ran: {:?}",
+        fake.calls()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A3a security review C1 / W1: post-claim re-check and repository bindings
+// ---------------------------------------------------------------------------
+
+const MSG_REPO_IN_USE: &str =
+    "repository is used by a task or sandbox of this project; nothing was removed";
+const MSG_REMOVE_WHILE_CREATING: &str =
+    "a sandbox is being created for this project; try again when it finishes; nothing was removed";
+const MSG_REPO_UNREGISTERED_DURING_CREATE: &str = "the repository was unregistered from this \
+     project while the sandbox was being prepared; nothing was run";
+
+/// A server whose `sandbox.create` calls `hook` right after its key claim
+/// commits and before the in-flight guard — the window in which a
+/// concurrent archive / delete / remove_repository can land. `slot` carries
+/// values the hook needs once the test has created them (project id, path).
+fn server_with_claim_hook(
+    fake: &FakeSbx,
+    slot: Arc<std::sync::Mutex<Vec<String>>>,
+    hook: fn(&ServerInner, &[String]),
+) -> TestServer {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("t.sqlite3")).unwrap();
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inner = ServerInner::with_config(
+        db,
+        fake.locator(),
+        CoreConfig {
+            test_after_create_claim: Some(sandpane_service::CreateClaimHook(Arc::new(
+                move |inner: &ServerInner| {
+                    if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let values = slot.lock().unwrap().clone();
+                        hook(inner, &values);
+                    }
+                },
+            ))),
+            ..CoreConfig::default()
+        },
+    );
+    serve_inner(inner, dir)
+}
+
+/// Run one frame on a worker thread; panic if Core does not answer within
+/// `secs` (a self-deadlock wedges every later request).
+fn call_with_timeout(
+    inner: &Arc<ServerInner>,
+    frame: serde_json::Value,
+    secs: u64,
+) -> serde_json::Value {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let inner = Arc::clone(inner);
+    let line = frame.to_string();
+    std::thread::spawn(move || {
+        let out = sandpane_service::handle_line(&inner, &line);
+        let _ = tx.send(out);
+    });
+    let out = rx
+        .recv_timeout(Duration::from_secs(secs))
+        .unwrap_or_else(|_| panic!("Core did not answer within {secs}s: deadlocked"));
+    println!(">> {frame}\n<< {out}");
+    serde_json::from_str(&out).unwrap()
+}
+
+fn hook_rpc(inner: &ServerInner, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let frame = serde_json::json!({"v":1,"id":"hook","method":method,"params":params});
+    let out = sandpane_service::handle_line(inner, &frame.to_string());
+    println!("(hook) >> {frame}\n(hook) << {out}");
+    serde_json::from_str(&out).unwrap()
+}
+
+/// Drive a keyed create whose post-claim re-check fails, assert the outcome,
+/// that sbx never ran, that the key was released, and that Core still answers.
+fn assert_recheck_refuses(
+    hook: fn(&ServerInner, &[String]),
+    mode: &str,
+    expect_code: &str,
+    expect_message: &str,
+) {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let slot = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = server_with_claim_hook(&fake, Arc::clone(&slot), hook);
+    let (_repo_dir, repo) = git_repo();
+    let p = s.ok(
+        "p",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo]}),
+    );
+    let pid = p["id"].as_str().unwrap().to_string();
+    *slot.lock().unwrap() = vec![pid.clone(), repo.clone()];
+    let mut params = serde_json::json!({"name": "atlas-auth", "projectId": pid,
+        "workspaceMode": mode, "idempotencyKey": "recheck"});
+    if mode != "mountless" {
+        params["repoPath"] = serde_json::json!(repo);
+    }
+    let resp = call_with_timeout(
+        &s.inner,
+        serde_json::json!({"v":1,"id":"c","method":"sandbox.create","params": params}),
+        10,
+    );
+    assert_eq!(resp["err"]["code"], expect_code, "{resp}");
+    assert_eq!(resp["err"]["message"], expect_message, "{resp}");
+    assert_eq!(create_calls(&fake), 0, "sbx never ran: {:?}", fake.calls());
+    assert!(
+        key_rows(&s).is_empty(),
+        "claim released: {:?}",
+        key_rows(&s)
+    );
+    // Core is not wedged: a follow-up request is answered promptly.
+    let probe = call_with_timeout(
+        &s.inner,
+        serde_json::json!({"v":1,"id":"f","method":"project.list","params":{"includeArchived": true}}),
+        10,
+    );
+    assert!(probe.get("ok").is_some(), "{probe}");
+}
+
+fn hook_archive(inner: &ServerInner, v: &[String]) {
+    let r = hook_rpc(
+        inner,
+        "project.archive",
+        serde_json::json!({"projectId": v[0]}),
+    );
+    assert!(r.get("ok").is_some(), "{r}");
+}
+
+fn hook_delete(inner: &ServerInner, v: &[String]) {
+    let step1 = hook_rpc(
+        inner,
+        "project.delete",
+        serde_json::json!({"projectId": v[0]}),
+    );
+    let token = step1["ok"]["confirmation"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = hook_rpc(
+        inner,
+        "project.delete",
+        serde_json::json!({"projectId": v[0], "confirmToken": token}),
+    );
+    assert_eq!(r["ok"]["deleted"], true, "{r}");
+}
+
+fn hook_remove_repository(inner: &ServerInner, v: &[String]) {
+    let r = hook_rpc(
+        inner,
+        "project.remove_repository",
+        serde_json::json!({"projectId": v[0], "path": v[1]}),
+    );
+    assert!(r.get("ok").is_some(), "{r}");
+}
+
+/// C1: archive lands between the archived check and the post-claim
+/// re-check. Previously a self-deadlock (DB guard held across `release`).
+#[test]
+fn keyed_create_recheck_refuses_when_archived_meanwhile_and_never_deadlocks() {
+    assert_recheck_refuses(
+        hook_archive,
+        "mountless",
+        "VALIDATION_FAILED",
+        "project is archived; unarchive it first; nothing was changed",
+    );
+}
+
+/// C1: delete lands in the same window (the in-flight count is not yet
+/// taken, so delete is allowed); the re-check sees the project gone.
+#[test]
+fn keyed_create_recheck_refuses_when_deleted_meanwhile_and_never_deadlocks() {
+    assert_recheck_refuses(hook_delete, "mountless", "NOT_FOUND", "project not found");
+}
+
+/// W1(b): the mounted repository is unregistered in the same window; the
+/// re-check refuses before sbx runs.
+#[test]
+fn keyed_create_recheck_refuses_when_its_repository_was_unregistered_meanwhile() {
+    for mode in ["direct_mount", "sbx_clone"] {
+        assert_recheck_refuses(
+            hook_remove_repository,
+            mode,
+            "CONFLICT",
+            MSG_REPO_UNREGISTERED_DURING_CREATE,
+        );
+    }
+}
+
+/// The released key is reusable after a refused re-check.
+#[test]
+fn a_key_refused_by_the_recheck_is_reusable() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let slot = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = server_with_claim_hook(&fake, Arc::clone(&slot), hook_archive);
+    let pid = new_project(&mut s);
+    *slot.lock().unwrap() = vec![pid.clone()];
+    let params = serde_json::json!({"name": "atlas-auth", "projectId": pid,
+        "workspaceMode": "mountless", "idempotencyKey": "again"});
+    let e = s.err("1", "sandbox.create", params.clone());
+    assert_eq!(e["code"], "VALIDATION_FAILED");
+    s.ok(
+        "2",
+        "project.unarchive",
+        serde_json::json!({"projectId": pid}),
+    );
+    let ok = s.ok("3", "sandbox.create", params);
+    assert!(ok.get("replayed").is_none(), "a first response: {ok}");
+    assert_eq!(create_calls(&fake), 1);
+}
+
+fn binding_repo_ids(s: &TestServer) -> Vec<(String, Option<String>)> {
+    let db = s.inner.lock_db();
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT workspace_mode, repo_id FROM sandbox_bindings ORDER BY rowid")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows
+}
+
+fn repo_row_id(s: &TestServer, path: &str) -> String {
+    s.inner
+        .lock_db()
+        .conn()
+        .query_row(
+            "SELECT id FROM repositories WHERE canonical_path = ?1",
+            [path],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// W1(a): a mounting binding records the registered repository it mounts;
+/// mountless records none.
+#[test]
+fn create_records_the_mounted_repository_on_the_binding() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let (_d, repo) = git_repo();
+    let p = s.ok(
+        "p",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo]}),
+    );
+    for (i, mode) in ["direct_mount", "sbx_clone", "mountless"]
+        .iter()
+        .enumerate()
+    {
+        let mut params = serde_json::json!({"name": format!("atlas-{i}x"), "projectId": p["id"],
+            "workspaceMode": mode});
+        if *mode != "mountless" {
+            params["repoPath"] = serde_json::json!(repo);
+        }
+        s.ok(&format!("c{i}"), "sandbox.create", params);
+    }
+    let rid = repo_row_id(&s, &repo);
+    assert_eq!(
+        binding_repo_ids(&s),
+        vec![
+            ("direct_mount".to_string(), Some(rid.clone())),
+            ("sbx_clone".to_string(), Some(rid)),
+            ("mountless".to_string(), None),
+        ]
+    );
+}
+
+/// W1(c): remove_repository refuses while a live binding mounts the repo;
+/// once the sandbox is removed (binding kept for audit) the repository can
+/// be unregistered and the audit row is detached from it (repo_id NULL).
+#[test]
+fn remove_repository_refuses_while_a_live_binding_mounts_it() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let (_d, repo) = git_repo();
+    let p = s.ok(
+        "p",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo]}),
+    );
+    s.ok(
+        "c",
+        "sandbox.create",
+        serde_json::json!({"name": "atlas-auth", "projectId": p["id"],
+            "workspaceMode": "direct_mount", "repoPath": repo}),
+    );
+    let remove = serde_json::json!({"projectId": p["id"], "path": repo});
+    let e = s.err("r1", "project.remove_repository", remove.clone());
+    assert_eq!(e["code"], "CONFLICT", "{e}");
+    assert_eq!(e["message"], MSG_REPO_IN_USE);
+    // Remove the sandbox (A1 token flow); its binding becomes an audit row.
+    let token = s.ok(
+        "x1",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    )["confirmation"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fake.ls_after("rm", EMPTY_LS);
+    s.ok(
+        "x2",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    let after = s.ok("r2", "project.remove_repository", remove);
+    assert_eq!(after["repositories"], serde_json::json!([]));
+    assert_eq!(
+        binding_repo_ids(&s),
+        vec![("direct_mount".to_string(), None)],
+        "audit row kept, detached from the unregistered repository"
+    );
+}
+
+/// W1(c): a LIVE mounting binding written before A3a (repo_id NULL) blocks
+/// removal of every repository of its project (conservative); a live
+/// mountless binding does not.
+#[test]
+fn remove_repository_is_conservative_about_pre_a3a_mounting_bindings() {
+    let mut s = start_server(no_sbx());
+    let (_d, repo) = git_repo();
+    let p = s.ok(
+        "p",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo]}),
+    );
+    let pid = p["id"].as_str().unwrap().to_string();
+    let remove = serde_json::json!({"projectId": pid, "path": repo});
+    s.inner
+        .lock_db()
+        .conn()
+        .execute(
+            "INSERT INTO sandbox_bindings (id, project_id, sandbox_name, workspace_mode, created_at)
+             VALUES ('legacy', ?1, 'atlas-auth', 'sbx_clone', 't')",
+            [&pid],
+        )
+        .unwrap();
+    let e = s.err("1", "project.remove_repository", remove.clone());
+    assert_eq!(e["code"], "CONFLICT", "{e}");
+    assert_eq!(e["message"], MSG_REPO_IN_USE);
+    s.inner
+        .lock_db()
+        .conn()
+        .execute_batch("UPDATE sandbox_bindings SET workspace_mode='mountless' WHERE id='legacy'")
+        .unwrap();
+    s.ok("2", "project.remove_repository", remove);
+}
+
+/// W1(c): remove_repository refuses while a create for the project is in
+/// flight (it may be about to mount the repository).
+#[test]
+fn remove_repository_refuses_while_a_sandbox_create_is_in_flight() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let (_d, repo) = git_repo();
+    let (_d2, other) = git_repo();
+    let p = s.ok(
+        "p",
+        "project.create",
+        serde_json::json!({"name": "Atlas Demo", "repositories": [repo, other]}),
+    );
+    std::fs::write(fake.dir.path().join("create.sleep"), "").unwrap();
+    let inner = Arc::clone(&s.inner);
+    let frame = serde_json::json!({"v":1,"id":"c","method":"sandbox.create",
+        "params":{"name":"atlas-auth","projectId": p["id"],"workspaceMode":"mountless"}})
+    .to_string();
+    let creator = std::thread::spawn(move || sandpane_service::handle_line(&inner, &frame));
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while create_calls(&fake) == 0 {
+        assert!(Instant::now() < deadline, "create never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Even a repository the create does not mount: Core cannot know yet.
+    let e = s.err(
+        "r",
+        "project.remove_repository",
+        serde_json::json!({"projectId": p["id"], "path": other}),
+    );
+    assert_eq!(e["code"], "CONFLICT", "{e}");
+    assert_eq!(e["message"], MSG_REMOVE_WHILE_CREATING);
+    creator.join().unwrap();
+    s.ok(
+        "r2",
+        "project.remove_repository",
+        serde_json::json!({"projectId": p["id"], "path": other}),
+    );
 }

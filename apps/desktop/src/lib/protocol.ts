@@ -105,11 +105,18 @@ export const ERROR_CODES: readonly ErrorCode[] = [
  * with `coreAdvertisesMethod` instead of assuming (AGENTS rule 5). So are the A1
  * lifecycle methods `sandbox.stop` and `sandbox.remove` (design 2026-10-09 §3).
  * There is deliberately NO `sandbox.start`: sbx v0.47 has no `start` command.
+ * The six A3a project-lifecycle methods (design §3.2) are additive too.
  */
 export const METHODS = [
   "system.probe",
   "project.create",
   "project.list",
+  "project.update",
+  "project.archive",
+  "project.unarchive",
+  "project.delete",
+  "project.add_repository",
+  "project.remove_repository",
   "sandbox.list",
   "sandbox.create",
   "sandbox.stop",
@@ -274,7 +281,42 @@ export interface Project {
    * both sides; a plain string compare is not proof of identity.
    */
   repositories?: string[];
+  /**
+   * A3a (additive): RFC 3339 instant the project was archived. ABSENT when it
+   * is live, and from a Core older than A3a. Core refuses
+   * `conversation.create` / `conversation.send` / `sandbox.create` /
+   * `project.update` and the repository methods on an archived project.
+   */
+  archivedAt?: string;
 }
+
+/** The six A3a project-lifecycle methods, in `Method::ALL` order. */
+export const PROJECT_LIFECYCLE_METHODS = [
+  "project.update",
+  "project.archive",
+  "project.unarchive",
+  "project.delete",
+  "project.add_repository",
+  "project.remove_repository",
+] as const;
+
+export type ProjectLifecycleMethod = (typeof PROJECT_LIFECYCLE_METHODS)[number];
+
+/** `project.update` params (A3a): at least one of `name` / `description`. */
+export interface ProjectUpdateParams {
+  projectId: string;
+  name?: string;
+  /** `""` clears the description. */
+  description?: string;
+}
+
+/**
+ * `project.delete` result as this client decodes it: exactly one of
+ * `confirmation` (step 1, nothing changed) or `deleted: true` (step 2).
+ */
+export type ProjectDeleteResult =
+  | { kind: "confirmation"; confirmation: ConfirmationRequest }
+  | { kind: "deleted" };
 
 export interface ProjectCreateParams {
   name: string;

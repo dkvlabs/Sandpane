@@ -27,6 +27,7 @@ import {
   type CoreCapabilities,
   type ErrorCode,
   type Method,
+  type Project,
   type RpcOkFrame,
   type SandboxCreateSpec,
   type SandboxStopResult,
@@ -42,6 +43,9 @@ import {
   decodeConversationHistory,
   decodeConversations,
   decodeCoreCapabilities,
+  decodeProject,
+  decodeProjectDeleteResult,
+  decodeProjects,
   decodeSandboxRemoveResult,
   decodeSandboxStopResult,
   decodeSandboxSummaries,
@@ -54,6 +58,12 @@ import {
   CoreValidationError,
   buildConversationHistoryParams,
   buildConversationListParams,
+  buildProjectDeleteConfirmParams,
+  buildProjectDeleteRequestParams,
+  buildProjectIdParams,
+  buildProjectListParams,
+  buildProjectRepositoryParams,
+  buildProjectUpdateParams,
   buildSandboxRemoveConfirmParams,
   buildSandboxRemoveRequestParams,
   buildSandboxStopParams,
@@ -170,13 +180,18 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
  * `sandbox.stop` (stop + re-query) can take about 330 s, and `sandbox.remove`
  * step 2 (identity re-check + `rm --force`) a little longer. Each stays above
  * the proxy's own budget for that method (`proxy_deadline_ms` in ipc_client.rs:
- * 320 s / 40 s / 350 s / 390 s), per-method drift-tested.
+ * 320 s / 40 s / 350 s / 390 s), per-method drift-tested. `project.create` and
+ * `project.add_repository` run Core's git canonicalization of a repository path
+ * (up to 30 s): 45 s here, 43 s in the proxy.
  */
 export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
   "sandbox.create": 330_000,
   "sandbox.list": 45_000,
   "sandbox.stop": 360_000,
   "sandbox.remove": 400_000,
+  // Core's git canonicalization of a repository path may take up to 30 s.
+  "project.create": 45_000,
+  "project.add_repository": 45_000,
 };
 
 /** The webview deadline for one method with the default options. */
@@ -437,8 +452,152 @@ export class CoreClient {
 
   // -- typed convenience wrappers (still one RPC each, no logic) ----------
 
-  listProjects() {
-    return this.request("project.list", {});
+  /**
+   * `project.list`. Default `{}` (live projects only — the frame every
+   * pre-A3a build sent); `includeArchived` adds `{ includeArchived: true }`.
+   */
+  listProjects(includeArchived = false) {
+    return this.request("project.list", buildProjectListParams(includeArchived));
+  }
+
+  /** `project.list`, decoded. */
+  async listProjectRows(includeArchived = false): Promise<Project[]> {
+    return decodeProjects(await this.listProjects(includeArchived));
+  }
+
+  // -- A3a project lifecycle (design 2026-10-09 §3.2) ---------------------
+
+  /** `project.update`: only the changed fields, Core's rules checked first. */
+  async updateProject(
+    projectId: string,
+    changes: { name?: string; description?: string },
+  ): Promise<Project> {
+    const params = preflight(() => buildProjectUpdateParams(projectId, changes));
+    return this.projectWrite("project.update", params);
+  }
+
+  /** `project.archive` (idempotent). */
+  async archiveProject(projectId: string): Promise<Project> {
+    return this.projectWrite("project.archive", preflight(() => buildProjectIdParams(projectId)));
+  }
+
+  /** `project.unarchive` (idempotent). */
+  async unarchiveProject(projectId: string): Promise<Project> {
+    return this.projectWrite("project.unarchive", preflight(() => buildProjectIdParams(projectId)));
+  }
+
+  /** `project.add_repository`: Core canonicalizes and validates the path. */
+  async addProjectRepository(projectId: string, path: string): Promise<Project> {
+    const params = preflight(() => buildProjectRepositoryParams(projectId, path));
+    return this.projectWrite("project.add_repository", params);
+  }
+
+  /** `project.remove_repository`: unregisters only; host files are never touched. */
+  async removeProjectRepository(projectId: string, path: string): Promise<Project> {
+    const params = preflight(() => buildProjectRepositoryParams(projectId, path));
+    return this.projectWrite("project.remove_repository", params);
+  }
+
+  /**
+   * One A3a project write that answers a `Project`. A lost answer is already
+   * "may have been applied" (none of these is replay-safe); an answer this
+   * build cannot decode, or one about a DIFFERENT project, is reported the same
+   * way — Core answered, so it may have applied it. The payload is never echoed.
+   */
+  private async projectWrite(
+    method:
+      | "project.update"
+      | "project.archive"
+      | "project.unarchive"
+      | "project.add_repository"
+      | "project.remove_repository",
+    params: { projectId: string },
+  ): Promise<Project> {
+    const raw = await this.projectRequest(method, params);
+    let project: Project;
+    try {
+      project = decodeProject(raw);
+    } catch {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        `Core answered ${method}, but this desktop build could not read the answer. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
+        { mayHaveBeenApplied: true },
+      );
+    }
+    if (project.id !== params.projectId) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        `Core answered ${method} about a different project than the one asked about. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
+        { mayHaveBeenApplied: true },
+      );
+    }
+    return project;
+  }
+
+  /** One A3a write exchange; Core `INTERNAL` becomes an unknown outcome. */
+  private async projectRequest(method: Method, params: Record<string, unknown>): Promise<unknown> {
+    try {
+      return await this.request(method, params);
+    } catch (err) {
+      throw markInternalUnknown(asCoreRequestError(err));
+    }
+  }
+
+  /**
+   * `project.delete` STEP 1: sends exactly `{ projectId }`. Core changes nothing
+   * and answers a confirmation bound to the project ID. A confirmation for any
+   * other project id is refused, so a token can never be confirmed against the
+   * wrong project. (The name may differ from the list after a rename; Core's
+   * name is what the dialog shows.)
+   */
+  async requestProjectDeletion(projectId: string): Promise<ConfirmationRequest> {
+    const params = preflight(() => buildProjectDeleteRequestParams(projectId));
+    const raw = await this.request("project.delete", params);
+    const result = decodeProjectDeleteResult(raw);
+    if (result.kind !== "confirmation") {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "project.delete step 1 answered `deleted` without a confirmation token; re-read the project list",
+        { mayHaveBeenApplied: true },
+      );
+    }
+    if (result.confirmation.target.id !== params.projectId) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "project.delete step 1 answered a confirmation for a different project; refusing to use it",
+      );
+    }
+    return result.confirmation;
+  }
+
+  /**
+   * `project.delete` STEP 2: `{ projectId, confirmToken }`, sent once. Only
+   * `deleted: true` is a success. Any answer this build cannot read is an
+   * UNKNOWN outcome (Core answered, so it may have deleted) — never "nothing
+   * was deleted".
+   */
+  async confirmProjectDeletion(projectId: string, confirmToken: string): Promise<{ deleted: true }> {
+    const params = preflight(() => buildProjectDeleteConfirmParams(projectId, confirmToken));
+    const raw = await this.projectRequest("project.delete", params);
+    let deleted = false;
+    try {
+      deleted = decodeProjectDeleteResult(raw).kind === "deleted";
+    } catch {
+      deleted = false;
+    }
+    if (!deleted) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        `Core answered project.delete step 2, but not with \`deleted: true\` in a form this build can read. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
+        { mayHaveBeenApplied: true },
+      );
+    }
+    return { deleted: true };
   }
 
   createProject(params: { name: string; repositories: string[] }) {
@@ -749,6 +908,26 @@ export class CoreClient {
  * Annotate a failed keyed-write exchange: record `idempotencyKeyed`, and treat a
  * Core `INTERNAL` as an unknown outcome. Every other verdict is kept as is.
  */
+/**
+ * A3a project writes: a Core `INTERNAL` (or an already-lost answer) is an
+ * UNKNOWN outcome — Core may have committed before it failed — so it is
+ * flagged `mayHaveBeenApplied` and the UI says "re-read state", never "retry".
+ * Unlike `markWriteOutcome` it adds no idempotency flag (these methods take no key).
+ */
+function markInternalUnknown(err: CoreRequestError): CoreRequestError {
+  if (!(err.isCoreError && err.code === "INTERNAL") || err.mayHaveBeenApplied) return err;
+  const details =
+    typeof err.details === "object" && err.details !== null && !Array.isArray(err.details)
+      ? (err.details as Record<string, unknown>)
+      : err.details === undefined
+        ? {}
+        : { coreDetails: err.details };
+  return new CoreRequestError(err.source, err.code, err.message, {
+    ...details,
+    mayHaveBeenApplied: true,
+  });
+}
+
 function markWriteOutcome(err: CoreRequestError, keyed: boolean): CoreRequestError {
   const details =
     typeof err.details === "object" && err.details !== null && !Array.isArray(err.details)

@@ -200,6 +200,23 @@ class TaskMonitorService(private val project: Project) : Disposable {
         connection.releaseTask(taskId)
     }
 
+    /**
+     * A3a: after Core CONFIRMED a project delete (`deleted: true`), drop this window's in-memory
+     * state for that project's conversations — tracked tasks and their rows. Core deleted those
+     * rows; nothing here decides a task state, it only stops showing what no longer exists.
+     * @return how many tasks were dropped.
+     */
+    fun forgetConversations(conversationIds: Collection<String>): Int {
+        var dropped = 0
+        conversationIds.forEach { cid ->
+            conversationTasks.remove(cid)?.forEach { taskId ->
+                untrack(taskId)
+                if (views.remove(taskId) != null) dropped++
+            }
+        }
+        return dropped
+    }
+
     /** Explicit discovery on a user refresh — the pre-advertisement path (see gap 1). */
     fun discoverTasks(projectId: String): CompletableFuture<Int> =
         connection.discoverTasks(projectId) { taskId -> track(taskId) }

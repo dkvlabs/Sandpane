@@ -6,6 +6,7 @@
  * explicit `unknown`/`unprobed` shape instead of a guess.
  */
 
+import { projectMessageCopy } from "./project-messages";
 import { MAX_HISTORY_BYTES, MAX_LIST_LIMIT, TASK_STATUSES } from "./protocol";
 import type {
   AgentCapability,
@@ -1893,6 +1894,18 @@ function describeCoreErrorUnrevealed(err: CoreRequestError): ErrorCopy {
         title: "Nothing was run — another operation on this sandbox is in progress",
         reason: err.message,
         action: "Wait for it to finish, then re-read state before trying again.",
+        tone: "attention",
+        ...coreHints(err),
+      };
+    }
+    // A3a: Core's exact project-lifecycle refusals (code + text). Each is a
+    // refusal before any change, so only these may say "nothing was …".
+    const lifecycle = projectMessageCopy(String(err.code), err.message);
+    if (lifecycle !== null) {
+      return {
+        title: lifecycle.title,
+        reason: err.message,
+        action: lifecycle.action,
         tone: "attention",
         ...coreHints(err),
       };

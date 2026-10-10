@@ -7,6 +7,8 @@ import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.core.KeyedCall
 import labs.dkv.sandpane.core.KeyedRequests
 import labs.dkv.sandpane.core.KeyedWrites
+import labs.dkv.sandpane.core.ProjectGuards
+import labs.dkv.sandpane.core.ProjectOutcomes
 import labs.dkv.sandpane.model.Conversation
 import labs.dkv.sandpane.model.ConversationCreateParams
 import labs.dkv.sandpane.model.CoreJson
@@ -17,6 +19,7 @@ import labs.dkv.sandpane.model.SandboxCreateSpec
 import labs.dkv.sandpane.model.SandboxStopResult
 import labs.dkv.sandpane.model.SandboxSummary
 import labs.dkv.sandpane.model.SbxAgents
+import labs.dkv.sandpane.settings.SandpaneSettings
 import labs.dkv.sandpane.text.VisibleText
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.buildJsonObject
@@ -45,6 +48,8 @@ class SbxService(private val project: Project) {
         val sandboxes: List<SandboxSummary>?,
         val probedAtMillis: Long,
         val failure: String?,
+        /** A3a: true only when [projects] came from `project.list {includeArchived:true}`. */
+        val archivedIncluded: Boolean = false,
     ) {
         val isEmpty: Boolean get() = projects.isNullOrEmpty() && sandboxes.isNullOrEmpty()
 
@@ -97,12 +102,16 @@ class SbxService(private val project: Project) {
     // read-only paths (JB0 / JB1)
     // -----------------------------------------------------------------------
 
-    fun listProjects(): CompletableFuture<List<SandpaneProject>> =
-        connection.call(
-            CoreMethods.PROJECT_LIST,
-            buildJsonObject { },
-            ListSerializer(SandpaneProject.serializer()),
-        )
+    /**
+     * `project.list`: `{}` (live projects only), or `{"includeArchived":true}` — which
+     * [labs.dkv.sandpane.core.CoreCommands.projectList] sends only when Core advertises the A3a
+     * methods, since a pre-A3a Core would silently ignore the flag.
+     */
+    fun listProjects(includeArchived: Boolean = false): CompletableFuture<List<SandpaneProject>> =
+        connection.commands.projectList(includeArchived)
+
+    /** Can this Core list archived projects at all (A3a advertised)? */
+    fun canListArchived(): Boolean = connection.commands.advertises(CoreMethods.PROJECT_ARCHIVE)
 
     fun listSandboxes(): CompletableFuture<List<SandboxSummary>> =
         connection.call(
@@ -118,13 +127,16 @@ class SbxService(private val project: Project) {
      * shows the real state rather than a stale list pretending to be current (AGENTS.md
      * rule 5). Both RPCs are issued from this single background task, never from the EDT.
      */
-    fun refresh(): CompletableFuture<Snapshot> {
+    fun refresh(includeArchivedOverride: Boolean = false): CompletableFuture<Snapshot> {
         val started = System.currentTimeMillis()
+        // The "show archived" view setting, or an unknown-outcome re-read (which must find the project
+        // wherever it ended up) — and never on a Core that cannot honour it.
+        val includeArchived = (includeArchivedOverride || SandpaneSettings.instance().showArchivedProjects) && canListArchived()
         // NOTE: this blocks on two futures from inside an io-pool task. That is safe ONLY
         // because ConnectionManager uses an elastic cached thread pool; if that pool ever
         // becomes fixed-size, replace the blocking .get() calls with a composed future.
         return connection.background("sandbox.refresh") {
-            val projects = runCatching { listProjects().get() }
+            val projects = runCatching { listProjects(includeArchived).get() }
             val sandboxes = runCatching { listSandboxes().get() }
             val problems = listOfNotNull(
                 projects.exceptionOrNull()?.let { ErrorAttribution.describe(CoreMethods.PROJECT_LIST, it) },
@@ -135,6 +147,7 @@ class SbxService(private val project: Project) {
                 sandboxes = sandboxes.getOrNull(),
                 probedAtMillis = if (problems.isEmpty()) System.currentTimeMillis() else started,
                 failure = problems.takeIf { it.isNotEmpty() }?.joinToString("; "),
+                archivedIncluded = includeArchived && projects.isSuccess,
             )
             snapshot = next
             listeners.forEach { runCatching { it.onSnapshot(next) } }
@@ -280,6 +293,63 @@ class SbxService(private val project: Project) {
         )
     }
 
+    // -----------------------------------------------------------------------
+    // project lifecycle (A3a) — explicit user actions only; every one re-reads project.list
+    // -----------------------------------------------------------------------
+
+    fun updateProject(projectId: String, name: String?, description: String?): CompletableFuture<SandpaneProject> =
+        afterProjectMutation(connection.commands.projectUpdate(projectId, name, description))
+
+    fun archiveProject(projectId: String): CompletableFuture<SandpaneProject> =
+        afterProjectMutation(connection.commands.projectArchive(projectId))
+
+    fun unarchiveProject(projectId: String): CompletableFuture<SandpaneProject> =
+        afterProjectMutation(connection.commands.projectUnarchive(projectId))
+
+    fun addRepository(projectId: String, path: String): CompletableFuture<SandpaneProject> =
+        afterProjectMutation(connection.commands.projectAddRepository(projectId, path))
+
+    fun removeRepository(projectId: String, path: String): CompletableFuture<SandpaneProject> =
+        afterProjectMutation(connection.commands.projectRemoveRepository(projectId, path))
+
+    /**
+     * Re-read `project.list` after every project mutation whatever the outcome; an UNKNOWN outcome
+     * re-reads with archived projects included ([ProjectOutcomes.isUnknown]).
+     */
+    private fun afterProjectMutation(call: CompletableFuture<SandpaneProject>): CompletableFuture<SandpaneProject> {
+        call.whenComplete { _, error -> refresh(includeArchivedOverride = error != null && ProjectOutcomes.isUnknown(error)) }
+        return call
+    }
+
+    fun interface ProjectDeletedListener {
+        /** Invoked on a background thread after Core confirmed `deleted: true` for [projectId]. */
+        fun onProjectDeleted(projectId: String)
+    }
+
+    private val deletedListeners = CopyOnWriteArrayList<ProjectDeletedListener>()
+
+    /** @return a remover. */
+    fun addProjectDeletedListener(listener: ProjectDeletedListener): () -> Unit {
+        deletedListeners.add(listener)
+        return { deletedListeners.remove(listener) }
+    }
+
+    /**
+     * Core says the project is gone — `deleted: true`, a step-2 NOT_FOUND, or (after an unknown
+     * outcome) a successful re-read with archived projects that no longer lists it: tell every window
+     * to drop its in-memory state for that project (selection, tracked tasks). Nothing is persisted
+     * per project by this plugin (see [SandpaneSettings]), so there is nothing on disk to clear.
+     */
+    fun forgetProject(projectId: String) {
+        deletedListeners.forEach { runCatching { it.onProjectDeleted(projectId) } }
+    }
+
+    /** [forgetProject], then re-read Core. */
+    fun projectDeleted(projectId: String) {
+        forgetProject(projectId)
+        refresh()
+    }
+
     /** Command success is not desired state: re-probe (docs/specs/02 §5). */
     private fun afterMutation(call: CompletableFuture<*>) {
         call.whenComplete { _, _ -> refresh() }
@@ -308,7 +378,6 @@ object SbxClientValidation {
     private val SANDBOX_NAME: Regex = Regex("^[a-z0-9](?:[a-z0-9]|-(?!-))*[a-z0-9]$|^[a-z0-9]$")
 
     private const val SANDBOX_NAME_MAX = 63
-    private const val PROJECT_NAME_MAX = 200
     private const val OPAQUE_ID_MAX = 128
 
     fun isSandboxNameValid(name: String): Boolean =
@@ -323,15 +392,12 @@ object SbxClientValidation {
         }
     }
 
+    /**
+     * `Validator::project_name` exactly (A3a review: never stricter, never looser) — no trimming,
+     * because Core does not trim either. See [ProjectGuards.nameProblem].
+     */
     fun requireProjectName(name: String) {
-        val trimmed = name.trim()
-        if (trimmed.isEmpty() || trimmed.length > PROJECT_NAME_MAX) {
-            throw IllegalArgumentException("project name must be 1..$PROJECT_NAME_MAX characters")
-        }
-        // A name is a label, never a path or an argument: refuse control characters outright.
-        if (trimmed.any { it.code < 0x20 }) {
-            throw IllegalArgumentException("project name contains control characters")
-        }
+        ProjectGuards.nameProblem(name)?.let { throw IllegalArgumentException("project name: $it") }
     }
 
     /** `SandboxCreateSpec.agent` must be an exact built-in sbx v0.47 agent ([SbxAgents.V0_47]). */

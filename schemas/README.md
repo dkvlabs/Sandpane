@@ -48,7 +48,14 @@ defined only by the Rust types — the `conversation.send` `idempotencyKey`
 the `replayed: true` marker on a replayed `SandboxSummary` / `TaskSummary`
 (absent on a first response; a replay is the FIRST response, not current
 state) — are pinned by the Rust protocol tests only: client adoption pending
-(A2 client step). The `docs/specs/02 §2` contract blocks are the
+(A2 client step). The A3a project-lifecycle shapes — `ProjectListParams`
+(`includeArchived`), `ProjectUpdateParams`, `ProjectIdParams`,
+`ProjectDeleteParams` / `ProjectDeleteResult` (the §2 token flow, reusing
+`ConfirmationRequest` with `external: false`), `ProjectRepositoryParams` and
+`Project.archivedAt` — are likewise defined by the Rust types; only their
+six method names are in `rpc-request`'s enum (gated by `schema-drift`).
+They are pinned by the Rust protocol and service tests only: client adoption
+pending (A3a client step). The `docs/specs/02 §2` contract blocks are the
 human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7
 generated-bindings deliverable, not here.

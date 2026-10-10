@@ -64,11 +64,20 @@ export const MAX_SCOPING_ID_LEN = 200;
  * A1 (design 2026-10-09 §3) added `sandbox.stop` and `sandbox.remove`. There is
  * deliberately NO `sandbox.start`: sbx v0.47 has no start command, so the UI
  * shows it as visibly unsupported instead of inventing one.
+ *
+ * A3a (design §3.2) added the six project lifecycle methods; their segments
+ * stay lowercase snake_case (`project.add_repository`).
  */
 export const CORE_METHODS = [
   'system.probe',
   'project.create',
   'project.list',
+  'project.update',
+  'project.archive',
+  'project.unarchive',
+  'project.delete',
+  'project.add_repository',
+  'project.remove_repository',
   'sandbox.list',
   'sandbox.create',
   'sandbox.stop',
@@ -228,6 +237,37 @@ export interface Project {
    * must canonicalize BOTH sides — never plain string-compare.
    */
   repositories?: string[];
+  /**
+   * A3a, additive: RFC 3339 time the project was archived; ABSENT when live.
+   * Archived = Core refuses conversation.create/send, sandbox.create,
+   * project.update and the repository methods until it is unarchived.
+   */
+  archivedAt?: string | null;
+}
+
+/** `project.list` params (A3a). Absent / `{}` = live projects only. */
+export interface ProjectListParams {
+  includeArchived?: boolean;
+}
+
+/** `project.update` (A3a): at least one of `name` / `description`. */
+export interface ProjectUpdateParams {
+  projectId: string;
+  name?: string;
+  /** Empty string clears the description. */
+  description?: string;
+}
+
+/** `project.delete` result: `confirmation` for step 1, `deleted: true` for step 2. */
+export interface ProjectDeleteResult {
+  confirmation?: ConfirmationRequest | null;
+  deleted?: boolean | null;
+}
+
+/** `project.add_repository` / `project.remove_repository` (A3a). */
+export interface ProjectRepositoryParams {
+  projectId: string;
+  path: string;
 }
 
 export interface ProjectCreateParams {
