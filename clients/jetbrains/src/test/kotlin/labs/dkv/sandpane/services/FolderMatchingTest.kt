@@ -1,6 +1,7 @@
 package labs.dkv.sandpane.services
 
 import labs.dkv.sandpane.model.Project
+import labs.dkv.sandpane.model.reported
 import labs.dkv.sandpane.model.SandboxSummary
 import labs.dkv.sandpane.model.WorkspaceMode
 import labs.dkv.sandpane.model.WorkspaceModeTone
@@ -129,7 +130,7 @@ class FolderMatchingTest {
     @Test
     fun directMountIsLabelledLiveWritable() {
         val view = WorkspaceModeView.forSandbox(
-            SandboxSummary(name = "atlas-auth", probedState = "running", boundProjectId = "p1", workspaceMode = WorkspaceMode.DIRECT_MOUNT),
+            SandboxSummary(name = "atlas-auth", probedState = "running", boundProjectId = "p1", workspaceMode = WorkspaceMode.DIRECT_MOUNT.reported()),
         )
         assertEquals(WorkspaceModeTone.LIVE_WRITABLE, view.tone)
         assertTrue(view.hostWritable, "direct_mount edits are already on the host")
@@ -152,7 +153,7 @@ class FolderMatchingTest {
     @Test
     fun everyNamedModeHasALabelAndOnlyDirectMountClaimsHostWrites() {
         val views = WorkspaceMode.entries.associateWith {
-            WorkspaceModeView.forSandbox(SandboxSummary(name = "s", workspaceMode = it))
+            WorkspaceModeView.forSandbox(SandboxSummary(name = "s", workspaceMode = it.reported()))
         }
         views.forEach { (mode, view) -> assertNotNull(view.label, "no label for $mode") }
         val writable = views.filterValues { it.hostWritable }.keys
@@ -172,7 +173,7 @@ class FolderMatchingTest {
 
     @Test
     fun theSandboxSummaryProjectsItsOwnMode() {
-        val bound = SandboxSummary(name = "s", workspaceMode = WorkspaceMode.SBX_CLONE)
+        val bound = SandboxSummary(name = "s", workspaceMode = WorkspaceMode.SBX_CLONE.reported())
         assertEquals(WorkspaceModeTone.ISOLATED, bound.modeView().tone)
         assertEquals(WorkspaceModeTone.UNKNOWN, SandboxSummary(name = "s").modeView().tone)
     }

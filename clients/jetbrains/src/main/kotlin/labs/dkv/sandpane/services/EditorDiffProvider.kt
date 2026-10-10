@@ -8,7 +8,10 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.FileChange
+import labs.dkv.sandpane.model.Reported
 import labs.dkv.sandpane.model.WorkspaceMode
+import labs.dkv.sandpane.model.describe
+import labs.dkv.sandpane.text.VisibleText
 import java.io.File
 
 /**
@@ -148,11 +151,13 @@ class EditorDiffProvider(private val project: Project) {
      * without a verified adapter path" the specs forbid (AGENTS.md rule 5), so it stays here as
      * a documented decision point returning Deferred until it is proven.
      */
-    fun openNativeDiff(resolved: Resolved, workspaceMode: WorkspaceMode?): DiffOutcome {
-        val modeWarning = workspaceMode?.let { liveWritableNotice(it) }
+    fun openNativeDiff(resolved: Resolved, workspaceMode: Reported<WorkspaceMode>?): DiffOutcome {
+        // A missing mode is UNVERIFIED, which [liveWritableNotice] says out loud (S5).
+        val modeWarning = liveWritableNotice(workspaceMode)
         val deferred = DiffOutcome.Deferred(
-            "Native side-by-side diff is a JB3 feature (docs/specs/04 §4). Showing '${resolved.change.path}' " +
-                "(${resolved.change.status.name.lowercase()}) via the platform diff API is not yet proven on " +
+            "Native side-by-side diff is a JB3 feature (docs/specs/04 §4). Showing " +
+                "'${ApplyPlan.displayPath(resolved.change.path)}' " +
+                "(${resolved.change.status.describe()}) via the platform diff API is not yet proven on " +
                 "this baseline. Opening the file instead." +
                 (modeWarning?.let { " $it" } ?: ""),
         )
@@ -164,10 +169,17 @@ class EditorDiffProvider(private val project: Project) {
      * pending (docs/specs/04 §3, specs/02 §7). Same for `host_worktree` when the worktree is
      * the one the IDE is editing.
      */
-    fun liveWritableNotice(mode: WorkspaceMode?): String? = when (mode) {
+    fun liveWritableNotice(mode: Reported<WorkspaceMode>?): String? = when (mode) {
         null ->
             "Workspace mode is UNVERIFIED: Core has no readable sandbox_bindings row for this " +
                 "binding, and it never guesses one. Treated as live-writable until verified (specs/02 §7)."
+        is Reported.Unknown ->
+            "Workspace mode '${mode.wireName}' is unknown to this plugin build (a newer Core added it). " +
+                "Treated as live-writable — never as isolated — until the plugin is updated (specs/02 §7)."
+        is Reported.Known -> knownModeNotice(mode.value)
+    }
+
+    private fun knownModeNotice(mode: WorkspaceMode): String = when (mode) {
         WorkspaceMode.DIRECT_MOUNT ->
             "Workspace mode direct_mount is live-writable: these edits are already applied on the host, " +
                 "and reviewing them cannot undo them."
@@ -181,15 +193,25 @@ class EditorDiffProvider(private val project: Project) {
     }
 
     /** Human summary of a review, including the refusals — never only the successes. */
-    fun summarize(target: ReviewTarget, mode: WorkspaceMode?): String = buildString {
+    fun summarize(target: ReviewTarget, mode: Reported<WorkspaceMode>?): String = buildString {
         val cs = target.changeSet
-        appendLine("Task ${cs.taskId.take(8)} · base ${cs.baseCommit.take(10)} · ${cs.changes.size} change(s)")
+        // Every Core/agent-supplied value is revealed single-line (paths through the same
+        // [ApplyPlan.displayPath] as the Apply dialog), so none can fake a line of the summary.
+        appendLine(
+            "Task ${VisibleText.reveal(cs.taskId.take(8))} · base ${VisibleText.reveal(cs.baseCommit.take(10))} · " +
+                "${cs.changes.size} change(s)",
+        )
         if (cs.hostDirty) {
             appendLine("Host working tree is DIRTY: apply in Core will refuse to overwrite uncommitted work.")
         }
         liveWritableNotice(mode)?.let { appendLine(it) }
-        target.resolved.forEach { appendLine("  ${it.change.status.name.lowercase()}  ${it.change.path}") }
-        target.unresolved.forEach { appendLine("  unresolved  ${it.change.path} — ${it.reason}") }
+        target.resolved.forEach { appendLine("  ${it.change.status.describe()}  ${ApplyPlan.displayPath(it.change.path)}") }
+        target.unresolved.forEach {
+            appendLine(
+                "  unresolved (${it.change.status.describe()})  ${ApplyPlan.displayPath(it.change.path)} — " +
+                    VisibleText.reveal(it.reason),
+            )
+        }
     }.trimEnd()
 
     companion object {

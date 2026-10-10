@@ -12,6 +12,7 @@
 // call from the EDT.
 package labs.dkv.sandpane.core
 
+import labs.dkv.sandpane.text.VisibleText
 import java.util.concurrent.CompletionException
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeoutException
@@ -35,8 +36,14 @@ object ErrorAttribution {
         return current
     }
 
-    /** Who refused, in the user's terms — no method prefix. */
-    fun describe(error: Throwable?): String = when (val t = unwrap(error)) {
+    /**
+     * Who refused, in the user's terms — no method prefix. Always ONE line with hidden characters
+     * escaped ([VisibleText.reveal]): the text carries Core's own messages, and every surface that
+     * shows it (notification bodies keep real newlines) must not let it fake a line (S2).
+     */
+    fun describe(error: Throwable?): String = VisibleText.reveal(describeRaw(error))
+
+    private fun describeRaw(error: Throwable?): String = when (val t = unwrap(error)) {
         null ->
             "Core gave no answer: the request finished with neither a result nor an error"
 

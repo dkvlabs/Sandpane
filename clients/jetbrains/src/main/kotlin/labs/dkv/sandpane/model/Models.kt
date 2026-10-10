@@ -7,6 +7,9 @@
 // Fidelity rules, exactly as in apps/desktop/src/lib/protocol.ts:
 //   * struct fields are `camelCase` on the frame            (#[serde(rename_all = "camelCase")])
 //   * TaskStatus / WorkspaceMode / FileChangeStatus / ContextRefKind are snake_case strings
+//   * where Core REPORTS a TaskStatus / FileChangeStatus / WorkspaceMode, the field is a
+//     [Reported] (Reported.kt): a value a newer Core added decodes as Reported.Unknown(raw)
+//     instead of failing the whole frame. Outgoing fields keep the closed enums.
 //   * ErrorCode is SCREAMING_SNAKE_CASE
 //   * AgentEvent is a union discriminated by `type`, with dotted variant names
 //
@@ -330,8 +333,12 @@ data class SandboxSummary(
      * safe — because an unverified `direct_mount` mount writes straight through to host files
      * (docs/specs/02 §7). Do not default this to a benign mode; [WorkspaceModeView] is the
      * single place that turns absence into the explicit unverified label.
+     *
+     * A mode a newer Core added is [Reported.Unknown] and gets the same worst-case
+     * (live-writable, never isolated) rendering — see [WorkspaceModeView.forSandbox].
      */
-    @SerialName("workspaceMode") val workspaceMode: WorkspaceMode? = null,
+    @Serializable(with = ReportedWorkspaceModeSerializer::class)
+    @SerialName("workspaceMode") val workspaceMode: Reported<WorkspaceMode>? = null,
 ) {
     /** Presentation of the mode exactly as Core reported it (absent ⇒ unverified, never safe). */
     fun modeView(): WorkspaceModeView = WorkspaceModeView.forSandbox(this)
@@ -339,7 +346,7 @@ data class SandboxSummary(
 
 /** Workspace mapping modes (specs/02 §7). */
 @Serializable
-enum class WorkspaceMode {
+enum class WorkspaceMode : WireEnum {
     /** Live-writable: edits are already on the host and must be labeled as such in every UI
      * surface (docs/specs/02 §7). */
     @SerialName("direct_mount") DIRECT_MOUNT,
@@ -348,7 +355,8 @@ enum class WorkspaceMode {
     @SerialName("host_worktree") HOST_WORKTREE,
     @SerialName("mountless") MOUNTLESS;
 
-    val wireName: String get() = name.lowercase()
+    /** The exact `@SerialName`, read from the generated serializer rather than re-derived. */
+    override val wireName: String get() = serializer().descriptor.getElementName(ordinal)
 
     /** direct_mount edits are already on the host; review cannot retroactively block them. */
     val isLiveWritable: Boolean get() = this == DIRECT_MOUNT
@@ -521,7 +529,7 @@ data class TaskEvent(
 
 /** Task lifecycle states. Transitions are enforced in Core, never here (AGENTS.md rule 3). */
 @Serializable
-enum class TaskStatus {
+enum class TaskStatus : WireEnum {
     @SerialName("created") CREATED,
     @SerialName("queued") QUEUED,
     @SerialName("preparing") PREPARING,
@@ -534,6 +542,8 @@ enum class TaskStatus {
     @SerialName("failed") FAILED,
     @SerialName("cancelled") CANCELLED,
     @SerialName("interrupted") INTERRUPTED;
+
+    override val wireName: String get() = serializer().descriptor.getElementName(ordinal)
 
     /** Terminal for display purposes only — never a client-side transition. */
     val isTerminal: Boolean
@@ -567,7 +577,9 @@ data class TaskListParams(
 data class TaskSummary(
     val id: String,
     @SerialName("conversationId") val conversationId: String,
-    val status: TaskStatus,
+    /** Core's stored status; one a newer Core added is [Reported.Unknown], shown as such. */
+    @Serializable(with = ReportedTaskStatusSerializer::class)
+    val status: Reported<TaskStatus>,
     @SerialName("sandboxName") val sandboxName: String? = null,
     @SerialName("taskBranch") val taskBranch: String? = null,
     @SerialName("baseCommit") val baseCommit: String? = null,
@@ -589,16 +601,23 @@ data class ChangeSet(
 @Serializable
 data class FileChange(
     val path: String,
-    val status: FileChangeStatus,
+    /**
+     * A status a newer Core added is [Reported.Unknown]: the file is listed with its raw status
+     * but is never selectable for apply ([labs.dkv.sandpane.services.ApplyPlan]).
+     */
+    @Serializable(with = ReportedFileChangeStatusSerializer::class)
+    val status: Reported<FileChangeStatus>,
 )
 
 @Serializable
-enum class FileChangeStatus {
+enum class FileChangeStatus : WireEnum {
     @SerialName("added") ADDED,
     @SerialName("modified") MODIFIED,
     @SerialName("deleted") DELETED,
     @SerialName("renamed") RENAMED,
     @SerialName("untracked") UNTRACKED;
+
+    override val wireName: String get() = serializer().descriptor.getElementName(ordinal)
 }
 
 /** Apply is an explicit Git operation in Core, never a file overwrite here (rule 7). */

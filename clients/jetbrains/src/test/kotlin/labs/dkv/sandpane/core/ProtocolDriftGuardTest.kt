@@ -11,6 +11,12 @@ import labs.dkv.sandpane.model.MAX_SCOPING_ID_LEN
 import labs.dkv.sandpane.model.MAX_SUBSCRIBE_BYTES
 import labs.dkv.sandpane.model.MAX_SUBSCRIBE_CURSORS
 import labs.dkv.sandpane.model.PROTOCOL_VERSION
+import labs.dkv.sandpane.model.FileChangeStatus
+import labs.dkv.sandpane.model.MAX_UNKNOWN_WIRE_NAME_LEN
+import labs.dkv.sandpane.model.ReportedFileChangeStatusSerializer
+import labs.dkv.sandpane.model.ReportedTaskStatusSerializer
+import labs.dkv.sandpane.model.ReportedWorkspaceModeSerializer
+import labs.dkv.sandpane.model.TaskStatus
 import labs.dkv.sandpane.model.WorkspaceMode
 import java.io.File
 import kotlin.test.Test
@@ -79,6 +85,7 @@ class ProtocolDriftGuardTest {
     private val requestSchema by lazy { read("schemas/rpc-request.schema.json") }
     private val capabilitiesSchema by lazy { read("schemas/core-capabilities.schema.json") }
     private val sandboxSpecSchema by lazy { read("schemas/sandbox-create-spec.schema.json") }
+    private val changeSetSchema by lazy { read("schemas/change-set.schema.json") }
     private val kotlinMirror by lazy { read("clients/jetbrains/src/main/kotlin/labs/dkv/sandpane/model/Models.kt") }
 
     // ------------------------------------------------------------------
@@ -350,6 +357,10 @@ class ProtocolDriftGuardTest {
 
     @Test
     fun workspaceModesAndStatusesMatchTheirEnums() {
+        // The Kotlin side is read from the GENERATED serializers (each enum's `wireName` is its
+        // descriptor element name, i.e. the exact @SerialName), not re-derived from `name`. The
+        // tolerant [Reported] decoders must know exactly the same set — an unknown value is only
+        // "unknown" relative to this list.
         val block = enumBlock("WorkspaceMode")
         assertTrue(block.contains("rename_all = \"snake_case\""), "WorkspaceMode casing rule changed")
         val modes = enumVariants(block).map { it.toSnakeCase() }
@@ -358,6 +369,7 @@ class ProtocolDriftGuardTest {
             modes,
             "WorkspaceMode variants drifted between Rust and Kotlin",
         )
+        assertEquals(modes, ReportedWorkspaceModeSerializer.knownWireNames)
         assertEquals(
             modes,
             schemaStringEnum(sandboxSpecSchema, "workspaceMode"),
@@ -365,12 +377,46 @@ class ProtocolDriftGuardTest {
         )
 
         val statuses = enumBlock("TaskStatus")
-        assertTrue(statuses.contains("rename_all = \"snake_case\""))
+        assertTrue(statuses.contains("rename_all = \"snake_case\""), "TaskStatus casing rule changed")
+        val statusNames = enumVariants(statuses).map { it.toSnakeCase() }
         assertEquals(
-            labs.dkv.sandpane.model.TaskStatus.entries.map { it.name.lowercase() },
-            enumVariants(statuses).map { it.toSnakeCase() },
+            TaskStatus.entries.map { it.wireName },
+            statusNames,
             "TaskStatus variants drifted between Rust and Kotlin",
         )
+        assertEquals(statusNames, ReportedTaskStatusSerializer.knownWireNames)
+
+        val fileStatuses = enumBlock("FileChangeStatus")
+        assertTrue(fileStatuses.contains("rename_all = \"snake_case\""), "FileChangeStatus casing rule changed")
+        val fileStatusNames = enumVariants(fileStatuses).map { it.toSnakeCase() }
+        assertEquals(
+            FileChangeStatus.entries.map { it.wireName },
+            fileStatusNames,
+            "FileChangeStatus variants drifted between Rust and Kotlin",
+        )
+        assertEquals(fileStatusNames, ReportedFileChangeStatusSerializer.knownWireNames)
+        assertEquals(
+            fileStatusNames,
+            schemaStringEnum(changeSetSchema, "status"),
+            "schemas/change-set.schema.json changes[].status enum drifted",
+        )
+    }
+
+    /**
+     * The tolerant decoders accept an unknown value only if it has the serde `snake_case` shape.
+     * That is sound exactly while every mirrored Rust enum keeps `rename_all = "snake_case"` (pinned
+     * above) and every CURRENT variant has that shape — checked here so a future variant spelled
+     * otherwise fails this gate instead of being refused as a malformed frame at runtime.
+     */
+    @Test
+    fun everyCurrentVariantFitsTheUnknownValueShape() {
+        val shape = Regex("^[a-z][a-z0-9]*(_[a-z0-9]+)*$")
+        for (name in listOf("WorkspaceMode", "TaskStatus", "FileChangeStatus")) {
+            enumVariants(enumBlock(name)).map { it.toSnakeCase() }.forEach { wire ->
+                assertTrue(shape.matches(wire), "$name::$wire does not fit the tolerant decoder's shape")
+                assertTrue(wire.length <= MAX_UNKNOWN_WIRE_NAME_LEN, "$name::$wire is longer than the decoder accepts")
+            }
+        }
     }
 
     @Test

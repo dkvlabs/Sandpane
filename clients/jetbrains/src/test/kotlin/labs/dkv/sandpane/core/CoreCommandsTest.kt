@@ -1,6 +1,7 @@
 package labs.dkv.sandpane.core
 
 import labs.dkv.sandpane.model.Conversation
+import labs.dkv.sandpane.model.reported
 import labs.dkv.sandpane.model.ConversationHistoryParams
 import labs.dkv.sandpane.model.ConversationHistoryResult
 import labs.dkv.sandpane.model.ConversationListParams
@@ -267,8 +268,21 @@ class CoreCommandsTest {
         val rows = commands.taskList(TaskListParams(projectId = "p1")).get()
         assertEquals(CoreMethods.TASK_LIST, rpc.only().first)
         assertEquals(1, rows.size)
-        assertEquals(TaskStatus.COMPLETED, rows.single().status)
+        assertEquals(TaskStatus.COMPLETED.reported(), rows.single().status)
         assertEquals("t1", rows.single().id)
+    }
+
+    @Test
+    fun aTaskListWithAStatusThisBuildDoesNotDefineStillReturnsEveryRow() {
+        // Before protocol tolerance, one unknown status failed the WHOLE task.list call.
+        val rpc = RecordingRpc().apply {
+            reply = """[{"id":"t1","conversationId":"c1","status":"running"},
+                {"id":"t2","conversationId":"c1","status":"paused_for_quota"}]"""
+        }
+        val rows = CoreCommands(rpc) { allV1 }.taskList(TaskListParams(projectId = "p1")).get()
+        assertEquals(listOf("t1", "t2"), rows.map { it.id })
+        assertEquals(TaskStatus.RUNNING.reported(), rows[0].status)
+        assertEquals(labs.dkv.sandpane.model.Reported.Unknown("paused_for_quota"), rows[1].status)
     }
 
     @Test

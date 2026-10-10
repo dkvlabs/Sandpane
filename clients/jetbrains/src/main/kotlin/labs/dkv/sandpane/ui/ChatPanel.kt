@@ -18,6 +18,8 @@ import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.PROTOCOL_VERSION
 import labs.dkv.sandpane.model.Project as SandpaneProject
 import labs.dkv.sandpane.model.SandboxSummary
+import labs.dkv.sandpane.model.describe
+import labs.dkv.sandpane.text.VisibleText
 import labs.dkv.sandpane.services.SandpaneContextProvider
 import labs.dkv.sandpane.services.SbxService
 import labs.dkv.sandpane.services.TaskMonitorService
@@ -693,7 +695,7 @@ class ChatPanel(
         )
         if (existing == null) rowsModel.addElement(row) else rowsModel.setElementAt(row, rowsModel.indexOf(existing))
         rowsById[rowId] = row
-        if (messages.selectedIndex < 0 || messages.selectedValue?.id == rowId) details.text = row.text
+        if (messages.selectedIndex < 0 || messages.selectedValue?.id == rowId) showDetails(row.text)
     }
 
     private fun applyTaskEvent(taskId: String, view: TaskMonitorService.TaskView, rendered: RenderedEvent?) {
@@ -791,8 +793,9 @@ class ChatPanel(
                     addSystemRow(
                         when (result) {
                             is TaskMonitorService.SendResult.FromSummary ->
+                                // An unknown status is still an ACCEPTED task: Core queued it.
                                 "Core accepted task ${result.taskId.take(8)} · status reported by Core: " +
-                                    result.summary.status.name.lowercase()
+                                    result.summary.status.describe()
 
                             is TaskMonitorService.SendResult.TaskIdOnly ->
                                 "Core accepted task ${result.taskId.take(8)} (id-only response; see protocol gap 2)"
@@ -851,7 +854,16 @@ class ChatPanel(
     }
 
     private fun showSelectedRowDetails() {
-        messages.selectedValue?.let { details.text = it.text }
+        messages.selectedValue?.let { showDetails(it.text) }
+    }
+
+    /**
+     * The full message body. A JTextArea never renders HTML, but agent text could still carry bidi
+     * overrides or zero-width characters that reorder or hide what is read (the "Trojan Source"
+     * shape), so those are shown escaped; real line breaks and tabs are kept.
+     */
+    private fun showDetails(text: String) {
+        details.text = VisibleText.revealMultiline(text)
     }
 
     /**

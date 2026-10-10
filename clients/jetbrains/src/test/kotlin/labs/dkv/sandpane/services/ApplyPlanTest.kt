@@ -1,10 +1,12 @@
 package labs.dkv.sandpane.services
 
 import labs.dkv.sandpane.model.ChangeSet
+import labs.dkv.sandpane.model.reported
 import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.model.FileChange
 import labs.dkv.sandpane.model.FileChangeStatus
 import labs.dkv.sandpane.model.GitApplyParams
+import labs.dkv.sandpane.model.Reported
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -22,8 +24,10 @@ class ApplyPlanTest {
         taskId = task,
         baseCommit = base,
         hostDirty = dirty,
-        changes = paths.map { FileChange(it, FileChangeStatus.MODIFIED) },
+        changes = paths.map { FileChange(it, FileChangeStatus.MODIFIED.reported()) },
     )
+
+    private fun change(path: String, status: Reported<FileChangeStatus>) = FileChange(path, status)
 
     @Test
     fun theWireSelectionIsExactlyTheReviewedPaths() {
@@ -62,6 +66,56 @@ class ApplyPlanTest {
         assertTrue(text.endsWith("… and 5 more"))
     }
 
+    /**
+     * S1: on a case-insensitive filesystem (the macOS and Windows default) `A.kt` and `a.kt` are
+     * one file, as are NFC and NFD spellings. An unknown-status entry must exclude its fold-twin
+     * too, and the excluded twin is listed as NOT sent rather than silently dropped.
+     */
+    @Test
+    fun anUnknownStatusEntryAlsoExcludesItsCaseAndNormalizationTwins() {
+        val nfd = "cafe\u0301.kt"
+        val nfc = "caf\u00E9.kt"
+        val reviewed = ChangeSet(
+            taskId = "t1",
+            baseCommit = base,
+            hostDirty = false,
+            changes = listOf(
+                change("src/A.kt", Reported.Unknown("type_changed")),
+                change("src/a.kt", FileChangeStatus.MODIFIED.reported()),
+                change(nfd, Reported.Unknown("copied")),
+                change(nfc, FileChangeStatus.MODIFIED.reported()),
+                change("ok.kt", FileChangeStatus.MODIFIED.reported()),
+            ),
+        )
+        val ready = assertIs<ApplyPlan.Decision.Ready>(ApplyPlan.decide("t1", reviewed))
+        assertEquals(listOf("ok.kt"), ready.params.selectedFiles)
+        assertEquals(listOf("src/A.kt", "src/a.kt", nfd, nfc), ready.notSent.map { it.path })
+        val notSent = ApplyPlan.describeNotSent(ready.notSent).replace('\u00A0', ' ')
+        assertTrue(notSent.contains("[x2] src/a.kt — same file as an unknown-status entry"), notSent)
+    }
+
+    @Test
+    fun selectedPathsThatDifferOnlyInCaseAreSentButPointedOut() {
+        val ready = assertIs<ApplyPlan.Decision.Ready>(
+            ApplyPlan.decide("task-1", changeSet("README.md", "readme.md", "src/B.kt")),
+        )
+        assertEquals(listOf("README.md", "readme.md", "src/B.kt"), ready.paths, "legitimate on a case-sensitive filesystem")
+        assertEquals(listOf(listOf("README.md", "readme.md")), ready.foldCollisions)
+    }
+
+    /** Security re-review W1: case-variant groups are bounded in count and in size. */
+    @Test
+    fun foldCollisionGroupsAreBoundedInTheDialog() {
+        val paths = (1..30).flatMap { g -> (1..8).map { v -> "dir$g/" + "f".repeat(v) + "F".repeat(8 - v) + ".kt" } }
+            .flatMap { listOf(it, it.lowercase()) }.distinct()
+        val ready = assertIs<ApplyPlan.Decision.Ready>(ApplyPlan.decide("task-1", changeSet(*paths.toTypedArray())))
+        assertEquals(30, ready.foldCollisions.size)
+        val html = labs.dkv.sandpane.ui.ApplyConfirmation.message("task-1", changeSet(*paths.toTypedArray()), ready).build()
+        assertEquals(ApplyPlan.MAX_LISTED_PATHS, Regex("""\[c\d+]""").findAll(html).count(), "group rows")
+        assertTrue(html.contains("… and 10 more group(s)"), html.takeLast(400))
+        assertTrue(html.contains("… and 3 more"), "per-group cap")
+    }
+
     @Test
     fun aPathlessEntryIsRefusedNotSilentlyDropped() {
         val refused = assertIs<ApplyPlan.Decision.Refused>(ApplyPlan.decide("task-1", changeSet("src/A.kt", " ")))
@@ -75,8 +129,8 @@ class ApplyPlanTest {
             baseCommit = base,
             hostDirty = false,
             changes = listOf(
-                FileChange("src/New.kt", FileChangeStatus.RENAMED),
-                FileChange("src/B.kt", FileChangeStatus.MODIFIED),
+                FileChange("src/New.kt", FileChangeStatus.RENAMED.reported()),
+                FileChange("src/B.kt", FileChangeStatus.MODIFIED.reported()),
             ),
         )
         val ready = assertIs<ApplyPlan.Decision.Ready>(ApplyPlan.decide("task-1", reviewed))

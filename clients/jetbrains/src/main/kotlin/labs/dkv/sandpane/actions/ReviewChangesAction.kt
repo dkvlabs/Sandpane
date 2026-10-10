@@ -11,6 +11,7 @@ import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.text.VisibleText
 import labs.dkv.sandpane.ui.PlainText
 import labs.dkv.sandpane.services.EditorDiffProvider
 import labs.dkv.sandpane.services.TaskMonitorService
@@ -57,7 +58,8 @@ class ReviewChangesAction : AnAction() {
                 project,
                 "Sandpane: nothing to review yet",
                 "Core reports no tracked task in awaiting_review for this window. Track a task by sending a " +
-                    "message (JB2) or use Sandpane: Refresh Projects and Sandboxes to pull Core's task list.",
+                    "message (JB2) or use Sandpane: Refresh Projects and Sandboxes to pull Core's task list." +
+                    tasks.unknownStatusNote(),
                 NotificationType.INFORMATION,
             )
             return
@@ -72,13 +74,13 @@ class ReviewChangesAction : AnAction() {
                 notify(
                     project,
                     ErrorAttribution.headline(CoreMethods.GIT_REVIEW, error),
-                    ErrorAttribution.describe(CoreMethods.GIT_REVIEW, error) + "\nfor task ${chosen.taskId}",
+                    ErrorAttribution.describe(CoreMethods.GIT_REVIEW, error) + "\nfor task ${VisibleText.reveal(chosen.taskId)}",
                     NotificationType.ERROR,
                 )
                 return@whenComplete
             }
             if (changeSet == null) {
-                notify(project, "Sandpane: git.review returned nothing", "task ${chosen.taskId}", NotificationType.WARNING)
+                notify(project, "Sandpane: git.review returned nothing", "task ${VisibleText.reveal(chosen.taskId)}", NotificationType.WARNING)
                 return@whenComplete
             }
             show(project, chosen, changeSet, candidates.size)
@@ -100,15 +102,18 @@ class ReviewChangesAction : AnAction() {
         val extra = if (candidateCount > 1) "\n(${candidateCount - 1} other task(s) also await review)" else ""
         notify(
             project,
-            "Sandpane: change set for task ${chosen.taskId.take(8)}",
+            "Sandpane: change set for task ${VisibleText.reveal(chosen.taskId.take(8))}",
             truncate(summary) + extra,
             type,
         )
     }
 
-    private fun truncate(text: String): String =
-        if (text.length <= MAX_NOTIFICATION_CHARS) text
-        else text.take(MAX_NOTIFICATION_CHARS) + "\n… (truncated; the tool window shows the full list)"
+    /** Cut on a code-point boundary (S4): never half of a surrogate pair at the end. */
+    private fun truncate(text: String): String {
+        if (text.codePointCount(0, text.length) <= MAX_NOTIFICATION_CHARS) return text
+        return text.substring(0, text.offsetByCodePoints(0, MAX_NOTIFICATION_CHARS)) +
+            "\n… (truncated; the tool window shows the full list)"
+    }
 
     companion object {
         /** Bound the notification body: a huge change set must not paste into a balloon. */

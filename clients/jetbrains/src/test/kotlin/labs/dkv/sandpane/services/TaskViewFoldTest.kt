@@ -2,6 +2,7 @@ package labs.dkv.sandpane.services
 
 import labs.dkv.sandpane.core.toRenderedEvent
 import labs.dkv.sandpane.model.TaskEvent
+import labs.dkv.sandpane.model.reported
 import labs.dkv.sandpane.model.TaskStatus
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -35,11 +36,11 @@ class TaskViewFoldTest {
     @Test
     fun holeFillingEventsDeliveredAfterNewerOnesDoNotRollStatusBack() {
         val afterGap = foldAll(listOf(status(1, "queued"), delta(2), delta(5), status(6, "awaiting_review")))
-        assertEquals(TaskStatus.AWAITING_REVIEW, afterGap.status)
+        assertEquals(TaskStatus.AWAITING_REVIEW.reported(), afterGap.status)
 
         // The resync fills 3 and 4 — older than 6 — and 4 says "running".
         val filled = foldAll(listOf(delta(3), status(4, "running")), afterGap)
-        assertEquals(TaskStatus.AWAITING_REVIEW, filled.status, "an older status.changed must not win")
+        assertEquals(TaskStatus.AWAITING_REVIEW.reported(), filled.status, "an older status.changed must not win")
         assertEquals(6L, filled.lastSequence)
         assertEquals(afterGap.lastEventAt, filled.lastEventAt)
     }
@@ -47,7 +48,7 @@ class TaskViewFoldTest {
     @Test
     fun inOrderEventsStillAdvanceTheRow() {
         val view = foldAll(listOf(status(1, "queued"), status(2, "running"), status(3, "awaiting_review")))
-        assertEquals(TaskStatus.AWAITING_REVIEW, view.status)
+        assertEquals(TaskStatus.AWAITING_REVIEW.reported(), view.status)
         assertEquals(3L, view.lastSequence)
     }
 }

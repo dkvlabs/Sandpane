@@ -13,8 +13,12 @@ import labs.dkv.sandpane.model.CancelAccepted
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.ConversationSendParams
 import labs.dkv.sandpane.model.CoreJson
+import labs.dkv.sandpane.model.CoreEventKinds
 import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.GitApplyParams
+import labs.dkv.sandpane.model.Reported
+import labs.dkv.sandpane.model.ReportedTaskStatusSerializer
+import labs.dkv.sandpane.model.describe
 import labs.dkv.sandpane.model.TaskAccepted
 import labs.dkv.sandpane.model.TaskEvent
 import labs.dkv.sandpane.model.TaskStatus
@@ -59,7 +63,11 @@ class TaskMonitorService(private val project: Project) : Disposable {
     data class TaskView(
         val taskId: String,
         val conversationId: String?,
-        val status: TaskStatus?,
+        /**
+         * Core-reported status: null when Core has not reported one yet, [Reported.Unknown] when
+         * a newer Core reported a value this build does not define (shown, never interpreted).
+         */
+        val status: Reported<TaskStatus>?,
         val sandboxName: String?,
         val taskBranch: String?,
         val baseCommit: String?,
@@ -72,10 +80,14 @@ class TaskMonitorService(private val project: Project) : Disposable {
          */
         val replayRefusal: String? = null,
     ) {
-        val awaitingReview: Boolean get() = status == TaskStatus.AWAITING_REVIEW
+        /** Only a KNOWN awaiting_review enables review/apply; an unknown status never does. */
+        val awaitingReview: Boolean get() = status == Reported.Known(TaskStatus.AWAITING_REVIEW)
+
+        /** Core reported a status this plugin build cannot interpret; every task action is off. */
+        val hasUnknownStatus: Boolean get() = status is Reported.Unknown
 
         val statusLabel: String
-            get() = status?.name?.lowercase() ?: "unknown — Core has not reported a status"
+            get() = status?.describe() ?: "unknown — Core has not reported a status"
     }
 
     /** How a `conversation.send` reply was understood — see protocol gap 2 above. */
@@ -125,6 +137,12 @@ class TaskMonitorService(private val project: Project) : Disposable {
     /** Read-only lookup of the tasks Core reports as awaiting review (no transition logic). */
     fun awaitingReviewTasks(): List<TaskView> =
         views.values.filter { it.awaitingReview }.sortedByDescending { it.lastSequence }
+
+    /**
+     * A sentence for "nothing to review/apply" notices when tracked tasks carry a status this build
+     * does not define — so those tasks are not silently invisible. Empty when there are none.
+     */
+    fun unknownStatusNote(): String = unknownStatusNote(views.values)
 
     fun tasksForConversation(conversationId: String): List<TaskView> =
         conversationTasks[conversationId].orEmpty().mapNotNull { views[it] }
@@ -351,6 +369,15 @@ class TaskMonitorService(private val project: Project) : Disposable {
     companion object {
         private const val MAX_NOTES = 12
 
+        /** Pure form of [unknownStatusNote] (instance method), over the given rows. */
+        internal fun unknownStatusNote(rows: Collection<TaskView>): String {
+            val unknown = rows.filter { it.hasUnknownStatus }
+            if (unknown.isEmpty()) return ""
+            val statuses = unknown.mapNotNull { it.status?.wireName }.distinct().sorted().joinToString(", ")
+            return "\n${unknown.size} tracked task(s) have a status this plugin build does not define " +
+                "($statuses); review and apply are disabled for them — update the plugin."
+        }
+
         /**
          * Project one durable event onto a task row. Pure.
          *
@@ -364,28 +391,51 @@ class TaskMonitorService(private val project: Project) : Disposable {
             if (event.sequence < current.lastSequence) {
                 return current.copy(conversationId = conversationId)
             }
-            val note = rendered.note
-            val notes = when {
-                note == null -> current.notes
-                current.notes.lastOrNull() == note -> current.notes
-                else -> (current.notes + note).takeLast(MAX_NOTES)
+            val change = decodeStatusChange(event)
+            var notes = current.notes
+            for (note in listOfNotNull(rendered.note, change?.note)) {
+                if (notes.lastOrNull() != note) notes = (notes + note).takeLast(MAX_NOTES)
             }
             return current.copy(
                 conversationId = conversationId,
-                status = decodeStatusChange(event) ?: current.status,
+                // An unknown value IS applied: the row then says "Unknown status '<raw>'" instead
+                // of silently keeping an older, known status that Core has moved past.
+                status = change?.status ?: current.status,
                 lastSequence = event.sequence,
                 lastEventAt = event.timestamp,
                 notes = notes,
             )
         }
 
-        /** `status.changed` payload is `{ "to": <TaskStatus> }` as produced by sandpane-service. */
+        /** What one `status.changed` event says; [status] is null when its payload is unreadable. */
+        private data class StatusChange(val status: Reported<TaskStatus>?, val note: String?)
+
+        /**
+         * `status.changed` payload is `{ "to": <TaskStatus> }` as produced by sandpane-service.
+         * Neither an unknown value nor an unreadable payload is dropped silently: both leave a
+         * note on the row (an unreadable one keeps the last reported status, and says so).
+         */
         @OptIn(ExperimentalSerializationApi::class)
-        private fun decodeStatusChange(event: TaskEvent): TaskStatus? {
-            if (event.kind != "status.changed") return null
-            return runCatching {
+        private fun decodeStatusChange(event: TaskEvent): StatusChange? {
+            if (event.kind != CoreEventKinds.STATUS_CHANGED) return null
+            val status = runCatching {
                 CoreJson.decodeFromJsonElement(StatusChangedPayload.serializer(), event.payload).to
             }.getOrNull()
+            return when (status) {
+                null -> StatusChange(
+                    null,
+                    "status.changed #${event.sequence} has an unreadable payload; the status shown is " +
+                        "the last one Core reported readably",
+                )
+
+                is Reported.Unknown -> StatusChange(
+                    status,
+                    "Core reported status '${status.wireName}', which this plugin build does not " +
+                        "define; review and apply stay off for it — update the plugin",
+                )
+
+                is Reported.Known -> StatusChange(status, null)
+            }
         }
 
         private fun conversationHint(event: TaskEvent): String? =
@@ -422,7 +472,10 @@ class TaskMonitorService(private val project: Project) : Disposable {
 
 /** `status.changed` wire payload, mirrored from the producer in `sandpane-service`. */
 @Serializable
-private data class StatusChangedPayload(@SerialName("to") val to: TaskStatus)
+private data class StatusChangedPayload(
+    @Serializable(with = ReportedTaskStatusSerializer::class)
+    @SerialName("to") val to: Reported<TaskStatus>,
+)
 
 /** A string node as text, or null for JSON null / a non-string node. */
 private fun JsonElement.asStringOrNull(): String? =

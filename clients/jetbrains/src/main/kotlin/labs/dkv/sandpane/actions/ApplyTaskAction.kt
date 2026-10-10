@@ -9,8 +9,9 @@ import com.intellij.openapi.project.Project
 import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.model.ApplyResult
-import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.text.VisibleText
+import labs.dkv.sandpane.ui.ApplyConfirmation
 import labs.dkv.sandpane.ui.PlainText
 import labs.dkv.sandpane.services.ApplyPlan
 import labs.dkv.sandpane.services.TaskMonitorService
@@ -67,7 +68,7 @@ class ApplyTaskAction : AnAction() {
             notify(
                 project,
                 "Sandpane: nothing to apply",
-                "Core reports no tracked task in awaiting_review.",
+                "Core reports no tracked task in awaiting_review." + tasks.unknownStatusNote(),
                 NotificationType.INFORMATION,
             )
             return
@@ -79,7 +80,7 @@ class ApplyTaskAction : AnAction() {
                 project,
                 "Sandpane: review first",
                 "Applying needs the base commit Core reported at review time, and this window has not " +
-                    "reviewed task ${candidate.taskId}. Run Sandpane: Review Changes first.",
+                    "reviewed task ${VisibleText.reveal(candidate.taskId)}. Run Sandpane: Review Changes first.",
                 NotificationType.WARNING,
             )
             return
@@ -87,14 +88,15 @@ class ApplyTaskAction : AnAction() {
 
         val plan = when (val decision = ApplyPlan.decide(candidate.taskId, reviewed)) {
             is ApplyPlan.Decision.Refused -> {
-                notify(project, "Sandpane: apply refused — nothing sent", decision.reason, NotificationType.ERROR)
+                notify(project, "Sandpane: apply refused — nothing sent", VisibleText.reveal(decision.reason), NotificationType.ERROR)
                 return
             }
 
             is ApplyPlan.Decision.Ready -> decision
         }
 
-        if (!confirm(project, "Sandpane: Apply Task Changes", applyMessage(candidate, reviewed, plan), "Apply via Core")) {
+        val message = ApplyConfirmation.message(candidate.taskId, reviewed, plan)
+        if (!confirm(project, "Sandpane: Apply Task Changes", message, "Apply via Core")) {
             notify(project, "Sandpane: nothing applied", "Cancelled.", NotificationType.INFORMATION)
             return
         }
@@ -115,40 +117,27 @@ class ApplyTaskAction : AnAction() {
                     )
                     return@whenComplete
                 }
-                notifyApplyResult(project, candidate.taskId, result)
+                notifyApplyResult(project, candidate.taskId, result, plan.notSent.size)
             }
     }
 
-    private fun applyMessage(
-        candidate: TaskMonitorService.TaskView,
-        reviewed: ChangeSet,
-        plan: ApplyPlan.Decision.Ready,
-    ): String = buildString {
-        appendLine("Apply task ${candidate.taskId.take(8)} through Core?")
-        appendLine()
-        appendLine("files (${plan.paths.size}) — exactly these are sent as the selection:")
-        appendLine(ApplyPlan.describePaths(plan.paths))
-        if (plan.renamedWithoutSource.isNotEmpty()) {
-            appendLine(
-                "renamed (${plan.renamedWithoutSource.size}): Core reports only the new path; the original " +
-                    "path is not part of the protocol's change set, so it is not shown here.",
-            )
-        }
-        appendLine("base commit: ${reviewed.baseCommit}")
-        appendLine("host dirty: ${reviewed.hostDirty} (checked again by Core before it touches anything)")
-        appendLine()
-        append("This is an explicit Git operation. If the repository moved since the review, Core aborts.")
-    }
-
-    private fun notifyApplyResult(project: Project, taskId: String, result: ApplyResult?) {
+    private fun notifyApplyResult(project: Project, taskId: String, result: ApplyResult?, notSent: Int) {
         if (result == null) {
-            notify(project, "Sandpane: git.apply returned nothing", "task $taskId", NotificationType.WARNING)
+            notify(project, "Sandpane: git.apply returned nothing", "task ${VisibleText.reveal(taskId)}", NotificationType.WARNING)
             return
         }
+        val leftOut = if (notSent > 0) {
+            "\n$notSent file(s) with a status this plugin build does not define were NOT part of the " +
+                "selection and were left unapplied."
+        } else {
+            ""
+        }
         val message = when {
-            result.applied -> "Applied. Re-read the files you expect to have changed."
-            else -> "Not applied. Core said: ${result.abortReason ?: "no reason given"}" +
-                (if (result.conflictedFiles.isNotEmpty()) "\nconflicts: ${result.conflictedFiles.joinToString(", ")}" else "")
+            result.applied -> "Applied. Re-read the files you expect to have changed.$leftOut"
+            // Core's reason is revealed single-line: notify keeps real newlines, and a reason must
+            // not be able to fake a line of this body (S2).
+            else -> "Not applied. Core said: ${result.abortReason?.let(VisibleText::reveal) ?: "no reason given"}" +
+                conflictsLine(result.conflictedFiles) + leftOut
         }
         notify(
             project,
@@ -156,5 +145,17 @@ class ApplyTaskAction : AnAction() {
             message,
             if (result.applied) NotificationType.INFORMATION else NotificationType.WARNING,
         )
+    }
+
+    /**
+     * Conflicted paths, each escaped ([ApplyPlan.displayPath]) so a newline in one cannot fake a
+     * line, and bounded like the confirmation list (W2): a change set with thousands of conflicts
+     * must not produce an unreadable notification.
+     */
+    private fun conflictsLine(conflicted: List<String>): String {
+        if (conflicted.isEmpty()) return ""
+        val shown = conflicted.take(ApplyPlan.MAX_LISTED_PATHS).joinToString(", ", transform = ApplyPlan::displayPath)
+        val more = conflicted.size - ApplyPlan.MAX_LISTED_PATHS
+        return "\nconflicts (${conflicted.size}): $shown" + if (more > 0) ", … and $more more" else ""
     }
 }

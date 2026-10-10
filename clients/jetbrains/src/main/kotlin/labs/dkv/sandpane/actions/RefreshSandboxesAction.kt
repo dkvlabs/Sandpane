@@ -6,6 +6,7 @@ import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.services.SbxService
+import labs.dkv.sandpane.text.VisibleText
 import labs.dkv.sandpane.services.TaskMonitorService
 
 /**
@@ -69,7 +70,7 @@ class RefreshSandboxesAction : AnAction() {
                 val caps = connection.capabilities
                 when {
                     caps?.sbx == null -> "SBX: not reported by this Core"
-                    caps.sbx.installed -> "SBX: installed ${caps.sbx.version?.let { "($it)" } ?: "(version not probed)"}" +
+                    caps.sbx.installed -> "SBX: installed ${caps.sbx.version?.let { "(${VisibleText.reveal(it)})" } ?: "(version not probed)"}" +
                         caps.sbx.daemonRunning?.let { if (it) ", daemon running" else ", daemon NOT running" }
                         .orEmpty() + "; ${coreProjects.size} project(s) in Core"
 
@@ -96,7 +97,7 @@ class RefreshSandboxesAction : AnAction() {
                     if (sbxLine.isNotEmpty()) appendLine(sbxLine)
                     appendLine(taskLine)
                     appendLine("agent gate: ${gate.reasonForUser()}")
-                    snapshot.failure?.let { appendLine("Core problems: $it") }
+                    snapshot.failure?.let { appendLine("Core problems: ${VisibleText.reveal(it)}") }
                 },
                 if (snapshot.failure == null) NotificationType.INFORMATION else NotificationType.WARNING,
             )

@@ -1,6 +1,7 @@
 package labs.dkv.sandpane.core
 
 import labs.dkv.sandpane.model.AgentEvent
+import labs.dkv.sandpane.model.reported
 import labs.dkv.sandpane.model.AgentEventCodec
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.ContextRef
@@ -281,7 +282,7 @@ class CoreClientFramingTest {
                 taskId = "t1",
                 baseCommit = "abc123",
                 hostDirty = true,
-                changes = listOf(FileChange(path = "src/main.rs", status = FileChangeStatus.MODIFIED)),
+                changes = listOf(FileChange(path = "src/main.rs", status = FileChangeStatus.MODIFIED.reported())),
             ),
         )
         val changeSet = CoreJson.parseToJsonElement(changeSetWire) as JsonObject
@@ -449,7 +450,7 @@ class CoreClientFramingTest {
                 name = "atlas-auth",
                 probedState = "running",
                 boundProjectId = "p1",
-                workspaceMode = WorkspaceMode.DIRECT_MOUNT,
+                workspaceMode = WorkspaceMode.DIRECT_MOUNT.reported(),
             ),
         )
         // The mode reuses the established snake_case enum names, under a camelCase KEY.

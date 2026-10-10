@@ -107,7 +107,9 @@ data class WorkspaceModeView(
          * promising isolation the wire never claimed.
          */
         fun unknown(rawName: String): WorkspaceModeView = WorkspaceModeView(
-            label = "Unknown workspace mode \"$rawName\"",
+            // Core's raw values reach here already snake_case-checked (Reported.kt); revealing
+            // keeps a direct caller from passing hidden characters into a label.
+            label = "Unknown workspace mode \"${labs.dkv.sandpane.text.VisibleText.reveal(rawName)}\"",
             badge = "UNKNOWN — TREAT AS LIVE-WRITABLE",
             explanation =
                 "Core reported a workspace mode this plugin build does not define. Until it is " +
@@ -117,14 +119,15 @@ data class WorkspaceModeView(
         )
 
         /**
-         * The view for one sandbox summary: the recorded mode when Core sent one, [unverified]
-         * when the field was absent.
-         *
-         * kotlinx maps a null to [WorkspaceMode]? = null, and an unrecognized string fails
-         * decoding upstream — so the only two states here are a known mode and absence.
+         * The view for one sandbox summary: the recorded mode when Core sent a known one,
+         * [unknown] (worst case, never isolated) when a newer Core sent a mode this build does
+         * not define, and [unverified] when the field was absent or null.
          */
-        fun forSandbox(summary: SandboxSummary): WorkspaceModeView =
-            summary.workspaceMode?.let(::forMode) ?: unverified()
+        fun forSandbox(summary: SandboxSummary): WorkspaceModeView = when (val mode = summary.workspaceMode) {
+            null -> unverified()
+            is Reported.Known -> forMode(mode.value)
+            is Reported.Unknown -> unknown(mode.wireName)
+        }
 
         /** One-line form for a crowded picker row. */
         fun labelFor(summary: SandboxSummary): String = forSandbox(summary).let {

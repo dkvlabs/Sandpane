@@ -10,6 +10,11 @@ client) implementing the JB0/JB1 surface of
 > of this section described a 2024.2.4 / Gradle 8.10.2 / JDK 17 build with 97 tests; those numbers
 > are superseded by the ones below.
 >
+> Re-run on 10.10.2026 after the anti-spoofing and unknown-enum tolerance change (entry 0029):
+> `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache` passes with
+> **205 tests, 0 failures, 0 errors, 0 skipped**, and `./gradlew verifyPlugin --offline` still
+> reports **`Compatible`** against IU-262.10968.63. The 161-test figures below are the U4 baseline.
+>
 > **Proven on this host** (exact commands and outputs in "Checks actually run" below):
 > `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
 > (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
@@ -264,15 +269,37 @@ baseline and **3** are additive in this revision: `task.list`, `conversation.lis
 `Project.repositories`, `SandboxSummary.workspaceMode` and the optional
 `TaskSubscribeParams.afterSequences`.
 
-This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (8 tests), which
+This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (9 tests), which
 reads the Rust sources and the schemas out of the working tree and compares them against the
 Kotlin mirror: method names **and their order**, the `Method::parse` arms, the
 `rpc-request.schema.json` `method` enum, every `pub const` numeric bound (evaluated, not copied), the
-enum value sets against both Rust and `sandbox-create-spec.schema.json`, the additive field names on
+`WorkspaceMode`/`TaskStatus`/`FileChangeStatus` value sets (read from the generated serializers)
+against Rust, `sandbox-create-spec.schema.json` and `change-set.schema.json`, the additive field names on
 both sides, the three `task.subscribe` cursor rules as they appear in `sandpane-service`, and the
 durable event kinds Core appends. Two classes are deliberately renamed on the Kotlin side
 (`RpcResponse` → `RpcResponseFrame`, `RpcError` → `RpcErrorPayload`); their **field** names are
 unchanged, and class names are not wire-visible.
+
+### Tolerance for enum values a newer Core adds
+
+Where Core **reports** a `TaskStatus` (`TaskSummary.status`, the `status.changed` payload), a
+`FileChangeStatus` (`FileChange.status`) or a `WorkspaceMode` (`SandboxSummary.workspaceMode`), the
+field is a `Reported<E>` (`model/Reported.kt`): `Known(value)` or `Unknown(raw)`. Before this, one new
+value failed the whole `task.list` / `git.review` / `sandbox.list` / `sandbox.create` decode — and a
+`conversation.send` reply after Core had already queued the task. Now:
+
+| Value | Shown as | Behaviour |
+|---|---|---|
+| unknown task status | `Unknown status '<raw>' — this plugin is older than Core` | never terminal, never running; review/apply off; "nothing to review/apply" notices count such tasks |
+| unknown `status.changed` | the row takes the unknown status and gets a note | an unreadable payload keeps the last status and leaves a note — neither is dropped silently |
+| `conversation.send` reply with an unknown status | `Core accepted task …` | accepted (Core did queue it); no INTERNAL, so no duplicate-retry bait |
+| unknown file status | listed with its raw status | **not selectable**: excluded from `selectedFiles`, listed under "NOT sent" in the Apply dialog and in the result notice; a set made only of them is refused |
+| unknown workspace mode | `UNKNOWN — TREAT AS LIVE-WRITABLE` | the existing worst-case view; never isolated |
+
+Truly malformed values still fail the frame: non-strings, `null` for a required field, and any
+string that is empty, longer than 64 chars or not serde `snake_case` (every mirrored Rust enum is
+`rename_all = "snake_case"`; the drift guard pins that). Outgoing fields (`TaskListParams.statuses`,
+`SandboxCreateSpec.workspaceMode`) keep the closed enums.
 
 ### Drift gate and its negative control
 
@@ -387,6 +414,28 @@ discovery revision this client is now synced to**):
   marks the frame faults this plugin raised about Core's reply, so an unusable answer is never
   reported as Core's judgment (AGENTS.md rule 5; `ErrorAttributionTest`, 13 tests).
 - **Bounded frames.** `NdjsonFramer` refuses to buffer past 4 MiB, mirroring the service cap.
+- **Core/agent text cannot spoof the UI.** On 2026.2.3, `Messages.showDialog` dispatches to
+  `AlertDialog`, whose message pane is always `text/html` (checked by disassembling the IDE jars;
+  `MessageDialog` and `Messages.InputDialog` switch to HTML only on an `<html>` prefix). Every
+  confirmation therefore goes through `DialogText.html` or `DialogHtml` (the Apply and send-context dialogs, whose Core/agent values sit in table cells) — an explicit `<html>` envelope around
+  fully escaped text, with whitespace runs kept — which is inert on all three renderers. Before
+  escaping, `VisibleText` shows control, line-break, bidi and zero-width characters as `\n` /
+  `\u202E`-style escapes (by code point, so emoji and other non-ASCII text are untouched). The Apply
+  dialog is built by `DialogHtml` as one table row per entry: the `[n]` marker (bold) in a
+  `nowrap` column of its own, the path in the next column, and section headers (bold) outside the
+  tables. The dialog word-wraps and force-breaks an over-long path at its width; with the table, a
+  wrapped tail always starts inside the path column, to the right of every real marker, so a
+  crafted path cannot render a fake entry or a fake "NOT sent" header (an earlier `<br>`-per-line
+  layout could; `DialogLayoutTest` lays the real dialog HTML out in a `JEditorPane` with the
+  platform's `HTMLEditorKitBuilder().withWordWrapViewFactory()` at fixed widths and a SansSerif 13
+  font, searches for such a path, and keeps the old layout as a control that does fail). The
+  AlertDialog's own pane — its width, CSS and font — was not built in a test: UNVERIFIED. NOT-sent entries carry their own `[x<n>]` markers. The
+  dialog also flags any path that had hidden characters or literally contains an escape-looking
+  sequence such as `\n` (also counting them past the 20 listed), elides absurdly long paths
+  visibly, and points out selected paths that differ only in case or Unicode normalization (NFC +
+  lower case: an approximation of APFS/NTFS folding). `MessageDialog`/`InputDialog` panes were not
+  laid out in a test either (UNVERIFIED). Labels, list rows, tooltips, action descriptions, notifications and the chat
+  detail pane apply the same treatment (`PlainText`, `notify`).
 - **No secrets in logs.** The unsolicited-frame log line is truncated to 240 chars, `system.err`
   is used only behind an opt-in `verboseLogging` flag, and no credential surface exists here.
 - **No JetBrains AI Assistant or internal APIs**; public extension points only.
@@ -422,6 +471,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Gate, online | `./gradlew test --rerun buildPlugin verifyPluginStructure --console=plain` | `BUILD SUCCESSFUL in 15s`, `19 actionable tasks: 12 executed, 7 up-to-date`; first-ever run (IDE download; intermediate config with toolchain 21 and no `jvmDefault` change) was `BUILD SUCCESSFUL in 4m 40s` |
 | Gate, offline from clean | `./gradlew clean --offline`, then `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache --console=plain` | `BUILD SUCCESSFUL in 17s`, `19 actionable tasks: 16 executed, 3 up-to-date`; `compileKotlin`, `compileTestKotlin`, `test`, `buildPlugin`, `verifyPluginStructure` executed |
 | Unit tests | JUnit XML in `build/test-results/test` | **161 tests, 0 failures, 0 errors, 0 skipped**, 20 result files (both runs) |
+| Gate after the anti-spoofing + enum-tolerance hardening, with the table-layout fix (10.10.2026; an intermediate 09.10.2026 run of the same command had 196 tests) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache --console=plain`; `./gradlew verifyPlugin --offline` | `BUILD SUCCESSFUL in 17s`; **205 tests, 0 failures, 0 errors, 0 skipped**, 26 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; 55 source files (32 main, 23 test) |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |
