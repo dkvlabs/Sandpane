@@ -599,4 +599,45 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0031 — Protocol A1: sandbox stop, confirmed remove, create agent
+
+- **date:** 2026-10-10
+- **phase:** C1 / protocol v1 addition A1 ([design of record](plans/2026-10-09-protocol-v1-additions.md) §2–§4), with the CL lifecycle work in all three clients.
+- **commit:** `b1067c7` (feat(protocol): sandbox.stop, confirmed sandbox.remove, create agent (A1))
+- **details:**
+  - **Protocol:** additive; `PROTOCOL_VERSION` stays 1; 16 advertised methods. Drift check is in sync (`make schema-drift`: 16 values match).
+  - **Core:**
+    - `sandbox.stop` (`requeried?` absent = state unknown).
+    - Two-step `sandbox.remove`. The 256-bit, single-use, 120 s in-memory token is bound to action, name and sbx id. Step 2 burns the token first, then re-checks the sbx id (CONFLICT on a replacement), runs `rm --force`, and re-queries. Every failure after `rm` runs is INTERNAL. Only the binding rows captured before `rm` are marked removed.
+    - A per-name in-flight lock across create and remove.
+    - `SandboxCreateSpec.agent?`: exact allowlist from captured `create --help`; defaults to shell; kit refs and `--cloud` refused.
+    - Shape-filtered `SandboxSummary.agent?` and sbx id.
+    - DB schema v4: `sbx_id`, `removed_at`.
+    - `external` = no live binding recorded for this sbx id. The token is documented as not proof of human presence.
+  - **Clients:** VS Code, JetBrains and desktop each have:
+    - pinned lists, typed wrappers, and `system.probe` gating;
+    - a native two-step confirmation: impact revealed and capped, the shared "NOT CONFIRMED AS CREATED BY SANDPANE" marker, expiry re-checked at click time, no retry, token never logged or shown;
+    - an honest unsupported Start;
+    - addressable-name validators mirroring Core;
+    - a Stop confirmation where the active-task count reads "cannot be checked" until Core records per-task sandbox names.
+    - VS Code and desktop also get an sbx agent picker defaulting to shell.
+  - **Deviations and open items:**
+    - JetBrains has no create UI.
+    - The VS Code webview has no lifecycle buttons.
+    - Head-of-line blocking on a shared client connection is disclosed and deferred.
+    - The out-of-band same-name race (sbx v0.47 has no remove-by-id) is disclosed.
+- **files:**
+  - Core and schemas: `core/crates/**` (new `confirm.rs`, `inflight.rs`), `schemas/*.json`.
+  - Clients: `clients/vscode/**`, `clients/jetbrains/**`, `apps/desktop/**`.
+  - Docs: `docs/specs/02_ARCHITECTURE_AND_DATA.md`, `docs/plans/*`, `docs/compatibility.md`, `README.md`.
+- **verification:**
+  - `make check` exit 0: Core 255; VS Code 338; desktop 401 + 8 opt-in skipped; Tauri 32.
+  - JetBrains 243 tests; `verifyPlugin` Compatible (IU-262.10968.63).
+  - Live checks against an isolated Core with no `sbx` reachable: VS Code 57/57, desktop 8/8.
+  - Never run against a real `sbx`, or in a real editor, app or IDE (UNVERIFIED).
+  - `cargo-audit` and `cargo-deny` not installed.
+- **review:** [audit/0031-protocol-a1-sandbox-lifecycle-review.md](audit/0031-protocol-a1-sandbox-lifecycle-review.md) — 3 × `security-reviewer` + `phase-reviewer`, no Critical; Warnings fixed pre-commit (one deferred and disclosed, one rejected with evidence)
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
