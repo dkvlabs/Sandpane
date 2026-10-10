@@ -284,6 +284,87 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
      - Desktop: there is no dialog plugin (A3a W3), so it shows the redacted export read-only, with a **Copy** button. Saving to a file waits for `@tauri-apps/plugin-dialog`; this is disclosed.
    - **After a delete,** any client-side selection of that conversation is cleared. An unknown step-2 outcome is settled by re-reading `conversation.list {includeArchived: true}`, as in A3a.
 
+### 3.4 A4 decisions (`conversation.send` mode), fixed before implementation
+
+1. **Wire.**
+   - `ConversationSendParams.mode?: "task" | "discuss"` (`Option`, `skip_serializing_if`). Absent means `"task"`.
+   - **Hash stability:** Core normalizes an explicit `"task"` to absent *before* the idempotency fingerprint is computed. Every A2 hash stays stable, and two clients that differ only in sending `"task"` explicitly get a replay, not a `CONFLICT`. Any other value is `VALIDATION_FAILED` (`mode must be "task" or "discuss"`).
+   - `TaskSummary.mode?: string` is present on every task created from A4 on (`"task"` or `"discuss"`) and absent on older rows. Clients decode it as an **open string**, never a strict enum (§1 table): an unknown value is displayed as-is, never a decode failure.
+   - Migration v7 adds `tasks.mode TEXT` (same backup and downgrade-refusal rules).
+   - `features` gains `"conversation-send-mode"`. Clients send `mode` only when it is advertised, because a pre-A4 Core silently drops the field and would treat a discussion as a task.
+2. **What `discuss` means.**
+   - A `discuss` task never gets a writable workspace. The internal `create_task` API refuses `discuss` with any workspace request other than none or `mountless` (`VALIDATION_FAILED`, "a discuss task never gets a writable workspace; nothing was run").
+   - The wire path has no workspace selection at all (item 4), so over the wire this cannot occur today. It is enforced and tested at the internal API.
+   - The task's scaffold event says which mode was requested. With no verified adapter, both modes still record `PERMISSION_DENIED` and stay `queued` (honest, unchanged).
+3. **Sandbox-name follow-up from A1 (describe, never refuse).**
+   - From A4 on, a new task stores `tasks.sandbox_name` from its conversation's `sandbox_id` (A3b) at send time. `TaskSummary.sandboxName` is then filled.
+   - It is a stored **name**, not an identity, and no task can run in a sandbox today. So `sandbox.stop` and `sandbox.remove` **never refuse** because of it.
+   - `sandbox.remove` step 1 adds one impact line when unfinished tasks were sent from chats that chose this sandbox name: "N unfinished task(s) were sent from chats that chose this sandbox name; removing it does not cancel them".
+   - `sandbox.stop` is unchanged.
+4. **Not in A4: workspace selection on the wire** (new row A4b below). A `conversation.send` that creates a `host_worktree` task writes a task branch and a worktree into the user's repository, and every such task stays `queued` with no wire-level discard. That needs its own decisions:
+   - which modes are allowed over the wire (never `direct_mount` without the live-writable label);
+   - which repositories qualify;
+   - how it interacts with the per-path writer lock;
+   - a token-confirmed `worktree.discard`, or landing after A9's cleanup.
+
+   Until then, `git.review`, `git.diff` and `git.apply` are reachable over the wire only for tasks that carry Git context, and the wire cannot create one. They are verified by Core integration tests that seed such tasks through the internal API and then send real frames through the dispatcher.
+5. **Clients.**
+   - Every pinned method list is unchanged (no new method).
+   - Known-features lists gain `conversation-send-mode`.
+   - The composer gets a Task / Discuss choice, shown only when the feature is advertised, with copy that says neither runs an agent in this build.
+   - `TaskSummary.mode` and `sandboxName` are shown read-only, revealed and capped.
+
+| # | Addition | Shape (additive) | Notes |
+|---|---|---|---|
+| A4b | Workspace selection on `conversation.send` + wire `worktree.discard` (token) | `workspace?: { mode, repoPath? }` | **Recorded, not scheduled.** Prerequisite for any wire-created task with Git context; designed and reviewed on its own because it writes host Git state. |
+
+### 3.5 A5 decisions (`git.diff` + `ChangeSet` fields), fixed before implementation
+
+1. **Exact change list (fixes a latent parsing bug).**
+   - `change_list` switches to `git diff --name-status -z --find-renames` and `git ls-files --others --exclude-standard -z`, and parses NUL-separated fields. Git C-quotes paths containing tab, newline, `"` or `\` even with `core.quotePath=false`, so today's line/tab parser returns quoted, wrong paths for such files.
+   - `--find-renames` is explicit, because a user's global `diff.renames=false` would otherwise silently turn renames into an add plus a delete.
+   - Copies are not detected (`-C` is not passed) and stay `added`.
+2. **Wire fields** (`#[serde(default, skip_serializing_if)]`):
+   - `FileChange.oldPath?`: set only for `renamed`.
+   - `ChangeSet.repoPath?`: the canonical host repository root of the task (the integration target `hostDirty` describes).
+   - `ChangeSet.uninspected?: string[]`: defined but **never produced in A5**. Repositories with submodules are still refused with `VALIDATION_FAILED`, as today.
+3. **`git.diff {taskId, path, maxBytes?}`** → `{path, oldPath?, status, patch, binary, truncated, lossy, baseBlob?}`. Read-only, not replay-sensitive.
+   - **Path gate.**
+     - `path` must equal, byte for byte, the `path` of an entry in the task's change list, **recomputed at call time** with the same `review_target` and submodule refusal as `git.review`.
+     - Otherwise: `VALIDATION_FAILED` "path is not in this task's change list; nothing was read".
+     - No other path form is accepted: no prefixes, globs or `..`.
+   - **Tracked entries** (added, modified, deleted, renamed):
+     - argv: `git diff --no-ext-diff --no-textconv --no-color --find-renames --end-of-options <base> -- :(literal)<path>`, plus `:(literal)<oldPath>` for a rename (otherwise rename detection sees only one side);
+     - same hardened runner and per-repository filter and attribute overrides as `change_list`.
+     - Binary is decided by a prior `--numstat -z` run with the same pathspecs (`-\t-`). A binary entry returns `binary: true` and an empty patch. `--binary` patches are never produced.
+   - **Untracked entries:** the patch is synthesized by Core; git is not run on the file.
+     - The file is opened relative to the review target with `O_NOFOLLOW`. A symlink yields its target text, as git would store it.
+     - The read is capped at `maxBytes + 1`.
+     - A NUL in the first 8000 bytes means `binary: true`.
+     - The patch is a standard new-file unified diff (`--- /dev/null`, `+++ b/<path>`, one `@@ -0,0 +1,N @@` hunk, and `\ No newline at end of file` when it applies).
+   - **Bounds and the frame cap:**
+     - `maxBytes` is clamped to 1..=524 288 (default 262 144). JSON escaping can grow a byte at most six-fold, so a maximal patch still serializes under the 4 MiB frame.
+     - Git output for `git.diff` goes through a **display-only** capped read that returns the first `maxBytes` bytes plus a `truncated` flag, instead of `exec`'s refusal. It is used only by `git.diff` and never for a decision; the change-list and dirty paths keep refusing truncated output.
+     - Truncation cuts at the last newline at or before the cap, or at a UTF-8 character boundary when there is none.
+   - **Encoding:** non-UTF-8 bytes in a text patch are decoded lossily (U+FFFD) and disclosed with `lossy: true`.
+   - **`baseBlob`:** the base-side blob id from `git ls-tree -z <base> -- :(literal)<oldPath or path>`. It is absent for added and untracked entries. There is no `taskBlob` in A5; the design-table field is dropped, because hashing working-tree content would need `hash-object` on agent-written files. A6 decides what it needs.
+4. **Errors:**
+   - unknown task: `NOT_FOUND`;
+   - no Git context: the existing `VALIDATION_FAILED` "task has no Git context (repo binding + base_commit)";
+   - worktree removed: the existing message;
+   - submodules: `VALIDATION_FAILED`;
+   - path not in the list: the message above;
+   - git failure: `INTERNAL`.
+5. **Method count:** 28 (A3b's 27 plus `git.diff`). Every pinned list moves together. `git.diff` is a read, but stays out of `REPLAY_SAFE_METHODS` / `replay_safe` like the other A-series methods. It does **not** use the default deadline: git runs under `RunLimits::QUERY` (30 s) for both the change list and the diff, so every client gives `git.diff` the 45 s git deadline from A3a W2 (desktop proxy 43 s / webview 45 s; JetBrains 45 s). `git.review` already has the same exposure, so its deadline moves to 45 s in the same commit.
+6. **Verification:**
+   - Core integration tests seed tasks with real Git context through the internal API against temporary repositories, including `host_worktree`. They cover modified, added, deleted, renamed (with old and new pathspecs), untracked, symlink, binary, non-UTF-8, truncation, and paths containing tab, newline and quotes. Each sends real `git.review` / `git.diff` frames through `handle_line`.
+   - Over the wire the live checks can confirm only that the method is advertised and answers "task has no Git context". This is recorded as UNVERIFIED until A4b.
+7. **Clients:**
+   - The review surface gets a per-file "Diff" action for entries returned by `git.review`, gated on `git.diff` being advertised.
+   - VS Code renders through its native diff editor where the patch allows, otherwise as a read-only text document. JetBrains uses its diff viewer or a read-only viewer. Desktop uses a read-only monospace view.
+   - `binary`, `truncated` and `lossy` are disclosed, and `oldPath → path` is shown for renames.
+   - Patch text is untrusted data: revealed, never rendered as HTML or Markdown, never executed.
+
 ## 4. Client obligations per addition
 
 Every client gets, for each addition:
