@@ -675,4 +675,30 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0033 — Protocol A3a: project lifecycle
+
+- **date:** 2026-10-11
+- **phase:** C2 (project half) / protocol v1 addition A3a ([design §3.2](plans/2026-10-09-protocol-v1-additions.md)), with all three clients.
+- **commit:** `9069f6a` (feat(protocol): project lifecycle (A3a))
+- **details:**
+  - **Core methods (22 total):** `project.update`, `project.archive`, `project.unarchive`, `project.delete` (A1 two-step token, bound to the project id via `consume_by_id`), `project.add_repository`, `project.remove_repository`; `project.list {includeArchived?}`; `Project.archivedAt`.
+  - **Delete:** one ordered transaction; refuses while unfinished tasks, sandboxes or an in-flight create exist; never touches host files, branches or sandboxes (worktree dirs and task branches are left in place, and the impact lines say so).
+  - **Archived projects** refuse new work (conversation create/send, sandbox create, update, repository methods); cancel, stop, remove, delete and unarchive stay allowed.
+  - **Validation:** new `Validator::project_name` and a stricter `project_description` refuse control, line-separator and bidi characters.
+  - **Review fixes:** a reachable Core self-deadlock (DB guard in an `if let` scrutinee) fixed with a deterministic test seam; bindings record `repo_id`, and a post-claim re-check refuses a create whose repository was unregistered meanwhile.
+  - **Clients:** 22-method pins; probe-gated project settings surfaces; A1-pattern delete confirmation; validators drift-tested against Core; a 45 s deadline for git-backed project calls; unknown delete outcomes settled by re-reading Core; local state forgotten only when Core no longer lists the project. JetBrains also hardened A1: an unreadable expiry fails closed, step 2 is sent off the EDT, and Core text is capped at 200 code points.
+  - **Deviation:** the desktop app adds a repository from a typed absolute path, not a native folder picker (design §3.2 item 9). It is accepted and disclosed in the desktop README.
+- **files:**
+  - `core/crates/**` (new `project_lifecycle.rs` and its test), `schemas/rpc-request.schema.json`, `schemas/README.md`
+  - `clients/vscode/**`, `clients/jetbrains/**`, `apps/desktop/**`
+  - `docs/plans/*`, `docs/specs/02_ARCHITECTURE_AND_DATA.md`, `docs/compatibility.md`, `README.md`
+- **verification:**
+  - `make check`: Core 324, schemas in sync (22 methods), VS Code 454, desktop 484 + 8 opt-in skipped, Tauri 32. The same run failed at JetBrains `:test` because a concurrent Gradle run shared the build directory; re-run alone below.
+  - JetBrains 311; `verifyPlugin` Compatible.
+  - Live, isolated Core with no `sbx`: VS Code 59/59, desktop 8/8.
+  - UNVERIFIED: never run against real `sbx` or in a real editor, app or IDE. `cargo-audit` and `cargo-deny` are not installed (no new dependencies).
+- **review:** [audit/0033-protocol-a3a-project-lifecycle-review.md](audit/0033-protocol-a3a-project-lifecycle-review.md) — `security-reviewer` on Core (BLOCK; C1 and W1 fixed) plus one combined security/phase pass on the clients (PASS-WITH-WARNINGS); no Critical remains; W1 and W2 fixed pre-commit; W3 accepted and disclosed
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
