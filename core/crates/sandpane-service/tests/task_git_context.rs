@@ -758,7 +758,7 @@ fn user_global_excludes_hide_ds_store_from_host_dirty_and_review() {
         .join("global-ignore");
     std::fs::write(&global, ".DS_Store\n").unwrap();
     let inner = reopen_with_excludes(&env, global.clone());
-    assert_eq!(inner.git.excludes_file, global);
+    assert_eq!(inner.git.active_excludes_file(), global);
     std::fs::write(env.repo.join(".DS_Store"), "finder\n").unwrap();
     let review = review_of(&inner, &task.id);
     assert_eq!(review["hostDirty"], false, "{review}");
@@ -778,7 +778,7 @@ fn excludes_candidates_inside_repositories_or_the_root_are_rejected() {
     let in_repo = env.repo.join("agent-ignore");
     std::fs::write(&in_repo, "*\n").unwrap();
     let inner = reopen_with_excludes(&env, in_repo);
-    assert_eq!(inner.git.excludes_file, PathBuf::from("/dev/null"));
+    assert_eq!(inner.git.active_excludes_file(), PathBuf::from("/dev/null"));
     std::fs::write(env.repo.join("work.txt"), "work\n").unwrap();
     let review = review_of(&inner, &task.id);
     assert_eq!(review["hostDirty"], true, "{review}");
@@ -786,5 +786,93 @@ fn excludes_candidates_inside_repositories_or_the_root_are_rejected() {
     let in_root = env.root.join("ignore");
     std::fs::write(&in_root, "*\n").unwrap();
     let inner = reopen_with_excludes(&env, in_root);
-    assert_eq!(inner.git.excludes_file, PathBuf::from("/dev/null"));
+    assert_eq!(inner.git.active_excludes_file(), PathBuf::from("/dev/null"));
+}
+
+/// Follow-up to 0027's commit review (validator scope mismatch): a global
+/// excludes file accepted at startup lies inside a repository that is
+/// registered LATER (a dotfiles repo). From then on an agent with write access
+/// there could hide files from the reviews and dirty gates of OTHER
+/// repositories, so registering it must revoke the file for every repository.
+#[test]
+fn registering_the_repository_that_holds_the_excludes_file_revokes_it_everywhere() {
+    let mut env = Env::new();
+    let task = env.create(WorkspaceMode::DirectMount, Some(env.repo_str()));
+    let base = env.root.parent().unwrap().parent().unwrap().to_path_buf();
+    let dotfiles = base.join("Nova Demo dotfiles");
+    init_repo(&dotfiles);
+    let global = dotfiles.join("gitignore_global");
+    std::fs::write(&global, ".DS_Store\n").unwrap();
+    env.inner = reopen_with_excludes(&env, global.clone());
+    assert_eq!(env.inner.git.active_excludes_file(), global);
+    std::fs::write(env.repo.join(".DS_Store"), "finder\n").unwrap();
+    assert_eq!(review_of(&env.inner, &task.id)["hostDirty"], false);
+
+    env.ok(
+        "project.create",
+        serde_json::json!({"name": "Nova Demo", "repositories": [dotfiles.display().to_string()]}),
+    );
+    assert_eq!(
+        env.inner.git.active_excludes_file(),
+        PathBuf::from("/dev/null")
+    );
+    // A DIFFERENT repository's review no longer honours the revoked file.
+    let review = review_of(&env.inner, &task.id);
+    assert_eq!(review["hostDirty"], true, "{review}");
+    assert_eq!(review["changes"][0]["path"], ".DS_Store", "{review}");
+}
+
+/// The realistic dotfiles layout: `~/.config/git/ignore` is a SYMLINK into a
+/// dotfiles repository that is registered after startup. The accepted path is
+/// the canonical target, so registering the dotfiles repo still revokes it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_excludes_file_is_revoked_when_its_target_repository_is_registered() {
+    let mut env = Env::new();
+    let task = env.create(WorkspaceMode::DirectMount, Some(env.repo_str()));
+    let base = env.root.parent().unwrap().parent().unwrap().to_path_buf();
+    let dotfiles = base.join("Orbit Demo dotfiles");
+    init_repo(&dotfiles);
+    let target = dotfiles.join("git").join("ignore");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, ".DS_Store\n").unwrap();
+    let config_git = base.join("home").join(".config").join("git");
+    std::fs::create_dir_all(&config_git).unwrap();
+    let link = config_git.join("ignore");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    env.inner = reopen_with_excludes(&env, link);
+    assert_eq!(
+        env.inner.git.active_excludes_file(),
+        target,
+        "accepted as the canonical target"
+    );
+    std::fs::write(env.repo.join(".DS_Store"), "finder\n").unwrap();
+    assert_eq!(review_of(&env.inner, &task.id)["hostDirty"], false);
+
+    env.ok(
+        "project.create",
+        serde_json::json!({"name": "Orbit Demo", "repositories": [dotfiles.display().to_string()]}),
+    );
+    assert_eq!(
+        env.inner.git.active_excludes_file(),
+        PathBuf::from("/dev/null")
+    );
+    assert_eq!(review_of(&env.inner, &task.id)["hostDirty"], true);
+}
+
+/// Registering an unrelated repository keeps an accepted excludes file.
+#[test]
+fn registering_an_unrelated_repository_keeps_the_excludes_file() {
+    let mut env = Env::new();
+    let base = env.root.parent().unwrap().parent().unwrap().to_path_buf();
+    let global = base.join("global-ignore");
+    std::fs::write(&global, ".DS_Store\n").unwrap();
+    env.inner = reopen_with_excludes(&env, global.clone());
+    let orbit = base.join("Orbit Demo repo");
+    init_repo(&orbit);
+    env.ok(
+        "project.create",
+        serde_json::json!({"name": "Orbit Demo", "repositories": [orbit.display().to_string()]}),
+    );
+    assert_eq!(env.inner.git.active_excludes_file(), global);
 }

@@ -111,7 +111,9 @@ pub struct CoreConfig {
     /// `main.rs` with `sandpane_core::git::user_excludes_candidate`, i.e.
     /// from global git config only). Vetted at startup by
     /// `accept_excludes_file` against every registered repository and the
-    /// worktree root; rejected or `None` → `/dev/null` (fail safe).
+    /// worktree root; rejected or `None` → `/dev/null` (fail safe). Re-vetted
+    /// whenever `project.create` registers repositories, and revoked for good
+    /// if one of them contains it.
     pub user_excludes_file: Option<PathBuf>,
 }
 
@@ -165,10 +167,7 @@ impl ServerInner {
             sbx_locator,
             sbx_limits: config.sbx_limits,
             instance_id: uuid::Uuid::new_v4().to_string(),
-            git: scoregit::GitRunner {
-                excludes_file,
-                ..scoregit::GitRunner::default()
-            },
+            git: scoregit::GitRunner::with_excludes_file(excludes_file),
             worktrees_root: config.worktrees_root,
         });
         // Read-only: report what a crash may have left behind; never delete.
@@ -201,9 +200,46 @@ impl ServerInner {
     }
 }
 
-/// Vet the user-excludes candidate once, at startup. Forbidden locations are
-/// every registered repository and Core's worktree root (agent-writable).
-/// A rejection is reported ONCE on stderr and falls back to `/dev/null`.
+/// Locations an excludes file must not lie in: every registered repository,
+/// plus `extra` (repositories about to be registered) and Core's worktree
+/// root — all agent-writable.
+fn excludes_forbidden_roots(
+    db: &Database,
+    extra: &[String],
+    worktrees_root: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT canonical_path FROM repositories")
+        .map_err(|e| format!("repository query: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("repository query: {e}"))?;
+    let mut forbidden = Vec::new();
+    for row in rows {
+        forbidden.push(PathBuf::from(
+            row.map_err(|e| format!("repository query: {e}"))?,
+        ));
+    }
+    forbidden.extend(extra.iter().map(PathBuf::from));
+    if let Some(root) = worktrees_root {
+        forbidden.push(root.to_path_buf());
+    }
+    Ok(forbidden)
+}
+
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    let uid = runtime::euid();
+    #[cfg(not(unix))]
+    let uid = 0;
+    uid
+}
+
+/// Vet the user-excludes candidate at startup. Forbidden locations are every
+/// registered repository and Core's worktree root (agent-writable). A
+/// rejection is reported ONCE on stderr and falls back to `/dev/null`.
+/// [`revet_excludes_for_new_repositories`] repeats the check on registration.
 fn vetted_excludes_file(
     db: &Database,
     candidate: Option<&Path>,
@@ -213,28 +249,14 @@ fn vetted_excludes_file(
     let Some(candidate) = candidate else {
         return fallback;
     };
-    let mut forbidden: Vec<PathBuf> =
-        match db.conn().prepare("SELECT canonical_path FROM repositories") {
-            Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
-                Ok(rows) => rows.filter_map(Result::ok).map(PathBuf::from).collect(),
-                Err(e) => {
-                    eprintln!("sandpane-service: user excludes not used (repository query: {e})");
-                    return fallback;
-                }
-            },
-            Err(e) => {
-                eprintln!("sandpane-service: user excludes not used (repository query: {e})");
-                return fallback;
-            }
-        };
-    if let Some(root) = worktrees_root {
-        forbidden.push(root.to_path_buf());
-    }
-    #[cfg(unix)]
-    let uid = runtime::euid();
-    #[cfg(not(unix))]
-    let uid = 0;
-    match scoregit::accept_excludes_file(candidate, &forbidden, uid) {
+    let forbidden = match excludes_forbidden_roots(db, &[], worktrees_root) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("sandpane-service: user excludes not used ({e})");
+            return fallback;
+        }
+    };
+    match scoregit::accept_excludes_file(candidate, &forbidden, current_uid()) {
         Ok(accepted) => accepted,
         Err(reason) => {
             eprintln!(
@@ -243,6 +265,36 @@ fn vetted_excludes_file(
                 candidate.display()
             );
             fallback
+        }
+    }
+}
+
+/// Re-vet the excludes file in force against the CURRENT repositories plus
+/// `new_repositories` (about to be registered) and the worktree root. A
+/// repository registered after startup may contain the user's global excludes
+/// file (a dotfiles repo); an agent writing there must not decide what the
+/// reviews and dirty gates of OTHER repositories ignore. On any failure the
+/// file is revoked for every repository (one-way, fail safe) and reported once.
+/// The per-call lexical guard in [`scoregit::GitRunner::effective_excludes`]
+/// stays as a second line.
+fn revet_excludes_for_new_repositories(
+    inner: &ServerInner,
+    db: &Database,
+    new_repositories: &[String],
+) {
+    let current = inner.git.active_excludes_file();
+    if current == Path::new("/dev/null") {
+        return;
+    }
+    let verdict = excludes_forbidden_roots(db, new_repositories, inner.worktrees_root.as_deref())
+        .and_then(|forbidden| scoregit::accept_excludes_file(&current, &forbidden, current_uid()));
+    if let Err(reason) = verdict {
+        if inner.git.revoke_excludes() {
+            eprintln!(
+                "sandpane-service: no longer using global excludes file {}: {reason}; reviews and \
+                 the dirty gate ignore NO extra files from now on (fail safe)",
+                current.display()
+            );
         }
     }
 }
@@ -778,6 +830,9 @@ fn project_create(
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
     let db = inner.lock_db();
+    // Before any row exists (so before any task can target these
+    // repositories): stop using an excludes file that lies inside one of them.
+    revet_excludes_for_new_repositories(inner, &db, &repositories);
     // One transaction: project + repository rows are all-or-nothing.
     let tx = db.conn().unchecked_transaction().map_err(internal)?;
     tx.execute(

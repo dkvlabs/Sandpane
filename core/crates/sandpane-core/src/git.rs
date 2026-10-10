@@ -65,6 +65,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -165,8 +166,15 @@ pub struct GitRunner {
     pub limits: RunLimits,
     /// The excludes file passed as `-c core.excludesFile=…` on EVERY call:
     /// `/dev/null` by default, or the user's own global excludes file once
-    /// the service resolved and accepted it at startup.
-    pub excludes_file: PathBuf,
+    /// the service resolved and accepted it at startup. Private, like
+    /// [`Self::excludes_revoked`], so no caller can read it past a revocation
+    /// or undo one: use [`Self::with_excludes_file`],
+    /// [`Self::active_excludes_file`] and [`Self::revoke_excludes`].
+    excludes_file: PathBuf,
+    /// Set once the service found [`Self::excludes_file`] no longer
+    /// acceptable (a repository registered later contains it). One-way: from
+    /// then on every call uses `/dev/null` until Core restarts and re-vets.
+    excludes_revoked: AtomicBool,
 }
 
 impl Default for GitRunner {
@@ -175,6 +183,7 @@ impl Default for GitRunner {
             program: PathBuf::from("git"),
             limits: RunLimits::QUERY,
             excludes_file: PathBuf::from("/dev/null"),
+            excludes_revoked: AtomicBool::new(false),
         }
     }
 }
@@ -245,11 +254,13 @@ pub fn user_excludes_candidate(
 
 /// Vet an excludes-file candidate. Accepted only as the CANONICAL path of an
 /// existing regular file (a dotfiles symlink is followed, then judged by its
-/// target), absolute, UTF-8 without control characters, owned by `uid`, and
-/// not inside any of `forbidden_roots` (registered repositories, Core's
-/// worktree root) — an agent-writable file must never decide what is
-/// ignored. Callers fall back to `/dev/null` on `Err` (fail safe: more files
-/// show as untracked, never fewer).
+/// target), absolute, UTF-8 without control characters, owned by `uid`, not
+/// writable by group or others — and neither is its directory — and not inside
+/// any of `forbidden_roots` (registered repositories, Core's worktree root):
+/// an agent- or other-user-writable file must never decide what is ignored.
+/// Callers fall back to `/dev/null` on `Err` (fail safe: more files show as
+/// untracked, never fewer). The service re-runs this whenever a repository is
+/// registered, because a later repository may contain the file.
 pub fn accept_excludes_file(
     candidate: &Path,
     forbidden_roots: &[PathBuf],
@@ -277,6 +288,24 @@ pub fn accept_excludes_file(
         if meta.uid() != uid {
             return Err(format!("{text} is owned by uid {}, not {uid}", meta.uid()));
         }
+        if meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{text} is writable by group or others (mode {:o})",
+                meta.mode() & 0o777
+            ));
+        }
+        // Whoever can write the directory can replace the file.
+        if let Some(parent) = canonical.parent() {
+            let pmeta = std::fs::metadata(parent)
+                .map_err(|e| format!("{} is not usable: {e}", parent.display()))?;
+            if pmeta.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "{text} lies in {}, which is writable by group or others (mode {:o})",
+                    parent.display(),
+                    pmeta.mode() & 0o777
+                ));
+            }
+        }
     }
     #[cfg(not(unix))]
     let _ = uid;
@@ -294,6 +323,15 @@ pub fn accept_excludes_file(
 }
 
 impl GitRunner {
+    /// The default runner, passing `excludes_file` (already vetted by
+    /// [`accept_excludes_file`]) on every call.
+    pub fn with_excludes_file(excludes_file: PathBuf) -> Self {
+        Self {
+            excludes_file,
+            ..Self::default()
+        }
+    }
+
     /// Build the hardened command (pure; no I/O). `ambient_env_keys` is the
     /// set of variable names in Core's own environment — every `GIT_*` one is
     /// explicitly removed. `extra_config` carries per-repo overrides such as
@@ -342,7 +380,7 @@ impl GitRunner {
     /// pure: Core passes canonical repository/worktree roots as `cwd`, and the
     /// accepted excludes path is canonical.
     pub fn effective_excludes(&self, cwd: &Path) -> String {
-        let path = &self.excludes_file;
+        let path = self.active_excludes_file();
         match path.to_str() {
             Some(p)
                 if path.is_absolute()
@@ -353,6 +391,22 @@ impl GitRunner {
             }
             _ => "/dev/null".to_string(),
         }
+    }
+
+    /// The excludes file in force for every call: the configured one, or
+    /// `/dev/null` once revoked.
+    pub fn active_excludes_file(&self) -> PathBuf {
+        if self.excludes_revoked.load(Ordering::SeqCst) {
+            PathBuf::from("/dev/null")
+        } else {
+            self.excludes_file.clone()
+        }
+    }
+
+    /// Stop using the configured excludes file for good. Returns `true` for
+    /// the call that actually revoked it (so the caller reports it once).
+    pub fn revoke_excludes(&self) -> bool {
+        !self.excludes_revoked.swap(true, Ordering::SeqCst)
     }
 
     /// Run a builder-produced vector in `cwd` under the full hardening. No
@@ -2158,6 +2212,70 @@ mod tests {
         };
         std::fs::write(repo.join("work.txt"), "work\n").unwrap();
         assert!(runner.is_dirty(&repo).unwrap());
+    }
+
+    /// An excludes file (or its directory) that another local user could
+    /// write is refused: whoever writes it decides what reviews ignore.
+    #[cfg(unix)]
+    #[test]
+    fn group_or_world_writable_excludes_files_or_directories_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = home.join("ignore");
+        std::fs::write(&file, ".DS_Store\n").unwrap();
+        let uid = euid_now();
+        let set = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(&file, 0o644);
+        assert_eq!(accept_excludes_file(&file, &[], uid).unwrap(), file);
+        set(&file, 0o666);
+        assert!(
+            accept_excludes_file(&file, &[], uid).is_err(),
+            "world-writable file"
+        );
+        set(&file, 0o664);
+        assert!(
+            accept_excludes_file(&file, &[], uid).is_err(),
+            "group-writable file"
+        );
+        set(&file, 0o644);
+        set(&home, 0o777);
+        assert!(
+            accept_excludes_file(&file, &[], uid).is_err(),
+            "world-writable directory"
+        );
+        set(&home, 0o775);
+        assert!(
+            accept_excludes_file(&file, &[], uid).is_err(),
+            "group-writable directory"
+        );
+        set(&home, 0o755);
+        assert_eq!(accept_excludes_file(&file, &[], uid).unwrap(), file);
+    }
+
+    /// Revocation is one-way and applies to every later call, in any cwd.
+    #[test]
+    fn a_revoked_excludes_file_is_never_used_again() {
+        let runner = GitRunner {
+            excludes_file: PathBuf::from("/opt/sandpane-test/git/ignore"),
+            ..GitRunner::default()
+        };
+        assert_eq!(
+            runner.effective_excludes(Path::new("/repo/atlas")),
+            "/opt/sandpane-test/git/ignore"
+        );
+        assert!(runner.revoke_excludes(), "first revocation reports itself");
+        assert!(!runner.revoke_excludes(), "later ones do not");
+        assert_eq!(
+            runner.effective_excludes(Path::new("/repo/atlas")),
+            "/dev/null"
+        );
+        assert_eq!(runner.active_excludes_file(), PathBuf::from("/dev/null"));
     }
 
     /// Per-call guard: an excludes file that lies inside the directory git
