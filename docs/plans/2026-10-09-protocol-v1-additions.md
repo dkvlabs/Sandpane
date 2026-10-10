@@ -188,6 +188,102 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
    - Each new method is gated on `system.probe` `methods`.
    - Project settings get: rename and description; an archive/unarchive toggle; a "show archived" filter (`includeArchived: true`); add repository (each client's native folder picker, with Core validating the path); remove repository; and delete through the shared two-step dialog pattern from A1 (impact lines revealed and capped, Cancel default, expiry re-checked at click time, no retry).
 
+### 3.3 A3b decisions (conversation lifecycle), fixed before implementation
+
+1. **Methods (5 new, 27 total).** Lowercase snake_case segments, as in §3.2.
+   - `conversation.rename {conversationId, title}` → `Conversation`.
+   - `conversation.archive {conversationId}` / `conversation.unarchive {conversationId}` → `Conversation`. Both are idempotent.
+   - `conversation.delete {conversationId, confirmToken?}` uses the §2 token flow:
+     - action `conversation.delete`;
+     - target `{name: <stored title>, id: <conversation id>}`, bound by id through `consume_by_id`, so a rename between the steps does not invalidate the token;
+     - step 2 returns `{deleted: true}`;
+     - `external` is always false.
+   - `conversation.export {conversationId, afterSequence?, limit?}` → a redacted export page (item 6). It is read-only.
+2. **Wire additions.**
+   - `Conversation` gains `archivedAt?` (absent when live) and `sandboxId?` (absent when none was stored).
+   - `conversation.list` gains `includeArchived?: boolean`, default false. Older clients therefore never see archived conversations.
+   - `features` gains `"conversation-sandbox-id"`. Without it, a client cannot tell "no sandbox was chosen" from "an older Core discarded the choice". Clients may rely on `sandboxId` being persisted only when the feature is advertised.
+3. **`sandboxId` is a stored name, not an identity.**
+   - Migration v6 adds `conversations.sandbox_id TEXT` (same backup and downgrade-refusal rules as v4/v5). `conversation.create` stores the value it already validates with `Validator::sandbox_name`.
+   - It is the sandbox **name** chosen when the conversation was created. Core does not check that the sandbox still exists, and a same-named replacement (A1) is indistinguishable.
+   - Clients present it as "sandbox chosen at creation", never as a binding. They show "not in the current sandbox list" when it is absent from `sandbox.list`.
+   - Rows created before v6 have no value. Nothing back-fills them.
+4. **What archived means.** Archiving is reversible and changes nothing outside Core.
+   - **Archived conversation:**
+     - `conversation.send` and `conversation.rename` are refused with `VALIDATION_FAILED` ("conversation is archived; unarchive it first; nothing was changed"). This replaces today's `NOT_FOUND` from the `archived_at IS NULL` filters on both send paths (the early check and the authoritative in-transaction re-check).
+     - Tasks already running keep running.
+     - `conversation.history`, `conversation.export` and task reads keep working. `history` stops answering `NOT_FOUND` for archived rows; before A3b no method could archive a conversation, so no client depended on that.
+   - **Archived project:** only reads, `conversation.archive` and `conversation.delete` are allowed. `conversation.rename` and `conversation.unarchive` are refused with A3a's project message ("project is archived; unarchive it first; nothing was changed").
+   - **Keyed replay:** `conversation.send` looks the idempotency key up before these checks. A keyed replay to a conversation that has since been archived or deleted returns the stored first response with `replayed: true`. This matches the documented asymmetry in §3.2 item 5: a replay is not current state.
+5. **Delete.**
+   - **Precondition:** checked at step 1 and again at step 2 under the DB lock, in the same transaction as the delete. If the conversation has a non-terminal task: `CONFLICT` ("conversation has tasks that are not finished; cancel or finish them first; nothing was deleted").
+     - A concurrent `conversation.send` cannot slip past. Send writes its task in one transaction that re-checks that the conversation exists. It either commits first (delete then sees a non-terminal task) or finds the conversation gone (`NOT_FOUND`).
+   - **Explicit order, in one transaction** (from the v1–v5 schema; `ON DELETE CASCADE` is only a backstop):
+     1. `verifications`, `task_artifacts` and `task_events` of the conversation's tasks;
+     2. `tasks`;
+     3. `agent_sessions`;
+     4. `messages`;
+     5. `client_state.selected_conversation`, set to NULL where it names this id (it has no foreign key);
+     6. the `conversations` row.
+   - **It never touches host files, worktrees, branches or sandboxes.** The impact lines say:
+     - how many messages and tasks are deleted;
+     - that task events, artifacts and verification records go with them;
+     - that Core-allocated worktree directories and task branches are **left in place**, with their count when Core knows it;
+     - that the chosen sandbox, if any, is not touched.
+   - **Locks:** filesystem checks for the impact lines run after the DB mutex is released (A3a I6). No lock guard may live in an `if let` / `match` / `while let` scrutinee whose body re-locks; that was A3a's C1 deadlock.
+   - **Idempotency keys** are not touched, as in A3a.
+6. **Export: always redacted, paged, bounded.**
+   - **Shape:** `{format: "sandpane.conversation-export.v1", exportedAt, conversation, messages, truncated, nextSequence, redaction: {bestEffort: true, replacements, byKind}}`.
+     - `conversation` is a `Conversation` with its title redacted.
+     - `messages` are `MessageRecord`s with their content redacted.
+     - `byKind` maps a kind name to its count.
+     - There is no unredacted mode.
+   - **Scope:** only the conversation metadata and its messages. Task events, artifacts and verification output are **not included**. Clients say so on the export surface and in the saved file.
+   - **Paging and bounds:** identical to `conversation.history`.
+     - `afterSequence`, and `limit` clamped to 1..=500.
+     - The same byte ceiling, `MAX_HISTORY_BYTES`, is counted over the raw serialized rows under the DB lock. The first row always passes.
+     - `truncated` and `nextSequence` follow history's rules. Clients loop until `truncated` is false, require `nextSequence` to strictly increase, and stop after a fixed page cap, disclosing a partial export.
+   - **Redaction never lengthens text, and runs after the DB lock is released.**
+     - Each match is replaced by `[REDACTED:<kind>]` when the matched span is at least that long. Otherwise it becomes one `*` per character.
+     - Markers are ASCII and need no JSON escaping, so a redacted row never serializes longer than the raw row. The ceiling counted under the lock therefore still bounds the page, and the 4 MiB frame cap holds.
+     - A test pins "output never longer than input" with a page made of short matches.
+   - **Engine:** the `regex` crate (1.13.1, MIT OR Apache-2.0, pinned exactly like `sha2`). It guarantees linear-time matching on hostile input, which a hand-written scanner would not. Patterns are compiled once with a size limit.
+   - **Kinds (best-effort, specs/06 §"Redact tokens, Authorization headers, .env values, SSH keys and private URLs"):**
+     - `auth-header`: `Authorization` / `Proxy-Authorization` values.
+     - `private-key`: PEM `PRIVATE KEY` blocks; an unterminated block is redacted to the end of the message.
+     - `token`: well-known prefixes, including GitHub `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_`, GitLab `glpat-`, Slack `xox?-`, OpenAI and Anthropic `sk-`, AWS `AKIA`, Google `AIza`, npm `npm_`, Hugging Face `hf_` and Docker `dckr_pat_`.
+     - `jwt`: three base64url segments beginning `eyJ`.
+     - `env-secret`: `NAME=value` / `NAME: value` lines whose name contains SECRET, TOKEN, PASSWORD, PASSWD, API_KEY, ACCESS_KEY, PRIVATE_KEY or CREDENTIAL (case-insensitive). Only the value is replaced.
+     - `url-credentials`: the `user:pass@` userinfo in a URL.
+     - `url-secret-param`: query values of `token`, `access_token`, `api_key`, `apikey`, `key`, `secret`, `password`, `sig`, `signature` and `X-Amz-Signature` / `X-Amz-Credential`.
+     - Host names and paths are **not** redacted. Clients must say: "Redaction is best-effort; review the export before sharing it."
+7. **Titles.**
+   - New `Validator::conversation_title`: 1..=200 characters, with the same refusals as `Validator::project_name` (every Cc including `\n` and `\t`, C1, U+2028/2029, U+200E/200F, U+061C, U+202A–202E, U+2066–2069).
+   - `conversation.create` uses it in place of `display_text`. An empty or whitespace-only title on create still becomes "Untitled conversation".
+   - On `conversation.rename`, an empty or whitespace-only title is refused (`VALIDATION_FAILED`).
+   - Titles stored before A3b may still contain those characters, and the title goes into impact line 0. Clients keep revealing and capping every Core string.
+8. **Exact user-facing messages** (clients match on them):
+   - `conversation is archived; unarchive it first; nothing was changed`
+   - `conversation has tasks that are not finished; cancel or finish them first; nothing was deleted`
+   - `conversation not found` (existing)
+   - A3a's `project is archived; unarchive it first; nothing was changed`
+   - A1's token rejection message
+9. **Clients.**
+   - **Pinned lists:** every pinned method list moves to 27 (§1 rule 4). None of the five methods joins `REPLAY_SAFE_METHODS` / `replay_safe`; export is a read, but stays out for uniformity. All five keep the default deadlines.
+   - **Gating:** each method is gated on `system.probe` `methods`. `includeArchived` is sent only when `conversation.archive` is advertised.
+   - **Chat surfaces get:**
+     - rename;
+     - archive / unarchive;
+     - a "show archived" filter;
+     - delete through the A1 two-step dialog pattern;
+     - export;
+     - "sandbox chosen at creation", when the feature is advertised.
+     - Send and rename are disabled on an archived conversation, showing Core's reason.
+   - **Export destination:**
+     - VS Code and JetBrains: the native save dialog. The file is written only to the path the user picks.
+     - Desktop: there is no dialog plugin (A3a W3), so it shows the redacted export read-only, with a **Copy** button. Saving to a file waits for `@tauri-apps/plugin-dialog`; this is disclosed.
+   - **After a delete,** any client-side selection of that conversation is cleared. An unknown step-2 outcome is settled by re-reading `conversation.list {includeArchived: true}`, as in A3a.
+
 ## 4. Client obligations per addition
 
 Every client gets, for each addition:
