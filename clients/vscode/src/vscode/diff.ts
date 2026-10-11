@@ -9,6 +9,7 @@
  */
 
 import type { ChangeSet, FileChange } from '../core-client/protocol';
+import { plainText } from '../text/visibleText';
 
 /**
  * A URI described by its parts, never by a pre-encoded string (review bug 1 /
@@ -151,14 +152,20 @@ export function buildDiffPlan(input: DiffPlanInput): DiffPlan {
   if (fsPath === null) {
     return {
       ok: false,
-      reason: `"${change.path}" is empty or escapes the repository root; no URI was built.`,
+      reason: `"${plainText(change.path, 300)}" is empty or escapes the repository root; no URI was built.`,
     };
   }
   const dirtyWarning = changeSet.hostDirty
     ? 'Host tree is dirty: these files may contain your own uncommitted work, and apply is ' +
       'blocked until that is resolved (specs/06 §6).'
     : undefined;
-  const title = `${change.path} (${shortRef(baseCommit)} ↔ working tree)${changeSet.hostDirty ? ' · host dirty' : ''}`;
+  // A5: review paths are EXACT (a real tab / newline may occur); the URI
+  // keeps them byte-exact, the editor title shows them revealed on one line.
+  const shownPath =
+    change.status === 'renamed' && typeof change.oldPath === 'string' && change.oldPath.length > 0
+      ? `${plainText(change.oldPath, 300)} \u2192 ${plainText(change.path, 300)}`
+      : plainText(change.path, 300);
+  const title = `${shownPath} (${shortRef(baseCommit)} \u2194 working tree)${changeSet.hostDirty ? ' \u00b7 host dirty' : ''}`;
 
   switch (change.status) {
     case 'untracked':
@@ -184,14 +191,31 @@ export function buildDiffPlan(input: DiffPlanInput): DiffPlan {
           ...(dirtyWarning ? { warning: dirtyWarning } : {}),
         },
       };
-    case 'renamed':
+    case 'renamed': {
+      // A5: Core sends the pre-rename path; compare base(oldPath) with the
+      // working tree at the new path. Without it (pre-A5 Core) refuse.
+      const oldFsPath =
+        typeof change.oldPath === 'string' && change.oldPath.length > 0 ? joinPath(repoRoot, change.oldPath) : null;
+      if (oldFsPath === null) {
+        return {
+          ok: false,
+          reason:
+            typeof change.oldPath === 'string' && change.oldPath.length > 0
+              ? 'the rename source is empty or escapes the repository root; no URI was built.'
+              : `Core's ChangeSet carries no rename source (oldPath) for this entry, so the old name is ` +
+                'unknown. A diff here would compare the wrong file.',
+        };
+      }
       return {
-        ok: false,
-        reason:
-          `Core's ChangeSet carries a single "path" per change and no rename source, so the ` +
-          'old name is unknown. A diff here would compare the wrong file. Renamed entries need a ' +
-          'protocol field for the original path (P4 gap).',
+        ok: true,
+        kind: 'diff',
+        plan: {
+          command: 'vscode.diff',
+          args: [gitRevisionSpec(oldFsPath, baseCommit), fileSpec(fsPath), title],
+          ...(dirtyWarning ? { warning: dirtyWarning } : {}),
+        },
       };
+    }
     case 'added':
     case 'modified':
       return {

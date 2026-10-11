@@ -1,5 +1,13 @@
 import { useState } from "react";
-import { useApplyChanges, useTaskReview } from "../../lib/hooks";
+import { capabilitiesOf, useApplyChanges, useCoreLink, useTaskDiff, useTaskReview } from "../../lib/hooks";
+import {
+  changeSetCompleteness,
+  copyDiffText,
+  diffFailureCopy,
+  diffGate,
+} from "../../lib/git-diff";
+import type { FileChangeStatus } from "../../lib/protocol";
+import { DiffView } from "./DiffView";
 import {
   displayPath,
   displayRaw,
@@ -22,11 +30,11 @@ import { ErrorPanel } from "../../features/projects/ProjectsView";
 /**
  * Git review surface (docs/specs/05 §3.C, design spec S07).
  *
- * Only the change set Core returned is listed — file paths and their status,
- * which is everything `git.review` provides in protocol v1. There is no diff
- * text method yet, so the panel says so instead of rendering invented hunks,
- * and apply is always an explicit, confirmed Git operation against a recorded
- * base commit.
+ * Only the change set Core returned is listed — file paths, their status and
+ * (A5) a rename's old path. Each entry has a Diff action (A5 `git.diff`, gated
+ * on advertisement) that shows Core's patch as read-only, revealed text; the
+ * patch is never applied from here. Apply is always an explicit, confirmed Git
+ * operation against a recorded base commit.
  *
  * Forward compatibility: a file whose status this build does not recognise is
  * listed with Core's raw status but cannot be selected, and its presence blocks
@@ -88,6 +96,12 @@ function ReviewPanelBody({
   const blocked = blockedReason !== null;
   const { changeSet, isLoading, error, refetch } = useTaskReview(taskId, requested && !blocked);
   const apply = useApplyChanges();
+  // A5: one open diff at a time, addressed by the entry's exact path + status.
+  const gate = diffGate(capabilitiesOf(useCoreLink()));
+  const [diffEntry, setDiffEntry] = useState<{ path: string; status: FileChangeStatus } | null>(null);
+  const [copyNote, setCopyNote] = useState<string | null>(null);
+  const diff = useTaskDiff(diffEntry === null ? null : { taskId, ...diffEntry });
+  const incomplete = changeSet === null ? null : changeSetCompleteness(changeSet);
 
   const summary = reviewSummary(
     changeSet,
@@ -153,9 +167,26 @@ function ReviewPanelBody({
               <dt>host dirty</dt>
               <dd>{changeSet.hostDirty ? "yes — uncommitted host changes exist" : "no"}</dd>
             </div>
+            {changeSet.repoPath !== undefined && (
+              <div className="kv">
+                <dt>repository</dt>
+                <dd>
+                  <Mono>{displayPath(changeSet.repoPath).text}</Mono>
+                </dd>
+              </div>
+            )}
           </dl>
 
-          {changeSet.changes.length === 0 ? (
+          {incomplete !== null && (
+            <Warning tone="attention" title="Change set not complete">
+              {incomplete} Core reported paths it could not inspect, so this list may not show every
+              change.
+            </Warning>
+          )}
+
+          {changeSet.changes.length === 0 && incomplete !== null ? (
+            <p className="muted">Core listed no inspected changes; see the warning above.</p>
+          ) : changeSet.changes.length === 0 ? (
             <EmptyState
               heading="Empty change set"
               body="Core reported no files changed against the base commit. That is a real result, not a load failure."
@@ -193,6 +224,11 @@ function ReviewPanelBody({
                         setSelected(next);
                       }}
                     />
+                    {change.oldPath !== undefined && (
+                      <>
+                        <Mono>{displayPath(change.oldPath).text}</Mono> →{" "}
+                      </>
+                    )}
                     <Mono>{shown.text}</Mono>
                   </label>
                   {shown.unusual && (
@@ -214,17 +250,59 @@ function ReviewPanelBody({
                   >
                     {fileChangeLabel(change.status, change.unrecognizedStatus)}
                   </Badge>
+                  <Button
+                    variant="ghost"
+                    disabled={gate.state !== "supported" || change.status === "unknown"}
+                    title={
+                      gate.state !== "supported"
+                        ? gate.note
+                        : change.status === "unknown"
+                          ? "This build does not recognise this entry's status, so it cannot name the entry for git.diff."
+                          : "Show Core's patch for this entry (read-only)"
+                    }
+                    onClick={() => {
+                      if (change.status === "unknown") return;
+                      setCopyNote(null);
+                      // The entry's path and status exactly as git.review returned them.
+                      setDiffEntry({ path: change.path, status: change.status });
+                    }}
+                  >
+                    Diff
+                  </Button>
                 </li>
                 );
               })}
             </ul>
           )}
 
-          <p className="muted">
-            Diff text needs a Core method that protocol v1 does not have yet (no{" "}
-            <Mono>git.diff</Mono>), so side-by-side hunks are a DT3 deliverable. Selection and
-            apply already work against the real change set.
-          </p>
+          {gate.state !== "supported" && <p className="muted">{gate.note}</p>}
+          {diffEntry !== null && (
+            <div className="review__diff">
+              {diff.isLoading && <p className="muted">Reading the diff from Core…</p>}
+              {diff.error !== null && (
+                <Warning tone="attention" title={diffFailureCopy(diff.error).title}>
+                  <p>{diffFailureCopy(diff.error).body}</p>
+                  <p>{diffFailureCopy(diff.error).action}</p>
+                </Warning>
+              )}
+              {diff.result !== null && (
+                <DiffView
+                  result={diff.result}
+                  maxBytesSent={undefined}
+                  copyNote={copyNote}
+                  onCopy={() => {
+                    const text = diff.result?.patch ?? "";
+                    void copyDiffText(globalThis.navigator?.clipboard, text).then((outcome) =>
+                      setCopyNote(outcome.ok ? "Copied the patch exactly as Core returned it." : outcome.message),
+                    );
+                  }}
+                />
+              )}
+              <Button variant="ghost" onClick={() => setDiffEntry(null)}>
+                Close diff
+              </Button>
+            </div>
+          )}
 
           <div className="row-actions">
             <Button

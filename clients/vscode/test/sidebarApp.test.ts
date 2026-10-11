@@ -511,3 +511,35 @@ describe('A4 composer: Task / Discuss send mode', () => {
     expect(text.match(/Send mode/g)).toHaveLength(1);
   });
 });
+
+describe('A5: per-task Diff button', () => {
+  const row = { taskId: 't-1', status: 'queued', branch: null, baseCommit: null, unknownKinds: [] };
+
+  it('posts showTaskPatch for the task when Core advertises git.diff', () => {
+    const h = boot();
+    h.push(state({ gitDiffSupported: true, tasks: [row] }));
+    h.flushFrame();
+    const button = h.byId('sp-diff-t-1');
+    expect(button.textContent).toBe('Diff');
+    expect(button.disabled).toBe(false);
+    h.posted.length = 0;
+    button.click();
+    expect(h.posted).toEqual([{ type: 'showTaskPatch', taskId: 't-1' }]);
+  });
+
+  it('is disabled with "not supported by this Core" when git.diff is not advertised (or the flag is absent)', () => {
+    const h = boot();
+    h.push(state({ gitDiffSupported: false, tasks: [row] }));
+    h.flushFrame();
+    const button = h.byId('sp-diff-t-1');
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute('title')).toContain('not supported by this Core');
+    h.posted.length = 0;
+    button.click();
+    expect(h.posted).toEqual([]);
+    const old = boot();
+    old.push(state({ tasks: [row] }));
+    old.flushFrame();
+    expect(old.byId('sp-diff-t-1').disabled).toBe(true);
+  });
+});

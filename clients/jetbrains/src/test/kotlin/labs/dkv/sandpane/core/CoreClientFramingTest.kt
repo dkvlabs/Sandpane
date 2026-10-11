@@ -61,7 +61,7 @@ import kotlin.test.assertTrue
  *     core/crates/sandpane-protocol/src/lib.rs;
  *   - the protocol-v1 additive fields: an OLD frame parses, and an absent value stays absent on
  *     the way out instead of becoming `null`, `{}`, or a benign workspace mode;
- *   - the 27-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
+ *   - the 28-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
  *     compared by [ProtocolDriftGuardTest]).
  *
  * NOT covered here, on purpose: a live socket round trip. `SocketChannel` against
@@ -207,7 +207,9 @@ class CoreClientFramingTest {
             "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
             "conversation.export",
         ).forEach { assertTrue(CoreMethods.isAllowlisted(it), it) }
-        assertEquals(27, CoreMethods.ALL.size)
+        // A5: git.diff is allowlisted.
+        assertTrue(CoreMethods.isAllowlisted("git.diff"))
+        assertEquals(28, CoreMethods.ALL.size)
     }
 
     @Test
@@ -224,7 +226,7 @@ class CoreClientFramingTest {
                 "conversation.create", "conversation.send", "conversation.list", "conversation.history",
                 "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
                 "conversation.export",
-                "task.cancel", "task.list", "task.subscribe", "git.review", "git.apply",
+                "task.cancel", "task.list", "task.subscribe", "git.review", "git.diff", "git.apply",
             ),
             CoreMethods.ALL,
         )
@@ -245,11 +247,13 @@ class CoreClientFramingTest {
             ),
             CoreMethods.ADDITIVE_A3B,
         )
+        assertEquals(setOf("git.diff"), CoreMethods.ADDITIVE_A5)
         assertEquals(
-            CoreMethods.ADDITIVE_IN_V1 + CoreMethods.ADDITIVE_A1 + CoreMethods.ADDITIVE_A3A + CoreMethods.ADDITIVE_A3B,
+            CoreMethods.ADDITIVE_IN_V1 + CoreMethods.ADDITIVE_A1 + CoreMethods.ADDITIVE_A3A + CoreMethods.ADDITIVE_A3B +
+                CoreMethods.ADDITIVE_A5,
             CoreMethods.REQUIRES_ADVERTISEMENT,
         )
-        assertEquals(16, CoreMethods.REQUIRES_ADVERTISEMENT.size, "every method beyond the 11-method baseline is gated")
+        assertEquals(17, CoreMethods.REQUIRES_ADVERTISEMENT.size, "every method beyond the 11-method baseline is gated")
     }
 
     // -----------------------------------------------------------------------

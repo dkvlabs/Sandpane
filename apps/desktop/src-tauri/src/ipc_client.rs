@@ -49,7 +49,8 @@ const RETRY_DELAY: Duration = Duration::from_millis(150);
 /// the `ls --json` re-query) up to about 330 s, and `sandbox.remove` step 2
 /// (identity re-check plus `rm --force`) a little longer. `project.create` and
 /// `project.add_repository` canonicalize a repository path with git, which may
-/// take up to 30 s. Everything else answers well inside the default.
+/// take up to 30 s, and so do `git.review` / `git.diff` (A5) for the change
+/// list and the diff. Everything else answers well inside the default.
 pub fn proxy_deadline_ms(method: Method) -> u64 {
     match method {
         Method::SandboxCreate => 320_000,
@@ -60,6 +61,10 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
         // take up to 30 s (`project.create`, A3a `project.add_repository`).
         Method::ProjectCreate => 43_000,
         Method::ProjectAddRepository => 43_000,
+        // A5 (design §3.5 item 5): git runs under Core's RunLimits::QUERY
+        // (30 s) for the change list and the diff.
+        Method::GitReview => 43_000,
+        Method::GitDiff => 43_000,
         _ => PROXY_DEADLINE_MS,
     }
 }
@@ -102,6 +107,10 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
 /// the first four write Core's database, `conversation.delete`'s step 1 mints a
 /// single-use token and step 2 deletes, and `conversation.export` — a read —
 /// stays out for uniformity, so a lost export answer is surfaced, not re-sent.
+///
+/// A5's `git.diff` is a read but stays out for the same uniformity (design
+/// 2026-10-09 §3.5 item 5); its lost answer is surfaced as "no file was
+/// changed", never re-sent.
 ///
 /// `src/lib/core-client.ts` mirrors this list as `REPLAY_SAFE_METHODS`; the
 /// drift test parses this `matches!` and fails if the two ever differ.
@@ -708,13 +717,14 @@ mod tests {
             "conversation.unarchive",
             "conversation.delete",
             "conversation.export",
+            "git.diff",
         ] {
             assert!(
                 validate_frame(&frame(method)).is_ok(),
                 "{method} must be allowlisted because Core's crate parses it"
             );
         }
-        assert_eq!(Method::ALL.len(), 27);
+        assert_eq!(Method::ALL.len(), 28);
         // Wire names are lowercase snake_case segments; camelCase is not a method.
         assert_eq!(
             validate_frame(&frame("project.addRepository"))
@@ -825,6 +835,8 @@ mod tests {
             Method::ConversationUnarchive,
             Method::ConversationDelete,
             Method::ConversationExport,
+            // A5: a read, but out of the replay-safe set like every A-series method.
+            Method::GitDiff,
         ] {
             assert!(!replay_safe(m), "{m:?} must never be re-sent");
         }
@@ -906,6 +918,9 @@ mod tests {
         // to 30 s), for project.create and project.add_repository alike.
         assert_eq!(proxy_deadline_ms(Method::ProjectCreate), 43_000);
         assert_eq!(proxy_deadline_ms(Method::ProjectAddRepository), 43_000);
+        // A5: git.review and git.diff run git under Core's 30 s query limit.
+        assert_eq!(proxy_deadline_ms(Method::GitReview), 43_000);
+        assert_eq!(proxy_deadline_ms(Method::GitDiff), 43_000);
     }
 
     #[test]

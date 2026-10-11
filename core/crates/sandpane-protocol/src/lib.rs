@@ -171,6 +171,9 @@ pub enum Method {
     TaskSubscribe,
     #[serde(rename = "git.review")]
     GitReview,
+    /// A5 (§3.5 item 3): one file's patch from a task's change list.
+    #[serde(rename = "git.diff")]
+    GitDiff,
     #[serde(rename = "git.apply")]
     GitApply,
 }
@@ -181,7 +184,7 @@ impl Method {
     /// from the enum rather than hand-written, and `dispatch` must match
     /// exhaustively over the same enum, so an advertised method always really
     /// exists and a handled method is always advertised.
-    pub const ALL: [Method; 27] = [
+    pub const ALL: [Method; 28] = [
         Self::SystemProbe,
         Self::ProjectCreate,
         Self::ProjectList,
@@ -208,6 +211,7 @@ impl Method {
         Self::TaskList,
         Self::TaskSubscribe,
         Self::GitReview,
+        Self::GitDiff,
         Self::GitApply,
     ];
 
@@ -245,6 +249,7 @@ impl Method {
             "task.list" => Self::TaskList,
             "task.subscribe" => Self::TaskSubscribe,
             "git.review" => Self::GitReview,
+            "git.diff" => Self::GitDiff,
             "git.apply" => Self::GitApply,
             _ => return None,
         })
@@ -278,6 +283,7 @@ impl Method {
             Self::TaskList => "task.list",
             Self::TaskSubscribe => "task.subscribe",
             Self::GitReview => "git.review",
+            Self::GitDiff => "git.diff",
             Self::GitApply => "git.apply",
         }
     }
@@ -1055,13 +1061,70 @@ pub struct ChangeSet {
     pub base_commit: String,
     pub host_dirty: bool,
     pub changes: Vec<FileChange>,
+    /// A5 (additive, §3.5 item 2): the canonical HOST repository root of the
+    /// task — the integration target that `host_dirty` describes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    /// A5 (additive, §3.5 item 2): paths Core could not inspect. Defined but
+    /// NEVER produced in A5 — a repository with submodules is still refused
+    /// with `VALIDATION_FAILED`, never returned as a partial list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uninspected: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileChange {
+    /// Exactly as git reports it (A5: NUL-separated, never C-quoted).
     pub path: String,
     pub status: FileChangeStatus,
+    /// A5 (additive, §3.5 item 2): the pre-rename path, set ONLY for
+    /// `renamed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+}
+
+/// `git.diff` params (A5, §3.5 item 3). Read-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffParams {
+    pub task_id: String,
+    /// Must equal, byte for byte, the `path` of an entry in the task's
+    /// change list as `git.review` returns it (recomputed at call time). No
+    /// other form (prefix, glob, `..`) is accepted.
+    pub path: String,
+    /// Clamped by Core to 1..=524288; default 262144.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// The entry's `status` as `git.review` lists it. Optional; REQUIRED in
+    /// effect when the path is listed more than once (e.g. `deleted` and
+    /// `untracked` after `git rm --cached`) — without it Core refuses
+    /// rather than pick one. When given, path AND status must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<FileChangeStatus>,
+}
+
+/// `git.diff` result (A5, §3.5 item 3). `patch` is UNTRUSTED text: display
+/// it, never render or execute it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffResult {
+    pub path: String,
+    /// Set only for `renamed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub status: FileChangeStatus,
+    /// A unified diff of at most `maxBytes` bytes; empty when `binary`.
+    pub patch: String,
+    pub binary: bool,
+    /// More existed than `maxBytes`; the patch ends at a line (or, for one
+    /// long line, a character) boundary.
+    pub truncated: bool,
+    /// Non-UTF-8 bytes were replaced with U+FFFD.
+    pub lossy: bool,
+    /// The base-side blob id; absent for `added` and `untracked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_blob: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1153,7 +1216,7 @@ mod tests {
     /// A3b added the five conversation lifecycle methods (§3.3 item 1).
     #[test]
     fn all_twenty_seven_methods_round_trip() {
-        const EXPECTED: [&str; 27] = [
+        const EXPECTED: [&str; 28] = [
             "system.probe",
             "project.create",
             "project.list",
@@ -1180,6 +1243,7 @@ mod tests {
             "task.list",
             "task.subscribe",
             "git.review",
+            "git.diff",
             "git.apply",
         ];
         assert_eq!(Method::ALL.len(), EXPECTED.len());
@@ -1478,6 +1542,87 @@ mod tests {
         let back: TaskSummary = serde_json::from_value(v).unwrap();
         assert_eq!(back.chosen_sandbox_name.as_deref(), Some("atlas-auth"));
         assert_eq!(back.sandbox_name, None);
+    }
+
+    /// A5 §3.5 item 2: the three ChangeSet/FileChange fields are optional
+    /// and absent when unset (a pre-A5 ChangeSet still decodes).
+    #[test]
+    fn change_set_a5_fields_are_optional() {
+        let old: ChangeSet = serde_json::from_str(
+            r#"{"taskId":"t","baseCommit":"b","hostDirty":false,
+                "changes":[{"path":"p","status":"modified"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.repo_path, None);
+        assert_eq!(old.uninspected, None);
+        assert_eq!(old.changes[0].old_path, None);
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(
+            v.get("repoPath").is_none() && v.get("uninspected").is_none(),
+            "{v}"
+        );
+        assert!(v["changes"][0].get("oldPath").is_none(), "{v}");
+        let new = ChangeSet {
+            repo_path: Some("/r".into()),
+            uninspected: Some(vec!["vendor/lib".into()]),
+            changes: vec![FileChange {
+                path: "new".into(),
+                status: FileChangeStatus::Renamed,
+                old_path: Some("old".into()),
+            }],
+            ..old
+        };
+        let v = serde_json::to_value(&new).unwrap();
+        assert_eq!(v["repoPath"], "/r");
+        assert_eq!(v["uninspected"][0], "vendor/lib");
+        assert_eq!(v["changes"][0]["oldPath"], "old");
+    }
+
+    /// A5 §3.5 item 3: `git.diff` params and result wire shapes.
+    #[test]
+    fn git_diff_params_and_result_shapes() {
+        let p: GitDiffParams = serde_json::from_str(r#"{"taskId":"t","path":"a b.txt"}"#).unwrap();
+        assert_eq!(p.max_bytes, None);
+        let p: GitDiffParams =
+            serde_json::from_str(r#"{"taskId":"t","path":"p","maxBytes":0}"#).unwrap();
+        assert_eq!(p.max_bytes, Some(0));
+        assert!(serde_json::from_str::<GitDiffParams>(r#"{"taskId":"t"}"#).is_err());
+        // A5 security I2: optional `status` disambiguates a path listed twice.
+        assert_eq!(p.status, None);
+        let p: GitDiffParams =
+            serde_json::from_str(r#"{"taskId":"t","path":"p","status":"untracked"}"#).unwrap();
+        assert_eq!(p.status, Some(FileChangeStatus::Untracked));
+        assert!(serde_json::from_str::<GitDiffParams>(
+            r#"{"taskId":"t","path":"p","status":"copied"}"#
+        )
+        .is_err());
+        assert!(serde_json::to_value(&p).unwrap()["status"] == "untracked");
+        let r = GitDiffResult {
+            path: "p".into(),
+            old_path: None,
+            status: FileChangeStatus::Untracked,
+            patch: String::new(),
+            binary: true,
+            truncated: false,
+            lossy: false,
+            base_blob: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"path":"p","status":"untracked","patch":"",
+                               "binary":true,"truncated":false,"lossy":false})
+        );
+        let r = GitDiffResult {
+            old_path: Some("o".into()),
+            base_blob: Some("b".repeat(40)),
+            status: FileChangeStatus::Renamed,
+            ..r
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["oldPath"], "o");
+        assert_eq!(v["baseBlob"], "b".repeat(40));
+        assert_eq!(Method::parse("git.diff"), Some(Method::GitDiff));
     }
 
     /// A2 review W1: a replay is marked, the first response never is.

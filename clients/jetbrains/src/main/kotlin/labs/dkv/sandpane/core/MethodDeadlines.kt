@@ -35,11 +35,21 @@ object MethodDeadlines {
      */
     const val PROJECT_ADD_REPOSITORY_MS: Int = 45_000
 
+    /**
+     * `git.review` / `git.diff` (A5): Core runs QUERY-bounded git (30 s per run; one call may run
+     * git several times). The 45 s git deadline from A3a W2; a timeout is "no answer in time" — both
+     * are read-only, so nothing changed.
+     */
+    const val GIT_REVIEW_MS: Int = 45_000
+    const val GIT_DIFF_MS: Int = 45_000
+
     /** The deadline for [method] given the user's [configuredMs]; never shorter than [configuredMs]. */
     fun forMethod(method: String, configuredMs: Int): Int = when (method) {
         CoreMethods.SANDBOX_STOP -> maxOf(configuredMs, SANDBOX_STOP_MS)
         CoreMethods.SANDBOX_REMOVE -> maxOf(configuredMs, SANDBOX_REMOVE_MS)
         CoreMethods.PROJECT_ADD_REPOSITORY -> maxOf(configuredMs, PROJECT_ADD_REPOSITORY_MS)
+        CoreMethods.GIT_REVIEW -> maxOf(configuredMs, GIT_REVIEW_MS)
+        CoreMethods.GIT_DIFF -> maxOf(configuredMs, GIT_DIFF_MS)
         else -> configuredMs
     }
 }

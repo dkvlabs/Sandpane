@@ -67,6 +67,15 @@ client) implementing the JB0/JB1 surface of
 > reports **`Compatible`** against IU-262.10968.63. A4 is UNVERIFIED end to end: the Task / Discuss
 > combo was never shown in an IDE and no A4 request reached a running Core.
 >
+> Re-run on 11.10.2026 after the A5 client work (`git.diff` + ChangeSet fields: 28-method pin with
+> `git.diff` after `git.review`, 45 s git deadline for both, per-file read-only diff viewer, exact review
+> paths): `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline
+> --no-build-cache` passes with **402 tests, 0 failures, 0 errors, 0 skipped** across 36 test
+> classes (JUnit XML), and `./gradlew verifyPlugin --offline --rerun-tasks` reports **`Compatible`**
+> against IU-262.10968.63. A5 is UNVERIFIED end to end: no task created over the wire has Git context
+> until A4b, so the Diff action has never reached a real `git.diff` answer; the chooser and viewer were
+> never shown in an IDE.
+>
 > **Proven on this host** (exact commands and outputs in "Checks actually run" below):
 > `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
 > (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
@@ -255,7 +264,7 @@ clients/jetbrains/
     │   │   ├── core/ReplayCursors.kt         # per-task cursor seam behind task.subscribe's afterSequences
     │   │   ├── core/ErrorAttribution.kt      # provenance of a failure: this plugin refused vs Core answered
     │   │   ├── core/EventStream.kt           # per-task checkpoint, bounded window, fan-out
-    │   │   ├── model/Models.kt               # kotlinx mirrors of sandpane-protocol (wire names, 27 methods)
+    │   │   ├── model/Models.kt               # kotlinx mirrors of sandpane-protocol (wire names, 28 methods)
     │   │   ├── model/WorkspaceModeView.kt    # workspaceMode rendering; absence => UNVERIFIED/live-writable
     │   │   ├── ui/ChatPanel.kt               # Swing list/composer/pickers/attachments/status + 50 ms flush
     │   │   ├── actions/{StartTask,ReviewChanges,ApplyTask,RefreshSandboxes}Action.kt
@@ -273,6 +282,9 @@ clients/jetbrains/
     │   │   ├── ui/ConversationDialogs.kt     # A3b: delete confirmation, export copy, rename dialog
     │   │   ├── core/SendMode.kt              # A4: Task / Discuss choice, send params, mode gate, display lines
     │   │   ├── ui/TaskRowText.kt             # A4: task row meta (status + Send mode + chosen sandbox name)
+    │   │   ├── core/GitDiff.kt               # A5: git.diff bounds and honest refusal copy
+    │   │   ├── ui/GitDiffText.kt             # A5: viewer title, disclosures, symlink line, revealed body
+    │   │   ├── ui/GitDiffDialogs.kt          # A5: file chooser + read-only diff viewer (DialogWrapper)
     │   │   ├── services/{SandpaneContextProvider,EditorDiffProvider,SbxService,TaskMonitorService}.kt
     │   │   ├── services/FolderMatching.kt    # folder → Core project, pure and canonicalized on both sides
     │   │   └── settings/{SandpaneSettings,SandpaneConfigurable}.kt
@@ -282,6 +294,7 @@ clients/jetbrains/
         ├── core/ProjectLifecycleTest.kt      # A3a frames, gating, delete flow, copy, validators (39 tests)
         ├── core/ConversationLifecycleTest.kt # A3b frames, gating, delete flow, copy, validator, UI state, single-flight (46 tests)
         ├── core/ConversationExportTest.kt    # A3b export paging, partial/failed, file shape, save/cancel (15 tests)
+        ├── core/GitDiffTest.kt               # A5 frames (exact path + status), gating, flags, copy, exact paths (12 tests)
         ├── core/SendModeTest.kt              # A4 send frames, mode gate, keyed retry, open-string mode, copy, no echo (11 tests)
         ├── core/CoreCommandsTest.kt          # guards, gates, the three cursor shapes  (30 tests)
         ├── core/SandboxLifecycleTest.kt      # A1 frames, token flow, stop report       (27 tests)
@@ -338,20 +351,21 @@ truth; `schemas/*.json` is hand-synced with it): camelCase payload fields, snake
 dotted `AgentEvent` discriminators, `v/id/method/params` frames with flattened `ok`/`err`, and
 `MAX_FRAME_BYTES = 4 MiB` from `sandpane-service`.
 
-The method surface is **27** (`Method::ALL` in Rust), of which **11** are the original protocol-v1
+The method surface is **28** (`Method::ALL` in Rust), of which **11** are the original protocol-v1
 baseline, **3** are the additive discovery reads (`task.list`, `conversation.list`,
 `conversation.history`), **2** are addition A1 (`sandbox.stop`, `sandbox.remove`), **6** are
 addition A3a (`project.update`, `project.archive`, `project.unarchive`, `project.delete`,
 `project.add_repository`, `project.remove_repository`) and **5** are addition A3b
 (`conversation.rename`, `conversation.archive`, `conversation.unarchive`, `conversation.delete`,
-`conversation.export` — in `Method::ALL` right after `conversation.history`, not at the end). All sixteen
+`conversation.export` — in `Method::ALL` right after `conversation.history`, not at the end) and **1** is
+addition A5 (`git.diff`, right after `git.review`). All seventeen
 additive methods are gated on `system.probe`'s `methods` (`CoreMethods.REQUIRES_ADVERTISEMENT`):
 not advertised ⇒ the action is visibly disabled and nothing is sent. There is deliberately **no**
 `sandbox.start` (sbx v0.47 has none); the Start Sandbox action only shows that unsupported state. The additive fields are `CoreCapabilities.methods`,
 `Project.repositories`, `SandboxSummary.workspaceMode` and the optional
 `TaskSubscribeParams.afterSequences`.
 
-This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (24 tests), which
+This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (25 tests), which
 reads the Rust sources and the schemas out of the working tree and compares them against the
 Kotlin mirror: method names **and their order**, the `Method::parse` arms, the
 `rpc-request.schema.json` `method` enum, every `pub const` numeric bound (evaluated, not copied), the
@@ -638,7 +652,32 @@ discovery revision this client is now synced to**):
   its decode messages, so `ErrorAttribution` maps `SerializationException` (and any other
   `IllegalArgumentException`) to fixed text ("…its content is not shown"), and `task.list` rows decode
   through the fixed-text `decodeOrFixed` path. A row with a non-string `mode` is never quoted back.
-- **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **27** protocol
+- **Per-file diff (A5).** After "Review changes", the notification offers **Show file diff…** only when
+  Core advertises `git.diff` (otherwise it says "Per-file diff: not supported by this Core" and offers
+  nothing). A native chooser lists Core's change entries as plain text; the selection IS Core's
+  `FileChange`, so `git.diff` sends its `path` byte-for-byte (no trim, normalization or validation —
+  a tab, newline, quote or non-ASCII name goes through unchanged) and ALWAYS its wire `status` (a path
+  can be listed twice). `maxBytes` is omitted (Core's 262 144 default) and could never exceed 524 288.
+  The call runs on ConnectionManager's io pool with the 45 s git deadline (also now `git.review`'s); the
+  read-only viewer (`DialogWrapper` + non-editable monospace `JTextArea`, which never renders markup)
+  opens on the EDT. The patch is untrusted: shown revealed (hidden, bidi, U+2028/U+2029 characters
+  become visible escapes), never applied, copied into the project, written to a temp file or run.
+  The viewer is named from the JSON `path` / `oldPath` (revealed, capped), never from the patch header.
+  Disclosures: `binary` → "treated as binary (possibly by repository attributes) — no text diff
+  shown"; `truncated` → "diff truncated at N bytes"; `lossy` → "contains bytes that are not valid
+  UTF-8; shown with replacement characters"; renames as `oldPath → path`; an untracked mode-120000
+  patch as "symlink → target" (read from fixed line positions — Core C-quotes a newline in a header
+  name, so a file name cannot forge the mode line); an empty patch as "Core returned an empty
+  patch". Nothing ever says "no changes". Core's exact refusals (no Git context, worktree removed,
+  work tree redirected, path not in / listed twice in the change list, non-UTF-8 path, the untracked
+  read refusals, submodules) each say nothing was read; INTERNAL says git failed and nothing was
+  changed; a timeout says "Core did not answer in time — no file was changed (git.diff is
+  read-only)". The review summary shows `repoPath` (revealed, capped), renames as `old → new`, and —
+  if Core ever reports `uninspected` paths — "N paths were not inspected by Core — this change list
+  is NOT complete". Exact review paths: `EditorDiffProvider.containPath` no longer trims or refuses
+  control characters (a tab or newline is a real file-name character); it refuses only an empty
+  path, a NUL, or an escape from the repository root.
+- **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **28** protocol
   method names before writing a byte; there is no free-form RPC. The refusal is a
   `CoreValidationException` — this client's own word — and not a `CoreRpcException`, because Core
   never saw the request.
@@ -718,6 +757,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Gate after the A3a combined-review fixes (11.10.2026) | same two commands (`verifyPlugin --offline --rerun`) | `BUILD SUCCESSFUL in 15s`; **311 tests, 0 failures, 0 errors, 0 skipped**, 32 result files (two fresh gate runs and three further `test --rerun` runs all green); verifier `Compatible` (no deprecated/experimental/internal usage files); 70 source files (41 main, 29 test) |
 | Gate after the A3b client work (conversation lifecycle, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 18s`; **376 tests, 0 failures, 0 errors, 0 skipped**, 34 result files (ConversationLifecycleTest 46, ConversationExportTest 15, ConversationSelectionTest 4, ConversationReconcileTest 4, ProtocolDriftGuardTest 23, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 76 source files (45 main, 31 test); zip 1 628 803 bytes; 7 Kotlin `w:` on the full recompile (`verifyPlugin --rerun-tasks`), all in pre-existing code (none in A3b files) |
 | Gate after the A4 client work (send mode, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 15s`; **389 tests, 0 failures, 0 errors, 0 skipped**, 35 result files (SendModeTest 11, ProtocolDriftGuardTest 24, RemoveConfirmationDialogTest 7, IdempotencyTest 19, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 79 source files (47 main, 32 test); zip 1 644 556 bytes; the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A4 files) |
+| Gate after the A5 client work (git.diff, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 15s`; **402 tests, 0 failures, 0 errors, 0 skipped**, 36 result files (GitDiffTest 12, ProtocolDriftGuardTest 25, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 83 source files (50 main, 33 test); zip 1 676 534 bytes; the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A5 files) |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |
@@ -726,7 +766,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Toolchain actually used | `./gradlew --version`, `./gradlew javaToolchains` | Gradle 9.8.1, Launcher JVM 23 (GraalVM CE); toolchain 25 = `Eclipse Temurin JDK 25 (25.0.3+9-LTS)`, `Detected by: Auto-provisioned by Gradle` |
 | Wrapper integrity | `shasum -a 256 gradle/wrapper/gradle-wrapper.jar` | `3b8a2577…8e98` = the published `gradle-9.8.1-wrapper.jar.sha256` |
 | Drift gate can fail (negative control) | mutated Kotlin mirror, then a mutated **copy** of the Rust sources via `-PsandpaneRepoRoot` | red in both directions with a message naming the drifted wire string; green after restore — see "Drift gate and its negative control" (recorded before U4; the gate ran green again in the suite above) |
-| Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 27 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
+| Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 28 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
 | Subprocess misuse (`ProcessBuilder`, `Runtime.exec`, `sh -c`, `bash -lc`) | grep over `src/main/kotlin` | **none** — no subprocess surface exists in this module |
 | Internal/private API references (`com.intellij.internal`, JetBrains AI, `setAccessible`, `Unsafe`, reflection) | grep, plus Plugin Verifier | none |
 | TCP / network surface | grep | none — every `TCP` hit is prose stating it is never used |
@@ -778,6 +818,10 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 - **A4 send mode** (11.10.2026): the Task / Discuss combo, its disabled state and the task-row meta were
   never shown in an IDE; no A4 request reached a running Core. Gating is tested against fabricated
   capability lists only.
+- **A5 git.diff** (11.10.2026): no task created over the wire has Git context until A4b, so the per-file
+  Diff action has never received a real `git.diff` answer; the chooser, the viewer and the review
+  notification action were never shown in an IDE. Frames, gating, disclosures and copy are tested
+  against fabricated answers shaped like Core's output.
 - **Older/newer Core compatibility** (testing this client against an older and a newer Core within
   the compatibility policy) has not been done; advertisement gating is tested against fabricated
   capability lists only.

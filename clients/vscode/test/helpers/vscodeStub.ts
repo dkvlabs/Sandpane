@@ -76,6 +76,15 @@ export const stub = {
   fileWrites: [] as { uri: StubUri; bytes: Uint8Array }[],
   /** When set, `workspace.fs.writeFile` rejects with it. */
   writeError: null as Error | null,
+  /** Quick picks shown (items + options); `pickIndex` chooses one (undefined = dismissed). */
+  quickPickCalls: [] as { items: { label: string; description?: string; detail?: string }[]; options: unknown }[],
+  pickIndex: undefined as number | undefined,
+  /** Content providers registered per scheme. */
+  contentProviders: new Map<string, { provideTextDocumentContent(uri: StubUri): string | undefined }>(),
+  /** Virtual documents opened / language set / shown (A5 patch view). */
+  openedDocuments: [] as StubTextDocument[],
+  languageChanges: [] as { uri: StubUri; languageId: string }[],
+  shownDocuments: [] as { document: StubTextDocument; options: unknown }[],
   reset(): void {
     this.config.clear();
     this.remoteName = undefined;
@@ -95,8 +104,19 @@ export const stub = {
     this.saveCalls.length = 0;
     this.fileWrites.length = 0;
     this.writeError = null;
+    this.quickPickCalls.length = 0;
+    this.pickIndex = undefined;
+    this.contentProviders.clear();
+    this.openedDocuments.length = 0;
+    this.languageChanges.length = 0;
+    this.shownDocuments.length = 0;
   },
 };
+
+export interface StubTextDocument {
+  uri: StubUri;
+  languageId: string;
+}
 
 export interface InputBoxCall {
   title?: string;
@@ -124,6 +144,8 @@ function answer(items: unknown[]): Promise<string | undefined> {
 
 export const Uri = {
   file: (fsPath: string): StubUri => makeUri({ scheme: 'file', path: fsPath, query: '', fragment: '' }),
+  from: (parts: { scheme: string; path?: string; query?: string; fragment?: string }): StubUri =>
+    makeUri({ scheme: parts.scheme, path: parts.path ?? '', query: parts.query ?? '', fragment: parts.fragment ?? '' }),
 };
 
 export class Disposable {
@@ -145,6 +167,18 @@ export const workspace = {
   }),
   get workspaceFolders() {
     return stub.workspaceFolders;
+  },
+  registerTextDocumentContentProvider: (
+    scheme: string,
+    provider: { provideTextDocumentContent(uri: StubUri): string | undefined },
+  ) => {
+    stub.contentProviders.set(scheme, provider);
+    return new Disposable(() => stub.contentProviders.delete(scheme));
+  },
+  openTextDocument: (uri: StubUri): Promise<StubTextDocument> => {
+    const document = { uri, languageId: uri.path.endsWith('.diff') ? 'diff' : 'plaintext' };
+    stub.openedDocuments.push(document);
+    return Promise.resolve(document);
   },
   fs: {
     writeFile: (uri: StubUri, bytes: Uint8Array): Promise<void> => {
@@ -181,6 +215,14 @@ export const window = {
     stub.saveCalls.push(options);
     return Promise.resolve(stub.saveUri);
   },
+  showQuickPick: <T extends { label: string }>(items: T[], options?: unknown): Promise<T | undefined> => {
+    stub.quickPickCalls.push({ items, options });
+    return Promise.resolve(stub.pickIndex === undefined ? undefined : items[stub.pickIndex]);
+  },
+  showTextDocument: (document: StubTextDocument, options?: unknown) => {
+    stub.shownDocuments.push({ document, options });
+    return Promise.resolve({ document });
+  },
   showErrorMessage: (message: string, ...items: unknown[]) => {
     stub.errors.push(message);
     stub.errorCalls.push({
@@ -201,6 +243,10 @@ export const commands = {
 
 export const languages = {
   getDiagnostics: () => [],
+  setTextDocumentLanguage: (document: StubTextDocument, languageId: string): Promise<StubTextDocument> => {
+    stub.languageChanges.push({ uri: document.uri, languageId });
+    return Promise.resolve({ ...document, languageId });
+  },
 };
 
 export enum DiagnosticSeverity {

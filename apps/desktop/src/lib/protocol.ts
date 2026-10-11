@@ -107,7 +107,8 @@ export const ERROR_CODES: readonly ErrorCode[] = [
  * There is deliberately NO `sandbox.start`: sbx v0.47 has no `start` command.
  * The six A3a project-lifecycle methods (design §3.2) are additive too, and so
  * are the five A3b conversation-lifecycle methods (design §3.3), which sit right
- * after `conversation.history` — not at the end.
+ * after `conversation.history` — not at the end. A5's `git.diff` (design §3.5)
+ * sits between `git.review` and `git.apply` (28 in all).
  */
 export const METHODS = [
   "system.probe",
@@ -136,6 +137,7 @@ export const METHODS = [
   "task.list",
   "task.subscribe",
   "git.review",
+  "git.diff",
   "git.apply",
 ] as const;
 
@@ -812,6 +814,13 @@ export interface ChangeSet {
   baseCommit: string;
   hostDirty: boolean;
   changes: FileChange[];
+  /** A5: the host repository root `hostDirty` describes (display only). */
+  repoPath?: string;
+  /**
+   * A5: paths Core could not inspect. Never produced by an A5 Core; if one is
+   * ever non-empty the change set is NOT complete and is never called so.
+   */
+  uninspected?: string[];
 }
 
 export type FileChangeStatus =
@@ -841,6 +850,38 @@ export interface FileChange {
   status: FileChangeStatus | "unknown";
   /** CLIENT-SIDE ONLY: Core's raw status string when `status` is `"unknown"`. */
   unrecognizedStatus?: string;
+  /** A5: the pre-rename path, only for `renamed`. Exact, like `path`. */
+  oldPath?: string;
+}
+
+/**
+ * `git.diff` params (A5). `path` is an entry's `path` from `git.review`,
+ * byte for byte; `status` is that entry's status (always sent: a path can be
+ * listed twice). `maxBytes` is clamped to 1..=524288 (default 262144).
+ */
+export interface GitDiffParams {
+  taskId: string;
+  path: string;
+  status: FileChangeStatus;
+  maxBytes?: number;
+}
+
+/**
+ * `git.diff` result (A5). `patch` is UNTRUSTED display text: never rendered as
+ * HTML or Markdown, never executed, never applied. File names come from
+ * `path` / `oldPath` only, never from the patch header.
+ */
+export interface GitDiffResult {
+  path: string;
+  oldPath?: string;
+  status: FileChangeStatus | "unknown";
+  /** CLIENT-SIDE ONLY: Core's raw status when this build does not know it. */
+  unrecognizedStatus?: string;
+  patch: string;
+  binary: boolean;
+  truncated: boolean;
+  lossy: boolean;
+  baseBlob?: string;
 }
 
 export interface GitApplyParams {

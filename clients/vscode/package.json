@@ -101,6 +101,10 @@
         "title": "Sandpane: Review Task Changes"
       },
       {
+        "command": "sandpane.showTaskPatch",
+        "title": "Sandpane: Show Task Patch (read-only, git.diff)"
+      },
+      {
         "command": "sandpane.applyTask",
         "title": "Sandpane: Apply Task Changes (Git)"
       },

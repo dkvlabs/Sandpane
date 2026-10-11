@@ -1415,3 +1415,48 @@ button.chip {
   margin: 0;
   overflow-wrap: anywhere;
 }
+
+/* A5: a git.diff patch, read-only text (never HTML). */
+.diff-view__disclosures {
+  margin: var(--space-1) 0;
+  padding-left: var(--space-4);
+}
+
+.diff-view__patch {
+  margin: 0;
+  max-height: 480px;
+  overflow: auto;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface-1);
+  color: var(--text-strong);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.45;
+  tab-size: 4;
+}
+
+.diff-line__mark {
+  display: inline-block;
+  width: 1.5ch;
+  color: var(--text-muted);
+}
+
+.diff-line[data-unusual="true"] .diff-line__mark {
+  color: var(--attention, currentColor);
+  font-weight: 700;
+}
+
+.diff-line--add {
+  color: var(--success, var(--text-strong));
+}
+
+.diff-line--del {
+  color: var(--danger, var(--text-strong));
+}
+
+.diff-line--hunk,
+.diff-line--meta {
+  color: var(--text-muted);
+}

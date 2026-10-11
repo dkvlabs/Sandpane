@@ -25,7 +25,7 @@ interface Frame {
   params: Record<string, unknown>;
 }
 
-/** `Method::ALL` order — what an A3b Core advertises (27 methods). */
+/** `Method::ALL` order — what an A5 Core advertises (28 methods). */
 const ALL_METHODS = [
   'system.probe', 'project.create', 'project.list',
   'project.update', 'project.archive', 'project.unarchive', 'project.delete',
@@ -34,11 +34,14 @@ const ALL_METHODS = [
   'sandbox.stop', 'sandbox.remove',
   'conversation.create', 'conversation.send', 'conversation.list', 'conversation.history',
   'conversation.rename', 'conversation.archive', 'conversation.unarchive', 'conversation.delete', 'conversation.export',
-  'task.cancel', 'task.list', 'task.subscribe', 'git.review', 'git.apply',
+  'task.cancel', 'task.list', 'task.subscribe', 'git.review', 'git.diff', 'git.apply',
 ];
 
+/** A pre-A5 (A4) Core: the 27 methods before git.diff. */
+const PRE_A5_METHODS = ALL_METHODS.filter((m) => m !== 'git.diff');
+
 /** A pre-A3b (A3a) Core: the 22 methods before the conversation lifecycle. */
-const PRE_A3B_METHODS = ALL_METHODS.filter((m) => !/^conversation\.(rename|archive|unarchive|delete|export)$/.test(m));
+const PRE_A3B_METHODS = PRE_A5_METHODS.filter((m) => !/^conversation\.(rename|archive|unarchive|delete|export)$/.test(m));
 
 /** A pre-A3a Core: the 16 methods before the project lifecycle. */
 const PRE_A3A_METHODS = PRE_A3B_METHODS.filter((m) => !/^project\.(update|archive|unarchive|delete|add_repository|remove_repository)$/.test(m));
@@ -89,6 +92,17 @@ class ScriptedCore {
     ],
     external: false,
   };
+  /** A5: the change list `git.review` answers (exact paths) and `git.diff` gates on. */
+  reviewChanges: Record<string, unknown>[] = [
+    { path: 'src/a#b?.ts', status: 'modified' },
+    { path: 'notes #1.txt', status: 'untracked' },
+  ];
+  /** A5: extra ChangeSet fields (`repoPath`, `uninspected`). */
+  reviewExtra: Record<string, unknown> = {};
+  /** A5: when set, `git.diff` answers this instead of a generated patch. */
+  diffAnswer: unknown = null;
+  /** A5: a marker inside the generated patch (must never reach the log). */
+  diffSecret = 'PATCH-CONTENT-MARKER';
   /** Future-Core shape: task.list rows carry `sandboxName`. Today's Core never sets it. */
   taskSandboxNames = false;
   /** A4 shape: task.list rows carry `mode` and `chosenSandboxName` (the chat's choice, NOT a binding). */
@@ -394,18 +408,48 @@ class ScriptedCore {
           : {};
         return this.remember(frame, { id: `task-new-${this.requests.length}`, conversationId: p['conversationId'], status: 'queued', ...sendMode });
       }
-      case 'git.review':
+      case 'git.review': {
+        const forced = this.takeForced('git.review');
+        if (forced) return forced;
         return {
           ok: {
             taskId: p['taskId'],
             baseCommit: 'b71995fc1e0f4a3c8f0d7b1a2e3c4d5e6f708192',
             hostDirty: false,
-            changes: [
-              { path: 'src/a#b?.ts', status: 'modified' },
-              { path: 'notes #1.txt', status: 'untracked' },
-            ],
+            changes: this.reviewChanges,
+            ...this.reviewExtra,
           },
         };
+      }
+      case 'git.diff': {
+        const forced = this.takeForced('git.diff');
+        if (forced) return forced;
+        // A5 (mirrors Core's gate): byte-exact path (+ status) in the change list.
+        const hits = this.reviewChanges.filter(
+          (c) => c['path'] === p['path'] && (p['status'] === undefined || c['status'] === p['status']),
+        );
+        if (hits.length !== 1) {
+          return {
+            err: {
+              code: 'VALIDATION_FAILED',
+              message:
+                hits.length === 0
+                  ? "path is not in this task's change list; nothing was read"
+                  : "path is listed more than once in this task's change list; pass its status; nothing was read",
+            },
+          };
+        }
+        return {
+          ok: this.diffAnswer ?? {
+            path: p['path'],
+            status: hits[0]?.['status'],
+            patch: `diff --git a/x b/x\n@@ -1 +1 @@\n-${this.diffSecret}\n+new\n`,
+            binary: false,
+            truncated: false,
+            lossy: false,
+          },
+        };
+      }
       default:
         return { err: { code: 'VALIDATION_FAILED', message: `unexpected ${frame.method}` } };
     }
@@ -2549,7 +2593,198 @@ describe('A4 conversation.send mode', () => {
     const { session } = await online(core);
     expect(await session.removeSandbox('atlas-box')).toBe(false);
     const call = stub.warningCalls.find((c) => c.items.includes('Remove sandbox'));
-    expect(call?.options?.detail).toContain(`• ${line}`);
+    expect(call?.options?.detail).toContain(`\u2022 ${line}`);
+    session.dispose();
+  });
+});
+
+describe('A5 git.diff: per-file patch view', () => {
+  async function online(core = new ScriptedCore()) {
+    const made = makeSession(core);
+    const logged: string[] = [];
+    made.session.setOutputChannel({ appendLine: (line: string) => logged.push(line) } as unknown as vscode.OutputChannel);
+    await made.session.attach();
+    await settle();
+    return { core, logged, ...made };
+  }
+
+  /** Fire the client deadline of the (held) request whose timeout is `ms`. */
+  function expire(timers: FakeTimers, ms: number): void {
+    const timer = timers.pending.find((t) => t.ms === ms);
+    if (!timer) throw new Error(`no pending ${ms} ms timer`);
+    timers.clear(timer.id);
+    timer.fn();
+  }
+
+  it('not advertised: refused visibly \u2014 no git.review / git.diff frame, no picker', async () => {
+    const core = new ScriptedCore();
+    core.methods = PRE_A5_METHODS;
+    const { session } = await online(core);
+    stub.pickIndex = 0;
+    expect(await session.showTaskPatch('task-a')).toBe(false);
+    expect(core.calls('git.review')).toHaveLength(0);
+    expect(core.calls('git.diff')).toHaveLength(0);
+    expect(stub.quickPickCalls).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toMatch(/"git\.diff"/);
+    expect(session.snapshot().gitDiffSupported).toBe(false);
+    session.dispose();
+  });
+
+  it('advertised: review \u2192 pick one entry \u2192 git.diff {taskId, path, status} exact \u2192 read-only sandpane-diff document, nothing written', async () => {
+    const { core, session, logged } = await online();
+    expect(session.snapshot().gitDiffSupported).toBe(true);
+    stub.pickIndex = 0;
+    expect(await session.showTaskPatch('task-a')).toBe(true);
+    expect(core.calls('git.review')).toHaveLength(1);
+    expect(core.calls('git.diff').map((f) => f.params)).toEqual([{ taskId: 'task-a', path: 'src/a#b?.ts', status: 'modified' }]);
+    expect(stub.quickPickCalls[0]?.items.map((i) => i.label)).toEqual(['src/a#b?.ts', 'notes #1.txt']);
+    const opened = stub.openedDocuments[0];
+    expect(opened?.uri.scheme).toBe('sandpane-diff');
+    expect(stub.shownDocuments).toHaveLength(1);
+    const text = session.patchDocuments.provideTextDocumentContent(opened!.uri);
+    expect(text).toContain('path: src/a#b?.ts');
+    expect(text).toContain('+new');
+    // Display only: no file write, no apply, no command that touches the repo.
+    expect(stub.fileWrites).toHaveLength(0);
+    expect(core.calls('git.apply')).toHaveLength(0);
+    expect(stub.commands.map((c) => c.command)).not.toContain('vscode.diff');
+    // Patch content is never logged.
+    expect(logged.join('\n')).not.toContain(core.diffSecret);
+    session.dispose();
+  });
+
+  it('a path with tab, newline and quotes listed twice: the picked entry travels byte-exact with its own status; labels are revealed', async () => {
+    const core = new ScriptedCore();
+    const path = 'dir/a\tb\n"c" \u00e9.txt';
+    core.reviewChanges = [
+      { path, status: 'deleted' },
+      { path, status: 'untracked' },
+    ];
+    const { session } = await online(core);
+    stub.pickIndex = 1;
+    expect(await session.showTaskPatch('task-a')).toBe(true);
+    expect(core.calls('git.diff')[0]?.params).toEqual({ taskId: 'task-a', path, status: 'untracked' });
+    const labels = stub.quickPickCalls[0]?.items.map((i) => i.label) ?? [];
+    for (const label of labels) expect(label).not.toMatch(/[\n\t]/);
+    expect(labels[0]).toContain('dir/a\\tb\\n"c"');
+    session.dispose();
+  });
+
+  it('renames are listed as old \u2192 new; dismissing the picker sends no git.diff', async () => {
+    const core = new ScriptedCore();
+    core.reviewChanges = [{ path: 'new.ts', status: 'renamed', oldPath: 'old.ts' }];
+    const { session } = await online(core);
+    expect(await session.showTaskPatch('task-a')).toBe(false);
+    expect(stub.quickPickCalls[0]?.items[0]?.label).toBe('old.ts \u2192 new.ts');
+    expect(core.calls('git.diff')).toHaveLength(0);
+    session.dispose();
+  });
+
+  it('flags are disclosed in the document; binary is never called "no changes"', async () => {
+    const core = new ScriptedCore();
+    core.diffAnswer = { path: 'src/a#b?.ts', status: 'modified', patch: '', binary: true, truncated: true, lossy: true };
+    const { session } = await online(core);
+    stub.pickIndex = 0;
+    await session.showTaskPatch('task-a');
+    const text = session.patchDocuments.provideTextDocumentContent(stub.openedDocuments[0]!.uri);
+    expect(text).toContain('treated as binary (possibly by repository attributes)');
+    expect(text).toContain('diff truncated at 262144 bytes');
+    expect(text).toContain('not valid UTF-8');
+    expect(text).not.toMatch(/no changes/i);
+    session.dispose();
+  });
+
+  it("Core's exact refusals get honest copy (path no longer listed; no Git context on review)", async () => {
+    const core = new ScriptedCore();
+    core.forced.set('git.diff', { code: 'VALIDATION_FAILED', message: "path is not in this task's change list; nothing was read" });
+    const { session } = await online(core);
+    stub.pickIndex = 0;
+    expect(await session.showTaskPatch('task-a')).toBe(false);
+    expect(stub.errors.at(-1)).toMatch(/no longer in the task's change list/);
+    expect(stub.openedDocuments).toHaveLength(0);
+
+    core.forced.set('git.review', { code: 'VALIDATION_FAILED', message: 'task has no Git context (repo binding + base_commit)' });
+    expect(await session.showTaskPatch('task-a')).toBe(false);
+    expect(stub.errors.at(-1)).toMatch(/no Git context/);
+    expect(core.calls('git.diff')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it('a git.diff timeout (45 s) says Core did not answer and that nothing was changed', async () => {
+    const core = new ScriptedCore();
+    core.hold = (f) => f.method === 'git.diff';
+    const { session, timers } = await online(core);
+    stub.pickIndex = 0;
+    const pending = session.showTaskPatch('task-a');
+    await settle();
+    expire(timers, 45_000);
+    expect(await pending).toBe(false);
+    expect(stub.errors.at(-1)).toContain('Core did not answer in time \u2014 no file was changed (git.diff is read-only).');
+    // The whole notification never claims Core state or an unknown outcome.
+    expect(stub.errors.at(-1)).not.toMatch(/UNKNOWN|may still (finish|run)|was (applied|changed) by Core/i);
+    session.dispose();
+  });
+
+  it('a malformed git.diff answer opens nothing and is not echoed', async () => {
+    const core = new ScriptedCore();
+    core.diffAnswer = { path: 'src/a#b?.ts', status: 'modified', patch: 5, secret: 'ECHO-ME' };
+    const { session, logged } = await online(core);
+    stub.pickIndex = 0;
+    expect(await session.showTaskPatch('task-a')).toBe(false);
+    expect(stub.openedDocuments).toHaveLength(0);
+    expect(stub.errors.at(-1)).toMatch(/not in the expected shape/);
+    expect([...stub.errors, ...logged].join('\n')).not.toContain('ECHO-ME');
+    session.dispose();
+  });
+
+  it('the webview Diff button reaches the same gated flow', async () => {
+    const { core, session } = await online();
+    stub.pickIndex = 0;
+    session.handleWebviewMessage({ type: 'showTaskPatch', taskId: 'task-a' });
+    await settle(20);
+    expect(core.calls('git.diff')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it('apply listing reveals exact paths and discloses uninspected paths (never "complete")', async () => {
+    const core = new ScriptedCore();
+    core.reviewChanges = [{ path: 'evil\nline.txt', status: 'added' }];
+    core.reviewExtra = { repoPath: '/repo/atlas', uninspected: ['sub'] };
+    const { session } = await online(core);
+    await session.applyTask('task-a');
+    const call = stub.warningCalls.find((c) => c.items.includes('Apply via Core'));
+    expect(call?.message).toContain('evil\\nline.txt');
+    expect(call?.message).not.toContain('evil\nline.txt');
+    expect(call?.message).toContain('1 paths were not inspected');
+    expect(call?.message).toContain('repository (from Core): /repo/atlas');
+    session.dispose();
+  });
+});
+
+describe('A5 review uses Core\'s repoPath and exact paths', () => {
+  it("prefers the open folder that IS Core's repoPath, and the URIs keep a real tab/newline byte-exact", async () => {
+    const core = new ScriptedCore();
+    const path = 'dir/new\nline\t.ts';
+    core.reviewChanges = [{ path, status: 'modified' }];
+    core.reviewExtra = { repoPath: '/repo/nova' };
+    const { session } = makeSession(core);
+    stub.workspaceFolders = [
+      { uri: Uri.file('/repo/atlas'), name: 'atlas' },
+      { uri: Uri.file('/repo/nova'), name: 'nova' },
+    ];
+    stub.answers.set('Yes, use this folder', 'Yes, use this folder');
+    await session.attach();
+    await settle();
+    await session.reviewChanges('task-a');
+    expect(stub.infos.at(-1)).toContain('/repo/nova\n');
+    expect(stub.infos.at(-1)).toContain("the task's repository as reported by Core");
+    expect(stub.infos.at(-1)).not.toMatch(/pre-A5/);
+    const diff = stub.commands.find((c) => c.command === 'vscode.diff');
+    const [left, right, title] = diff?.args as [StubUri, StubUri, string];
+    expect(left.path).toBe(`/repo/nova/${path}`);
+    expect(right.path).toBe(`/repo/nova/${path}`);
+    expect(title).not.toMatch(/[\n\t]/);
+    expect(session.snapshot().status?.text).toContain('repository (from Core): /repo/nova');
     session.dispose();
   });
 });

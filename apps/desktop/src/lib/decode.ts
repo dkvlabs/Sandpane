@@ -36,6 +36,7 @@ import {
   type CoreCapabilities,
   type ErrorCode,
   type FileChange,
+  type GitDiffResult,
   type FileChangeStatus,
   type MessageRecord,
   type Project,
@@ -650,13 +651,38 @@ export function decodeChangeSet(value: unknown): ChangeSet {
       path,
       status: status.value,
       ...("raw" in status ? { unrecognizedStatus: status.raw } : {}),
+      // A5: exact pre-rename path; absent stays absent.
+      ...optField("oldPath", optStr(f, "oldPath", "FileChange")),
     };
   });
+  const uninspected = optStrArray(c, "uninspected", "ChangeSet");
   return {
     taskId: str(c, "taskId", "ChangeSet"),
     baseCommit: str(c, "baseCommit", "ChangeSet"),
     hostDirty: bool(c, "hostDirty", "ChangeSet"),
     changes,
+    ...optField("repoPath", optStr(c, "repoPath", "ChangeSet")),
+    ...(uninspected === undefined ? {} : { uninspected }),
+  };
+}
+
+/**
+ * `git.diff` result (A5), decoded strictly. The patch is kept verbatim (it is
+ * display text); no error message ever includes it or any other payload value.
+ */
+export function decodeGitDiffResult(value: unknown): GitDiffResult {
+  const r = asRecord(value, "GitDiffResult");
+  const status = tolerantEnum<FileChangeStatus>(r.status, "GitDiffResult.status", FILE_CHANGE_STATUSES);
+  return {
+    path: str(r, "path", "GitDiffResult"),
+    ...optField("oldPath", optStr(r, "oldPath", "GitDiffResult")),
+    status: status.value,
+    ...("raw" in status ? { unrecognizedStatus: status.raw } : {}),
+    patch: str(r, "patch", "GitDiffResult"),
+    binary: bool(r, "binary", "GitDiffResult"),
+    truncated: bool(r, "truncated", "GitDiffResult"),
+    lossy: bool(r, "lossy", "GitDiffResult"),
+    ...optField("baseBlob", optStr(r, "baseBlob", "GitDiffResult")),
   };
 }
 

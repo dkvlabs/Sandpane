@@ -207,7 +207,10 @@ class ProtocolDriftGuardTest {
     fun kotlinMethodsMatchRustMethodAllExactlyIncludingOrder() {
         val fromAll = methodAllWireNames()
         assertEquals(CoreMethods.ALL, fromAll, "CoreMethods.ALL drifted from Method::ALL (order included)")
-        assertEquals(27, fromAll.size, "addition A3b advertises 27 methods")
+        assertEquals(28, fromAll.size, "addition A5 advertises 28 methods")
+        // A5: git.diff sits immediately after git.review and before git.apply.
+        assertEquals(fromAll.indexOf("git.review") + 1, fromAll.indexOf("git.diff"))
+        assertEquals(fromAll.indexOf("git.diff") + 1, fromAll.indexOf("git.apply"))
 
         // parse() must accept every advertised name, and the schema enum must carry the same set.
         val parsed = parseArms().toSet()
@@ -226,7 +229,7 @@ class ProtocolDriftGuardTest {
             "project.update", "project.archive", "project.unarchive", "project.delete",
             "project.add_repository", "project.remove_repository",
             "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
-            "conversation.export",
+            "conversation.export", "git.diff",
         ).forEach { added ->
             assertTrue(fromAll.contains(added), "Rust no longer advertises $added")
             assertTrue(CoreMethods.ALL.contains(added), "the Kotlin mirror dropped $added")
@@ -243,7 +246,7 @@ class ProtocolDriftGuardTest {
     @Test
     fun methodAdvertisementIsDerivedNotHandWritten() {
         assertTrue(
-            rust.contains("pub const ALL: [Method; 27]"),
+            rust.contains("pub const ALL: [Method; 28]"),
             "Method::ALL's declared length changed — update CoreMethods.ALL and this gate",
         )
         assertTrue(
@@ -333,6 +336,13 @@ class ProtocolDriftGuardTest {
             "pub best_effort: bool" to "@SerialName(\"bestEffort\")",
             "pub by_kind: std::collections::BTreeMap<String, u64>" to "@SerialName(\"byKind\")",
             "pub exported_at: String" to "@SerialName(\"exportedAt\")",
+            // A5
+            "pub repo_path: Option<String>" to "@SerialName(\"repoPath\") val repoPath: String? = null",
+            "pub uninspected: Option<Vec<String>>" to "val uninspected: List<String>? = null",
+            "pub old_path: Option<String>" to "@SerialName(\"oldPath\") val oldPath: String? = null",
+            "pub max_bytes: Option<u64>" to "@SerialName(\"maxBytes\") val maxBytes: Int? = null",
+            "pub base_blob: Option<String>" to "@SerialName(\"baseBlob\") val baseBlob: String? = null",
+            "pub lossy: bool" to "val lossy: Boolean",
             // A4
             "pub mode: Option<String>" to "val mode: String? = null",
             "pub chosen_sandbox_name: Option<String>" to "@SerialName(\"chosenSandboxName\") val chosenSandboxName: String? = null",
@@ -571,10 +581,21 @@ class ProtocolDriftGuardTest {
         assertTrue(MethodDeadlines.SANDBOX_REMOVE_MS > query + mutation + query, "remove floor no longer outlasts Core")
         // A3a: add_repository runs one QUERY-class `git rev-parse --show-toplevel` before its DB write.
         assertTrue(MethodDeadlines.PROJECT_ADD_REPOSITORY_MS > query, "add_repository floor no longer outlasts Core's git query")
+        // A5: git.review and git.diff run QUERY-bounded git; both get the 45 s git deadline.
+        assertEquals(45_000, MethodDeadlines.GIT_REVIEW_MS)
+        assertEquals(45_000, MethodDeadlines.GIT_DIFF_MS)
+        assertTrue(MethodDeadlines.GIT_DIFF_MS > query && MethodDeadlines.GIT_REVIEW_MS > query)
+        assertEquals(45_000, MethodDeadlines.forMethod(CoreMethods.GIT_DIFF, 15_000))
+        assertEquals(45_000, MethodDeadlines.forMethod(CoreMethods.GIT_REVIEW, 15_000))
+        assertEquals(120_000, MethodDeadlines.forMethod(CoreMethods.GIT_DIFF, 120_000), "a longer user setting still wins")
+        // A5 moved show_toplevel onto `exec_output(..., &self.limits)`; the runner's default limits are QUERY.
+        val gitRs = read("core/crates/sandpane-core/src/git.rs")
         assertTrue(
-            Regex("""pub fn show_toplevel[\s\S]{0,120}self\.run\(""").containsMatchIn(read("core/crates/sandpane-core/src/git.rs")),
+            Regex("""pub fn show_toplevel[\s\S]{0,120}self\.run\(""").containsMatchIn(gitRs) ||
+                Regex("""pub fn show_toplevel[\s\S]{0,400}&self\.limits,""").containsMatchIn(gitRs),
             "show_toplevel no longer goes through the QUERY-bounded runner",
         )
+        assertTrue(gitRs.contains("limits: RunLimits::QUERY"), "the git runner's default limits are no longer QUERY")
     }
 
     // ------------------------------------------------------------------
@@ -832,6 +853,42 @@ class ProtocolDriftGuardTest {
         assertFalse(requiredOf(capabilitiesSchema, root).contains("features"), "features became required — not additive")
         assertTrue(rust.contains("pub features: Vec<String>"))
         assertTrue(kotlinMirror.contains("val features: List<String> = emptyList()"))
+    }
+
+    /** A5 (\u00A73.5): git.diff's exact refusals, bounds and wire shape are Core's. */
+    @Test
+    fun gitDiffMessagesAndBoundsMatchCore() {
+        val diff = read("core/crates/sandpane-core/src/diff.rs")
+        val git = read("core/crates/sandpane-core/src/git.rs")
+        assertEquals(rustStringConst(service, "MSG_WORK_TREE_REDIRECTED"), GitDiffs.MSG_WORK_TREE_REDIRECTED)
+        assertEquals(rustStringConst(service, "MSG_DIFF_PATH_NOT_IN_LIST"), GitDiffs.MSG_PATH_NOT_IN_LIST)
+        assertEquals(rustStringConst(service, "MSG_DIFF_PATH_LISTED_TWICE"), GitDiffs.MSG_PATH_LISTED_TWICE)
+        assertEquals(rustStringConst(service, "MSG_DIFF_PATH_NOT_EXACT"), GitDiffs.MSG_PATH_NOT_EXACT)
+        assertTrue(service.contains("\"${GitDiffs.MSG_NO_GIT_CONTEXT}\".to_string()"), "no-Git-context text changed")
+        assertTrue(service.contains("(ErrorCode::NotFound, \"${GitDiffs.MSG_TASK_NOT_FOUND}\".to_string())"))
+        val removed = Regex(""""(the task's worktree was removed[^"]*)"""").find(service)?.groupValues?.get(1)
+            ?.replace(Regex("""\\\n\s*"""), "") ?: fail("worktree-removed message not found")
+        assertEquals(removed, GitDiffs.MSG_WORKTREE_REMOVED)
+        assertTrue(service.contains("format!(\"{m}${GitDiffs.NOTHING_READ_SUFFIX}\")"), "the untracked refusal suffix changed")
+        assertTrue(diff.contains("changed while it was being read"))
+        assertTrue(git.contains("\"${GitDiffs.SUBMODULE_PREFIX}{}{extra};"), "the submodule refusal prefix changed")
+        fun usize(name: String) = Regex("""pub const $name: usize = ([0-9_]+);""").find(diff)?.groupValues?.get(1)?.replace("_", "")?.toInt()
+            ?: fail("diff.rs has no $name")
+        assertEquals(usize("MAX_DIFF_BYTES"), GitDiffs.MAX_BYTES)
+        assertEquals(usize("DEFAULT_DIFF_BYTES"), GitDiffs.DEFAULT_BYTES)
+        val params = Regex("""pub struct GitDiffParams \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1) ?: fail("GitDiffParams not found")
+        assertEquals(listOf("task_id", "path", "max_bytes", "status"), Regex("""pub ([a-z_]+):""").findAll(params).map { it.groupValues[1] }.toList())
+        assertTrue(params.contains("pub status: Option<FileChangeStatus>"))
+        val result = Regex("""pub struct GitDiffResult \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1) ?: fail("GitDiffResult not found")
+        assertEquals(
+            listOf("path", "old_path", "status", "patch", "binary", "truncated", "lossy", "base_blob"),
+            Regex("""pub ([a-z_]+):""").findAll(result).map { it.groupValues[1] }.toList(),
+        )
+        assertTrue(Regex("""#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\s*pub uninspected: Option<Vec<String>>""").containsMatchIn(rust))
+        assertTrue(Regex("""#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\s*pub repo_path: Option<String>""").containsMatchIn(rust))
+        // git.diff stays out of every replay/retry path: this plugin keeps no replay-safe list, and
+        // Core's own replay-safe set does not name it.
+        assertFalse(Regex("""replay_safe[\s\S]{0,400}GitDiff""").containsMatchIn(rust + service), "git.diff became replay-safe")
     }
 
     /** A4 (\u00A73.4): the mode values, the normalisation and the exact refusal are Core's. */

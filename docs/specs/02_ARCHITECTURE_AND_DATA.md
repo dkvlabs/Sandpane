@@ -70,7 +70,7 @@ interface SandpaneRpc {
   'sandbox.stop': { request: { name: string }; response: { stopped: true; requeried?: SandboxSummary /* ABSENT = not listed or re-query failed: state unknown */ } };
   'sandbox.remove': { request: { name: string; confirmToken?: string }; response: { confirmation?: ConfirmationRequest /* step 1: nothing changed */; removed?: true /* step 2 */ } /* two-step token flow: docs/plans/2026-10-09-protocol-v1-additions.md §2 */ };
   'conversation.create': { request: { projectId: string; agentId: string; sandboxId?: string /* A3b: persisted as the chosen sandbox NAME, not a binding */; title?: string }; response: Conversation /* + sandboxId?, archivedAt? (A3b) */ };
-  'conversation.send': { request: { conversationId: string; content: string; attachments?: ContextRef[]; idempotencyKey?: string /* A2 */ }; response: TaskSummary /* + replayed?: true on a keyed replay */ };
+  'conversation.send': { request: { conversationId: string; content: string; attachments?: ContextRef[]; idempotencyKey?: string /* A2 */; mode?: 'task' | 'discuss' /* A4, feature conversation-send-mode */ }; response: TaskSummary /* + replayed?: true on a keyed replay; A4: mode?, chosenSandboxName? (a name the chat chose, never a binding) */ };
   'conversation.list': { request: { projectId?: string; limit?: number; includeArchived?: boolean /* A3b; default false */ }; response: Conversation[] };
   'conversation.history': { request: { conversationId: string; afterSequence?: number; limit?: number }; response: { messages: MessageRecord[]; truncated: boolean; nextSequence: number } /* A3b: also serves archived conversations */ };
   'conversation.rename': { request: { conversationId: string; title: string }; response: Conversation };
@@ -81,14 +81,15 @@ interface SandpaneRpc {
   'task.cancel': { request: { taskId: string }; response: { requested: boolean } };
   'task.list': { request: { projectId?: string; statuses?: TaskStatus[]; limit?: number }; response: TaskSummary[] };
   'task.subscribe': { request: { projectId?: string; taskId?: string; afterSequence?: number; afterSequences?: Record<string, number> }; response: TaskEvent[] };
-  'git.review': { request: { taskId: string }; response: ChangeSet };
+  'git.review': { request: { taskId: string }; response: ChangeSet /* A5: exact NUL-parsed paths, oldPath? on renames, repoPath?, uninspected? */ };
+  'git.diff': { request: { taskId: string; path: string /* byte-exact entry of the recomputed change list */; status?: FileChangeStatus; maxBytes?: number /* 1..=524288, default 262144 */ }; response: { path: string; oldPath?: string; status: FileChangeStatus; patch: string; binary: boolean; truncated: boolean; lossy: boolean; baseBlob?: string } /* A5, read-only, display-only */ };
   'git.apply': { request: { taskId: string; selectedFiles?: string[]; expectedBase: string }; response: ApplyResult };
 }
 ```
 
 Neither prompts nor file paths are executable commands. CLI operations are implemented as specific backend methods with strictly constructed argument arrays.
 
-**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 27-method v1 surface (`docs/CHANGELOG.md` 0010; `sandbox.stop` and `sandbox.remove` added by A1 the six project lifecycle methods by A3a and the five conversation lifecycle methods by A3b of `docs/plans/2026-10-09-protocol-v1-additions.md`; there is no `sandbox.start` because sbx v0.47 has none). Rules that keep it honest:
+**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 28-method v1 surface (`docs/CHANGELOG.md` 0010; `sandbox.stop` and `sandbox.remove` added by A1 the six project lifecycle methods by A3a the five conversation lifecycle methods by A3b, the send `mode` by A4 and `git.diff` by A5 of `docs/plans/2026-10-09-protocol-v1-additions.md`; there is no `sandbox.start` because sbx v0.47 has none). Rules that keep it honest:
 
 - **Idempotency keys (A2).** A keyed `sandbox.create` / `conversation.send` is stored durably for 24 h; a replay with identical params returns the first response plus `replayed: true` (not current state), different params or an unfinished/unknown earlier attempt give `CONFLICT` and run nothing new. Decisions: `docs/plans/2026-10-09-protocol-v1-additions.md` §3.1.
 - **`PROTOCOL_VERSION` stays `1`** — the revision is additive only: new methods, new optional request fields, new response fields that are absent-tolerant (`#[serde(default)]`). Nothing was renamed or removed, so an older client's frames still parse.
@@ -109,7 +110,7 @@ SQLite: WAL mode, foreign keys, indexed events and migrations. Store Sandpane's 
 | `conversations` | id, project_id, title, agent_id, created_at, archived_at, sandbox_id (v6, A3b: chosen sandbox name, not a binding) | more than one per project |
 | `messages` | id, conversation_id, role, content, sequence | redact or encrypt optional sensitive history |
 | `agent_sessions` | id, conversation_id, provider, native_session_id, capability_snapshot | native session may be unavailable |
-| `tasks` | id, conversation_id, sandbox_binding_id, repo_id, base_commit, task_branch, status | each task owns exact Git context |
+| `tasks` | id, conversation_id, sandbox_binding_id, repo_id, base_commit, task_branch, status, mode (v7, A4: requested send mode), chosen_sandbox_name (v7, A4: the chat's chosen sandbox name, never a binding) | each task owns exact Git context |
 | `task_events` | sequence PK, task_id, kind, payload, timestamp | append-only, replayable |
 | `task_artifacts` | id, task_id, kind, file_path, checksum | bounded retention |
 | `verifications` | id, task_id, command_label, exit_code, output_artifact | user-approved commands |

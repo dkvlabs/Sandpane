@@ -126,6 +126,8 @@ interface SidebarState {
   composerBlocked: string | null;
   /** A4: Core advertises `conversation-send-mode` (absent from an older host = no). */
   sendModeSupported?: boolean;
+  /** A5: Core advertises `git.diff` (absent from an older host = no). */
+  gitDiffSupported?: boolean;
   lines: ChatLine[];
   transcript: { scope: 'conversation' | 'project'; label: string };
   tasks: TaskRow[];
@@ -657,7 +659,7 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
   memo.lineKeys = lineKeys;
 
   // --- tasks: stable button ids keep focus across a rebuild ---
-  const tasksKey = JSON.stringify(state.tasks);
+  const tasksKey = JSON.stringify([state.tasks, state.gitDiffSupported === true]);
   if (tasksKey !== memo.tasks) {
     memo.tasks = tasksKey;
     const children: HTMLElement[] = [];
@@ -684,6 +686,20 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
       review.setAttribute('aria-label', `Review changes of task ${row.taskId}`);
       review.addEventListener('click', () => api.postMessage({ type: 'reviewTask', taskId: row.taskId }));
       children.push(review);
+
+      // A5: the patch of one file, read-only — enabled only when Core
+      // advertises git.diff (a disabled button never posts).
+      const diff = el('button', 'secondary', 'Diff');
+      diff.id = `sp-diff-${token}`;
+      diff.setAttribute('aria-label', `Show the patch of one file of task ${row.taskId}`);
+      if (state.gitDiffSupported === true) {
+        diff.setAttribute('title', "Pick a file and show Core's patch, read-only");
+      } else {
+        diff.disabled = true;
+        diff.setAttribute('title', 'Diff: not supported by this Core (it does not advertise "git.diff")');
+      }
+      diff.addEventListener('click', () => api.postMessage({ type: 'showTaskPatch', taskId: row.taskId }));
+      children.push(diff);
 
       // Cancel is an explicit request; Core decides whether the state allows it.
       const cancel = el('button', 'secondary', 'Cancel');

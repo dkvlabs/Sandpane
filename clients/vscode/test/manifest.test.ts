@@ -33,10 +33,11 @@ describe('contributed commands match the registered ones', () => {
   const extension = readFileSync(join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
   const registered = [...extension.matchAll(/registerCommand\('(sandpane\.[A-Za-z]+)'/g)].map((m) => m[1]);
 
-  it('every contributed command is registered and vice versa (20, incl. the 8 A3a project commands)', () => {
+  it('every contributed command is registered and vice versa (21, incl. the 8 A3a project commands and A5 Show Task Patch)', () => {
     expect([...contributed].sort()).toEqual([...registered].sort());
-    expect(contributed).toHaveLength(20);
+    expect(contributed).toHaveLength(21);
     for (const id of [
+      'sandpane.showTaskPatch',
       'sandpane.renameProject',
       'sandpane.editProjectDescription',
       'sandpane.archiveProject',
@@ -48,5 +49,13 @@ describe('contributed commands match the registered ones', () => {
     ]) {
       expect(contributed).toContain(id);
     }
+  });
+});
+
+describe('A5 patch view wiring', () => {
+  it('extension.ts registers the session patch store as the sandpane-diff content provider', () => {
+    const extension = readFileSync(join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
+    expect(extension).toContain('vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, session.patchDocuments)');
+    expect(extension).toContain("import { PATCH_SCHEME } from './vscode/gitDiff';");
   });
 });

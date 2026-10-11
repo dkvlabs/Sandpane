@@ -98,6 +98,8 @@ export const CORE_METHODS = [
   'task.list',
   'task.subscribe',
   'git.review',
+  // A5 (§3.5): read-only, display-only patch for ONE `git.review` entry.
+  'git.diff',
   'git.apply',
 ] as const;
 
@@ -684,8 +686,11 @@ export const FILE_CHANGE_STATUSES = [
 export type FileChangeStatus = (typeof FILE_CHANGE_STATUSES)[number];
 
 export interface FileChange {
+  /** A5: EXACT (NUL-parsed) — real tab / newline characters, never C-quoted. */
   path: string;
   status: FileChangeStatus;
+  /** A5: the pre-rename path; present only for `renamed`. */
+  oldPath?: string | null;
 }
 
 export interface ChangeSet {
@@ -693,6 +698,46 @@ export interface ChangeSet {
   baseCommit: string;
   hostDirty: boolean;
   changes: FileChange[];
+  /** A5: the canonical host repository root of the task (displayable). */
+  repoPath?: string | null;
+  /**
+   * A5: paths Core did NOT inspect. Never produced in A5; if ever non-empty,
+   * the change set is incomplete and must never be presented as complete.
+   */
+  uninspected?: string[] | null;
+}
+
+/** A5: `git.diff` byte bounds (sandpane_core::diff). Core clamps to 1..=MAX. */
+export const MAX_DIFF_BYTES = 524_288;
+export const DEFAULT_DIFF_BYTES = 262_144;
+
+/**
+ * A5 `git.diff` params. `path` is passed byte-for-byte as `git.review`
+ * returned it (never trimmed, normalized or validated here — Core gates it
+ * against the change list); `status` is ALWAYS the entry's status, so a path
+ * listed twice is unambiguous.
+ */
+export interface GitDiffParams {
+  taskId: string;
+  path: string;
+  status: FileChangeStatus;
+  /** Omitted ⇒ Core's default (262 144). Never above 524 288. */
+  maxBytes?: number;
+}
+
+/**
+ * A5 `git.diff` result: UNTRUSTED display-only text. Never rendered as HTML
+ * or Markdown, never executed, never applied or written into the repository.
+ */
+export interface GitDiffResult {
+  path: string;
+  oldPath?: string | null;
+  status: FileChangeStatus;
+  patch: string;
+  binary: boolean;
+  truncated: boolean;
+  lossy: boolean;
+  baseBlob?: string | null;
 }
 
 /** `git.apply` params — explicit Git operation with a base check (specs/06 §6). */

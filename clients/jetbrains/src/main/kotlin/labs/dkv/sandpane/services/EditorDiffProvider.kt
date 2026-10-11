@@ -93,22 +93,7 @@ class EditorDiffProvider(private val project: Project) {
      * @return the canonical file inside [root], or null when the path escapes it or is blank.
      * Deleted changes legitimately have no file on disk; callers handle that separately.
      */
-    fun containWithin(root: File, relativePath: String): File? {
-        val trimmed = relativePath.trim()
-        if (trimmed.isEmpty() || trimmed.any { it.code == 0 || it.code < 0x20 }) return null
-        return try {
-            val rootCanonical = root.canonicalFile
-            val candidate = if (File(trimmed).isAbsolute) File(trimmed).canonicalFile
-            else File(rootCanonical, trimmed).canonicalFile
-            if (candidate == rootCanonical || candidate.path.startsWith(rootCanonical.path + File.separator)) {
-                candidate
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
+    fun containWithin(root: File, relativePath: String): File? = containPath(root, relativePath)
 
     /** Look the file up in the VFS; a rescan is only ever attempted off the EDT. */
     fun findVisibleFile(file: File): VirtualFile? {
@@ -166,55 +151,96 @@ class EditorDiffProvider(private val project: Project) {
 
     /**
      * Direct-mount changes are ALREADY on disk: the review UI must not imply they are safely
-     * pending (docs/specs/04 §3, specs/02 §7). Same for `host_worktree` when the worktree is
-     * the one the IDE is editing.
+     * pending (docs/specs/04 §3, specs/02 §7).
      */
-    fun liveWritableNotice(mode: Reported<WorkspaceMode>?): String? = when (mode) {
-        null ->
-            "Workspace mode is UNVERIFIED: Core has no readable sandbox_bindings row for this " +
-                "binding, and it never guesses one. Treated as live-writable until verified (specs/02 §7)."
-        is Reported.Unknown ->
-            "Workspace mode '${mode.wireName}' is unknown to this plugin build (a newer Core added it). " +
-                "Treated as live-writable — never as isolated — until the plugin is updated (specs/02 §7)."
-        is Reported.Known -> knownModeNotice(mode.value)
-    }
-
-    private fun knownModeNotice(mode: WorkspaceMode): String = when (mode) {
-        WorkspaceMode.DIRECT_MOUNT ->
-            "Workspace mode direct_mount is live-writable: these edits are already applied on the host, " +
-                "and reviewing them cannot undo them."
-        WorkspaceMode.HOST_WORKTREE ->
-            "Workspace mode host_worktree writes to a host directory: confirm the IDE is showing that same " +
-                "worktree before treating this review as a gate."
-        WorkspaceMode.SBX_CLONE ->
-            "Workspace mode sbx_clone: the change set lives in the sandbox until it is applied through Core."
-        WorkspaceMode.MOUNTLESS ->
-            "Workspace mode mountless: no host project access is assumed."
-    }
+    fun liveWritableNotice(mode: Reported<WorkspaceMode>?): String? = modeNotice(mode)
 
     /** Human summary of a review, including the refusals — never only the successes. */
-    fun summarize(target: ReviewTarget, mode: Reported<WorkspaceMode>?): String = buildString {
-        val cs = target.changeSet
-        // Every Core/agent-supplied value is revealed single-line (paths through the same
-        // [ApplyPlan.displayPath] as the Apply dialog), so none can fake a line of the summary.
-        appendLine(
-            "Task ${VisibleText.reveal(cs.taskId.take(8))} · base ${VisibleText.reveal(cs.baseCommit.take(10))} · " +
-                "${cs.changes.size} change(s)",
-        )
-        if (cs.hostDirty) {
-            appendLine("Host working tree is DIRTY: apply in Core will refuse to overwrite uncommitted work.")
-        }
-        liveWritableNotice(mode)?.let { appendLine(it) }
-        target.resolved.forEach { appendLine("  ${it.change.status.describe()}  ${ApplyPlan.displayPath(it.change.path)}") }
-        target.unresolved.forEach {
-            appendLine(
-                "  unresolved (${it.change.status.describe()})  ${ApplyPlan.displayPath(it.change.path)} — " +
-                    VisibleText.reveal(it.reason),
-            )
-        }
-    }.trimEnd()
+    fun summarize(target: ReviewTarget, mode: Reported<WorkspaceMode>?): String = summarizeTarget(target, mode)
 
     companion object {
+        /**
+         * Direct-mount changes are ALREADY on disk: the review UI must not imply they are safely
+         * pending (docs/specs/04 §3, specs/02 §7). Same for `host_worktree` when the worktree is
+         * the one the IDE is editing.
+         */
+        fun modeNotice(mode: Reported<WorkspaceMode>?): String? = when (mode) {
+            null ->
+                "Workspace mode is UNVERIFIED: Core has no readable sandbox_bindings row for this " +
+                    "binding, and it never guesses one. Treated as live-writable until verified (specs/02 §7)."
+            is Reported.Unknown ->
+                "Workspace mode '${mode.wireName}' is unknown to this plugin build (a newer Core added it). " +
+                    "Treated as live-writable — never as isolated — until the plugin is updated (specs/02 §7)."
+            is Reported.Known -> knownModeNotice(mode.value)
+        }
+
+        private fun knownModeNotice(mode: WorkspaceMode): String = when (mode) {
+            WorkspaceMode.DIRECT_MOUNT ->
+                "Workspace mode direct_mount is live-writable: these edits are already applied on the host, " +
+                    "and reviewing them cannot undo them."
+            WorkspaceMode.HOST_WORKTREE ->
+                "Workspace mode host_worktree writes to a host directory: confirm the IDE is showing that same " +
+                    "worktree before treating this review as a gate."
+            WorkspaceMode.SBX_CLONE ->
+                "Workspace mode sbx_clone: the change set lives in the sandbox until it is applied through Core."
+            WorkspaceMode.MOUNTLESS ->
+                "Workspace mode mountless: no host project access is assumed."
+        }
+
+        /**
+         * The canonical file inside [root] for an EXACT review path (A5: git.review paths are NUL-parsed,
+         * never C-quoted), or null when it escapes [root], is empty, or holds a NUL. Never trimmed, and a
+         * tab or newline is a legitimate file-name character, not a reason to refuse.
+         */
+        fun containPath(root: File, relativePath: String): File? {
+            if (relativePath.isEmpty() || relativePath.contains(0.toChar())) return null
+            return try {
+                val rootCanonical = root.canonicalFile
+                val asFile = File(relativePath)
+                val candidate = if (asFile.isAbsolute) asFile.canonicalFile else File(rootCanonical, relativePath).canonicalFile
+                if (candidate == rootCanonical || candidate.path.startsWith(rootCanonical.path + File.separator)) {
+                    candidate
+                } else {
+                    null
+                }
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        /** A change's path, `old \u2192 new` for a rename, through the Apply dialog's [ApplyPlan.displayPath]. */
+        fun changeLabel(change: FileChange): String =
+            change.oldPath?.let { "${ApplyPlan.displayPath(it)} \u2192 ${ApplyPlan.displayPath(change.path)}" }
+                ?: ApplyPlan.displayPath(change.path)
+
+        /** Human summary of a review, including the refusals — never only the successes. */
+        fun summarizeTarget(target: ReviewTarget, mode: Reported<WorkspaceMode>?): String = buildString {
+            val cs = target.changeSet
+            // Every Core/agent-supplied value is revealed single-line (paths through the same
+            // [ApplyPlan.displayPath] as the Apply dialog), so none can fake a line of the summary.
+            appendLine(
+                "Task ${VisibleText.reveal(cs.taskId.take(8))} · base ${VisibleText.reveal(cs.baseCommit.take(10))} · " +
+                    "${cs.changes.size} change(s)",
+            )
+            // A5: the host repository root Core reviewed against, revealed and capped.
+            cs.repoPath?.let { appendLine("repository: ${VisibleText.reveal(labs.dkv.sandpane.text.DisplayCap.cap(it))}") }
+            // A5: never claim a list is complete when Core says it could not inspect some paths.
+            cs.uninspected?.takeIf { it.isNotEmpty() }?.let {
+                appendLine("${it.size} paths were not inspected by Core \u2014 this change list is NOT complete.")
+            }
+            if (cs.hostDirty) {
+                appendLine("Host working tree is DIRTY: apply in Core will refuse to overwrite uncommitted work.")
+            }
+            modeNotice(mode)?.let { appendLine(it) }
+            target.resolved.forEach { appendLine("  ${it.change.status.describe()}  ${changeLabel(it.change)}") }
+            target.unresolved.forEach {
+                appendLine(
+                    "  unresolved (${it.change.status.describe()})  ${changeLabel(it.change)} — " +
+                        VisibleText.reveal(it.reason),
+                )
+            }
+        }.trimEnd()
+
         fun instance(project: Project): EditorDiffProvider =
             project.getService(EditorDiffProvider::class.java)
     }

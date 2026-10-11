@@ -1398,7 +1398,8 @@ fn probe_advertises_the_conversation_lifecycle_methods_and_feature() {
         .iter()
         .map(|m| m.as_str().unwrap())
         .collect();
-    assert_eq!(methods.len(), 27);
+    // 27 after A3b; 28 since A5 added git.diff.
+    assert_eq!(methods.len(), 28);
     for m in [
         "conversation.rename",
         "conversation.archive",

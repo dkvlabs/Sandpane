@@ -169,6 +169,35 @@ export const A3B_CORE_METHODS: readonly string[] = (() => {
   ];
 })();
 
+/**
+ * Every method the A5 Core dispatches (28), in `Method::ALL` order: `git.diff`
+ * sits right after `git.review`.
+ */
+export const A5_CORE_METHODS: readonly string[] = (() => {
+  const at = A3B_CORE_METHODS.indexOf("git.review") + 1;
+  return [...A3B_CORE_METHODS.slice(0, at), "git.diff", ...A3B_CORE_METHODS.slice(at)];
+})();
+
+/** One change-set entry the double serves (MODELED A5 git.review / git.diff). */
+export interface FakeGitChange {
+  path: string;
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked";
+  oldPath?: string;
+  /** The full patch Core would produce (cut to `maxBytes` when served). */
+  patch: string;
+  binary?: boolean;
+  lossy?: boolean;
+  baseBlob?: string;
+}
+
+/** A task the double gives real-looking Git context (MODELED, never captured). */
+export interface FakeGitTask {
+  repoPath: string;
+  baseCommit: string;
+  hostDirty: boolean;
+  changes: FakeGitChange[];
+}
+
 /** `TaskStateMachine::is_terminal` (sandpane-core); anything else blocks a delete. */
 const TERMINAL_TASK_STATUSES = new Set(["completed", "rejected", "failed", "cancelled", "interrupted"]);
 
@@ -261,6 +290,13 @@ export class FakeCore {
   public addRepositoryRefusal: { code: string; message: string } | null = null;
   /** MODELED fault for the next A3a project write (applied first, then the answer is lost / INTERNAL). */
   public projectFault: ProjectFault | null = null;
+  /**
+   * MODELED A5: tasks with Git context. A task in `tasks` but not here answers
+   * git.review / git.diff with Core's "no Git context" refusal.
+   */
+  readonly gitTasks = new Map<string, FakeGitTask>();
+  /** MODELED A5: Core's refusal for the next git.review / git.diff, if any. */
+  public gitRefusal: { code: string; message: string } | null = null;
   /** Extra impact lines appended to every confirmation (hostile-content tests). */
   public extraImpact: string[] = [];
   /** MODELED A3b conversation-delete tokens → bound conversation id. */
@@ -1036,6 +1072,71 @@ export class FakeCore {
             replacements: [...byKind.values()].reduce((a, b) => a + b, 0),
             byKind: kinds,
           },
+        });
+      }
+      // -- A5 git.review / git.diff (MODELED on sandpane-service, see header) --
+      case "git.review":
+      case "git.diff": {
+        if (this.gitRefusal !== null) {
+          const refusal = this.gitRefusal;
+          this.gitRefusal = null;
+          return err(refusal.code, refusal.message);
+        }
+        const taskId = String(params.taskId ?? "");
+        if (!this.tasks.some((t) => t.id === taskId)) return err("NOT_FOUND", "task not found");
+        const git = this.gitTasks.get(taskId);
+        if (git === undefined) {
+          return err("VALIDATION_FAILED", "task has no Git context (repo binding + base_commit)");
+        }
+        if (request.method === "git.review") {
+          return ok({
+            taskId,
+            baseCommit: git.baseCommit,
+            hostDirty: git.hostDirty,
+            changes: git.changes.map((c) => ({
+              path: c.path,
+              status: c.status,
+              ...(c.oldPath === undefined ? {} : { oldPath: c.oldPath }),
+            })),
+            repoPath: git.repoPath,
+          });
+        }
+        // gate_change: byte-exact path, optional status, never an arbitrary pick.
+        const matches = git.changes.filter(
+          (c) => c.path === params.path && (params.status === undefined || c.status === params.status),
+        );
+        if (matches.length === 0) {
+          return err("VALIDATION_FAILED", "path is not in this task's change list; nothing was read");
+        }
+        if (matches.length > 1) {
+          return err(
+            "VALIDATION_FAILED",
+            "path is listed more than once in this task's change list; pass its status; nothing was read",
+          );
+        }
+        const entry = matches[0];
+        const requested = typeof params.maxBytes === "number" ? params.maxBytes : 262_144;
+        const cap = Math.min(524_288, Math.max(1, Math.floor(requested)));
+        const binary = entry.binary === true;
+        const bytes = new TextEncoder().encode(entry.patch);
+        let patch = binary ? "" : entry.patch;
+        let truncated = false;
+        if (!binary && bytes.length > cap) {
+          // Cut at the last newline at or before the cap (Core's display read).
+          const head = bytes.slice(0, cap);
+          const nl = head.lastIndexOf(0x0a);
+          patch = new TextDecoder().decode(nl >= 0 ? head.slice(0, nl + 1) : head);
+          truncated = true;
+        }
+        return ok({
+          path: entry.path,
+          ...(entry.oldPath === undefined ? {} : { oldPath: entry.oldPath }),
+          status: entry.status,
+          patch,
+          binary,
+          truncated,
+          lossy: entry.lossy === true,
+          ...(entry.baseBlob === undefined ? {} : { baseBlob: entry.baseBlob }),
         });
       }
       default:

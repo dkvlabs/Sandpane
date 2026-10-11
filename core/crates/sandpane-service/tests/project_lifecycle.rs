@@ -1004,8 +1004,9 @@ fn probe_advertises_the_project_lifecycle_methods() {
         .iter()
         .map(|m| m.as_str().unwrap())
         .collect();
-    // 22 after A3a; 27 since A3b added the five conversation methods.
-    assert_eq!(methods.len(), 27);
+    // 22 after A3a; 27 since A3b added the five conversation methods; 28
+    // since A5 added git.diff.
+    assert_eq!(methods.len(), 28);
     for m in [
         "project.update",
         "project.archive",

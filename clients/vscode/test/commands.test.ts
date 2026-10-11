@@ -215,9 +215,9 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
     ).toMatchObject({ params: { taskId: 't1', expectedBase: 'refs/heads/main' } });
   });
 
-  it('exposes exactly the 27 allowlisted methods and nothing else', () => {
-    expect(CORE_METHODS).toHaveLength(27);
-    expect(new Set(CORE_METHODS).size).toBe(27);
+  it('exposes exactly the 28 allowlisted methods and nothing else', () => {
+    expect(CORE_METHODS).toHaveLength(28);
+    expect(new Set(CORE_METHODS).size).toBe(28);
     expect(CORE_METHODS).not.toContain('shell.exec');
     expect(CORE_METHODS).not.toContain('sbx.raw');
     expect(CORE_METHODS).not.toContain('sandbox.start');
@@ -257,6 +257,7 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
       taskList: 'task.list',
       taskSubscribe: 'task.subscribe',
       gitReview: 'git.review',
+      gitDiff: 'git.diff',
       gitApply: 'git.apply',
     };
     // No extra callable method on the prototype (AGENTS.md: no free-form RPC).

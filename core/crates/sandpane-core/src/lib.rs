@@ -5,6 +5,7 @@
 //! with fixed executables + argument arrays only — never through a shell.
 
 pub mod db;
+pub mod diff;
 pub mod events;
 pub mod git;
 pub mod idempotency;

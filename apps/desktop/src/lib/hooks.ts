@@ -95,6 +95,8 @@ import {
   type KnownFeature,
   type ApplyResult,
   type ChangeSet,
+  type FileChangeStatus,
+  type GitDiffResult,
   type Conversation,
   type ConversationHistoryResult,
   type CoreCapabilities,
@@ -736,6 +738,34 @@ export function useTaskReview(taskId: string | null, enabled: boolean) {
     changeSet: query.data ?? null,
     isLoading: query.isPending && enabled,
     error: query.error ? asCoreRequestError(query.error) : null,
+    refetch: () => void query.refetch(),
+  };
+}
+
+/**
+ * A5 `git.diff` for ONE change-set entry, as React Query server state. Never
+ * retried automatically (not replay-safe), and kept only briefly in the cache:
+ * the patch is untrusted display text, never logged.
+ */
+export function useTaskDiff(
+  entry: { taskId: string; path: string; status: FileChangeStatus } | null,
+) {
+  const deps = useDeps();
+  const query = useQuery<GitDiffResult>({
+    queryKey: ["core", "git", "diff", entry?.taskId ?? "", entry?.path ?? "", entry?.status ?? ""],
+    queryFn: () => {
+      if (entry === null) throw new Error("no entry");
+      return deps.client.diffFile(entry);
+    },
+    enabled: entry !== null && deps.transportAvailable,
+    retry: false,
+    staleTime: 10_000,
+    gcTime: 60_000,
+  });
+  return {
+    result: query.data ?? null,
+    isLoading: query.isPending && entry !== null,
+    error: query.error ?? null,
     refetch: () => void query.refetch(),
   };
 }

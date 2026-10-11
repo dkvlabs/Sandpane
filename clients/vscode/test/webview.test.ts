@@ -182,3 +182,12 @@ describe('webview message whitelist', () => {
     expect(state.lines).toEqual([]);
   });
 });
+
+describe('A5 webview message: showTaskPatch', () => {
+  it('parses a task id strictly', () => {
+    expect(parseWebviewMessage({ type: 'showTaskPatch', taskId: 't1' })).toEqual({ type: 'showTaskPatch', taskId: 't1' });
+    expect(parseWebviewMessage({ type: 'showTaskPatch', taskId: 5 })).toBeUndefined();
+    expect(parseWebviewMessage({ type: 'showTaskPatch', taskId: '' })).toBeUndefined();
+    expect(parseWebviewMessage({ type: 'showTaskPatch', taskId: 'x'.repeat(201) })).toBeUndefined();
+  });
+});

@@ -322,6 +322,18 @@ pub fn accept_excludes_file(
     Ok(canonical)
 }
 
+/// Whether a hardened call pins git's work tree to its cwd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkTree {
+    /// `--work-tree=<cwd>`: every call except the detector.
+    Pin,
+    /// Let git discover the work tree (honouring `core.worktree`). ONLY for
+    /// [`GitRunner::show_toplevel`], whose job is to report where git puts
+    /// the work tree: callers compare it with the directory they expect, so
+    /// a pinned answer (always `cwd`) would make those checks tautological.
+    Discover,
+}
+
 impl GitRunner {
     /// The default runner, passing `excludes_file` (already vetted by
     /// [`accept_excludes_file`]) on every call.
@@ -335,7 +347,9 @@ impl GitRunner {
     /// Build the hardened command (pure; no I/O). `ambient_env_keys` is the
     /// set of variable names in Core's own environment — every `GIT_*` one is
     /// explicitly removed. `extra_config` carries per-repo overrides such as
-    /// blanked filter drivers.
+    /// blanked filter drivers. The work tree is pinned to `cwd`
+    /// (`--work-tree=<cwd>`, the first argument); `cwd` must be absolute —
+    /// every runner path refuses a relative one before spawning.
     pub fn hardened_command<I>(
         &self,
         cwd: &Path,
@@ -347,7 +361,41 @@ impl GitRunner {
     where
         I: IntoIterator<Item = OsString>,
     {
+        self.command(
+            cwd,
+            WorkTree::Pin,
+            extra_config,
+            attr_source,
+            args,
+            ambient_env_keys,
+        )
+    }
+
+    /// [`Self::hardened_command`] with an explicit work-tree policy. Only
+    /// [`Self::show_toplevel`] uses [`WorkTree::Discover`].
+    fn command<I>(
+        &self,
+        cwd: &Path,
+        work_tree: WorkTree,
+        extra_config: &[String],
+        attr_source: Option<&str>,
+        args: &[String],
+        ambient_env_keys: I,
+    ) -> Command
+    where
+        I: IntoIterator<Item = OsString>,
+    {
         let mut cmd = Command::new(&self.program);
+        if work_tree == WorkTree::Pin {
+            // A5 security C1: a GLOBAL option, first, so a repository-local
+            // `core.worktree` (agent-writable `.git/config`) can never move
+            // the work tree away from `cwd` — neither to hide the user's
+            // uncommitted work nor to read files outside the repository.
+            // (`-c core.worktree=` does not override it; `--work-tree` does.)
+            let mut pin = OsString::from("--work-tree=");
+            pin.push(cwd.as_os_str());
+            cmd.arg(pin);
+        }
         for key in ambient_env_keys {
             if key.to_string_lossy().starts_with("GIT_") {
                 cmd.env_remove(key);
@@ -427,13 +475,7 @@ impl GitRunner {
         args: &[String],
         limits: &RunLimits,
     ) -> Result<String, GitError> {
-        let non_paths: Vec<String> = args
-            .iter()
-            .filter(|a| !Path::new(a.as_str()).is_absolute())
-            .cloned()
-            .collect();
-        Validator::assert_no_shell_metachars(&non_paths).map_err(GitError::Validation)?;
-        let repo = self.repo_overrides(cwd)?;
+        let repo = self.prepare_run(cwd, args)?;
         self.exec(cwd, &repo.config, Some(repo.empty_tree), args, limits)
     }
 
@@ -445,30 +487,106 @@ impl GitRunner {
         args: &[String],
         limits: &RunLimits,
     ) -> Result<String, GitError> {
-        let cmd = self.hardened_command(
+        let out = self.exec_bytes(cwd, extra, attr_source, args, &[], limits)?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// [`Self::exec`] as raw bytes (for `-z` parsing), with optional literal
+    /// pathspecs appended. Truncated output is REFUSED: callers act on it.
+    fn exec_bytes(
+        &self,
+        cwd: &Path,
+        extra: &[String],
+        attr_source: Option<&str>,
+        args: &[String],
+        pathspecs: &[LiteralPathspec],
+        limits: &RunLimits,
+    ) -> Result<Vec<u8>, GitError> {
+        let out = self.exec_output(
             cwd,
+            WorkTree::Pin,
             extra,
             attr_source,
             args,
+            pathspecs,
+            limits,
+        )?;
+        if out.stdout_truncated {
+            // Never act on a partial change list / partial status.
+            let sub = args.first().map(String::as_str).unwrap_or("?");
+            return Err(GitError::Exec(format!(
+                "git {sub} output exceeded {} bytes; refusing truncated output",
+                limits.max_stdout
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    /// Spawn one hardened git under `limits`; a non-zero exit is an error.
+    /// Output may be truncated: every caller decides (refuse, or display).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_output(
+        &self,
+        cwd: &Path,
+        work_tree: WorkTree,
+        extra: &[String],
+        attr_source: Option<&str>,
+        args: &[String],
+        pathspecs: &[LiteralPathspec],
+        limits: &RunLimits,
+    ) -> Result<crate::process::BoundedOutput, GitError> {
+        let mut argv: Vec<String> = args.to_vec();
+        argv.extend(pathspecs.iter().map(|p| p.as_str().to_string()));
+        let cmd = self.command(
+            cwd,
+            work_tree,
+            extra,
+            attr_source,
+            &argv,
             std::env::vars_os().map(|(k, _)| k),
         );
         let out = run_bounded(cmd, limits).map_err(|e| GitError::Exec(e.to_string()))?;
-        let sub = args.first().map(String::as_str).unwrap_or("?");
         if !out.status.success() {
+            let sub = args.first().map(String::as_str).unwrap_or("?");
             return Err(GitError::Exec(format!(
                 "git {sub} exited {}: {}",
                 out.status,
                 out.stderr_lossy().trim()
             )));
         }
-        if out.stdout_truncated {
-            // Never act on a partial change list / partial status.
-            return Err(GitError::Exec(format!(
-                "git {sub} output exceeded {} bytes; refusing truncated output",
-                limits.max_stdout
-            )));
-        }
-        Ok(out.stdout_lossy())
+        Ok(out)
+    }
+
+    /// The tripwire + per-repository overrides shared by every run: `args`
+    /// (never pathspecs) pass [`Validator::assert_no_shell_metachars`]
+    /// except absolute paths, exactly as in [`Self::run_with_limits`].
+    fn prepare_run(&self, cwd: &Path, args: &[String]) -> Result<RepoOverrides, GitError> {
+        let non_paths: Vec<String> = args
+            .iter()
+            .filter(|a| !Path::new(a.as_str()).is_absolute())
+            .cloned()
+            .collect();
+        Validator::assert_no_shell_metachars(&non_paths).map_err(GitError::Validation)?;
+        self.repo_overrides(cwd)
+    }
+
+    /// Hardened run returning raw bytes; refuses truncated output.
+    fn run_bytes(
+        &self,
+        cwd: &Path,
+        args: &[String],
+        pathspecs: &[LiteralPathspec],
+        limits: &RunLimits,
+    ) -> Result<Vec<u8>, GitError> {
+        let repo = self.prepare_run(cwd, args)?;
+        self.exec_bytes(
+            cwd,
+            &repo.config,
+            Some(repo.empty_tree),
+            args,
+            pathspecs,
+            limits,
+        )
     }
 
     /// One read-only `git config --get-regexp` call: the filter drivers to
@@ -476,6 +594,14 @@ impl GitRunner {
     /// `required=false`) and the object format (for the empty-tree attribute
     /// source). Unsafe driver names / unknown formats fail CLOSED.
     fn repo_overrides(&self, cwd: &Path) -> Result<RepoOverrides, GitError> {
+        // Every repository call passes through here first: the work-tree
+        // pin is only meaningful for an absolute cwd.
+        if !cwd.is_absolute() {
+            return Err(GitError::Exec(format!(
+                "git cwd {} is not absolute",
+                cwd.display()
+            )));
+        }
         let query: Vec<String> = vec![
             "config".into(),
             "--null".into(),
@@ -601,7 +727,8 @@ impl GitRunner {
         let line = out.trim_end_matches(['\n', '\r']);
         if line.is_empty() || line.contains('\n') {
             return Err(GitError::Exec(format!(
-                "unexpected rev-parse output {out:?}"
+                "unexpected rev-parse output {}",
+                excerpt(out.as_bytes())
             )));
         }
         // Relative output is relative to the cwd git ran in (`dir`).
@@ -609,13 +736,32 @@ impl GitRunner {
             .map_err(|e| GitError::Exec(format!("common dir {line:?} not usable: {e}")))
     }
 
-    /// Absolute path of the working tree's top level containing `dir`.
+    /// Absolute path of the working tree's top level containing `dir`, AS
+    /// GIT RESOLVES IT: the one call that does not pin the work tree
+    /// ([`WorkTree::Discover`]), so a repository-local `core.worktree`
+    /// redirect shows up here and callers that compare the answer with the
+    /// directory they expect detect it (A5 security C1).
     pub fn show_toplevel(&self, dir: &Path) -> Result<PathBuf, GitError> {
-        let out = self.run(dir, &GitArgs::show_toplevel())?;
+        let args = GitArgs::show_toplevel();
+        let repo = self.prepare_run(dir, &args)?;
+        let out = self.exec_output(
+            dir,
+            WorkTree::Discover,
+            &repo.config,
+            Some(repo.empty_tree),
+            &args,
+            &[],
+            &self.limits,
+        )?;
+        if out.stdout_truncated {
+            return Err(GitError::Exec("rev-parse output truncated".into()));
+        }
+        let out = out.stdout_lossy();
         let line = out.trim_end_matches(['\n', '\r']);
         if line.is_empty() || line.contains('\n') {
             return Err(GitError::Exec(format!(
-                "unexpected rev-parse output {out:?}"
+                "unexpected rev-parse output {}",
+                excerpt(out.as_bytes())
             )));
         }
         Ok(PathBuf::from(line))
@@ -665,43 +811,91 @@ impl GitRunner {
     pub fn change_list(&self, repo: &Path, base_commit: &str) -> Result<Vec<RawChange>, GitError> {
         Validator::git_ref(base_commit)?;
         self.refuse_submodules(repo)?;
-        let tracked = self.run(repo, &GitArgs::diff_name_status(base_commit))?;
-        let mut changes = Vec::new();
-        for line in tracked.lines() {
-            let mut fields = line.split('\t');
-            let (Some(code), Some(first_path)) = (fields.next(), fields.next()) else {
-                continue;
-            };
-            let status = match code.chars().next() {
-                Some('A') | Some('C') => "added",
-                Some('M') | Some('T') => "modified",
-                Some('D') => "deleted",
-                Some('R') => "renamed",
-                // U (unmerged), X (conflict), B, L: surface as modified so a
-                // review never silently drops a touched file.
-                _ => "modified",
-            };
-            // Rename/copy lines carry the old path first and the new path
-            // second; every other line carries one path.
-            let path = match (status, fields.next()) {
-                ("renamed" | "added", Some(second)) => second,
-                _ => first_path,
-            };
-            changes.push(RawChange {
-                path: path.to_string(),
-                status: status.to_string(),
-            });
-        }
-        let untracked = self.run(repo, &GitArgs::ls_files_others())?;
-        for line in untracked.lines() {
-            if !line.trim().is_empty() {
-                changes.push(RawChange {
-                    path: line.to_string(),
-                    status: "untracked".to_string(),
-                });
-            }
-        }
+        // A5: NUL-separated output, parsed as bytes — git C-quotes paths
+        // holding tab, newline, `"` or `\` even with `core.quotePath=false`,
+        // so a line parser returned quoted, wrong paths for them.
+        let tracked = self.run_bytes(
+            repo,
+            &GitArgs::diff_name_status(base_commit),
+            &[],
+            &self.limits,
+        )?;
+        let mut changes = parse_name_status_z(&tracked)?;
+        let untracked = self.run_bytes(repo, &GitArgs::ls_files_others(), &[], &self.limits)?;
+        changes.extend(parse_ls_files_z(&untracked)?);
         Ok(changes)
+    }
+
+    /// DISPLAY-ONLY (A5 §3.5 item 3): the unified diff of `specs` against
+    /// `base`, as its first `cap` bytes plus whether more existed — instead
+    /// of [`Self::exec`]'s refusal. Same hardening as every other call
+    /// (tripwire on `args`, per-repository filter/attribute overrides,
+    /// bounded runner). Used ONLY by `git.diff`, never for a decision.
+    pub fn diff_patch_display(
+        &self,
+        repo: &Path,
+        base: &str,
+        specs: &[LiteralPathspec],
+        cap: usize,
+    ) -> Result<(Vec<u8>, bool), GitError> {
+        Validator::git_ref(base)?;
+        let args = GitArgs::diff_patch(base);
+        let overrides = self.prepare_run(repo, &args)?;
+        let limits = RunLimits {
+            max_stdout: cap,
+            ..self.limits
+        };
+        let out = self.exec_output(
+            repo,
+            WorkTree::Pin,
+            &overrides.config,
+            Some(overrides.empty_tree),
+            &args,
+            specs,
+            &limits,
+        )?;
+        Ok((out.stdout, out.stdout_truncated))
+    }
+
+    /// Whether the diff of `specs` against `base` is binary, from ONE
+    /// `--numstat -z` record (`-\t-`). Zero or several records fail closed:
+    /// the caller asked about exactly one entry (a rename passes both paths).
+    pub fn diff_is_binary(
+        &self,
+        repo: &Path,
+        base: &str,
+        specs: &[LiteralPathspec],
+    ) -> Result<bool, GitError> {
+        Validator::git_ref(base)?;
+        let out = self.run_bytes(repo, &GitArgs::diff_numstat(base), specs, &self.limits)?;
+        match parse_numstat_z(&out)?.as_slice() {
+            [binary] => Ok(*binary),
+            other => Err(GitError::Exec(format!(
+                "expected one numstat record for {:?}, found {}",
+                specs
+                    .iter()
+                    .map(LiteralPathspec::as_str)
+                    .collect::<Vec<_>>(),
+                other.len()
+            ))),
+        }
+    }
+
+    /// The blob id of `spec` in `base`'s tree (`None` when absent there).
+    pub fn base_blob(
+        &self,
+        repo: &Path,
+        base: &str,
+        spec: &LiteralPathspec,
+    ) -> Result<Option<String>, GitError> {
+        Validator::git_ref(base)?;
+        let out = self.run_bytes(
+            repo,
+            &GitArgs::ls_tree(base),
+            std::slice::from_ref(spec),
+            &self.limits,
+        )?;
+        parse_ls_tree_blob_z(&out)
     }
 }
 
@@ -800,10 +994,258 @@ pub fn gitlink_paths_from_ls_files_stage(out: &str) -> Result<Vec<String>, GitEr
     Ok(paths)
 }
 
+/// One entry of [`GitRunner::change_list`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawChange {
+    /// The path as git reported it (NUL-separated, so never C-quoted). Bytes
+    /// that are not UTF-8 are replaced (U+FFFD) for display — see `exact`.
     pub path: String,
     pub status: String,
+    /// A5: the pre-rename path, set ONLY for `renamed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// `false` when `path` (or `old_path`) was NOT valid UTF-8 and was
+    /// decoded lossily: such a string cannot name the file, so nothing may
+    /// be read through it (`git.diff` refuses; fail closed). Not serialized.
+    #[serde(skip, default = "exact_default")]
+    pub exact: bool,
+}
+
+fn exact_default() -> bool {
+    true
+}
+
+impl RawChange {
+    pub fn new(path: &str, status: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            status: status.to_string(),
+            old_path: None,
+            exact: true,
+        }
+    }
+}
+
+/// A `:(literal)<path>` pathspec (A5): the ONLY form in which a repository
+/// path reaches a git argument vector. `literal` magic disables globbing, so
+/// the path names exactly one file. Pathspecs travel in their own channel,
+/// appended after `--` (see [`GitRunner::diff_patch_display`]): they are
+/// EXEMPT from the shell-metacharacter tripwire, because a real filename may
+/// legitimately contain a newline, `$(`, a backtick, `&&` or `||` (no shell
+/// is ever involved). Built ONLY from a `RawChange` that git itself reported
+/// ([`Self::from_change`], [`Self::from_old_path`]), never from a client
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralPathspec(String);
+
+impl LiteralPathspec {
+    /// The pathspec naming `change.path` — the only public way to build one
+    /// (A5 security I1), so every pathspec comes from a change-list entry.
+    /// Refuses a lossy entry (`!exact`: non-UTF-8 bytes git reported, which
+    /// the string cannot name), an empty path, or one holding NUL.
+    ///
+    /// The raw string constructor is crate-private:
+    ///
+    /// ```compile_fail
+    /// let _ = sandpane_core::git::LiteralPathspec::new("anything");
+    /// ```
+    pub fn from_change(change: &RawChange) -> Result<Self, GitError> {
+        Self::exact(change)?;
+        Self::new(&change.path)
+    }
+
+    /// The pathspec naming a rename's pre-rename path (`None` when the
+    /// entry has none). Same refusals as [`Self::from_change`].
+    pub fn from_old_path(change: &RawChange) -> Result<Option<Self>, GitError> {
+        Self::exact(change)?;
+        change.old_path.as_deref().map(Self::new).transpose()
+    }
+
+    fn exact(change: &RawChange) -> Result<(), GitError> {
+        if change.exact {
+            Ok(())
+        } else {
+            Err(GitError::Validation(ValidationError::InvalidShape {
+                reason: "change-list path is not valid UTF-8".into(),
+            }))
+        }
+    }
+
+    /// Refuses an empty path or one holding NUL (not representable in argv).
+    pub(crate) fn new(path: &str) -> Result<Self, GitError> {
+        if path.is_empty() {
+            return Err(GitError::Validation(ValidationError::Empty));
+        }
+        if path.contains('\0') {
+            return Err(GitError::Validation(ValidationError::DisallowedChar {
+                found: '\0',
+            }));
+        }
+        Ok(Self(format!(":(literal){path}")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// At most this many bytes of git's stdout are quoted in a malformed-output
+/// error (A5 security I3): the message reaches logs and INTERNAL frames.
+pub const PARSER_EXCERPT_BYTES: usize = 512;
+
+/// `out` for an error message: its first [`PARSER_EXCERPT_BYTES`] bytes,
+/// lossily decoded and `Debug`-quoted, plus the total size when cut.
+fn excerpt(out: &[u8]) -> String {
+    if out.len() <= PARSER_EXCERPT_BYTES {
+        format!("{:?}", String::from_utf8_lossy(out))
+    } else {
+        format!(
+            "{:?}… ({} bytes)",
+            String::from_utf8_lossy(&out[..PARSER_EXCERPT_BYTES]),
+            out.len()
+        )
+    }
+}
+
+/// UTF-8 decode that reports whether the bytes were exact.
+fn decode_exact(bytes: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => (s.to_string(), true),
+        Err(_) => (String::from_utf8_lossy(bytes).into_owned(), false),
+    }
+}
+
+/// NUL-terminated fields; the final terminator yields no empty field.
+fn nul_fields(out: &[u8]) -> Vec<&[u8]> {
+    let mut fields: Vec<&[u8]> = out.split(|b| *b == 0).collect();
+    if fields.last().is_some_and(|f| f.is_empty()) {
+        fields.pop();
+    }
+    fields
+}
+
+/// Parse `git diff --name-status -z` (`<code>\0<path>\0`, or
+/// `<code>\0<old>\0<new>\0` for R/C). Renames carry `old_path`; copies
+/// (not requested, but possible) stay `added` at the new path. A malformed
+/// record fails CLOSED (never a silently shorter list).
+pub fn parse_name_status_z(out: &[u8]) -> Result<Vec<RawChange>, GitError> {
+    let fields = nul_fields(out);
+    let malformed = || {
+        GitError::Exec(format!(
+            "unexpected diff --name-status -z output {}",
+            excerpt(out)
+        ))
+    };
+    let mut changes = Vec::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let code = fields[i];
+        let Some(letter) = code.first() else {
+            return Err(malformed());
+        };
+        let status = match letter {
+            b'A' | b'C' => "added",
+            b'M' | b'T' => "modified",
+            b'D' => "deleted",
+            b'R' => "renamed",
+            // U (unmerged), X, B, …: surface as modified so a review never
+            // silently drops a touched file.
+            _ => "modified",
+        };
+        let two = matches!(letter, b'R' | b'C');
+        let n = if two { 2 } else { 1 };
+        let paths = fields.get(i + 1..i + 1 + n).ok_or_else(malformed)?;
+        if paths.iter().any(|p| p.is_empty()) {
+            return Err(malformed());
+        }
+        let (path, path_exact) = decode_exact(paths[n - 1]);
+        let mut change = RawChange::new(&path, status);
+        change.exact = path_exact;
+        if *letter == b'R' {
+            let (old, old_exact) = decode_exact(paths[0]);
+            change.old_path = Some(old);
+            change.exact = path_exact && old_exact;
+        }
+        changes.push(change);
+        i += 1 + n;
+    }
+    Ok(changes)
+}
+
+/// Parse `git ls-files --others -z` into `untracked` entries.
+pub fn parse_ls_files_z(out: &[u8]) -> Result<Vec<RawChange>, GitError> {
+    Ok(nul_fields(out)
+        .into_iter()
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            let (path, exact) = decode_exact(f);
+            RawChange {
+                exact,
+                ..RawChange::new(&path, "untracked")
+            }
+        })
+        .collect())
+}
+
+/// Parse `git diff --numstat -z` into one "is binary" flag per record
+/// (`-\t-\t` = binary). Record forms: `<a>\t<d>\t<path>\0`, or for a
+/// rename `<a>\t<d>\t\0<old>\0<new>\0`. Anything else fails CLOSED.
+pub fn parse_numstat_z(out: &[u8]) -> Result<Vec<bool>, GitError> {
+    let fields = nul_fields(out);
+    let malformed = || {
+        GitError::Exec(format!(
+            "unexpected diff --numstat -z output {}",
+            excerpt(out)
+        ))
+    };
+    let counts = |f: &[u8]| f == b"-" || (!f.is_empty() && f.iter().all(u8::is_ascii_digit));
+    let mut flags = Vec::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let mut parts = fields[i].splitn(3, |b| *b == b'\t');
+        let (Some(added), Some(deleted), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(malformed());
+        };
+        if !counts(added) || !counts(deleted) || ((added == b"-") != (deleted == b"-")) {
+            return Err(malformed());
+        }
+        flags.push(added == b"-");
+        if path.is_empty() {
+            let pair = fields.get(i + 1..i + 3).ok_or_else(malformed)?;
+            if pair.iter().any(|p| p.is_empty()) {
+                return Err(malformed());
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(flags)
+}
+
+/// Parse `git ls-tree -z <base> -- <one pathspec>`: `None` when the path is
+/// not in the base tree; the blob id otherwise. A non-blob entry, more than
+/// one entry, or a malformed id fails CLOSED.
+pub fn parse_ls_tree_blob_z(out: &[u8]) -> Result<Option<String>, GitError> {
+    let fields = nul_fields(out);
+    let malformed = || GitError::Exec(format!("unexpected ls-tree -z output {}", excerpt(out)));
+    match fields.as_slice() {
+        [] => Ok(None),
+        [entry] => {
+            let text = std::str::from_utf8(entry).map_err(|_| malformed())?;
+            let (meta, _path) = text.split_once('\t').ok_or_else(malformed)?;
+            let mut m = meta.split(' ');
+            let (Some(_mode), Some("blob"), Some(oid), None) =
+                (m.next(), m.next(), m.next(), m.next())
+            else {
+                return Err(malformed());
+            };
+            Validator::full_object_id(oid).map_err(|_| malformed())?;
+            Ok(Some(oid.to_string()))
+        }
+        _ => Err(malformed()),
+    }
 }
 
 /// Pure argument-vector builders (unit-testable without a repo).
@@ -851,6 +1293,60 @@ impl GitArgs {
             "--no-textconv".into(),
             "--ignore-submodules=dirty".into(),
             "--name-status".into(),
+            // A5: NUL-separated, never C-quoted; renames detected even when
+            // the user/repo config sets `diff.renames=false`.
+            "-z".into(),
+            "--find-renames".into(),
+            "--end-of-options".into(),
+            base.into(),
+            "--".into(),
+        ]
+    }
+
+    /// `git.diff` binary probe: `--numstat -z` of the given pathspecs
+    /// (appended after the trailing `--` by the runner).
+    pub fn diff_numstat(base: &str) -> Vec<String> {
+        vec![
+            "diff".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+            "--ignore-submodules=dirty".into(),
+            "--numstat".into(),
+            "-z".into(),
+            "--find-renames".into(),
+            "--end-of-options".into(),
+            base.into(),
+            "--".into(),
+        ]
+    }
+
+    /// `git.diff` patch (§3.5 item 3): `--no-color`, renames found, never
+    /// `--binary`; the literal pathspecs follow the trailing `--`. The
+    /// shape is pinned against repository config (A5 security W1):
+    /// `a/`/`b/` prefixes (`diff.noprefix`, `diff.mnemonicPrefix`,
+    /// `diff.srcPrefix`/`dstPrefix`) and 3 lines of context (`diff.context`).
+    pub fn diff_patch(base: &str) -> Vec<String> {
+        vec![
+            "diff".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+            "--no-color".into(),
+            "--src-prefix=a/".into(),
+            "--dst-prefix=b/".into(),
+            "-U3".into(),
+            "--ignore-submodules=dirty".into(),
+            "--find-renames".into(),
+            "--end-of-options".into(),
+            base.into(),
+            "--".into(),
+        ]
+    }
+
+    /// `git.diff` base blob: `ls-tree -z <base> --` + one literal pathspec.
+    pub fn ls_tree(base: &str) -> Vec<String> {
+        vec![
+            "ls-tree".into(),
+            "-z".into(),
             "--end-of-options".into(),
             base.into(),
             "--".into(),
@@ -875,6 +1371,7 @@ impl GitArgs {
             "ls-files".into(),
             "--others".into(),
             "--exclude-standard".into(),
+            "-z".into(),
             "--".into(),
         ]
     }
@@ -1177,6 +1674,8 @@ mod tests {
                 "--no-textconv",
                 "--ignore-submodules=dirty",
                 "--name-status",
+                "-z",
+                "--find-renames",
                 "--end-of-options",
                 "abc1234",
                 "--"
@@ -1184,7 +1683,44 @@ mod tests {
         );
         assert_eq!(
             GitArgs::ls_files_others(),
-            vec!["ls-files", "--others", "--exclude-standard", "--"]
+            vec!["ls-files", "--others", "--exclude-standard", "-z", "--"]
+        );
+        // A5 git.diff vectors (literal pathspecs are appended after `--`).
+        assert_eq!(
+            GitArgs::diff_patch("abc1234"),
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "-U3",
+                "--ignore-submodules=dirty",
+                "--find-renames",
+                "--end-of-options",
+                "abc1234",
+                "--"
+            ]
+        );
+        assert_eq!(
+            GitArgs::diff_numstat("abc1234"),
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=dirty",
+                "--numstat",
+                "-z",
+                "--find-renames",
+                "--end-of-options",
+                "abc1234",
+                "--"
+            ]
+        );
+        assert_eq!(
+            GitArgs::ls_tree("abc1234"),
+            vec!["ls-tree", "-z", "--end-of-options", "abc1234", "--"]
         );
         // Index-only scan (never enters a submodule work tree), repo-wide
         // regardless of cwd via the `:(top)` pathspec.
@@ -1456,7 +1992,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        let mut expected: Vec<String> = Vec::new();
+        let mut expected: Vec<String> = vec!["--work-tree=/repo".into()];
         for c in HARDENING_CONFIG {
             expected.push("-c".into());
             expected.push(c.to_string());
@@ -1593,14 +2129,8 @@ mod tests {
         // Nothing committed: the base-vs-working-tree diff must still surface
         // the modification, and ls-files the untracked file (T15).
         let changes = runner.change_list(dir.path(), &base).unwrap();
-        assert!(changes.contains(&RawChange {
-            path: "file.txt".into(),
-            status: "modified".into()
-        }));
-        assert!(changes.contains(&RawChange {
-            path: "new.txt".into(),
-            status: "untracked".into()
-        }));
+        assert!(changes.contains(&RawChange::new("file.txt", "modified")));
+        assert!(changes.contains(&RawChange::new("new.txt", "untracked")));
     }
 
     #[test]
@@ -1620,8 +2150,8 @@ mod tests {
         let changes = runner.change_list(dir.path(), &base).unwrap();
         assert!(
             changes.contains(&RawChange {
-                path: "renamed.txt".into(),
-                status: "renamed".into()
+                old_path: Some("file.txt".into()),
+                ..RawChange::new("renamed.txt", "renamed")
             }),
             "{changes:?}"
         );
@@ -1641,6 +2171,441 @@ mod tests {
                 .any(|c| c.path == "日本.txt" && c.status == "untracked"),
             "{changes:?}"
         );
+    }
+
+    /// A5 §3.5 item 1: paths git would C-quote (tab, newline, `"`, `\`),
+    /// non-ASCII, a leading `-`, and every shell-tripwire sequence come back
+    /// EXACTLY (NUL-separated parsing), for every status; a rename carries
+    /// its old path.
+    #[test]
+    fn change_list_reports_special_character_paths_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let runner = GitRunner::default();
+        let d = dir.path();
+        let names = [
+            "tab\there.txt",
+            "new\nline.txt",
+            "quo\"te.txt",
+            "back\\slash.txt",
+            "日本 é.txt",
+            "-leading.txt",
+            "$(x) `y` a&&b c||d.txt",
+        ];
+        for n in &names {
+            std::fs::write(d.join(n), format!("{n}\n")).unwrap();
+        }
+        std::fs::write(d.join("old \"name\".txt"), "rename me\nrename me\n").unwrap();
+        git_plain(d, &["add", "-A"]);
+        git_plain(d, &["commit", "-qm", "special"]);
+        let base = runner.rev_parse_head(d).unwrap();
+        // modified, deleted, renamed (staged), untracked — all special.
+        std::fs::write(d.join("tab\there.txt"), "changed\n").unwrap();
+        std::fs::remove_file(d.join("new\nline.txt")).unwrap();
+        git_plain(d, &["mv", "--", "old \"name\".txt", "re\\named\n.txt"]);
+        std::fs::write(d.join("-untracked \t\"x\".txt"), "u\n").unwrap();
+        let mut changes = runner.change_list(d, &base).unwrap();
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut expected = vec![
+            RawChange::new("tab\there.txt", "modified"),
+            RawChange::new("new\nline.txt", "deleted"),
+            RawChange {
+                old_path: Some("old \"name\".txt".into()),
+                ..RawChange::new("re\\named\n.txt", "renamed")
+            },
+            RawChange::new("-untracked \t\"x\".txt", "untracked"),
+        ];
+        expected.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(changes, expected);
+        assert!(changes.iter().all(|c| c.exact));
+        // Untouched special files are not listed; touching each one lists it
+        // verbatim (covers the tripwire sequences and the leading dash).
+        for n in &names[2..] {
+            std::fs::write(d.join(n), "edited\n").unwrap();
+        }
+        let listed: Vec<String> = runner
+            .change_list(d, &base)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        for n in &names[2..] {
+            assert!(listed.iter().any(|p| p == n), "{n:?} not in {listed:?}");
+        }
+    }
+
+    /// `--find-renames` is explicit: a repo (or user) `diff.renames=false`
+    /// must not turn a rename into an add plus a delete.
+    #[test]
+    fn change_list_detects_renames_even_when_repo_config_disables_them() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let d = dir.path();
+        git_plain(d, &["config", "diff.renames", "false"]);
+        let runner = GitRunner::default();
+        let base = runner.rev_parse_head(d).unwrap();
+        git_plain(d, &["mv", "file.txt", "moved.txt"]);
+        let changes = runner.change_list(d, &base).unwrap();
+        assert_eq!(
+            changes,
+            vec![RawChange {
+                old_path: Some("file.txt".into()),
+                ..RawChange::new("moved.txt", "renamed")
+            }]
+        );
+    }
+
+    /// Pure parser: NUL-separated records, two paths for R/C, one otherwise;
+    /// copies stay `added` without an old path; non-UTF-8 bytes are decoded
+    /// lossily for display but flagged NOT exact (a lossy path can never be
+    /// used to name the file); a malformed record fails closed.
+    #[test]
+    fn name_status_z_parser_is_exact_and_fails_closed() {
+        let out =
+            b"M\0a\tb\0R087\0old\nx\0new\"y\0C100\0src\0copy\0D\0gone\0A\0\xff\xfe.bin\0T\0t\0";
+        let parsed = parse_name_status_z(out).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                RawChange::new("a\tb", "modified"),
+                RawChange {
+                    old_path: Some("old\nx".into()),
+                    ..RawChange::new("new\"y", "renamed")
+                },
+                RawChange::new("copy", "added"),
+                RawChange::new("gone", "deleted"),
+                RawChange {
+                    exact: false,
+                    ..RawChange::new("\u{fffd}\u{fffd}.bin", "added")
+                },
+                RawChange::new("t", "modified"),
+            ]
+        );
+        // A rename whose OLD path is not UTF-8 is not exact either.
+        let r = parse_name_status_z(b"R100\0\xc3\0ok\0").unwrap();
+        assert!(!r[0].exact, "{r:?}");
+        for bad in [&b"M\0"[..], b"R100\0only-one\0", b"\0x\0"] {
+            assert!(parse_name_status_z(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_name_status_z(b"").unwrap().is_empty());
+        let others = parse_ls_files_z(b"a b\0new\nline\0\xff\0").unwrap();
+        assert_eq!(
+            others,
+            vec![
+                RawChange::new("a b", "untracked"),
+                RawChange::new("new\nline", "untracked"),
+                RawChange {
+                    exact: false,
+                    ..RawChange::new("\u{fffd}", "untracked")
+                },
+            ]
+        );
+    }
+
+    /// A5 §3.5 item 3: the display-only capped run returns the first
+    /// `cap` bytes plus `truncated`, while the decision path (`run`/`exec`)
+    /// still REFUSES truncated output — both on the same oversized diff.
+    #[test]
+    fn display_capped_diff_truncates_while_exec_still_refuses_truncated_output() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let d = dir.path();
+        let base = GitRunner::default().rev_parse_head(d).unwrap();
+        std::fs::write(d.join("file.txt"), "x\n".repeat(4096)).unwrap();
+        // 2 KiB: enough for the filter-enumeration probe (a global
+        // `filter.lfs.*` config is common), far below the ~8 KiB diff.
+        let small = GitRunner {
+            limits: RunLimits {
+                max_stdout: 2048,
+                ..RunLimits::QUERY
+            },
+            ..GitRunner::default()
+        };
+        // The decision path (`run` → `exec`) on the SAME diff vector.
+        let refused = small.run(d, &GitArgs::diff_patch(&base)).unwrap_err();
+        assert!(
+            refused.to_string().contains("refusing truncated output"),
+            "{refused}"
+        );
+        let spec = LiteralPathspec::new("file.txt").unwrap();
+        let (bytes, truncated) = small
+            .diff_patch_display(d, &base, std::slice::from_ref(&spec), 64)
+            .unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert!(truncated);
+        let (full, truncated) = GitRunner::default()
+            .diff_patch_display(d, &base, &[spec], 1 << 20)
+            .unwrap();
+        assert!(!truncated);
+        assert!(
+            full.starts_with(b"diff --git a/file.txt b/file.txt\n"),
+            "{full:?}"
+        );
+    }
+
+    /// Pathspecs travel in their own channel: a filename holding every
+    /// tripwire sequence (newline, `$(`, backtick, `&&`, `||`) is diffed
+    /// exactly, while ordinary arguments still trip the wire.
+    #[test]
+    fn literal_pathspecs_carry_tripwire_sequences_and_args_still_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let d = dir.path();
+        let name = "x\n$(y) `z` a&&b c||d *?[g].txt";
+        std::fs::write(d.join(name), "one\n").unwrap();
+        std::fs::write(d.join("x-decoy.txt"), "decoy\n").unwrap();
+        git_plain(d, &["add", "-A"]);
+        git_plain(d, &["commit", "-qm", "special"]);
+        let runner = GitRunner::default();
+        let base = runner.rev_parse_head(d).unwrap();
+        std::fs::write(d.join(name), "two\n").unwrap();
+        std::fs::write(d.join("x-decoy.txt"), "changed\n").unwrap();
+        let spec = LiteralPathspec::new(name).unwrap();
+        assert_eq!(spec.as_str(), format!(":(literal){name}"));
+        let (patch, _) = runner
+            .diff_patch_display(d, &base, std::slice::from_ref(&spec), 1 << 20)
+            .unwrap();
+        let text = String::from_utf8(patch).unwrap();
+        assert!(text.contains("-one\n+two\n"), "{text}");
+        assert!(!text.contains("decoy"), "literal, never a glob: {text}");
+        assert!(!runner.diff_is_binary(d, &base, &[spec]).unwrap());
+        assert!(runner
+            .run(d, &["diff".to_string(), "a\nb".to_string()])
+            .is_err());
+        assert!(LiteralPathspec::new("").is_err());
+        assert!(LiteralPathspec::new("a\0b").is_err());
+    }
+
+    /// A5 security I1: pathspecs are built from change-list entries only —
+    /// the entry's path, or its pre-rename path — and never from a lossy
+    /// (non-UTF-8) entry, whose string cannot name the file.
+    #[test]
+    fn literal_pathspecs_come_only_from_change_list_entries() {
+        let c = RawChange::new("a b.txt", "modified");
+        assert_eq!(
+            LiteralPathspec::from_change(&c).unwrap().as_str(),
+            ":(literal)a b.txt"
+        );
+        assert_eq!(LiteralPathspec::from_old_path(&c).unwrap(), None);
+        let mut r = RawChange::new("new.txt", "renamed");
+        r.old_path = Some("old.txt".into());
+        assert_eq!(
+            LiteralPathspec::from_old_path(&r)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            ":(literal)old.txt"
+        );
+        let mut lossy = r.clone();
+        lossy.exact = false;
+        assert!(LiteralPathspec::from_change(&lossy).is_err());
+        assert!(LiteralPathspec::from_old_path(&lossy).is_err());
+        assert!(LiteralPathspec::from_change(&RawChange::new("", "modified")).is_err());
+    }
+
+    /// Binary is decided by `--numstat -z` (`-\t-`); a rename with both
+    /// pathspecs is ONE record and its patch shows the rename; `baseBlob`
+    /// is the base-side blob id (absent for a path not in the base).
+    #[test]
+    fn numstat_binary_rename_patch_and_base_blob_on_a_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let d = dir.path();
+        std::fs::write(d.join("bin.dat"), b"a\0b").unwrap();
+        std::fs::write(d.join("long.txt"), "line\n".repeat(20)).unwrap();
+        git_plain(d, &["add", "-A"]);
+        git_plain(d, &["commit", "-qm", "more"]);
+        let runner = GitRunner::default();
+        let base = runner.rev_parse_head(d).unwrap();
+        std::fs::write(d.join("bin.dat"), b"a\0c").unwrap();
+        git_plain(d, &["config", "diff.renames", "false"]);
+        git_plain(d, &["mv", "long.txt", "moved \"long\".txt"]);
+        let bin = LiteralPathspec::new("bin.dat").unwrap();
+        assert!(runner
+            .diff_is_binary(d, &base, std::slice::from_ref(&bin))
+            .unwrap());
+        let ren = [
+            LiteralPathspec::new("moved \"long\".txt").unwrap(),
+            LiteralPathspec::new("long.txt").unwrap(),
+        ];
+        assert!(!runner.diff_is_binary(d, &base, &ren).unwrap());
+        let (patch, _) = runner.diff_patch_display(d, &base, &ren, 1 << 20).unwrap();
+        let text = String::from_utf8(patch).unwrap();
+        assert!(text.contains("rename from long.txt\n"), "{text}");
+        assert!(
+            text.contains("rename to \"moved \\\"long\\\".txt\"\n"),
+            "{text}"
+        );
+        let expected = {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("{base}:long.txt")])
+                .current_dir(d)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(runner.base_blob(d, &base, &ren[1]).unwrap(), Some(expected));
+        assert_eq!(runner.base_blob(d, &base, &ren[0]).unwrap(), None);
+        // Two records where one is required fails closed.
+        assert!(runner
+            .diff_is_binary(d, &base, &[bin, ren[1].clone()])
+            .is_err());
+    }
+
+    /// A5 security C1: a repository-local `core.worktree` (agent-writable
+    /// `.git/config`) must never move the work tree of a hardened call —
+    /// not to hide the user's uncommitted work (`is_dirty`, the apply gate)
+    /// and not to read files outside the repository (`change_list`, the
+    /// patch). Only `show_toplevel` is left unpinned: it is the detector.
+    #[test]
+    fn a_repo_local_core_worktree_never_moves_the_work_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let runner = GitRunner::default();
+        let base = runner.rev_parse_head(&repo).unwrap();
+        let clean = root.join("clean-copy");
+        git_plain(
+            &repo,
+            &["worktree", "add", "-q", "--detach", clean.to_str().unwrap()],
+        );
+        assert!(clean.join("file.txt").exists());
+        // The user's uncommitted work, then the redirect to the clean copy.
+        std::fs::write(repo.join("file.txt"), "base\nUSER WORK\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
+        git_plain(&repo, &["config", "core.worktree", clean.to_str().unwrap()]);
+        assert!(runner.is_dirty(&repo).unwrap(), "redirect hid user work");
+        assert!(matches!(
+            preconditions_for_apply(&runner, &repo, &base),
+            Err(GitError::DirtyHostState(_))
+        ));
+        // Detector: the UNPINNED top level names the redirect target.
+        assert_eq!(
+            std::fs::canonicalize(runner.show_toplevel(&repo).unwrap()).unwrap(),
+            clean
+        );
+
+        // Redirect OUTSIDE: an index entry whose work-tree file would be
+        // read from the outside directory, plus an outside-only file.
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("notes.txt"), "FAKE-SECRET\n").unwrap();
+        std::fs::write(outside.join("only-outside.txt"), "FAKE-SECRET\n").unwrap();
+        std::fs::write(outside.join("file.txt"), "base\n").unwrap();
+        git_plain(&repo, &["config", "--unset", "core.worktree"]);
+        std::fs::write(repo.join("notes.txt"), "placeholder\n").unwrap();
+        git_plain(&repo, &["add", "notes.txt"]);
+        git_plain(
+            &repo,
+            &["config", "core.worktree", outside.to_str().unwrap()],
+        );
+        let changes = runner.change_list(&repo, &base).unwrap();
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(!paths.contains(&"only-outside.txt"), "{paths:?}");
+        assert!(paths.contains(&"untracked.txt"), "{paths:?}");
+        let spec = LiteralPathspec::new("notes.txt").unwrap();
+        let (patch, _) = runner
+            .diff_patch_display(&repo, &base, std::slice::from_ref(&spec), 1 << 20)
+            .unwrap();
+        let text = String::from_utf8(patch).unwrap();
+        assert!(!text.contains("FAKE-SECRET"), "{text}");
+        assert!(text.contains("+placeholder\n"), "{text}");
+    }
+
+    /// The pin is only meaningful for an absolute cwd (`--work-tree=rel`
+    /// plus `current_dir(rel)` would name `rel/rel`): refused, no spawn.
+    #[test]
+    fn a_relative_cwd_is_refused_before_any_git_runs() {
+        let runner = GitRunner::default();
+        let e = runner.is_dirty(Path::new("relative/repo")).unwrap_err();
+        assert!(e.to_string().contains("is not absolute"), "{e}");
+        let e = runner.show_toplevel(Path::new("relative")).unwrap_err();
+        assert!(e.to_string().contains("is not absolute"), "{e}");
+    }
+
+    /// The pin is the FIRST argument of every hardened call (a global
+    /// option, before `-c` and the subcommand); the detector alone omits it.
+    #[test]
+    fn every_hardened_call_pins_the_work_tree_except_the_detector() {
+        let runner = GitRunner::default();
+        let argv = |cmd: &Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let pinned = runner.hardened_command(
+            Path::new("/some repo"),
+            &[],
+            None,
+            &GitArgs::status_porcelain(),
+            Vec::<OsString>::new(),
+        );
+        let a = argv(&pinned);
+        assert_eq!(a[0], "--work-tree=/some repo", "{a:?}");
+        assert_eq!(a.iter().filter(|x| x.starts_with("--work-tree")).count(), 1);
+        let detector = runner.command(
+            Path::new("/some repo"),
+            WorkTree::Discover,
+            &[],
+            None,
+            &GitArgs::show_toplevel(),
+            Vec::<OsString>::new(),
+        );
+        assert!(
+            !argv(&detector).iter().any(|x| x.starts_with("--work-tree")),
+            "{:?}",
+            argv(&detector)
+        );
+    }
+
+    /// A5 security I3: a malformed-output error quotes at most
+    /// [`PARSER_EXCERPT_BYTES`] of git's stdout (plus its total size), never
+    /// the whole buffer — the message reaches logs and an INTERNAL frame.
+    #[test]
+    fn parser_errors_quote_a_bounded_excerpt() {
+        let huge = "x".repeat(100_000);
+        let errors = [
+            parse_name_status_z(huge.as_bytes()).unwrap_err(),
+            parse_numstat_z(huge.as_bytes()).unwrap_err(),
+            parse_ls_tree_blob_z(huge.as_bytes()).unwrap_err(),
+        ];
+        for e in errors {
+            let m = e.to_string();
+            assert!(m.len() < PARSER_EXCERPT_BYTES + 200, "{} bytes", m.len());
+            assert!(m.contains(&"x".repeat(PARSER_EXCERPT_BYTES)), "{m}");
+            assert!(m.contains("100000 bytes"), "{m}");
+        }
+        // Short output is quoted whole, with no size note.
+        let m = parse_numstat_z(b"x\ty\tp\0").unwrap_err().to_string();
+        assert!(m.contains("x\\ty\\tp\\0") && !m.contains("bytes"), "{m}");
+    }
+
+    #[test]
+    fn numstat_and_ls_tree_parsers_fail_closed() {
+        assert_eq!(parse_numstat_z(b"3\t1\tp\0").unwrap(), vec![false]);
+        assert_eq!(parse_numstat_z(b"-\t-\tp\0").unwrap(), vec![true]);
+        assert_eq!(parse_numstat_z(b"0\t0\t\0old\0new\0").unwrap(), vec![false]);
+        assert_eq!(parse_numstat_z(b"-\t-\t\0old\0new\0").unwrap(), vec![true]);
+        assert_eq!(parse_numstat_z(b"").unwrap(), Vec::<bool>::new());
+        for bad in [&b"3\tp\0"[..], b"-\t-\t\0old\0", b"x\ty\tp\0"] {
+            assert!(parse_numstat_z(bad).is_err(), "{bad:?}");
+        }
+        let oid = "b5660615986901aceae1450e10650892e191e6a0";
+        assert_eq!(
+            parse_ls_tree_blob_z(format!("100644 blob {oid}\tp\0").as_bytes()).unwrap(),
+            Some(oid.to_string())
+        );
+        assert_eq!(parse_ls_tree_blob_z(b"").unwrap(), None);
+        for bad in [
+            format!("160000 commit {oid}\tp\0"),
+            format!("100644 blob {oid}\tp\0100644 blob {oid}\tq\0"),
+            "100644 blob nothex\tp\0".to_string(),
+            "garbage\0".to_string(),
+        ] {
+            assert!(parse_ls_tree_blob_z(bad.as_bytes()).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

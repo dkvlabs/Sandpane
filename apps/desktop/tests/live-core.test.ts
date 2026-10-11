@@ -109,23 +109,25 @@ describeLive("real Core answers the way the mirror claims", () => {
       "task.list",
       "conversation.list",
       "conversation.history",
-      // A3b: the five conversation-lifecycle methods (27 in all).
+      // A3b: the five conversation-lifecycle methods.
       ...CONVERSATION_LIFECYCLE_METHODS,
+      // A5: git.diff (28 in all).
+      "git.diff",
     ];
     for (const method of additive) {
       expect(coreAdvertisesMethod(outcome.capabilities, method)).toBe(true);
     }
     // Every advertised name must be one this client is allowed to call, and an
-    // A3b Core advertises exactly this client's 27, in Method::ALL order.
+    // A5 Core advertises exactly this client's 28, in Method::ALL order.
     const allowlist: readonly string[] = METHODS;
     for (const advertised of outcome.capabilities.methods ?? []) {
       expect(allowlist).toContain(advertised);
     }
     expect(outcome.capabilities.methods).toEqual([...METHODS]);
-    expect(METHODS).toHaveLength(27);
+    expect(METHODS).toHaveLength(28);
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SANDBOX_ID)).toBe(true);
     // A4: conversation-send-mode, and an A4 Core advertises exactly this
-    // client's known features (no method was added: still 27).
+    // client's known features (A4 added no method; A5 added git.diff: 28).
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SEND_MODE)).toBe(true);
     expect(outcome.capabilities.features).toEqual([...KNOWN_FEATURES]);
   });

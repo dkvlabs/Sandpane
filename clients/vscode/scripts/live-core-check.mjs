@@ -139,8 +139,8 @@ async function main() {
 
   // ---- method advertisement (the discovery revision) --------------------
   check(
-    'system.probe advertises exactly the 27 methods the client allowlists',
-    Array.isArray(caps.methods) && caps.methods.length === 27 && caps.methods.join(',') === CORE_METHODS.join(','),
+    'system.probe advertises exactly the 28 methods the client allowlists',
+    Array.isArray(caps.methods) && caps.methods.length === 28 && caps.methods.join(',') === CORE_METHODS.join(','),
     (caps.methods ?? []).join(','),
   );
   const schemaMethods = JSON.parse(
@@ -184,6 +184,14 @@ async function main() {
       .every((m) => coreAdvertisesMethod(caps, m)) &&
       (caps.methods ?? []).indexOf('conversation.rename') === (caps.methods ?? []).indexOf('conversation.history') + 1,
     (caps.methods ?? []).filter((m) => m.startsWith('conversation.')).join(','),
+  );
+  // A5: git.diff is advertised right after git.review (exercised below on a
+  // wire-created task, which has no Git context until A4b).
+  check(
+    'A5: Core advertises git.diff, right after git.review',
+    coreAdvertisesMethod(caps, 'git.diff') &&
+      (caps.methods ?? []).indexOf('git.diff') === (caps.methods ?? []).indexOf('git.review') + 1,
+    (caps.methods ?? []).filter((m) => m.startsWith('git.')).join(','),
   );
   // A2: advertisement only. This harness never sends a keyed sandbox.create
   // (it would drive the real sbx); keyed sends are not exercised here either.
@@ -331,6 +339,19 @@ async function main() {
     'git.review refuses instead of inventing a diff (no Git context)',
     reviewError?.code === 'VALIDATION_FAILED' || reviewError?.code === 'NOT_FOUND',
     `${reviewError?.code}: ${reviewError?.message}`,
+  );
+
+  // A5: a wire-created task has no Git context, so git.diff refuses with
+  // Core's exact message (no patch is ever invented).
+  let diffError = null;
+  await commands.gitDiff({ taskId: summary.id, path: 'README.md', status: 'modified' }).catch((e) => {
+    diffError = e;
+  });
+  check(
+    'A5: git.diff on a wire-created task answers "task has no Git context"',
+    diffError?.code === 'VALIDATION_FAILED' &&
+      String(diffError?.message ?? '').endsWith('task has no Git context (repo binding + base_commit)'),
+    `${diffError?.code}: ${diffError?.message}`,
   );
 
   let applyError = null;

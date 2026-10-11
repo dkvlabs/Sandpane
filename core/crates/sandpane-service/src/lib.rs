@@ -47,12 +47,12 @@ use sandpane_protocol::{
     ConversationCreateParams, ConversationDeleteParams, ConversationExportParams,
     ConversationHistoryParams, ConversationHistoryResult, ConversationIdParams,
     ConversationListParams, ConversationRenameParams, ConversationSendParams, CoreCapabilities,
-    ErrorCode, FileChange, FileChangeStatus, GitApplyParams, MessageRecord, Method, Project,
-    ProjectCreateParams, ProjectDeleteParams, ProjectIdParams, ProjectRepositoryParams,
-    ProjectUpdateParams, RpcRequest, RpcResponse, SandboxCreateSpec, SandboxRemoveParams,
-    SandboxRemoveResult, SandboxStopParams, SandboxStopResult, SandboxSummary, SbxStatus,
-    TaskEvent, TaskListParams, TaskStatus, TaskSubscribeParams, TaskSummary, WorkspaceMode,
-    CORE_VERSION, PROTOCOL_VERSION,
+    ErrorCode, FileChange, FileChangeStatus, GitApplyParams, GitDiffParams, GitDiffResult,
+    MessageRecord, Method, Project, ProjectCreateParams, ProjectDeleteParams, ProjectIdParams,
+    ProjectRepositoryParams, ProjectUpdateParams, RpcRequest, RpcResponse, SandboxCreateSpec,
+    SandboxRemoveParams, SandboxRemoveResult, SandboxStopParams, SandboxStopResult, SandboxSummary,
+    SbxStatus, TaskEvent, TaskListParams, TaskStatus, TaskSubscribeParams, TaskSummary,
+    WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
 };
 
 /// Bounded frame size: refuse oversized input instead of buffering forever
@@ -946,6 +946,9 @@ fn dispatch(
             Some(t) => git_review(inner, t).map_err(Into::into),
             None => Err((ErrorCode::ValidationFailed, "taskId required".to_string()).into()),
         },
+        Method::GitDiff => parse_params::<GitDiffParams>(params)
+            .and_then(|p| git_diff(inner, p))
+            .map_err(Into::into),
         Method::GitApply => parse_params::<GitApplyParams>(params)
             .and_then(|p| git_apply(inner, p))
             .map_err(Into::into),
@@ -3672,7 +3675,47 @@ fn git_context(inner: &ServerInner, task_id: &str) -> Result<TaskGitContext, Svc
 ///   to the task;
 /// - `direct_mount` (and legacy rows with no mode) → the live host tree;
 /// - `sbx_clone` → refused: the work lives in the sandbox's private clone.
+///
+/// Whatever the mode, the target is then CONFIRMED (A5 security C1): git's
+/// own, unpinned answer for the top level of the target must be the target
+/// itself. A repository-local `core.worktree` (agent-writable in a
+/// direct_mount) that sends git elsewhere is refused here, once, for both
+/// `git.review` and `git.diff` — every later call is also pinned
+/// (`--work-tree`), so this is defence in depth, not the only barrier.
 fn review_target(inner: &ServerInner, ctx: &TaskGitContext) -> Result<PathBuf, SvcError> {
+    let target = review_target_by_mode(inner, ctx)?;
+    confirm_work_tree(inner, &target)?;
+    Ok(target)
+}
+
+/// Refuse (VALIDATION_FAILED, [`MSG_WORK_TREE_REDIRECTED`]) when git's
+/// unpinned `rev-parse --show-toplevel` in `target` is not `target`
+/// (compared canonically), or cannot be answered at all — a `core.worktree`
+/// naming a missing directory fails that way. A target that is itself
+/// unusable stays INTERNAL. Runs no git under the DB lock (none is held).
+fn confirm_work_tree(inner: &ServerInner, target: &Path) -> Result<(), SvcError> {
+    let redirected = || {
+        (
+            ErrorCode::ValidationFailed,
+            MSG_WORK_TREE_REDIRECTED.to_string(),
+        )
+    };
+    let want = std::fs::canonicalize(target).map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!("work tree {} is not usable: {e}", target.display()),
+        )
+    })?;
+    let top = inner.git.show_toplevel(target).map_err(|_| redirected())?;
+    let top = std::fs::canonicalize(&top).map_err(|_| redirected())?;
+    if top == want {
+        Ok(())
+    } else {
+        Err(redirected())
+    }
+}
+
+fn review_target_by_mode(inner: &ServerInner, ctx: &TaskGitContext) -> Result<PathBuf, SvcError> {
     let repo = Path::new(&ctx.repo_path);
     let mode = match &ctx.workspace_mode {
         None => None,
@@ -3753,21 +3796,230 @@ fn git_review(inner: &ServerInner, task_id: String) -> Result<serde_json::Value,
         task_id,
         base_commit,
         host_dirty: dirty,
+        // A5 §3.5 item 2: the integration target `hostDirty` describes.
+        repo_path: Some(ctx.repo_path.clone()),
+        // Defined, never produced in A5 (submodules are refused above).
+        uninspected: None,
         changes: changes
             .into_iter()
             .map(|c| FileChange {
+                status: file_change_status(&c.status),
+                old_path: c.old_path,
                 path: c.path,
-                status: match c.status.as_str() {
-                    "added" => FileChangeStatus::Added,
-                    "deleted" => FileChangeStatus::Deleted,
-                    "renamed" => FileChangeStatus::Renamed,
-                    "untracked" => FileChangeStatus::Untracked,
-                    _ => FileChangeStatus::Modified,
-                },
             })
             .collect(),
     };
     serde_json::to_value(change_set).map_err(internal)
+}
+
+fn file_change_status(raw: &str) -> FileChangeStatus {
+    match raw {
+        "added" => FileChangeStatus::Added,
+        "deleted" => FileChangeStatus::Deleted,
+        "renamed" => FileChangeStatus::Renamed,
+        "untracked" => FileChangeStatus::Untracked,
+        _ => FileChangeStatus::Modified,
+    }
+}
+
+/// `git.diff` (A5, §3.5 item 3): one file's patch from the task's change
+/// list. Read-only. The task context is read under the DB lock (released
+/// before any git or file I/O); then the SAME checks as `git.review` run, in
+/// the same order — review target, base, host submodule refusal, the change
+/// list (which refuses submodules in the target) — and `path` must equal an
+/// entry of that freshly recomputed list byte for byte.
+fn git_diff(inner: &ServerInner, p: GitDiffParams) -> Result<serde_json::Value, SvcError> {
+    let ctx = git_context(inner, &p.task_id)?;
+    let target = review_target(inner, &ctx)?;
+    let Some(base_commit) = ctx.base_commit.clone() else {
+        return Err((
+            ErrorCode::ValidationFailed,
+            "task has no Git context (repo binding + base_commit)".to_string(),
+        ));
+    };
+    let repo = Path::new(&ctx.repo_path);
+    // `git.review` refuses a HOST repository with submodules (through its
+    // dirty check); the task worktree has its own index, so the change list
+    // alone would not. Same refusal, same order.
+    inner
+        .git
+        .refuse_submodules(repo)
+        .map_err(review_git_error)?;
+    let changes = inner
+        .git
+        .change_list(&target, &base_commit)
+        .map_err(review_git_error)?;
+    let entry = gate_change(changes, &p.path, p.status)?;
+    let cap = sandpane_core::diff::clamp_max_bytes(p.max_bytes);
+    let status = file_change_status(&entry.status);
+    let result = if status == FileChangeStatus::Untracked {
+        untracked_diff(&target, entry, status, cap)?
+    } else {
+        tracked_diff(inner, &target, &base_commit, entry, status, cap)?
+    };
+    serde_json::to_value(result).map_err(internal)
+}
+
+/// The change-list entry whose `path` equals `path` byte for byte (§3.5
+/// item 3: no prefix, glob, `..` or other form) and, when given, whose
+/// status is `status`. A path listed more than once (A5 security I2: e.g.
+/// `deleted` + `untracked` after `git rm --cached`) is refused unless
+/// `status` picks exactly one — never an arbitrary choice. An entry git
+/// reported as non-UTF-8 is refused: its lossy string cannot name the file.
+fn gate_change(
+    changes: Vec<scoregit::RawChange>,
+    path: &str,
+    status: Option<FileChangeStatus>,
+) -> Result<scoregit::RawChange, SvcError> {
+    let mut matches: Vec<scoregit::RawChange> = changes
+        .into_iter()
+        .filter(|c| c.path.as_bytes() == path.as_bytes())
+        .filter(|c| status.is_none_or(|s| file_change_status(&c.status) == s))
+        .collect();
+    let entry = match matches.len() {
+        0 => {
+            return Err((
+                ErrorCode::ValidationFailed,
+                MSG_DIFF_PATH_NOT_IN_LIST.to_string(),
+            ))
+        }
+        1 => matches.remove(0),
+        _ => {
+            return Err((
+                ErrorCode::ValidationFailed,
+                MSG_DIFF_PATH_LISTED_TWICE.to_string(),
+            ))
+        }
+    };
+    if !entry.exact {
+        return Err((
+            ErrorCode::ValidationFailed,
+            MSG_DIFF_PATH_NOT_EXACT.to_string(),
+        ));
+    }
+    Ok(entry)
+}
+
+/// A tracked entry: binary probe (`--numstat -z`), then the display-capped
+/// patch (never `--binary`), then the base blob. Pathspecs come from the
+/// matched entry (both sides for a rename).
+fn tracked_diff(
+    inner: &ServerInner,
+    target: &Path,
+    base: &str,
+    entry: scoregit::RawChange,
+    status: FileChangeStatus,
+    cap: usize,
+) -> Result<GitDiffResult, SvcError> {
+    let git_err = |e: scoregit::GitError| (ErrorCode::Internal, e.to_string());
+    let new_side = scoregit::LiteralPathspec::from_change(&entry).map_err(git_err)?;
+    let old_side = scoregit::LiteralPathspec::from_old_path(&entry).map_err(git_err)?;
+    let mut specs = vec![new_side.clone()];
+    specs.extend(old_side.clone());
+    let binary = inner
+        .git
+        .diff_is_binary(target, base, &specs)
+        .map_err(git_err)?;
+    let (patch, truncated, lossy) = if binary {
+        (String::new(), false, false)
+    } else {
+        let (bytes, more) = inner
+            .git
+            .diff_patch_display(target, base, &specs, cap)
+            .map_err(git_err)?;
+        let (cut, truncated) = sandpane_core::diff::cut_display(&bytes, cap, more);
+        let (text, lossy) = sandpane_core::diff::decode_display(&cut);
+        (text, truncated, lossy)
+    };
+    let base_blob = match status {
+        FileChangeStatus::Added => None,
+        _ => {
+            let side = entry.old_path.as_deref().unwrap_or(&entry.path);
+            let side_spec = old_side.as_ref().unwrap_or(&new_side);
+            match inner
+                .git
+                .base_blob(target, base, side_spec)
+                .map_err(git_err)?
+            {
+                Some(oid) => Some(oid),
+                // A modified/deleted/renamed entry MUST exist in the base.
+                None => {
+                    return Err((
+                        ErrorCode::Internal,
+                        format!("{side:?} is listed as {status:?} but is not in the base tree"),
+                    ))
+                }
+            }
+        }
+    };
+    Ok(GitDiffResult {
+        path: entry.path,
+        old_path: entry.old_path,
+        status,
+        patch,
+        binary,
+        truncated,
+        lossy,
+        base_blob,
+    })
+}
+
+/// An untracked entry: Core reads it itself (git has no diff for it) with
+/// the hardened component-wise open (`sandpane_core::diff::read_untracked`)
+/// and synthesizes a new-file patch, cut to `cap` like any other.
+fn untracked_diff(
+    target: &Path,
+    entry: scoregit::RawChange,
+    status: FileChangeStatus,
+    cap: usize,
+) -> Result<GitDiffResult, SvcError> {
+    use sandpane_core::diff::{self, UntrackedContent, UntrackedError};
+    let refused = |m: String| {
+        (
+            ErrorCode::ValidationFailed,
+            format!("{m}; nothing was read"),
+        )
+    };
+    let read = match diff::read_untracked(target, &entry.path, cap) {
+        Ok(read) => read,
+        Err(UntrackedError::Escapes(m))
+        | Err(UntrackedError::NotAFile(m))
+        | Err(UntrackedError::Changed(m)) => return Err(refused(m)),
+        Err(UntrackedError::Io(e)) => {
+            return Err((
+                ErrorCode::Internal,
+                format!("reading untracked {:?} failed: {e}", entry.path),
+            ))
+        }
+    };
+    let mode = read.mode();
+    let (content, partial) = match read {
+        UntrackedContent::File {
+            bytes, over_cap, ..
+        } => (bytes, over_cap),
+        UntrackedContent::Symlink { target } => (target, false),
+    };
+    let binary = diff::is_binary(&content);
+    let (patch, truncated, lossy) = if binary {
+        (String::new(), false, false)
+    } else {
+        // The cap bounds the FINISHED patch; a cut keeps whole lines and an
+        // honest hunk header.
+        let (bounded, truncated) =
+            diff::new_file_patch_within(&entry.path, mode, &content, partial, cap);
+        let (text, lossy) = diff::decode_display(&bounded);
+        (text, truncated, lossy)
+    };
+    Ok(GitDiffResult {
+        path: entry.path,
+        old_path: None,
+        status,
+        patch,
+        binary,
+        truncated,
+        lossy,
+        base_blob: None,
+    })
 }
 
 /// `git.review` error mapping: a submodule refusal is a structured
@@ -3779,6 +4031,24 @@ fn review_git_error(e: scoregit::GitError) -> SvcError {
         other => (ErrorCode::Internal, other.to_string()),
     }
 }
+
+/// A5 security C1: git resolves the task's work tree somewhere other than
+/// its recorded directory (`git.review` and `git.diff`).
+pub const MSG_WORK_TREE_REDIRECTED: &str =
+    "git does not place this task's work tree at its recorded directory (is a repository-local \
+     core.worktree set?); nothing was read";
+
+/// §3.5 item 3 — clients match on this exact string.
+pub const MSG_DIFF_PATH_NOT_IN_LIST: &str =
+    "path is not in this task's change list; nothing was read";
+/// A5 security I2: the path names more than one change-list entry and no
+/// (or no disambiguating) `status` was given.
+pub const MSG_DIFF_PATH_LISTED_TWICE: &str =
+    "path is listed more than once in this task's change list; pass its status; nothing was read";
+/// A5 decision (not in §3.5): git reported this entry's path (or old path)
+/// as non-UTF-8 bytes; the lossy display string cannot name the file.
+pub const MSG_DIFF_PATH_NOT_EXACT: &str =
+    "this path is not valid UTF-8, so Core cannot name the file exactly; nothing was read";
 
 fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value, SvcError> {
     // Security W3: the client's base assertion must be a FULL object id and
@@ -4029,6 +4299,90 @@ mod tests {
         })
         .unwrap();
         serde_json::from_str(&handle_line(i, &line)).unwrap()
+    }
+
+    /// A5 §3.5 item 3: the path gate is byte-exact against the recomputed
+    /// list, and an entry whose path (or old path) git reported as non-UTF-8
+    /// is refused — a lossy string can never name the file.
+    #[test]
+    fn git_diff_path_gate_is_exact_and_refuses_lossy_entries() {
+        let changes = || {
+            vec![
+                scoregit::RawChange::new("a.txt", "modified"),
+                scoregit::RawChange {
+                    exact: false,
+                    ..scoregit::RawChange::new("caf\u{fffd}.txt", "untracked")
+                },
+                scoregit::RawChange {
+                    old_path: Some("o\u{fffd}".into()),
+                    exact: false,
+                    ..scoregit::RawChange::new("renamed.txt", "renamed")
+                },
+            ]
+        };
+        assert_eq!(gate_change(changes(), "a.txt", None).unwrap().path, "a.txt");
+        for bad in ["", "a.tx", "a.txt ", "A.txt", "./a.txt"] {
+            let e = gate_change(changes(), bad, None).unwrap_err();
+            assert_eq!(e.0, ErrorCode::ValidationFailed);
+            assert_eq!(e.1, MSG_DIFF_PATH_NOT_IN_LIST, "{bad:?}");
+        }
+        for lossy in ["caf\u{fffd}.txt", "renamed.txt"] {
+            let e = gate_change(changes(), lossy, None).unwrap_err();
+            assert_eq!(e.0, ErrorCode::ValidationFailed, "{lossy}");
+            assert_eq!(e.1, MSG_DIFF_PATH_NOT_EXACT, "{lossy}");
+        }
+        // I2: a path listed twice needs its status; a wrong status is
+        // not in the list; a right one picks exactly that entry.
+        let dup = || {
+            vec![
+                scoregit::RawChange::new("d.txt", "deleted"),
+                scoregit::RawChange::new("d.txt", "untracked"),
+            ]
+        };
+        let e = gate_change(dup(), "d.txt", None).unwrap_err();
+        assert_eq!(
+            e,
+            (
+                ErrorCode::ValidationFailed,
+                MSG_DIFF_PATH_LISTED_TWICE.into()
+            )
+        );
+        for s in [FileChangeStatus::Deleted, FileChangeStatus::Untracked] {
+            let got = gate_change(dup(), "d.txt", Some(s)).unwrap();
+            assert_eq!(file_change_status(&got.status), s);
+        }
+        let e = gate_change(dup(), "d.txt", Some(FileChangeStatus::Modified)).unwrap_err();
+        assert_eq!(e.1, MSG_DIFF_PATH_NOT_IN_LIST);
+        let e = gate_change(changes(), "a.txt", Some(FileChangeStatus::Added)).unwrap_err();
+        assert_eq!(e.1, MSG_DIFF_PATH_NOT_IN_LIST);
+    }
+
+    /// A5 §3.5 item 3 bounds: the LARGEST possible `git.diff` answer — a
+    /// maximal patch of control characters (each JSON-escaped six-fold) plus
+    /// long path / oldPath — still fits one frame.
+    #[test]
+    fn a_maximal_git_diff_response_fits_one_frame() {
+        let nasty_path = "\u{1}".repeat(4096);
+        let result = sandpane_protocol::GitDiffResult {
+            path: nasty_path.clone(),
+            old_path: Some(nasty_path),
+            status: FileChangeStatus::Renamed,
+            patch: "\u{1}".repeat(sandpane_core::diff::MAX_DIFF_BYTES),
+            binary: false,
+            truncated: true,
+            lossy: true,
+            base_blob: Some("f".repeat(64)),
+        };
+        let frame = serde_json::to_string(&RpcResponse::ok(
+            "x".repeat(128),
+            serde_json::to_value(result).unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            frame.len() > 6 * sandpane_core::diff::MAX_DIFF_BYTES,
+            "escaping is real"
+        );
+        assert!(frame.len() < MAX_FRAME_BYTES, "{} bytes", frame.len());
     }
 
     /// A4 §3.4 item 1 — hash stability. These fingerprints were computed at

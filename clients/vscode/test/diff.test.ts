@@ -73,10 +73,43 @@ describe('vscode.diff argument builder', () => {
     }
   });
 
-  it('refuses a renamed file because the ChangeSet has no old path', () => {
+  it('refuses a renamed file when Core sent no old path (pre-A5 Core)', () => {
     const result = plan('renamed', 'src/NewName.ts');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toMatch(/rename/i);
+  });
+
+  it('A5: diffs a rename base(oldPath) \u2194 working(path) when Core sent oldPath', () => {
+    const result = buildDiffPlan({
+      repoRoot: REPO,
+      changeSet: changeSet(),
+      change: { path: 'src/NewName.ts', status: 'renamed', oldPath: 'src/OldName.ts' },
+    });
+    expect(result.ok && result.kind).toBe('diff');
+    if (result.ok && result.kind === 'diff') {
+      expect(result.plan.args[0]).toEqual({ scheme: 'git', fsPath: `${REPO}/src/OldName.ts`, ref: BASE });
+      expect(result.plan.args[1]).toEqual({ scheme: 'file', fsPath: `${REPO}/src/NewName.ts` });
+      expect(result.plan.args[2]).toContain('src/OldName.ts \u2192 src/NewName.ts');
+    }
+    const escaping = buildDiffPlan({
+      repoRoot: REPO,
+      changeSet: changeSet(),
+      change: { path: 'src/NewName.ts', status: 'renamed', oldPath: '../outside.ts' },
+    });
+    expect(escaping.ok).toBe(false);
+  });
+
+  it('A5: exact review paths (real tab / newline, no C-quoting) join to the repo root byte-exact; the title is revealed', () => {
+    const path = 'dir/new\nline\t"q".txt';
+    const result = plan('modified', path);
+    expect(result.ok && result.kind).toBe('diff');
+    if (result.ok && result.kind === 'diff') {
+      expect(result.plan.args[0]).toEqual({ scheme: 'git', fsPath: `${REPO}/${path}`, ref: BASE });
+      expect(result.plan.args[1]).toEqual({ scheme: 'file', fsPath: `${REPO}/${path}` });
+      // One visible line: the editor title never breaks on Core's newline.
+      expect(result.plan.args[2]).not.toMatch(/[\n\t]/);
+      expect(result.plan.args[2]).toContain('dir/new\\nline\\t"q".txt');
+    }
   });
 
   it('refuses when Core recorded no base commit', () => {

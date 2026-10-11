@@ -75,7 +75,20 @@ that sandbox; `TaskSummary.sandboxName` keeps its pre-A4 binding-only
 meaning) — are likewise defined by the Rust types; no method is added and no
 enum is added to any schema. The `conversation-send-mode`
 feature is in `core-capabilities` (gated by `schema-drift`). Client adoption
-pending (A4 client step). The
+pending (A4 client step). A5 adds the read-only method `git.diff` (28
+methods; in `rpc-request`'s enum right after `git.review`, gated by
+`schema-drift`) with `GitDiffParams {taskId, path, maxBytes?, status?}` and
+`GitDiffResult {path, oldPath?, status, patch, binary, truncated, lossy,
+baseBlob?}` defined by the Rust types; `change-set.schema.json` gains the
+optional `repoPath`, `uninspected` (defined, never produced in A5) and
+`changes[].oldPath` together with the Rust `ChangeSet` / `FileChange`. Since
+A5 a change-list `path` is exactly git's (NUL-separated, never C-quoted), and
+`git.diff` accepts only that exact string. A path can be listed twice (for
+example `deleted` and `untracked` after `git rm --cached`): `git.diff` then
+refuses (`VALIDATION_FAILED`) unless the optional `status` — one of the
+`changes[].status` values — names the entry; when given, path and status
+must both match. Client adoption pending (A5 client
+step). The
 `docs/specs/02 §2` contract blocks are the
 human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7

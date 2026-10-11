@@ -20,10 +20,11 @@ an earlier revision of this README claimed that while the crate did not compile 
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A4 send-mode pass, 2026-10-11
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A5 git.diff pass, 2026-10-11
 
-Run fresh after the A4 `conversation.send` mode client work (protocol design 2026-10-09 §3.4), against
-the A4 Core + schema in the working tree, on top of the A3b conversation-lifecycle work (§3.3) and
+Run fresh after the A5 `git.diff` + ChangeSet fields client work (protocol design 2026-10-09 §3.5),
+against the A5 Core + schema in the working tree, on top of the A4 send-mode work (§3.4), the A3b
+conversation-lifecycle work (§3.3) and
 the A3a project-lifecycle work (§3.2), the A2 idempotency work and its review fixes
 (W1–W4, I4, I5) and the A1 sandbox-lifecycle work and its review fixes. Every row below is a command that was actually run, with its actual
 result, except where a row says it was not re-run:
@@ -31,13 +32,13 @@ result, except where a row says it was not re-run:
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **19 files, 583 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm test` (`vitest run`) | OK — **20 files, 607 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
 | `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
 | `cd src-tauri && cargo fmt --check` | OK — no diff |
-| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b / A4 passes (`clippy --all-targets` below compiles the crate) |
+| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b / A4 / A5 passes (`clippy --all-targets` below compiles the crate) |
 | `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
-| `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 27; the six A3a project methods and the five A3b conversation methods are allowlisted and never replay-safe; all five A3b methods and the A3a methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s) |
-| `make desktop-check` (repo root) | NOT re-run in the A3b / A4 passes (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
+| `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 28; the six A3a project methods, the five A3b conversation methods and A5's `git.diff` are allowlisted and never replay-safe; the A3a and A3b methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s, and `git.review` / `git.diff` are at 43 s) |
+| `make desktop-check` (repo root) | NOT re-run in the A3b / A4 / A5 passes (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
 | `npm run lint --if-present` | No `lint` script in this package — nothing ran |
 
 **Correction of an earlier claim.** A previous revision of this table reported `cargo check` OK
@@ -225,6 +226,50 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 | Clipboard write inside the Tauri webview | **UNVERIFIED** — the Copy path is tested with an injected clipboard; WebKit permission behaviour in the native window was never exercised |
 | `ChatPanel` wiring (settings section, disabled Send on an archived chat) | Not SSR-renderable in this suite (external-store hooks); the pieces it composes are tested, the panel itself is **UNVERIFIED** |
 | `tests/live-core.test.ts` A3b pins (27 methods, `conversation-sandbox-id` advertised) | Updated, **not run** (skips without `SANDPANE_SOCKET`) |
+
+### A5 git.diff — what the desktop does, and status
+
+- **Methods: 28.** `git.diff` sits between `git.review` and `git.apply` (drift-tested against Rust
+  `Method::ALL`, the schema, and the proxy's `Method::ALL.len()` test). It is NOT replay-safe (TS
+  `REPLAY_SAFE_METHODS` and Rust `replay_safe`). `git.review` and `git.diff` get the git deadline:
+  webview 45 s, proxy 43 s, pinned on both sides.
+- **Change set.** `ChangeSet.repoPath` is shown (revealed); `FileChange.oldPath` is shown as
+  `oldPath → path` for renames; `uninspected` (never produced by an A5 Core) would show "N paths
+  were not inspected — this change set is not complete", and an empty list is then never called
+  an empty change set. Paths are exact since A5 (no C-quoting); they are revealed on display, so a
+  tab or newline in a file name is visible.
+- **Diff action.** Every change-set entry gets a Diff button, gated on `git.diff` being advertised
+  (otherwise disabled with "not supported by this Core"). It sends `{taskId, path, status}` with
+  the entry's `path` byte for byte (never trimmed or normalized) and ALWAYS its `status` (a path
+  can be listed twice). `maxBytes` is omitted (Core's default 262 144); the client never sends
+  more than 524 288. An entry whose status this build does not recognise cannot be diffed.
+- **Rendering.** The patch is untrusted text: a read-only monospace `<pre>` of React text
+  children (never `dangerouslySetInnerHTML`), split on LF, each line revealed (hidden, control,
+  bidi characters, CR and U+2028 become `\u` escapes; the line is marked "!"; tabs stay), capped at
+  2 000 lines × 1 000 characters with the rest counted. File names come from the JSON
+  `path` / `oldPath` only. A Copy button copies the patch exactly as Core returned it and reports
+  failure honestly. The view says it is display only; the patch is never applied, written to
+  the repository or run.
+- **Disclosures.** `binary`: "treated as binary (possibly by repository attributes) — no text diff
+  shown"; `truncated`: "diff truncated at N bytes"; `lossy`: "contains bytes that are not valid
+  UTF-8; shown with replacement characters"; renames `oldPath → path`; a `new file mode 120000`
+  header (read only before the first hunk) as "symlink → target"; `baseBlob` as a short id; an
+  empty non-binary patch as "Core returned an empty patch …". Never "no changes".
+- **Honest copy.** Core's exact refusals (path not in the change list, listed twice, not valid
+  UTF-8, work tree redirected, no Git context, worktree removed, submodules, and the untracked
+  read refusals ending "; nothing was read") map to "Nothing was read — …" (drift-tested against
+  `sandpane-service`, `git.rs`, `diff.rs`). A timeout is "Core did not answer in time — no file was
+  changed (git.diff is read-only)"; INTERNAL is "Core could not produce the diff — no file was
+  changed …". `git.diff` failures never use the "may have been applied" wording of writes.
+
+| Item | Status |
+| --- | --- |
+| Frames, gating, decoding, disclosures, copy, deadlines, SSR of the diff view | Functional headless: `tests/git-diff.test.ts` (24 tests) against an in-memory FakeCore. **UNVERIFIED live** — never run against a real A5 Core, never in the running desktop app |
+| FakeCore `git.review` (exact paths, `repoPath`, `oldPath`) / `git.diff` (path + status gate, truncation, binary, refusals) | **Modeled** on `sandpane-service/src/lib.rs` (working tree, §3.5), **not captured** |
+| A diff of a real task | **UNVERIFIED and not reachable over the wire today**: no wire-created task has Git context until A4b, so a real Core answers "task has no Git context" |
+| The Diff button, the open diff and Copy inside `ReviewPanel` | `ReviewPanel` is not SSR-rendered in this suite; `DiffView` and the pure helpers are tested, the wiring is **UNVERIFIED** |
+| Clipboard in the Tauri webview | **UNVERIFIED** (tested with an injected clipboard) |
+| `tests/live-core.test.ts` A5 pins (28 methods, `git.diff` advertised) | Updated, **not run** |
 
 ### A4 send mode — what the desktop does, and status
 
@@ -565,7 +610,8 @@ a non-compiling shell can no longer hide behind a green `make check`.
   under Verification). Start stays unsupported because sbx v0.47 has no `start` command. Still
   deferred: capability-gated advanced wizard options, and project↔sandbox binding beyond
   `sandbox.create`.
-- **DT3:** real diff text viewer (no `git.diff` in v1), selective apply UX, verification
+- **DT3:** read-only per-file diff text is implemented (A5 `git.diff`; see "A5 git.diff" under
+  Verification). Still deferred: a side-by-side viewer, selective apply UX, verification
   history, "open in IDE", approval responses (no approval RPC exists).
 - **DT4:** network policy, port publishing (loopback by default), templates, MCP, secret
   presence, redacted diagnostics export, native-app/SSH wizard.

@@ -52,6 +52,7 @@ import type {
   ProjectUpdateParams,
   SandboxCreateSpec,
   SendMode,
+  GitDiffParams,
   SandboxRemoveResult,
   SandboxStopResult,
   SandboxSummary,
@@ -61,6 +62,8 @@ import type {
   TaskSummary,
 } from './protocol';
 import {
+  FILE_CHANGE_STATUSES,
+  MAX_DIFF_BYTES,
   SBX_AGENTS,
   SEND_MODES,
   isSbxAgent,
@@ -514,6 +517,20 @@ export const SANDBOX_STOP_TIMEOUT_MS = 360_000;
  * (the outcome is then reported UNKNOWN, never as a failure).
  */
 export const PROJECT_GIT_TIMEOUT_MS = 45_000;
+
+/**
+ * A5 (§3.5 item 5): `git.review` and `git.diff` run git under
+ * `RunLimits::QUERY` (30 s per run) — the same 45 s git deadline. A single
+ * `git.diff` may run git several times, so it can still exceed this; it is
+ * read-only, so a timeout changed nothing.
+ */
+export const GIT_QUERY_TIMEOUT_MS = PROJECT_GIT_TIMEOUT_MS;
+
+/** A5: `maxBytes` exactly as Core clamps it (1..=MAX_DIFF_BYTES); absent stays absent. */
+export function clampDiffBytes(maxBytes: number | undefined): number | undefined {
+  if (maxBytes === undefined || !Number.isFinite(maxBytes)) return undefined;
+  return Math.min(MAX_DIFF_BYTES, Math.max(1, Math.trunc(maxBytes)));
+}
 
 /**
  * `sandbox.remove` (either step) — step 1 probes the target, step 2 runs
@@ -1008,8 +1025,36 @@ export class CoreCommands {
   /** `{taskId}` → `ChangeSet` (base commit, dirty host flag, per-file status). */
   gitReview(taskId: string): Promise<ChangeSet> {
     return guarded(() =>
-      this.connection.request<ChangeSet>('git.review', { taskId: requireId(taskId, 'taskId') }),
+      this.connection.request<ChangeSet>(
+        'git.review',
+        { taskId: requireId(taskId, 'taskId') },
+        { timeoutMs: GIT_QUERY_TIMEOUT_MS },
+      ),
     );
+  }
+
+  /**
+   * A5: `{taskId, path, status, maxBytes?}` → `GitDiffResult` (display only).
+   * `path` goes out byte-for-byte as `git.review` returned it — no trimming,
+   * normalizing or path validation (Core gates it against the change list,
+   * so a client check could only be stricter than Core). `status` is always
+   * sent. The answer is untrusted; callers shape-check it before display.
+   */
+  gitDiff(params: GitDiffParams): Promise<unknown> {
+    return guarded(() => {
+      if (typeof params.path !== 'string') throw new CoreValidationError('path', 'must be a string');
+      if (!(FILE_CHANGE_STATUSES as readonly unknown[]).includes(params.status)) {
+        throw new CoreValidationError('status', `must be one of ${FILE_CHANGE_STATUSES.join(', ')}`);
+      }
+      const payload: Record<string, unknown> = {
+        taskId: requireId(params.taskId, 'taskId'),
+        path: params.path,
+        status: params.status,
+      };
+      const maxBytes = clampDiffBytes(params.maxBytes);
+      if (maxBytes !== undefined) payload['maxBytes'] = maxBytes;
+      return this.connection.request<unknown>('git.diff', payload, { timeoutMs: GIT_QUERY_TIMEOUT_MS });
+    });
   }
 
   /** Explicit, base-checked Git integration. Never a file overwrite (specs/06 §6). */

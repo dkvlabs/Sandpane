@@ -513,6 +513,42 @@ class CoreCommands(
             }
     }
 
+    /**
+     * `git.diff` (A5): one entry of the task's `git.review` change list. [change]'s `path` is sent
+     * EXACTLY as Core listed it (no trim, normalization or validation), with its wire `status` (a path
+     * can be listed twice). [maxBytes] is omitted for Core's default and clamped to 1..524 288. The
+     * answer's patch is never echoed if it does not decode.
+     */
+    fun gitDiff(
+        taskId: String,
+        change: labs.dkv.sandpane.model.FileChange,
+        maxBytes: Int? = null,
+    ): CompletableFuture<labs.dkv.sandpane.model.GitDiffResult> {
+        advertisementGap(CoreMethods.GIT_DIFF)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildGitDiffPayload(taskId, change, maxBytes)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.GIT_DIFF, payload)
+            .thenApply { ok ->
+                decodeOrFixed(CoreMethods.GIT_DIFF) {
+                    CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.GitDiffResult.serializer(), ok)
+                }
+            }
+    }
+
+    internal fun buildGitDiffPayload(taskId: String, change: labs.dkv.sandpane.model.FileChange, maxBytes: Int?): JsonElement =
+        CoreJson.encodeToJsonElement(
+            labs.dkv.sandpane.model.GitDiffParams.serializer(),
+            labs.dkv.sandpane.model.GitDiffParams(
+                taskId = CoreGuards.requireId(taskId, "taskId"),
+                path = change.path,
+                status = change.status.wireName,
+                maxBytes = GitDiffs.clampMaxBytes(maxBytes),
+            ),
+        )
+
     private fun conversationCall(method: String, build: () -> JsonElement): CompletableFuture<Conversation> {
         advertisementGap(method)?.let { return CompletableFuture.failedFuture(it) }
         val payload = try {

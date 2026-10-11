@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://sandpane.dkvlabs.invalid/schemas/change-set.schema.json",
   "title": "SandpaneChangeSet",
-  "description": "git.review result: the ACTUAL change set versus the task's recorded base revision, including untracked files (specs/06 §6, specs/08 T15). Never a mocked-up diff.",
+  "description": "git.review result: the ACTUAL change set versus the task's recorded base revision, including untracked files (specs/06 §6, specs/08 T15). Never a mocked-up diff. A5 adds the optional repoPath, uninspected and changes[].oldPath (design 2026-10-09 §3.5 item 2).",
   "type": "object",
   "required": ["taskId", "baseCommit", "hostDirty", "changes"],
   "additionalProperties": false,
@@ -10,6 +10,8 @@
     "taskId": { "type": "string" },
     "baseCommit": { "type": "string", "description": "Recorded base revision the task started from." },
     "hostDirty": { "type": "boolean", "description": "True when the host working tree has uncommitted changes at review time." },
+    "repoPath": { "type": "string", "description": "A5 (additive, optional): the canonical host repository root of the task - the integration target hostDirty describes." },
+    "uninspected": { "type": "array", "items": { "type": "string" }, "description": "A5 (additive, optional): paths Core could not inspect. Defined but never produced in A5: a repository with submodules is still refused with VALIDATION_FAILED, never returned as a partial list." },
     "changes": {
       "type": "array",
       "items": {
@@ -17,7 +19,8 @@
         "required": ["path", "status"],
         "additionalProperties": false,
         "properties": {
-          "path": { "type": "string" },
+          "path": { "type": "string", "description": "Exactly as git reports it (NUL-separated since A5, never C-quoted). git.diff accepts only this exact string." },
+          "oldPath": { "type": "string", "description": "A5 (additive, optional): the pre-rename path; set only for status renamed." },
           "status": {
             "type": "string",
             "enum": ["added", "modified", "deleted", "renamed", "untracked"]

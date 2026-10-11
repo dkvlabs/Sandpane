@@ -23,6 +23,7 @@ import {
   MAX_SUBSCRIBE_CURSORS,
   TASK_STATUSES,
   type ConversationExportParams,
+  type GitDiffParams,
   type ConversationHistoryParams,
   type ConversationListParams,
   type TaskListParams,
@@ -589,4 +590,26 @@ export function buildConversationExportParams(
   const limit = clampLimit(params.limit);
   if (limit !== undefined) payload.limit = limit;
   return payload;
+}
+
+// ---------------------------------------------------------------------------
+// A5 git.diff (design §3.5)
+// ---------------------------------------------------------------------------
+
+/** Core's `MAX_DIFF_BYTES` / `DEFAULT_DIFF_BYTES` (drift-tested). */
+export const GIT_DIFF_MAX_BYTES = 524_288;
+export const GIT_DIFF_DEFAULT_BYTES = 262_144;
+
+/**
+ * The exact `git.diff` params. `path` is passed through byte for byte and is
+ * NOT validated (Core's change-list gate decides); `status` always travels;
+ * `maxBytes` is omitted unless given, then clamped to Core's own 1..=524288
+ * (Core clamps the same way, so this is never stricter than Core).
+ */
+export function buildGitDiffParams(params: GitDiffParams): GitDiffParams {
+  const out: GitDiffParams = { taskId: params.taskId, path: params.path, status: params.status };
+  if (params.maxBytes !== undefined && Number.isFinite(params.maxBytes)) {
+    out.maxBytes = Math.min(GIT_DIFF_MAX_BYTES, Math.max(1, Math.floor(params.maxBytes)));
+  }
+  return out;
 }

@@ -51,7 +51,13 @@ import type {
   SbxAgent,
   SendMode,
 } from './core-client/protocol';
-import { coreAdvertisesFeature, coreAdvertisesMethod, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT } from './core-client/protocol';
+import {
+  coreAdvertisesFeature,
+  coreAdvertisesMethod,
+  DEFAULT_DIFF_BYTES,
+  DEFAULT_LIST_LIMIT,
+  MAX_LIST_LIMIT,
+} from './core-client/protocol';
 import {
   REPLAY_NOTICE,
   RETRY_SAFELY,
@@ -85,6 +91,16 @@ import {
   stopOutcomeView,
 } from './vscode/sandboxActions';
 import { plainText } from './text/visibleText';
+import {
+  MALFORMED_DIFF_COPY,
+  PATCH_SCHEME,
+  PatchDocumentStore,
+  changeLabel,
+  changeSetNotes,
+  gitErrorCopy,
+  parseGitDiffResult,
+  renderPatchDocument,
+} from './vscode/gitDiff';
 import {
   DISCUSS_NOT_ADVERTISED,
   DISCUSS_NOT_WRITABLE,
@@ -2075,6 +2091,7 @@ export class SandpaneSession {
   async reviewChanges(taskId: string): Promise<ChangeSet | undefined> {
     try {
       const changeSet = await this.commands.gitReview(taskId);
+      // A5: exact paths may carry a real tab / newline — never trusted as text.
       const repoRoot = await this.confirmRepoRoot(changeSet);
       if (!repoRoot) {
         this.setStatus('error', 'Review aborted: no confirmed repository root to build diff URIs from.');
@@ -2106,15 +2123,103 @@ export class SandpaneSession {
         `${changeSet.changes.length} change(s) from Core, ${opened} opened`,
         notOpened > 0 ? `${notOpened} more not opened (limit per review) — run Review again after closing editors` : null,
         changeSet.hostDirty ? 'HOST DIRTY — apply is blocked until your own edits are resolved' : null,
-        refused.length > 0 ? `${refused.length} not shown: ${refused.map((r) => `${r.path} (${r.reason})`).join('; ')}` : null,
+        ...changeSetNotes(changeSet),
+        refused.length > 0
+          ? `${refused.length} not shown: ${refused.map((r) => `${plainText(r.path, 300)} (${r.reason})`).join('; ')}`
+          : null,
       ].filter((s): s is string => s !== null);
       this.setStatus('info', notes.join(' · '));
       this.emit();
       return changeSet;
     } catch (error) {
-      this.reportError(error, 'git.review');
+      this.reportError(error, 'git.review', gitErrorCopy(error, 'git.review') ?? undefined);
       return undefined;
     }
+  }
+
+  /** A5: in-memory backing store of the read-only `sandpane-diff:` documents. */
+  readonly patchDocuments = new PatchDocumentStore();
+
+  /**
+   * A5 "Diff" for one file of a task: `git.review` (exact change list) → the
+   * user picks one entry → `git.diff {taskId, path, status}` with the entry's
+   * path byte-exact → a read-only virtual document (`sandpane-diff:`, `diff`
+   * language). Display only: nothing is written, applied or run; no temp
+   * file. Gated on a fresh `git.diff` advertisement before any frame.
+   * Returns true only when a patch document was opened.
+   */
+  async showTaskPatch(taskId: string): Promise<boolean> {
+    if (!(await this.ensureAdvertised('git.diff', 'Show task patch'))) return false;
+    let changeSet: ChangeSet;
+    try {
+      changeSet = await this.commands.gitReview(taskId);
+    } catch (error) {
+      this.reportError(error, 'git.review', gitErrorCopy(error, 'git.review') ?? undefined);
+      return false;
+    }
+    const notes = changeSetNotes(changeSet);
+    if (changeSet.changes.length === 0) {
+      this.setStatus(
+        'info',
+        ['Core lists no changed file for this task, so there is no patch to show', ...notes].join(' \u00b7 '),
+      );
+      this.emit();
+      return false;
+    }
+    const picked = await vscode.window.showQuickPick(
+      changeSet.changes.map((change) => ({
+        label: changeLabel(change),
+        description: change.status,
+        change,
+      })),
+      {
+        title: `Show the patch of one file (task ${taskId.slice(0, 8)}) \u2014 read-only, from Core's git.diff`,
+        placeHolder: notes.length > 0 ? notes.join(' \u00b7 ') : 'Pick a file from the change list Core reported',
+        matchOnDescription: true,
+      },
+    );
+    if (!picked) {
+      this.setStatus('info', 'No file picked; nothing was requested.');
+      this.emit();
+      return false;
+    }
+    let raw: unknown;
+    try {
+      raw = await this.commands.gitDiff({ taskId, path: picked.change.path, status: picked.change.status });
+    } catch (error) {
+      this.reportError(error, 'git.diff', gitErrorCopy(error, 'git.diff') ?? undefined);
+      return false;
+    }
+    const result = parseGitDiffResult(raw);
+    if (!result) {
+      void vscode.window.showErrorMessage(`git.diff \u2014 ${MALFORMED_DIFF_COPY}`);
+      this.setStatus('error', `git.diff: ${MALFORMED_DIFF_COPY}`);
+      this.log('git.diff answer failed the shape check (payload not logged)');
+      this.emit();
+      return false;
+    }
+    const rendered = renderPatchDocument({ taskId, result, maxBytes: DEFAULT_DIFF_BYTES });
+    const { path } = this.patchDocuments.put(result.path, rendered.text);
+    try {
+      const uri = vscode.Uri.from({ scheme: PATCH_SCHEME, path });
+      let document = await vscode.workspace.openTextDocument(uri);
+      if (document.languageId !== 'diff') document = await vscode.languages.setTextDocumentLanguage(document, 'diff');
+      await vscode.window.showTextDocument(document, { preview: true });
+    } catch (error) {
+      this.reportError(error, 'open patch view', 'The patch was received but the read-only view could not be opened.');
+      return false;
+    }
+    const flags = [
+      result.binary ? 'binary' : null,
+      result.truncated ? 'truncated' : null,
+      result.lossy ? 'lossy' : null,
+    ].filter((f): f is string => f !== null);
+    this.setStatus(
+      'info',
+      `Patch of ${changeLabel(result)} opened read-only${flags.length > 0 ? ` (${flags.join(', ')} \u2014 see the header)` : ''}`,
+    );
+    this.emit();
+    return true;
   }
 
   /** Apply = explicit confirmed Git operation through Core, never a file write. */
@@ -2123,17 +2228,20 @@ export class SandpaneSession {
     try {
       changeSet = await this.commands.gitReview(taskId);
     } catch (error) {
-      this.reportError(error, 'git.review');
+      this.reportError(error, 'git.review', gitErrorCopy(error, 'git.review') ?? undefined);
       return;
     }
+    // A5: exact paths are revealed (a real newline must not pose as a new row).
     const listing = changeSet.changes
-      .map((c) => `· ${c.status} ${c.path}`)
+      .map((c) => `· ${c.status} ${changeLabel(c)}`)
       .join('\n');
+    const notes = changeSetNotes(changeSet);
     const message =
       `Apply task ${taskId.slice(0, 8)} into the host repository?\n\n` +
       `base: ${changeSet.baseCommit}\n` +
-      `host dirty: ${changeSet.hostDirty ? 'YES — Core will abort rather than overwrite your work' : 'no'}\n\n` +
-      `${listing || '· (no changes reported)'}`;
+      `host dirty: ${changeSet.hostDirty ? 'YES — Core will abort rather than overwrite your work' : 'no'}\n` +
+      (notes.length > 0 ? `${notes.join('\n')}\n` : '') +
+      `\n${listing || '· (no changes reported)'}`;
     const answer = await vscode.window.showWarningMessage(
       message,
       { modal: true, detail: 'Core performs the Git operation; this client never writes host files.' },
@@ -2248,6 +2356,9 @@ export class SandpaneSession {
       case 'cancelTask':
         void this.cancelTask(message.taskId);
         break;
+      case 'showTaskPatch':
+        void this.showTaskPatch(message.taskId);
+        break;
       case 'reviewTask':
         void this.reviewChanges(message.taskId);
         break;
@@ -2347,6 +2458,7 @@ export class SandpaneSession {
       conversations: this.conversationListView(),
       composerBlocked: this.composerBlockedReason(),
       sendModeSupported: this.coreHasFeature(SEND_MODE_FEATURE),
+      gitDiffSupported: this.coreAdvertises('git.diff'),
       lines: transcript.lines.map((line) => ({
         role: line.role,
         text: line.text,
@@ -2545,19 +2657,29 @@ export class SandpaneSession {
       })),
     );
     const project = this.projects.find((p) => p.id === this.selectedProjectId);
-    const matched = matchWorkspaceFolder(canonical, project?.repositories ?? []);
+    // A5: Core now names the task's repository (`repoPath`); prefer the open
+    // folder that IS that repository, else fall back to the project match.
+    const coreRepo = typeof changeSet.repoPath === 'string' && changeSet.repoPath.length > 0 ? changeSet.repoPath : null;
+    const byCore = coreRepo ? matchWorkspaceFolder(canonical, [coreRepo]) : null;
+    const matched = byCore ?? matchWorkspaceFolder(canonical, project?.repositories ?? []);
     const candidate = matched?.fsPath ?? canonical[0]?.fsPath;
     if (!candidate) return null;
-    const provenance = matched
-      ? `This folder is one of the project's repositories registered in Core (${matched.canonical}).`
-      : project?.repositories && project.repositories.length > 0
-        ? `WARNING: no open folder matches the project's repositories in Core (${project.repositories.join(', ')}).`
-        : 'Core reports no repository for the selected project.';
+    const provenance = byCore
+      ? `This folder is the task's repository as reported by Core (${plainText(coreRepo, 500)}).`
+      : coreRepo
+        ? `WARNING: no open folder is the task's repository reported by Core (${plainText(coreRepo, 500)}).`
+        : matched
+          ? `This folder is one of the project's repositories registered in Core (${matched.canonical}).`
+          : project?.repositories && project.repositories.length > 0
+            ? `WARNING: no open folder matches the project's repositories in Core (${project.repositories.join(', ')}).`
+            : 'Core reports no repository for the selected project.';
     const answer = await vscode.window.showInformationMessage(
       `Diff the ${changeSet.changes.length} reported change(s) against the task base ` +
         `${changeSet.baseCommit.slice(0, 8)} using this workspace folder as the repository root?\n\n${candidate}\n\n` +
         `${provenance}\n\n` +
-        'Gap: protocol v1 git.review does not return the task repository path (P4). Confirm it is the right repo.',
+        (coreRepo
+          ? 'Confirm it is the right repository.'
+          : 'This Core did not report the task repository path (pre-A5). Confirm it is the right repo.'),
       { modal: true },
       'Yes, use this folder',
     );

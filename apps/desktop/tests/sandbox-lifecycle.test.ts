@@ -165,14 +165,15 @@ describe("A1 pinned lists", () => {
     ]);
     expect(rustMethodAll().names).toEqual([...METHODS]);
     expect(schemaMethodEnum()).toEqual([...METHODS]);
-    expect(METHODS).toHaveLength(27);
-    // The A1 Core's set is today's minus the six A3a project methods and the
-    // five A3b conversation methods.
+    expect(METHODS).toHaveLength(28);
+    // The A1 Core's set is today's minus the six A3a project methods, the
+    // five A3b conversation methods and A5's git.diff.
     expect(A1_CORE_METHODS).toEqual(
       METHODS.filter(
         (m) =>
           !(PROJECT_LIFECYCLE_METHODS as readonly string[]).includes(m) &&
-          !(CONVERSATION_LIFECYCLE_METHODS as readonly string[]).includes(m),
+          !(CONVERSATION_LIFECYCLE_METHODS as readonly string[]).includes(m) &&
+          m !== "git.diff",
       ),
     );
   });

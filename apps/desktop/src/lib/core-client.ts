@@ -24,6 +24,8 @@ import {
   type ConversationHistoryResult,
   type ConversationListParams,
   type ChangeSet,
+  type GitDiffParams,
+  type GitDiffResult,
   type ConfirmationRequest,
   type ConversationSendParams,
   type CoreCapabilities,
@@ -42,6 +44,7 @@ import {
 import { FrameTooLargeError, MalformedFrameError, encodeFrame } from "./framing";
 import {
   decodeChangeSet,
+  decodeGitDiffResult,
   decodeConversation,
   decodeConversationDeleteResult,
   decodeConversationExportPage,
@@ -80,6 +83,7 @@ import {
   buildTaskListParams,
   checkIdempotencyKey,
   buildTaskSubscribeParams,
+  buildGitDiffParams,
 } from "./guards";
 
 /** The only thing the client needs from a transport. */
@@ -192,8 +196,9 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
  * the proxy's own budget for that method (`proxy_deadline_ms` in ipc_client.rs:
  * 320 s / 40 s / 350 s / 390 s), per-method drift-tested. `project.create` and
  * `project.add_repository` run Core's git canonicalization of a repository path
- * (up to 30 s): 45 s here, 43 s in the proxy. The five A3b conversation methods
- * keep the default (design §3.3 item 9).
+ * (up to 30 s): 45 s here, 43 s in the proxy, and so do A5's `git.review` and
+ * `git.diff` (git under Core's 30 s query limit). The five A3b conversation
+ * methods keep the default (design §3.3 item 9).
  */
 export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
   "sandbox.create": 330_000,
@@ -203,6 +208,10 @@ export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
   // Core's git canonicalization of a repository path may take up to 30 s.
   "project.create": 45_000,
   "project.add_repository": 45_000,
+  // A5 (design §3.5 item 5): git runs under RunLimits::QUERY (30 s) for the
+  // change list and the diff, so git.review and git.diff get the git deadline.
+  "git.review": 45_000,
+  "git.diff": 45_000,
 };
 
 /** The webview deadline for one method with the default options. */
@@ -219,7 +228,7 @@ export function requestTimeoutFor(method: Method): number {
  * remove's step 1: it mints a single-use token in Core, and step 2 acts. Neither
  * step is ever re-sent automatically. The A3a project methods and the five A3b
  * conversation methods are absent too; `conversation.export` is a read but
- * stays out for uniformity (design §3.3 item 9).
+ * stays out for uniformity (design §3.3 item 9), and so does A5's `git.diff`.
  */
 export const REPLAY_SAFE_METHODS: ReadonlySet<Method> = new Set<Method>([
   "system.probe",
@@ -753,6 +762,15 @@ export class CoreClient {
   /** `git.review`, decoded (an unrecognised file status is listed, never applied). */
   async reviewChangeSet(taskId: string): Promise<ChangeSet> {
     return decodeChangeSet(await this.request("git.review", { taskId }));
+  }
+
+  /**
+   * `git.diff` (A5): one change-set entry's patch, read-only. The entry's
+   * `path` travels byte for byte and its `status` always travels. The patch
+   * is decoded strictly and never put into an error or a log.
+   */
+  async diffFile(params: GitDiffParams): Promise<GitDiffResult> {
+    return decodeGitDiffResult(await this.request("git.diff", buildGitDiffParams(params)));
   }
 
   cancelTask(taskId: string) {

@@ -48,6 +48,7 @@
         "task.list",
         "task.subscribe",
         "git.review",
+        "git.diff",
         "git.apply"
       ]
     },

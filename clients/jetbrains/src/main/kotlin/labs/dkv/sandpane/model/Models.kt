@@ -168,7 +168,10 @@ object CoreMethods {
     const val GIT_REVIEW: String = "git.review"
     const val GIT_APPLY: String = "git.apply"
 
-    /** Wire order of `Method::ALL` — 27 methods as of protocol-v1 addition A3b. */
+    /** A5: one file's patch from a task's `git.review` change list. Read-only, display-only. */
+    const val GIT_DIFF: String = "git.diff"
+
+    /** Wire order of `Method::ALL` — 28 methods as of protocol-v1 addition A5. */
     val ALL: List<String> = listOf(
         SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST,
         PROJECT_UPDATE, PROJECT_ARCHIVE, PROJECT_UNARCHIVE, PROJECT_DELETE,
@@ -178,7 +181,7 @@ object CoreMethods {
         CONVERSATION_CREATE, CONVERSATION_SEND, CONVERSATION_LIST, CONVERSATION_HISTORY,
         CONVERSATION_RENAME, CONVERSATION_ARCHIVE, CONVERSATION_UNARCHIVE, CONVERSATION_DELETE,
         CONVERSATION_EXPORT,
-        TASK_CANCEL, TASK_LIST, TASK_SUBSCRIBE, GIT_REVIEW, GIT_APPLY,
+        TASK_CANCEL, TASK_LIST, TASK_SUBSCRIBE, GIT_REVIEW, GIT_DIFF, GIT_APPLY,
     )
 
     /**
@@ -207,7 +210,10 @@ object CoreMethods {
      * these — see [CoreCapabilities.advertises]: a call is refused locally, before a byte is written,
      * when the connected Core's `system.probe` does not list it (design 2026-10-09 §1 rule 3).
      */
-    val REQUIRES_ADVERTISEMENT: Set<String> = ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A + ADDITIVE_A3B
+    /** The method addition A5 ADDED (design §3.5); a pre-A5 Core does NOT dispatch it. */
+    val ADDITIVE_A5: Set<String> = setOf(GIT_DIFF)
+
+    val REQUIRES_ADVERTISEMENT: Set<String> = ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A + ADDITIVE_A3B + ADDITIVE_A5
 
     /**
      * The honest unsupported state for starting a sandbox (design 2026-10-09 §3 row A1). Shown to the
@@ -1009,6 +1015,13 @@ data class ChangeSet(
     @SerialName("baseCommit") val baseCommit: String,
     @SerialName("hostDirty") val hostDirty: Boolean,
     val changes: List<FileChange> = emptyList(),
+    /** A5, additive: the canonical HOST repository root (the integration target [hostDirty] describes). */
+    @SerialName("repoPath") val repoPath: String? = null,
+    /**
+     * A5, additive: paths Core could not inspect. Never produced in A5; when non-empty the change list
+     * is NOT complete and the UI must say so.
+     */
+    val uninspected: List<String>? = null,
 )
 
 @Serializable
@@ -1020,7 +1033,45 @@ data class FileChange(
      */
     @Serializable(with = ReportedFileChangeStatusSerializer::class)
     val status: Reported<FileChangeStatus>,
+    /** A5, additive: the pre-rename path, set only for `renamed`. Exact, like [path]. */
+    @SerialName("oldPath") val oldPath: String? = null,
 )
+
+/**
+ * `git.diff` params (A5). [path] is EXACTLY an entry's `path` from `git.review` (never trimmed,
+ * normalized or validated here); [status] is that entry's wire status, always sent (a path can be
+ * listed twice). [maxBytes] is omitted for Core's default and never above 524 288.
+ */
+@Serializable
+data class GitDiffParams(
+    @SerialName("taskId") val taskId: String,
+    val path: String,
+    val status: String,
+    @SerialName("maxBytes") val maxBytes: Int? = null,
+)
+
+/**
+ * `git.diff` result (A5). [patch] is UNTRUSTED text: displayed revealed, never rendered as markup,
+ * executed, applied or written anywhere. File names come from [path] / [oldPath] only, never from
+ * the patch header.
+ */
+@Serializable
+data class GitDiffResult(
+    val path: String,
+    @SerialName("oldPath") val oldPath: String? = null,
+    @Serializable(with = ReportedFileChangeStatusSerializer::class)
+    val status: Reported<FileChangeStatus>,
+    val patch: String,
+    val binary: Boolean,
+    val truncated: Boolean,
+    val lossy: Boolean,
+    @SerialName("baseBlob") val baseBlob: String? = null,
+) {
+    /** The patch is never printed, even from a debug or error path. */
+    override fun toString(): String =
+        "GitDiffResult(status=${status.wireName}, patchChars=${patch.length}, binary=$binary, " +
+            "truncated=$truncated, lossy=$lossy)"
+}
 
 @Serializable
 enum class FileChangeStatus : WireEnum {

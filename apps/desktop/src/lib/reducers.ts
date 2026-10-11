@@ -7,6 +7,7 @@
  */
 
 import { conversationMessageCopy } from "./conversation-messages";
+import { gitMessageCopy } from "./git-messages";
 import { projectMessageCopy } from "./project-messages";
 import { MAX_HISTORY_BYTES, MAX_LIST_LIMIT, TASK_STATUSES } from "./protocol";
 import type {
@@ -1915,7 +1916,8 @@ function describeCoreErrorUnrevealed(err: CoreRequestError): ErrorCopy {
     // A3b: the same, for Core's exact conversation-lifecycle refusals.
     const lifecycle =
       projectMessageCopy(String(err.code), err.message) ??
-      conversationMessageCopy(String(err.code), err.message);
+      conversationMessageCopy(String(err.code), err.message) ??
+      gitMessageCopy(String(err.code), err.message);
     if (lifecycle !== null) {
       return {
         title: lifecycle.title,

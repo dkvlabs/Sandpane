@@ -12,6 +12,7 @@
  */
 
 import * as vscode from 'vscode';
+import { PATCH_SCHEME } from './vscode/gitDiff';
 import * as fs from 'node:fs';
 import { SandpaneSession } from './session';
 import { SandpaneChatProvider } from './webview/sidebar';
@@ -100,6 +101,8 @@ export function activate(context: vscode.ExtensionContext): void {
       webviewOptions: { retainContextWhenHidden: true },
     }),
     vscode.window.createTreeView(SandpaneTaskTreeProvider.viewId, { treeDataProvider: tree }),
+    // A5: read-only virtual documents for git.diff patches (in memory, no temp files).
+    vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, session.patchDocuments),
     ...registrations(session, output, log),
   );
 
@@ -316,6 +319,14 @@ function registrations(
         const taskId = typeof taskIdArg === 'string' ? taskIdArg : await pickTask(session);
         if (!taskId) return undefined;
         return session.reviewChanges(taskId);
+      }),
+    ),
+
+    vscode.commands.registerCommand('sandpane.showTaskPatch', (taskIdArg?: unknown) =>
+      guard('Sandpane: show task patch', async () => {
+        const taskId = typeof taskIdArg === 'string' ? taskIdArg : await pickTask(session);
+        if (!taskId) return undefined;
+        return session.showTaskPatch(taskId);
       }),
     ),
 

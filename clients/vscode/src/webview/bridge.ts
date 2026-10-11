@@ -134,6 +134,8 @@ export interface SidebarState {
    * Task / Discuss choice is disabled at Task and nothing sends `mode`.
    */
   sendModeSupported: boolean;
+  /** A5: Core advertises `git.diff` (the per-task Diff button is enabled). */
+  gitDiffSupported: boolean;
   lines: ChatLine[];
   /** What the stream shows: one conversation, or every task of the project. */
   transcript: { scope: 'conversation' | 'project'; label: string };
@@ -173,6 +175,8 @@ export type WebviewToExtension =
     }
   | { type: 'cancelTask'; taskId: string }
   | { type: 'reviewTask'; taskId: string }
+  /** A5: pick one file of the task's change list and show its patch (read-only). */
+  | { type: 'showTaskPatch'; taskId: string }
   /** A3b: select a Core-listed conversation; `''` = start a new one on the next send. */
   | { type: 'selectConversation'; conversationId: string }
   /** A3b: one lifecycle action on a Core-listed conversation (native dialogs follow). */
@@ -189,6 +193,7 @@ export const WEBVIEW_MESSAGE_KINDS: readonly string[] = [
   'send',
   'cancelTask',
   'reviewTask',
+  'showTaskPatch',
   'selectConversation',
   'conversationAction',
   'toggleArchivedConversations',
@@ -242,6 +247,10 @@ export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefine
         ...(r.mode === 'discuss' ? { mode: 'discuss' as const } : {}),
       };
     }
+    case 'showTaskPatch': {
+      const id = webviewId((raw as { taskId?: unknown }).taskId, false);
+      return id === undefined ? undefined : { type: 'showTaskPatch', taskId: id };
+    }
     case 'cancelTask':
     case 'reviewTask': {
       const r = raw as { taskId?: unknown };
@@ -273,6 +282,7 @@ export function emptySidebarState(connection: ConnectionTone): SidebarState {
     conversations: { supported: false, note: null, showArchived: false, showArchivedSupported: false, rows: [] },
     composerBlocked: null,
     sendModeSupported: false,
+    gitDiffSupported: false,
     lines: [],
     transcript: { scope: 'project', label: 'Transcript of all tasks in this project (no conversation selected)' },
     tasks: [],
