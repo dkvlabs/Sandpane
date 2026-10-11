@@ -887,4 +887,71 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0038 — Protocol A7: verification commands and project.context
+
+- **date:** 2026-10-12
+- **phase:** protocol v1 addition A7 ([design §3.7](plans/2026-10-09-protocol-v1-additions.md)), with all three clients
+- **commits:**
+  - `5d29980` (docs(plan): A7 verification and project.context design decisions (§3.7))
+  - `bd48a10` (feat(protocol): verification commands and project.context (A7))
+- **details:**
+  - **Wire:**
+    - Six methods follow `git.apply`: `verification.list`, `verification.approve`, `verification.revoke`, `verification.run`, `verification.result` and `project.context`, making **34 methods**.
+    - New feature `verification`, making **6 features**.
+    - Additive event kinds: `verification.started`, `verification.finished` (`outcome` includes `interrupted`).
+    - Migration v8 adds `verification_commands` and `verification_runs`.
+  - **What it does:**
+    - A user approves an exact argv plus a label. `verification.run` runs it only inside the task's bound sandbox, through `sbx exec -- <name> <argv…>`. It never runs on the host or through a shell.
+    - The environment is cleared down to an allowlist. Core uses an empty 0700 working directory of its own, also for `version` and `ls --json`.
+    - Runs are asynchronous (`runId`, `startedSequence`). Output is stored only in `verification_runs` and read through `verification.result`; it is never put in events. Each run gets exactly one terminal record.
+    - `project.context` reads manifests with `openat`/`O_NOFOLLOW`, runs no tool and redacts notes. Its suggestions only pre-fill the approval editor.
+  - **Safety:**
+    - Approval refuses secret-like values (per element, joined, and as JSON) and control characters other than TAB and LF. The secret check runs again at run start.
+    - The version gate uses `VERIFIED_EXEC_VERSIONS`, which is empty, so every real `sbx` gets `UNSUPPORTED_SBX_VERSION` until captures C-1, C-2, C-5 and C-7. The identity gate requires a fresh `ls --json` to list exactly the bound id, `running`, and the bound mount.
+    - Caps: 1 run per task, 1 per sandbox, 4 globally. A `direct_mount` run takes the repository writer lock.
+    - Keyed replay comes first.
+    - Responses are capped at `MAX_FRAME_BYTES − 64 KiB`, with `outputIncomplete` disclosed.
+    - `process.rs` uses a single-threaded unreaped-leader runner, so there is no stale group signal (this also fixes the pre-existing `run_bounded`).
+  - **Clients:**
+    - approve, revoke and run confirmations reachable only from a user gesture, listing every revealed argv element with its count;
+    - the run target comes from the task binding (`sandboxName`);
+    - a fresh key per gesture, and "Retry safely" only after a lost answer and within 23 h of the first send;
+    - a 45 s deadline for `project.context` and `verification.run`;
+    - output shown as escaped plain text; exit 0 is never "passed";
+    - verification events are display-only.
+  - **Deviations:**
+    - The client brief gave `verification.run` the default deadline. That was wrong, because Core gates for up to 33 s before the durable start. All clients now use 45 s, and it is drift-pinned.
+    - VS Code applies the 23 h retry window to the A2 retries too.
+    - Graceful shutdown is implemented, but `main.rs` has no shutdown path (disclosed in §3.7).
+  - **Process change:** Core and its wire files were frozen with SHA-256 hashes before the clients were briefed, and the hashes were checked before the commit (lesson from A6).
+  - **Open:**
+    - W-D and the A7 capture gate (I-h) are A4b preconditions.
+    - Verification cancel needs C-4.
+- **files:**
+  - `core/crates/**`: new `sandpane-core/src/verification.rs` and `context.rs`, `sandpane-service/src/verification.rs`, `tests/verification.rs`; changes to `validation.rs`, `process.rs`, `sbx.rs`, `db.rs`, `diff.rs` and the lifecycle handlers
+  - `schemas/verification.schema.json` and `schemas/project-context.schema.json` (new); `rpc-request`, `core-capabilities`, `task-event`, `schemas/README.md`
+  - `clients/vscode/**`, `clients/jetbrains/**`, `apps/desktop/**`
+  - `docs/plans/2026-10-09-protocol-v1-additions.md`, `README.md`
+- **verification:**
+  - Core: `cargo test` 596 passed, 0 failed; fmt and clippy clean.
+  - `make check` exited 0 on `bd48a10`'s tree: schemas in sync (34 methods, 6 features); VS Code 810; desktop 736 + 9 opt-in skipped; Tauri shell 36.
+  - JetBrains, run alone: 483 tests, 0 failures; `verifyPlugin` Compatible (IU-262.10968.63).
+  - Live checks against an isolated Core with no `sbx`:
+    - VS Code 66/66, including that the A7 methods and feature are advertised, a fresh project lists no commands, and a secret-like approve is refused with nothing stored;
+    - desktop 9/9.
+  - All 14 frozen wire files matched their hashes.
+  - 0 raw invisible characters in 116 staged files. The secret gate flagged only the fictional `/Users/demo` fixture user, with 0 real paths.
+  - No new dependency.
+  - UNVERIFIED:
+    - never run against a real `sbx` or in a real editor, app or IDE;
+    - no real `verification.run`: it is version-gated, and no task is bound until A4b;
+    - captures C-1–C-7 are not taken.
+- **review:** [audit/0038-protocol-a7-verification-review.md](audit/0038-protocol-a7-verification-review.md)
+  - Design: `security-reviewer` returned BLOCK on C1 (fixed), then PASS-WITH-WARNINGS.
+  - Core: `security-reviewer` returned PASS-WITH-WARNINGS (W1–W3, S1, S2, I2 fixed), then a re-verification returned PASS-WITH-WARNINGS (N1, I-a, I-b fixed; I-c, I-d, I-e accepted).
+  - Clients: two `security-reviewer` passes returned PASS-WITH-WARNINGS (J-W1, J-W2, VS Code W1–W3, the cross-client run deadline and the dispatched Info all fixed).
+  - No Critical remains.
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
