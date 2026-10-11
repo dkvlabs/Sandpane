@@ -1,5 +1,5 @@
 /**
- * Typed wrappers for **exactly** the 27 Core methods (`sandpane_protocol::Method`
+ * Typed wrappers for **exactly** the 28 Core methods (`sandpane_protocol::Method`
  * / `Method::ALL`). Every wrapper maps to one Core method; `sandbox.remove` has
  * two wrappers because its two confirmation steps are deliberately separate
  * calls (`sandboxRemoveRequest` never carries a token, `sandboxRemoveConfirm`
@@ -355,6 +355,18 @@ export function validateDisplayText(value: string, max: number, field: string): 
       throw new CoreValidationError(field, 'contains a disallowed character U+7f');
     }
   }
+  return value;
+}
+
+/**
+ * `git.apply` `selectedFiles` entries are EXACT paths as `git.review` lists them
+ * (A5: a real tab, CR or newline may occur), and Core's params type
+ * (`Option<Vec<String>>`) adds no rule of its own; so only an empty entry or a
+ * NUL (never part of a Git path) is refused here. The frame cap still bounds it.
+ */
+export function validateSelectedFile(value: string): string {
+  if (typeof value !== 'string' || value.length === 0) throw new CoreValidationError('selectedFiles', 'value is empty');
+  if (value.includes('\0')) throw new CoreValidationError('selectedFiles', 'path contains a NUL byte');
   return value;
 }
 
@@ -1065,9 +1077,7 @@ export class CoreCommands {
         expectedBase: validateGitRef(params.expectedBase),
       };
       if (Array.isArray(params.selectedFiles) && params.selectedFiles.length > 0) {
-        payload['selectedFiles'] = params.selectedFiles.map((file) =>
-          validateDisplayText(file, 4096, 'selectedFiles'),
-        );
+        payload['selectedFiles'] = params.selectedFiles.map(validateSelectedFile);
       }
       return this.connection.request<ApplyResult>('git.apply', payload);
     });

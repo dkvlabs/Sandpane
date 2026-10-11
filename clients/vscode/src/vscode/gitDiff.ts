@@ -48,6 +48,9 @@ export function truncatedDisclosure(maxBytes: number): string {
 }
 export const DIFF_TIMEOUT_COPY = 'Core did not answer in time \u2014 no file was changed (git.diff is read-only).';
 const REVIEW_TIMEOUT_COPY = 'Core did not answer in time \u2014 no file was changed (git.review is read-only).';
+export const DIFF_INTERNAL_COPY = 'Core could not produce the diff (INTERNAL) \u2014 no file was changed (git.diff is read-only).';
+export const REVIEW_INTERNAL_COPY =
+  'Core could not produce the change list (INTERNAL) \u2014 no file was changed (git.review is read-only).';
 export const MALFORMED_DIFF_COPY = "Core's git.diff answer was not in the expected shape; nothing is shown.";
 
 /** Display caps (revealed, then capped). */
@@ -69,6 +72,9 @@ export function gitErrorCopy(error: unknown, operation: 'git.review' | 'git.diff
     return operation === 'git.diff' ? DIFF_TIMEOUT_COPY : REVIEW_TIMEOUT_COPY;
   }
   if (!(error instanceof CoreRpcError)) return null;
+  // Both methods are read-only, so an INTERNAL answer changed nothing; Core's
+  // message is not echoed (it is free-form).
+  if (error.code === 'INTERNAL') return operation === 'git.diff' ? DIFF_INTERNAL_COPY : REVIEW_INTERNAL_COPY;
   const message = rpcMessage(error);
   if (error.code === 'NOT_FOUND' && message === MSG_TASK_NOT_FOUND) {
     return 'Core has no such task (it may have been deleted); nothing was read.';
@@ -136,11 +142,20 @@ export function parseGitDiffResult(raw: unknown): GitDiffResult | null {
   };
 }
 
+/**
+ * A path for a QuickPick / tree label: `plainText`, plus `$(` broken with a
+ * visible space — a QuickPick label renders `$(name)` as a theme icon, so a
+ * file named `$(pass-filled) README.md` would otherwise show a fake check.
+ */
+function labelText(value: string): string {
+  return plainText(value, MAX_PATH_CHARS).replace(/\$\(/g, '$ (');
+}
+
 /** A change-list entry for a picker / listing: revealed, one line; renames as `old → new`. */
 export function changeLabel(change: Pick<FileChange, 'path' | 'oldPath'>): string {
-  const path = plainText(change.path, MAX_PATH_CHARS);
+  const path = labelText(change.path);
   return typeof change.oldPath === 'string' && change.oldPath.length > 0
-    ? `${plainText(change.oldPath, MAX_PATH_CHARS)} \u2192 ${path}`
+    ? `${labelText(change.oldPath)} \u2192 ${path}`
     : path;
 }
 
@@ -158,17 +173,27 @@ export function changeSetNotes(changeSet: ChangeSet): string[] {
 }
 
 /**
- * The link target of a synthesized untracked symlink patch (`new file mode
- * 120000`): its single `+` line is the target TEXT, never the target's
- * content. `null` for anything else.
+ * The link target of Core's synthesized untracked symlink patch (`new file
+ * mode 120000`): its single `+` line is the target TEXT, never the target's
+ * content. Same rule as JetBrains (`GitDiffText.symlinkTarget`), read from the
+ * patch's fixed line positions (Core C-quotes a newline in a header name, so
+ * a file name cannot forge the mode line): status `untracked`, not binary or
+ * truncated, `diff --git ` first, the mode line exactly at index 1, the hunk
+ * header exactly `@@ -0,0 +1 @@`, and exactly one `+` line after it.
+ * Anything else (a typechange listed as `modified`, a target spanning two
+ * `+` lines) is `null` — no symlink line is shown.
  */
-export function symlinkTarget(patch: string): string | null {
-  const lines = patch.split('\n');
-  if (!lines.some((line) => line === 'new file mode 120000')) return null;
-  const hunk = lines.findIndex((line) => line.startsWith('@@'));
-  if (hunk < 0) return null;
-  const target = lines.slice(hunk + 1).find((line) => line.startsWith('+'));
-  return target === undefined ? null : target.slice(1);
+export function symlinkTarget(
+  result: Pick<GitDiffResult, 'patch' | 'status' | 'binary' | 'truncated'>,
+): string | null {
+  if (result.status !== 'untracked' || result.binary || result.truncated) return null;
+  const lines = result.patch.split('\n');
+  if (lines.length < 6 || !lines[0]?.startsWith('diff --git ') || lines[1] !== 'new file mode 120000') return null;
+  const hunk = lines.findIndex((line) => line.startsWith('@@ '));
+  if (hunk < 0 || lines[hunk] !== '@@ -0,0 +1 @@') return null;
+  const added = lines.slice(hunk + 1).filter((line) => line.startsWith('+'));
+  if (added.length !== 1) return null;
+  return added[0]?.slice(1) ?? null;
 }
 
 /**
@@ -213,7 +238,7 @@ export function renderPatchDocument(input: PatchDocumentInput): { text: string; 
         if (revealed.crlf) crlfLines += 1;
         return revealed.text;
       });
-  const target = symlinkTarget(result.patch);
+  const target = symlinkTarget(result);
   const header = [
     '# Sandpane \u2014 Core git.diff for one file (read-only, display only): this patch is never applied, run or written to your repository.',
     `# task: ${plainText(input.taskId, 200)}`,

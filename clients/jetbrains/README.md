@@ -71,7 +71,8 @@ client) implementing the JB0/JB1 surface of
 > `git.diff` after `git.review`, 45 s git deadline for both, per-file read-only diff viewer, exact review
 > paths): `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline
 > --no-build-cache` passes with **402 tests, 0 failures, 0 errors, 0 skipped** across 36 test
-> classes (JUnit XML), and `./gradlew verifyPlugin --offline --rerun-tasks` reports **`Compatible`**
+> classes (JUnit XML); after the A5 review fixes (CR reveal in the patch view, VCS root chosen by
+> `repoPath`) the same gate passes with **410 tests** across 37 classes, and `./gradlew verifyPlugin --offline --rerun-tasks` reports **`Compatible`**
 > against IU-262.10968.63. A5 is UNVERIFIED end to end: no task created over the wire has Git context
 > until A4b, so the Diff action has never reached a real `git.diff` answer; the chooser and viewer were
 > never shown in an IDE.
@@ -677,6 +678,14 @@ discovery revision this client is now synced to**):
   is NOT complete". Exact review paths: `EditorDiffProvider.containPath` no longer trims or refuses
   control characters (a tab or newline is a real file-name character); it refuses only an empty
   path, a NUL, or an escape from the repository root.
+  A5 review fixes: a carriage return in the patch is never obeyed or hidden — a CRLF ending and a lone
+  CR both show as `\r` (the patch is split on `\n` only), and a CRLF patch adds "contains N lines with
+  carriage returns (CRLF) — shown as \r". Review navigation now resolves paths against the IDE VCS
+  root whose canonical path equals Core's `repoPath` (`ReviewRoots.choose`, symlinks resolved), never
+  simply the first root; with no match it warns "Core's repository (…) is not a VCS root of this
+  project" and resolves nothing (no fallback to another root or `basePath`); a Core that sends no
+  `repoPath` likewise resolves nothing and says so. The Diff action is unaffected (Core reads by task
+  and path, never an IDE root).
 - **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **28** protocol
   method names before writing a byte; there is no free-form RPC. The refusal is a
   `CoreValidationException` — this client's own word — and not a `CoreRpcException`, because Core
@@ -758,6 +767,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Gate after the A3b client work (conversation lifecycle, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 18s`; **376 tests, 0 failures, 0 errors, 0 skipped**, 34 result files (ConversationLifecycleTest 46, ConversationExportTest 15, ConversationSelectionTest 4, ConversationReconcileTest 4, ProtocolDriftGuardTest 23, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 76 source files (45 main, 31 test); zip 1 628 803 bytes; 7 Kotlin `w:` on the full recompile (`verifyPlugin --rerun-tasks`), all in pre-existing code (none in A3b files) |
 | Gate after the A4 client work (send mode, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 15s`; **389 tests, 0 failures, 0 errors, 0 skipped**, 35 result files (SendModeTest 11, ProtocolDriftGuardTest 24, RemoveConfirmationDialogTest 7, IdempotencyTest 19, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 79 source files (47 main, 32 test); zip 1 644 556 bytes; the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A4 files) |
 | Gate after the A5 client work (git.diff, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 15s`; **402 tests, 0 failures, 0 errors, 0 skipped**, 36 result files (GitDiffTest 12, ProtocolDriftGuardTest 25, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 83 source files (50 main, 33 test); zip 1 676 534 bytes; the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A5 files) |
+| Gate after the A5 review fixes (W3 CR reveal, I3 VCS root, 11.10.2026) | same two commands | `BUILD SUCCESSFUL`; **410 tests, 0 failures, 0 errors, 0 skipped**, 37 result files (GitDiffTest 15, ReviewRootTest 5); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |

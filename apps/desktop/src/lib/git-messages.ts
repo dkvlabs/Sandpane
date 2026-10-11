@@ -6,6 +6,11 @@
  * reads any file content, which is the only reason the copy says "nothing was
  * read". Matched on code AND text; anything else gets the generic copy.
  * Dependency-free so `reducers.ts` can use it for every error surface.
+ *
+ * The two PATTERN matches (the submodule prefix and the `; nothing was read`
+ * suffix) apply only to an error that answered `git.review` or `git.diff`: on
+ * any other method — or when the method is unknown — the same text is not
+ * evidence that nothing was read, so it gets the generic copy (A5 review I4).
  */
 
 export const MSG_WORK_TREE_REDIRECTED =
@@ -30,8 +35,14 @@ export interface GitMessageCopy {
   action: string;
 }
 
-/** Copy for one of Core's exact A5 git refusals, or `null` for anything else. */
-export function gitMessageCopy(code: string, message: string): GitMessageCopy | null {
+/** The methods whose refusals the pattern matches below describe. */
+const GIT_READ_METHODS: ReadonlySet<string> = new Set(["git.review", "git.diff"]);
+
+/**
+ * Copy for one of Core's exact A5 git refusals, or `null` for anything else.
+ * `method` is the method the error answered (`CoreRequestError.method`).
+ */
+export function gitMessageCopy(code: string, message: string, method?: string): GitMessageCopy | null {
   if (code !== "VALIDATION_FAILED") return null;
   switch (message) {
     case MSG_DIFF_PATH_NOT_IN_LIST:
@@ -65,6 +76,7 @@ export function gitMessageCopy(code: string, message: string): GitMessageCopy | 
         action: "The worktree was discarded; there is nothing left to review.",
       };
   }
+  if (method === undefined || !GIT_READ_METHODS.has(method)) return null;
   if (message.startsWith(SUBMODULE_REFUSAL_PREFIX)) {
     return {
       title: "Nothing was read — the repository contains submodules",

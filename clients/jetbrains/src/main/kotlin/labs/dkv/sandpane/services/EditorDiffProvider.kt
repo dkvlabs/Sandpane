@@ -39,6 +39,8 @@ class EditorDiffProvider(private val project: Project) {
         val changeSet: ChangeSet,
         val resolved: List<Resolved>,
         val unresolved: List<Unresolved>,
+        /** I3: why no IDE root was used ([ReviewRoot.Refused]); null when the paths were resolved. */
+        val rootWarning: String? = null,
     ) {
         val nothingToShow: Boolean get() = changeSet.changes.isEmpty()
     }
@@ -208,6 +210,18 @@ class EditorDiffProvider(private val project: Project) {
             }
         }
 
+        /**
+         * I3: no IDE root is Core's repository ([ReviewRoots.choose] refused), so EVERY change stays
+         * unresolved and [warning] is carried into the summary. Never falls back to another root or to
+         * the project base directory, as [resolve] would with a null root.
+         */
+        fun unresolvedTarget(changeSet: ChangeSet, warning: String): ReviewTarget = ReviewTarget(
+            changeSet,
+            emptyList(),
+            changeSet.changes.map { Unresolved(it, "not resolved: Core's repository root is not confirmed for this project") },
+            rootWarning = warning,
+        )
+
         /** A change's path, `old \u2192 new` for a rename, through the Apply dialog's [ApplyPlan.displayPath]. */
         fun changeLabel(change: FileChange): String =
             change.oldPath?.let { "${ApplyPlan.displayPath(it)} \u2192 ${ApplyPlan.displayPath(change.path)}" }
@@ -224,6 +238,8 @@ class EditorDiffProvider(private val project: Project) {
             )
             // A5: the host repository root Core reviewed against, revealed and capped.
             cs.repoPath?.let { appendLine("repository: ${VisibleText.reveal(labs.dkv.sandpane.text.DisplayCap.cap(it))}") }
+            // I3: the IDE root mismatch (or an unreported repository), revealed again (idempotent).
+            target.rootWarning?.let { appendLine(VisibleText.reveal(it)) }
             // A5: never claim a list is complete when Core says it could not inspect some paths.
             cs.uninspected?.takeIf { it.isNotEmpty() }?.let {
                 appendLine("${it.size} paths were not inspected by Core \u2014 this change list is NOT complete.")

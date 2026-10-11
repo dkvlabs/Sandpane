@@ -243,10 +243,52 @@ describe('A5 display: the patch document', () => {
   it('shows a symlink (mode 120000) as "symlink \u2192 target", never the target content', () => {
     const patch =
       'diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+../secret/target\n\\ No newline at end of file\n';
-    expect(symlinkTarget(patch)).toBe('../secret/target');
-    expect(symlinkTarget(result().patch)).toBeNull();
+    expect(symlinkTarget(result({ status: 'untracked', path: 'link', patch }))).toBe('../secret/target');
+    expect(symlinkTarget(result())).toBeNull();
     const doc = render(result({ status: 'untracked', path: 'link', patch }));
     expect(doc.text).toContain('symlink \u2192 ../secret/target');
+  });
+
+  // W1 (combined client review): the JetBrains rule — untracked only, the mode
+  // line at index 1, the exact one-line hunk header, exactly one `+` line, and
+  // not binary / truncated. Anything else shows NO symlink line.
+  const SYMLINK_PATCH =
+    'diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+../t\n\\ No newline at end of file\n';
+
+  it('a typechange (tracked file \u2192 symlink, listed as modified) shows no symlink line', () => {
+    // Captured shape (reviewer scratch tc.patch): two sections, the mode line mid-patch.
+    const typechange =
+      'diff --git a/f b/f\ndeleted file mode 100644\nindex ce01362..0000000\n--- a/f\n+++ /dev/null\n@@ -1 +0,0 @@\n-hello\n' +
+      'diff --git a/f b/f\nnew file mode 120000\nindex 0000000..2b65e96\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+/etc/target\n\\ No newline at end of file\n';
+    for (const status of ['modified', 'untracked'] as const) {
+      const r = result({ status, path: 'f', patch: typechange });
+      expect(symlinkTarget(r), status).toBeNull();
+      expect(render(r).text, status).not.toMatch(/symlink \u2192/);
+    }
+  });
+
+  it('a link target spanning two + lines (a newline in the target) shows no symlink line', () => {
+    // Captured shape (reviewer scratch ml.patch).
+    const twoLines =
+      'diff --git a/p b/p\nnew file mode 120000\n--- /dev/null\n+++ b/p\n@@ -0,0 +1,2 @@\n+safe\n+../../x\n\\ No newline at end of file\n';
+    const r = result({ status: 'untracked', path: 'p', patch: twoLines });
+    expect(symlinkTarget(r)).toBeNull();
+    expect(render(r).text).not.toMatch(/symlink \u2192/);
+    // Same header, exact hunk, but two `+` lines.
+    const forged = SYMLINK_PATCH.replace('+../t\n', '+safe\n+../../x\n');
+    expect(symlinkTarget(result({ status: 'untracked', path: 'link', patch: forged }))).toBeNull();
+  });
+
+  it('the symlink line needs untracked, mode line at index 1, the exact hunk header, not binary/truncated', () => {
+    const ok = result({ status: 'untracked', path: 'link', patch: SYMLINK_PATCH });
+    expect(symlinkTarget(ok)).toBe('../t');
+    expect(symlinkTarget({ ...ok, status: 'modified' })).toBeNull();
+    expect(symlinkTarget({ ...ok, status: 'added' })).toBeNull();
+    expect(symlinkTarget({ ...ok, binary: true })).toBeNull();
+    expect(symlinkTarget({ ...ok, truncated: true })).toBeNull();
+    expect(symlinkTarget({ ...ok, patch: SYMLINK_PATCH.replace('diff --git a/link b/link\n', 'diff --git a/link b/link\nold mode 100644\n') })).toBeNull();
+    expect(symlinkTarget({ ...ok, patch: SYMLINK_PATCH.replace('@@ -0,0 +1 @@', '@@ -0,0 +1 @@ ctx') })).toBeNull();
+    expect(symlinkTarget({ ...ok, patch: SYMLINK_PATCH.replace('diff --git ', 'xdiff --git ') })).toBeNull();
   });
 
   it('names come from JSON: a path containing " b/" is shown as Core named it, not as the header splits it', () => {
@@ -291,6 +333,17 @@ describe('A5 review labels and notes', () => {
     expect(changeLabel({ path: 'new\nline\t.txt' })).toBe('new\\nline\\t.txt');
   });
 
+  it('breaks "$(" so a file name cannot render a theme icon in the QuickPick label (W2)', () => {
+    const label = changeLabel({ path: '$(pass-filled) README.md' });
+    expect(label).not.toContain('$(');
+    expect(label).toBe('$ (pass-filled) README.md');
+    const renamed = changeLabel({ path: 'b$(check)', oldPath: '$(warning)a' });
+    expect(renamed).not.toContain('$(');
+    expect(renamed).toBe('$ (warning)a \u2192 b$ (check)');
+    // `](` stays broken too (plainText).
+    expect(changeLabel({ path: '[x](command:evil)' })).not.toContain('](');
+  });
+
   it('shows Core\'s repoPath and never claims completeness when paths were not inspected', () => {
     const cs: ChangeSet = { taskId: 't', baseCommit: 'b', hostDirty: false, changes: [], repoPath: '/repo/at\u202Elas', uninspected: ['x', 'y'] };
     const notes = changeSetNotes(cs);
@@ -320,7 +373,20 @@ describe('A5 copy: each exact refusal says what Core did (nothing was read)', ()
     }
     expect(gitErrorCopy(rpc('VALIDATION_FAILED', 'something else'))).toBeNull();
     expect(gitErrorCopy(rpc('NOT_FOUND', 'task not found anywhere'))).toBeNull();
-    expect(gitErrorCopy(rpc('INTERNAL', MSG_DIFF_PATH_NOT_IN_LIST))).toBeNull();
+  });
+
+  it('INTERNAL from git.diff / git.review says Core could not produce it and that nothing was changed (W5)', () => {
+    expect(gitErrorCopy(rpc('INTERNAL', 'git exited 128'), 'git.diff')).toBe(
+      'Core could not produce the diff (INTERNAL) \u2014 no file was changed (git.diff is read-only).',
+    );
+    expect(gitErrorCopy(rpc('INTERNAL', MSG_DIFF_PATH_NOT_IN_LIST))).toBe(
+      'Core could not produce the diff (INTERNAL) \u2014 no file was changed (git.diff is read-only).',
+    );
+    expect(gitErrorCopy(rpc('INTERNAL', 'x'), 'git.review')).toBe(
+      'Core could not produce the change list (INTERNAL) \u2014 no file was changed (git.review is read-only).',
+    );
+    // Core's message is never echoed into the copy.
+    expect(gitErrorCopy(rpc('INTERNAL', 'secret-ish detail'), 'git.diff')).not.toContain('secret-ish');
   });
 
   it('a timeout says Core did not answer and that git.diff is read-only', () => {

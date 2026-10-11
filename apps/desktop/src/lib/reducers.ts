@@ -1917,7 +1917,7 @@ function describeCoreErrorUnrevealed(err: CoreRequestError): ErrorCopy {
     const lifecycle =
       projectMessageCopy(String(err.code), err.message) ??
       conversationMessageCopy(String(err.code), err.message) ??
-      gitMessageCopy(String(err.code), err.message);
+      gitMessageCopy(String(err.code), err.message, err.method);
     if (lifecycle !== null) {
       return {
         title: lifecycle.title,

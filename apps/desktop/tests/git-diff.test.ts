@@ -20,6 +20,7 @@ import {
   CoreClient,
   CoreRequestError,
   METHOD_TIMEOUT_MS,
+  PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX,
   REPLAY_SAFE_METHODS,
 } from "../src/lib/core-client";
 import { decodeChangeSet, decodeGitDiffResult } from "../src/lib/decode";
@@ -32,6 +33,7 @@ import {
   buildGitDiffParams,
   changeSetCompleteness,
   copyDiffText,
+  diffCopyNote,
   diffDisclosures,
   diffFailureCopy,
   diffGate,
@@ -301,13 +303,19 @@ describe("disclosures", () => {
       "\\ No newline at end of file",
       "",
     ].join("\n");
-    expect(symlinkTarget(patch)).toBe(`../tar${cp(0x202e)}get`);
+    expect(symlinkTarget({ ...RESULT, status: "untracked", patch })).toBe(`../tar${cp(0x202e)}get`);
     expect(diffDisclosures({ ...RESULT, status: "untracked", path: "link", patch }, undefined)).toContain(
       "symlink → ../tar\\u202Eget",
     );
-    expect(symlinkTarget(PATCH)).toBeNull();
+    expect(symlinkTarget({ ...RESULT, status: "untracked", patch: PATCH })).toBeNull();
     // A "+new file mode 120000" CONTENT line after the hunk is not a header.
-    expect(symlinkTarget("diff --git a/x b/x\n--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+new file mode 120000\n")).toBeNull();
+    expect(
+      symlinkTarget({
+        ...RESULT,
+        status: "untracked",
+        patch: "diff --git a/x b/x\n--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+new file mode 120000\n",
+      }),
+    ).toBeNull();
   });
 });
 
@@ -329,16 +337,16 @@ describe("refusals and failures get honest copy", () => {
       ["VALIDATION_FAILED", '"fifo" is not a regular file; nothing was read', /not a regular file/],
     ];
     for (const [code, message, reason] of cases) {
-      const copy = gitMessageCopy(code, message);
+      const copy = gitMessageCopy(code, message, "git.diff");
       expect(copy, message).not.toBeNull();
       expect(copy?.title, message).toMatch(/^Nothing was read/);
       expect(`${copy?.title} ${copy?.action}`, message).toMatch(reason);
-      const err = new CoreRequestError("core", code as "VALIDATION_FAILED", message);
+      const err = new CoreRequestError("core", code as "VALIDATION_FAILED", message, undefined, "git.diff");
       expect(describeCoreError(err).title).toBe(copy?.title);
     }
     // Not an exact message / another code: no "nothing was read" claim.
-    expect(gitMessageCopy("INTERNAL", MSG_DIFF_PATH_NOT_IN_LIST)).toBeNull();
-    expect(gitMessageCopy("VALIDATION_FAILED", "something else")).toBeNull();
+    expect(gitMessageCopy("INTERNAL", MSG_DIFF_PATH_NOT_IN_LIST, "git.diff")).toBeNull();
+    expect(gitMessageCopy("VALIDATION_FAILED", "something else", "git.diff")).toBeNull();
   });
 
   it("through FakeCore: unknown path, twice-listed without status, no Git context, unknown task", async () => {
@@ -458,5 +466,155 @@ describe("FakeCore A5 model", () => {
     expect(cut.patch.endsWith("\n")).toBe(true);
     expect(new TextEncoder().encode(cut.patch).length).toBeLessThanOrEqual(60);
     expect(cut.baseBlob).toBe("b".repeat(40));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A5 combined client review fixes (W1, W4, I2, I4, I5)
+// ---------------------------------------------------------------------------
+
+describe("A5 review fixes", () => {
+  const SYMLINK = [
+    "diff --git a/link b/link",
+    "new file mode 120000",
+    "--- /dev/null",
+    "+++ b/link",
+    "@@ -0,0 +1 @@",
+    "+../target",
+    "\\ No newline at end of file",
+    "",
+  ].join("\n");
+  const untracked = (patch: string): GitDiffResult => ({ ...RESULT, status: "untracked", path: "link", patch });
+
+  it("W1: the symlink line needs untracked + line 2 'new file mode 120000' + '@@ -0,0 +1 @@' + exactly one '+' line", () => {
+    expect(symlinkTarget(untracked(SYMLINK))).toBe("../target");
+    // A target with a newline is two '+' lines: no symlink line at all, never a partial target.
+    const twoLines = [
+      "diff --git a/p b/p",
+      "new file mode 120000",
+      "--- /dev/null",
+      "+++ b/p",
+      "@@ -0,0 +1,2 @@",
+      "+safe",
+      "+../../x",
+      "\\ No newline at end of file",
+      "",
+    ].join("\n");
+    expect(symlinkTarget(untracked(twoLines))).toBeNull();
+    expect(diffDisclosures(untracked(twoLines), undefined).join(" ")).not.toContain("symlink");
+    // Two '+' lines under an exact '@@ -0,0 +1 @@' header are refused too.
+    expect(symlinkTarget(untracked(SYMLINK.replace("+../target", "+a\n+b")))).toBeNull();
+    // A typechange: the mode appears mid-patch (after a deletion), not on line 2.
+    const typechange = [
+      "diff --git a/f b/f",
+      "deleted file mode 100644",
+      "index ce01362..0000000",
+      "--- a/f",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-hello",
+      "diff --git a/f b/f",
+      "new file mode 120000",
+      "index 0000000..2b65e96",
+      "--- /dev/null",
+      "+++ b/f",
+      "@@ -0,0 +1 @@",
+      "+/etc/target",
+      "\\ No newline at end of file",
+      "",
+    ].join("\n");
+    for (const status of ["modified", "untracked"] as const) {
+      expect(symlinkTarget({ ...RESULT, status, patch: typechange })).toBeNull();
+      expect(diffDisclosures({ ...RESULT, status, patch: typechange }, undefined).join(" ")).not.toContain("symlink");
+    }
+    // Only an untracked entry, never a binary or truncated one.
+    expect(symlinkTarget({ ...untracked(SYMLINK), status: "added" })).toBeNull();
+    expect(symlinkTarget({ ...untracked(SYMLINK), truncated: true })).toBeNull();
+    expect(symlinkTarget({ ...untracked(SYMLINK), binary: true })).toBeNull();
+  });
+
+  it("W4: the proxy's lost-answer suffix (Rust, read from disk) never reaches the git.diff failure copy", () => {
+    const rustSuffix = rustStrConst("apps/desktop/src-tauri/src/ipc_client.rs", "MAY_HAVE_BEEN_APPLIED_SUFFIX");
+    expect(rustSuffix).toBe(PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX);
+    for (const [code, proxyCode] of [
+      ["TRANSPORT_CLOSED", "CONNECTION_CLOSED"],
+      ["MALFORMED_FRAME", "MALFORMED_FRAME"],
+      ["TRANSPORT_UNAVAILABLE", "READ_FAILED"],
+    ] as const) {
+      const err = new CoreRequestError(
+        "client",
+        code,
+        `Core closed the connection before answering${PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX}`,
+        { proxyCode, mayHaveBeenApplied: true },
+      );
+      const copy = diffFailureCopy(err);
+      const all = `${copy.title} ${copy.body} ${copy.action}`;
+      expect(all).not.toContain(PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX.trim());
+      expect(all).not.toMatch(/may have been applied|already been delivered/i);
+      expect(copy.body).toContain("Core closed the connection before answering");
+      expect(copy.title).toMatch(/no file was changed \(git\.diff is read-only\)$/);
+    }
+  });
+
+  it("W4: the proxy marks the suffix only for methods that may mutate (is_read_only, separate from replay_safe)", () => {
+    const proxy = desktopProxyRustSource();
+    const body = /fn is_read_only\(method: Method\) -> bool \{([\s\S]*?)\n\}/.exec(proxy)?.[1] ?? "";
+    expect(body).toMatch(/Method::GitDiff\s*=>\s*true|Method::GitDiff\s*\|/);
+    expect(proxy).toMatch(/fn after_write\(method: Method, mut err: ProxyError\) -> ProxyError \{\s*if !is_read_only\(method\)/);
+  });
+
+  it("I2: the per-line cap applies to the whole joined line, not to each tab-separated segment", () => {
+    const line = `+${"a".repeat(899)}\t${"b".repeat(900)}`;
+    const [shown] = patchView(line).lines;
+    expect(shown.text).toBe(`+${"a".repeat(899)}\t${"b".repeat(99)}… (801 more characters)`);
+    // Many short segments cannot add up past the cap either.
+    const tabs = patchView(Array.from({ length: 600 }, () => "xy").join("\t")).lines[0];
+    expect(Array.from(tabs.text.replace(/… \(\d+ more characters\)$/, ""))).toHaveLength(1000);
+    // A hidden character past the cut still marks the line.
+    expect(patchView(`+${"a".repeat(1200)}${cp(0x202e)}`).lines[0].unusual).toBe(true);
+  });
+
+  it("I4: the submodule prefix and the '; nothing was read' suffix are git.review / git.diff copy only", () => {
+    const patterned = [
+      `${SUBMODULE_REFUSAL_PREFIX}"vendor/lib"; Sandpane cannot verify submodule work trees safely`,
+      '"docs/x" changed while it was being read; nothing was read',
+    ];
+    for (const message of patterned) {
+      for (const method of ["git.review", "git.diff"] as const) {
+        expect(gitMessageCopy("VALIDATION_FAILED", message, method)?.title).toMatch(/^Nothing was read/);
+        const err = new CoreRequestError("core", "VALIDATION_FAILED", message, undefined, method);
+        expect(describeCoreError(err).title).toMatch(/^Nothing was read/);
+      }
+      for (const method of ["conversation.delete", "project.update", "git.apply", undefined] as const) {
+        expect(gitMessageCopy("VALIDATION_FAILED", message, method), String(method)).toBeNull();
+        const err = new CoreRequestError("core", "VALIDATION_FAILED", message, undefined, method);
+        expect(describeCoreError(err).title, String(method)).not.toMatch(/nothing was read/i);
+      }
+    }
+  });
+
+  it("I4: a Core error from the wire carries the method it answered", async () => {
+    const { client } = core();
+    const err = await failure(client.diffFile({ taskId: "t1", path: "nope.txt", status: "modified" }));
+    expect(err.method).toBe("git.diff");
+  });
+
+  it("I5: the Copy note counts lines with hidden characters and says never to apply the patch", () => {
+    expect(diffCopyNote(PATCH)).toBe(
+      "Copied the patch exactly as Core returned it. Never apply this patch — it may create symlinks.",
+    );
+    // Counted over the WHOLE patch (Copy copies all of it), not just the shown lines; tabs are not hidden.
+    const hidden = [
+      `+a${cp(0x202e)}b`,
+      "+\tplain tab",
+      ...Array.from({ length: 2100 }, () => "+x"),
+      `+z${cp(0x200b)}`,
+      `+cr\r`,
+      "",
+    ].join("\n");
+    expect(diffCopyNote(hidden)).toBe(
+      "Copied the patch exactly as Core returned it. It contains 3 lines with hidden characters. Never apply this patch — it may create symlinks.",
+    );
+    expect(diffCopyNote(`+a${cp(0x2028)}b\n`)).toContain("It contains 1 line with hidden characters.");
   });
 });

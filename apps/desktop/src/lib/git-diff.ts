@@ -9,13 +9,18 @@
  *   text children, revealed (hidden, control and bidi characters become
  *   visible escapes and the line is marked) and capped. It is never rendered
  *   as HTML or Markdown, never executed, and never offered for apply.
- * - File names come from the JSON `path` / `oldPath` only; the patch header is
- *   read for one thing — `new file mode 120000` (a symlink) — and only before
- *   the first hunk.
+ * - File names come from the JSON `path` / `oldPath` only; the patch is read
+ *   for one thing — the "symlink → target" line — and only from the fixed
+ *   shape of Core's untracked symlink patch (see `symlinkTarget`).
  * - `git.diff` is read-only, so no failure can have changed a file.
  */
 
-import { CoreRequestError, MAY_HAVE_BEEN_APPLIED_COPY, asCoreRequestError } from "./core-client";
+import {
+  CoreRequestError,
+  MAY_HAVE_BEEN_APPLIED_COPY,
+  PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX,
+  asCoreRequestError,
+} from "./core-client";
 import { coreAdvertisesMethod, type ChangeSet, type CoreCapabilities, type GitDiffResult } from "./protocol";
 import { describeCoreError, displayRevealed, featureGate, type FeatureGate } from "./reducers";
 import { MAX_CORE_MESSAGE_CHARS } from "./sandbox-lifecycle";
@@ -56,18 +61,26 @@ export function changeSetCompleteness(changeSet: Pick<ChangeSet, "uninspected">)
 }
 
 /**
- * The symlink target of a new-file patch whose header says
- * `new file mode 120000`, or `null`. Only the header (before the first `@@`)
- * is read for the mode; the target is the first `+` line of the hunk — the
- * link's text, never the content of what it points to.
+ * The target of Core's untracked symlink patch, or `null`. The JetBrains rule
+ * (A5 review W1), all of which must hold, else no symlink line is shown:
+ * the entry is `untracked` (and neither binary nor truncated); line 2 is
+ * exactly `new file mode 120000` (Core C-quotes a newline in a header name, so
+ * a file name cannot forge it, and a typechange's mid-patch mode never
+ * counts); the first hunk header is exactly `@@ -0,0 +1 @@`; and the hunk has
+ * exactly ONE `+` line. A target containing a newline is two `+` lines, so it
+ * is never shown partially. The `+` line is the link's text, never the
+ * content of what it points to.
  */
-export function symlinkTarget(patch: string): string | null {
-  const lines = patch.split("\n");
+export function symlinkTarget(
+  result: Pick<GitDiffResult, "status" | "patch" | "binary" | "truncated">,
+): string | null {
+  if (result.status !== "untracked" || result.binary || result.truncated) return null;
+  const lines = result.patch.split("\n");
+  if (!lines[0]?.startsWith("diff --git ") || lines[1] !== "new file mode 120000") return null;
   const hunk = lines.findIndex((line) => line.startsWith("@@"));
-  if (hunk < 0) return null;
-  if (!lines.slice(0, hunk).includes("new file mode 120000")) return null;
-  const added = lines.slice(hunk + 1).find((line) => line.startsWith("+"));
-  return added === undefined ? null : added.slice(1);
+  if (hunk < 0 || lines[hunk] !== "@@ -0,0 +1 @@") return null;
+  const added = lines.slice(hunk + 1).filter((line) => line.startsWith("+"));
+  return added.length === 1 ? added[0].slice(1) : null;
 }
 
 /**
@@ -79,7 +92,7 @@ export function diffDisclosures(result: GitDiffResult, maxBytesSent: number | un
   const name = (value: string) => displayRevealed(value, DIFF_NAME_MAX_CHARS).text;
   if (result.oldPath !== undefined) out.push(`${name(result.oldPath)} → ${name(result.path)}`);
   if (result.binary) out.push(BINARY_DISCLOSURE);
-  const target = result.binary ? null : symlinkTarget(result.patch);
+  const target = symlinkTarget(result);
   if (target !== null) out.push(`symlink → ${name(target)}`);
   if (result.truncated) out.push(`diff truncated at ${maxBytesSent ?? GIT_DIFF_DEFAULT_BYTES} bytes`);
   if (result.lossy) out.push(LOSSY_DISCLOSURE);
@@ -97,31 +110,67 @@ export interface PatchLine {
   kind: "add" | "del" | "hunk" | "context" | "meta";
 }
 
+/** Reveal every segment between tabs (tabs stay patch whitespace), uncapped. */
+function revealKeepingTabs(value: string): { text: string; unusual: boolean } {
+  let unusual = false;
+  const text = value
+    .split("\t")
+    .map((part) => {
+      const revealed = displayRevealed(part, Number.MAX_SAFE_INTEGER);
+      if (revealed.unusual) unusual = true;
+      return revealed.text;
+    })
+    .join("\t");
+  return { text, unusual };
+}
+
+/** The patch's lines (split on LF only; one trailing LF ends the last line). */
+function patchLines(patch: string): string[] {
+  if (patch.length === 0) return [];
+  return patch.endsWith("\n") ? patch.slice(0, -1).split("\n") : patch.split("\n");
+}
+
 /**
- * The patch as display lines: split on LF only, each line revealed (tabs are
- * kept as patch whitespace; every other control, hidden or bidi character is
- * escaped, including CR and U+2028) and capped, at most
+ * One display line: the WHOLE line (tabs included) is capped at
+ * `PATCH_LINE_MAX_CHARS` code points, then revealed (A5 review I2 — the cap
+ * was per tab segment). `unusual` looks at the whole line, so a hidden
+ * character past the cut still marks it.
+ */
+function displayPatchLine(line: string): { text: string; unusual: boolean } {
+  const points = Array.from(line);
+  const cut = points.length > PATCH_LINE_MAX_CHARS;
+  const head = revealKeepingTabs(cut ? points.slice(0, PATCH_LINE_MAX_CHARS).join("") : line);
+  const unusual = cut ? revealKeepingTabs(line).unusual : head.unusual;
+  return {
+    text: cut ? `${head.text}… (${points.length - PATCH_LINE_MAX_CHARS} more characters)` : head.text,
+    unusual,
+  };
+}
+
+/**
+ * The patch as display lines: split on LF only, each line capped and revealed
+ * (tabs are kept as patch whitespace; every other control, hidden or bidi
+ * character is escaped, including CR and U+2028), at most
  * `PATCH_VIEW_MAX_LINES` lines with the rest counted.
  */
 export function patchView(patch: string): { lines: PatchLine[]; hiddenLines: number } {
-  if (patch.length === 0) return { lines: [], hiddenLines: 0 };
-  const all = patch.endsWith("\n") ? patch.slice(0, -1).split("\n") : patch.split("\n");
+  const all = patchLines(patch);
   const shown = all.slice(0, PATCH_VIEW_MAX_LINES);
   return {
-    lines: shown.map((line) => {
-      let unusual = false;
-      const text = line
-        .split("\t")
-        .map((part) => {
-          const revealed = displayRevealed(part, PATCH_LINE_MAX_CHARS);
-          if (revealed.unusual) unusual = true;
-          return revealed.text;
-        })
-        .join("\t");
-      return { text, unusual, kind: lineKind(line) };
-    }),
+    lines: shown.map((line) => ({ ...displayPatchLine(line), kind: lineKind(line) })),
     hiddenLines: all.length - shown.length,
   };
+}
+
+/**
+ * The note after a successful Copy (A5 review I5). Copy takes the WHOLE patch,
+ * so the hidden-character count is over every line, not just the shown ones.
+ */
+export function diffCopyNote(patch: string): string {
+  const hidden = patchLines(patch).filter((line) => revealKeepingTabs(line).unusual).length;
+  const count =
+    hidden === 0 ? "" : ` It contains ${hidden} ${hidden === 1 ? "line" : "lines"} with hidden characters.`;
+  return `Copied the patch exactly as Core returned it.${count} Never apply this patch — it may create symlinks.`;
 }
 
 function lineKind(line: string): PatchLine["kind"] {
@@ -157,16 +206,28 @@ export interface DiffFailureCopy {
 }
 
 /**
+ * `message` without the "may have been applied" suffix of either plane: the
+ * webview's own (`MAY_HAVE_BEEN_APPLIED_COPY`) or the native proxy's
+ * (`PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX`, which a current proxy never adds to a
+ * read, but an older shell might).
+ */
+function withoutAppliedSuffix(message: string): string {
+  for (const suffix of [MAY_HAVE_BEEN_APPLIED_COPY, PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX]) {
+    if (message.endsWith(suffix)) return message.slice(0, -suffix.length).trimEnd();
+  }
+  return message;
+}
+
+/**
  * Copy for a failed `git.diff`. It is read-only: no failure — a timeout, a
  * lost answer, Core's INTERNAL — can have changed a file, so the
- * "may have been applied" wording of writes never appears here. Core's exact
- * refusals keep their "Nothing was read — …" copy.
+ * "may have been applied" wording of writes never appears here (neither the
+ * webview's nor the proxy's suffix — A5 review W4). Core's exact refusals keep
+ * their "Nothing was read — …" copy.
  */
 export function diffFailureCopy(err: unknown): DiffFailureCopy {
   const error = asCoreRequestError(err);
-  const raw = error.message.endsWith(MAY_HAVE_BEEN_APPLIED_COPY)
-    ? error.message.slice(0, -MAY_HAVE_BEEN_APPLIED_COPY.length).trimEnd()
-    : error.message;
+  const raw = withoutAppliedSuffix(error.message);
   const reason = displayRevealed(raw, MAX_CORE_MESSAGE_CHARS).text;
   if (error.isCoreError) {
     if (error.code === "INTERNAL") {
@@ -176,7 +237,7 @@ export function diffFailureCopy(err: unknown): DiffFailureCopy {
         action: "Re-read the review and try again; git may have failed or timed out inside Core.",
       };
     }
-    const copy = describeCoreError(new CoreRequestError("core", error.code, raw));
+    const copy = describeCoreError(new CoreRequestError("core", error.code, raw, undefined, "git.diff"));
     return { title: copy.title, body: `Core reported ${String(error.code)}: ${reason}`, action: copy.action };
   }
   if (error.code === "TIMEOUT") {

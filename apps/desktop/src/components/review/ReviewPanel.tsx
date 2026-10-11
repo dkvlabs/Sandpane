@@ -3,6 +3,7 @@ import { capabilitiesOf, useApplyChanges, useCoreLink, useTaskDiff, useTaskRevie
 import {
   changeSetCompleteness,
   copyDiffText,
+  diffCopyNote,
   diffFailureCopy,
   diffGate,
 } from "../../lib/git-diff";
@@ -293,7 +294,7 @@ function ReviewPanelBody({
                   onCopy={() => {
                     const text = diff.result?.patch ?? "";
                     void copyDiffText(globalThis.navigator?.clipboard, text).then((outcome) =>
-                      setCopyNote(outcome.ok ? "Copied the patch exactly as Core returned it." : outcome.message),
+                      setCopyNote(outcome.ok ? diffCopyNote(text) : outcome.message),
                     );
                   }}
                 />

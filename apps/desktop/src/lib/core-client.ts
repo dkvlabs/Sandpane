@@ -155,6 +155,12 @@ export class CoreRequestError extends Error {
     readonly code: ErrorCode | ClientErrorCode | UnrecognizedCoreCode,
     message: string,
     readonly details?: unknown,
+    /**
+     * The method this failure answered, when known (set for Core's own error
+     * frames, proxy failures and timeouts). Copy that only fits one method —
+     * e.g. A5's git refusal patterns — is scoped on it; unknown = not scoped in.
+     */
+    readonly method?: Method,
   ) {
     super(message);
     this.name = "CoreRequestError";
@@ -222,7 +228,10 @@ export function requestTimeoutFor(method: Method): number {
 /**
  * Methods with no server-side effect. Mirrors `replay_safe` in
  * src-tauri/src/ipc_client.rs exactly (drift-tested). For every OTHER method a
- * lost answer is reported as "may have been applied — re-read state".
+ * lost answer is reported as "may have been applied — re-read state", except
+ * that the native proxy never says so for a read outside this set (its
+ * `is_read_only`: `git.diff`, `conversation.export`), and the webview's own
+ * timeout copy for those is stripped by their failure copy.
  *
  * `sandbox.stop` and `sandbox.remove` are deliberately absent — including
  * remove's step 1: it mints a single-use token in Core, and step 2 acts. Neither
@@ -244,6 +253,15 @@ export const REPLAY_SAFE_METHODS: ReadonlySet<Method> = new Set<Method>([
 export function isReplaySafe(method: Method): boolean {
   return REPLAY_SAFE_METHODS.has(method);
 }
+
+/**
+ * The native proxy's own suffix for a lost answer to a method that may change
+ * state (`MAY_HAVE_BEEN_APPLIED_SUFFIX` in src-tauri/src/ipc_client.rs,
+ * drift-tested). The proxy never adds it to a read (`is_read_only`); copy for a
+ * read strips it anyway, so an older shell cannot make it say "applied".
+ */
+export const PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX =
+  " — the request had already been delivered to Core, so it may have been applied. Re-read state before retrying.";
 
 /** Copy appended to a lost answer for a state-changing method. */
 export const MAY_HAVE_BEEN_APPLIED_COPY =
@@ -306,6 +324,7 @@ function proxyFailure(method: Method, err: unknown): CoreRequestError {
       ? `the desktop could not exchange ${method} with Core (${proxy.proxyCode}): ${proxy.message}`
       : proxy.message,
     { proxyCode: proxy.proxyCode, mayHaveBeenApplied: proxy.mayHaveBeenApplied },
+    method,
   );
 }
 
@@ -446,6 +465,7 @@ export class CoreClient {
         response.err.code,
         response.err.message,
         response.err.details,
+        method,
       );
     }
     return response.ok;
@@ -1084,10 +1104,13 @@ function markInternalUnknown(err: CoreRequestError): CoreRequestError {
       : err.details === undefined
         ? {}
         : { coreDetails: err.details };
-  return new CoreRequestError(err.source, err.code, err.message, {
-    ...details,
-    mayHaveBeenApplied: true,
-  });
+  return new CoreRequestError(
+    err.source,
+    err.code,
+    err.message,
+    { ...details, mayHaveBeenApplied: true },
+    err.method,
+  );
 }
 
 function markWriteOutcome(err: CoreRequestError, keyed: boolean): CoreRequestError {
@@ -1098,11 +1121,13 @@ function markWriteOutcome(err: CoreRequestError, keyed: boolean): CoreRequestErr
         ? {}
         : { coreDetails: err.details };
   const unknown = err.mayHaveBeenApplied || (err.isCoreError && err.code === "INTERNAL");
-  return new CoreRequestError(err.source, err.code, err.message, {
-    ...details,
-    ...(unknown ? { mayHaveBeenApplied: true } : {}),
-    idempotencyKeyed: keyed,
-  });
+  return new CoreRequestError(
+    err.source,
+    err.code,
+    err.message,
+    { ...details, ...(unknown ? { mayHaveBeenApplied: true } : {}), idempotencyKeyed: keyed },
+    err.method,
+  );
 }
 
 /**
@@ -1118,6 +1143,7 @@ export function timeoutError(method: Method, timeoutMs: number): CoreRequestErro
       ? `${method} did not answer within ${timeoutMs} ms. ${MAY_HAVE_BEEN_APPLIED_COPY}`
       : `${method} did not answer within ${timeoutMs} ms`,
     { mayHaveBeenApplied: applied },
+    method,
   );
 }
 

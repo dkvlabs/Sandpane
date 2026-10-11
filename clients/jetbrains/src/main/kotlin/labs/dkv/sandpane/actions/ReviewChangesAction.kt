@@ -23,6 +23,8 @@ import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.text.VisibleText
 import labs.dkv.sandpane.ui.PlainText
 import labs.dkv.sandpane.services.EditorDiffProvider
+import labs.dkv.sandpane.services.ReviewRoot
+import labs.dkv.sandpane.services.ReviewRoots
 import labs.dkv.sandpane.services.TaskMonitorService
 
 /**
@@ -103,11 +105,17 @@ class ReviewChangesAction : AnAction() {
         candidateCount: Int,
     ) {
         val diff = EditorDiffProvider.instance(project)
-        val repositoryRoot = ProjectLevelVcsManager.getInstance(project).getAllVcsRoots().firstOrNull()?.path?.path
-            ?: project.basePath
-        val target = diff.resolve(changeSet, repositoryRoot)
+        // I3: resolve against the VCS root that IS Core's repoPath, never simply the first root; with no
+        // match nothing is resolved and the summary says so. This runs on the completing (io) thread of
+        // git.review, off the EDT, since choosing canonicalizes paths on disk.
+        val vcsRoots = ProjectLevelVcsManager.getInstance(project).getAllVcsRoots().map { it.path.path }
+        val target = when (val root = ReviewRoots.choose(changeSet.repoPath, vcsRoots)) {
+            is ReviewRoot.Matched -> diff.resolve(changeSet, root.root)
+            is ReviewRoot.Refused -> EditorDiffProvider.unresolvedTarget(changeSet, root.warning)
+        }
         val summary = diff.summarize(target, null)
-        val type = if (target.unresolved.isNotEmpty() || changeSet.hostDirty) NotificationType.WARNING else NotificationType.INFORMATION
+        val warn = target.unresolved.isNotEmpty() || changeSet.hostDirty || target.rootWarning != null
+        val type = if (warn) NotificationType.WARNING else NotificationType.INFORMATION
         val extra = if (candidateCount > 1) "\n(${candidateCount - 1} other task(s) also await review)" else ""
         val connection = ConnectionManager.instance()
         // A5: a per-file Diff action, only when Core advertises git.diff; otherwise visibly unsupported.

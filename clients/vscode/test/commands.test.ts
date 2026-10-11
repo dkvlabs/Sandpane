@@ -289,6 +289,21 @@ describe('client-side guards mirror sandpane_core::validation', () => {
     return { error, writes: h.transport.writes.length, frames: h.transport.sentFrames() };
   }
 
+  it('git.apply selectedFiles: exact paths (tab, CR, newline) pass; only empty or NUL is refused (I1)', async () => {
+    const exact = ['dir/new\nline\t.ts', 'a\rb.txt', 'x\u0001y', 'z\u007f', 'x'.repeat(5000)];
+    const ok = await attempt((c) => c.gitApply({ taskId: 't1', expectedBase: 'b71995fc', selectedFiles: exact }));
+    expect(ok.error).toBe(null);
+    expect(ok.writes).toBe(1);
+    expect(ok.frames[0]).toMatchObject({ method: 'git.apply', params: { selectedFiles: exact } });
+    for (const bad of ['', 'a\u0000b']) {
+      const { error, writes } = await attempt((c) =>
+        c.gitApply({ taskId: 't1', expectedBase: 'b71995fc', selectedFiles: ['ok.ts', bad] }),
+      );
+      expect(error, JSON.stringify(bad)).toBeInstanceOf(CoreValidationError);
+      expect(writes).toBe(0);
+    }
+  });
+
   it('rejects shell-shaped sandbox names before sending', async () => {
     for (const bad of ['', 'A', 'a--b', 'a;', 'a b', '$(id)', '../x', 'a-', '-a', 'x'.repeat(64)]) {
       const { error, writes } = await attempt((c) =>

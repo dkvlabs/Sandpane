@@ -20,6 +20,12 @@ object GitDiffText {
     const val EMPTY_COPY: String = "Core returned an empty patch"
     const val UNSUPPORTED: String =
         "Per-file diff: not supported by this Core (it does not advertise git.diff); nothing is sent."
+    /**
+     * W3: how a carriage return in the patch is shown: the same `\r` escape [VisibleText] uses, so a CR
+     * is never obeyed (it cannot return the caret and overwrite the start of the line) and never hidden
+     * (a CRLF ending is NOT folded into the line break, as [VisibleText.revealMultiline] does for chat).
+     */
+    const val CR_MARKER: String = "\\r"
     const val READ_ONLY_NOTE: String =
         "Read-only view of Core's patch. It is never applied, copied into the project or run."
 
@@ -44,6 +50,7 @@ object GitDiffText {
         if (result.binary) add(BINARY_COPY)
         if (result.truncated) add(truncatedCopy(requestedMaxBytes))
         if (result.lossy) add(LOSSY_COPY)
+        if (!result.binary) crlfLineCount(result.patch).takeIf { it > 0 }?.let { add(crlfCopy(it)) }
         if (result.patch.isEmpty() && !result.binary && !result.truncated) add(EMPTY_COPY)
         result.baseBlob?.let { add("base blob ${VisibleText.reveal(it.take(12))}") }
     }
@@ -64,6 +71,17 @@ object GitDiffText {
         return "symlink \u2192 " + shown(added.single().drop(1))
     }
 
-    /** The patch for the read-only text area: revealed, real line breaks kept; empty when binary. */
-    fun body(result: GitDiffResult): String = if (result.binary) "" else VisibleText.revealMultiline(result.patch)
+    fun crlfCopy(lines: Int): String =
+        "contains $lines ${if (lines == 1) "line" else "lines"} with carriage returns (CRLF) \u2014 shown as $CR_MARKER"
+
+    /** Lines (split on `\n` only; never [String.lines], which also splits on a bare CR) ending in CR. */
+    fun crlfLineCount(patch: String): Int = patch.split('\n').count { it.endsWith('\r') }
+
+    /**
+     * The patch for the read-only text area; empty when binary. Split on `\n` ONLY, each line revealed
+     * on its own (tabs stay real), then rejoined with `\n`: a CR, whether a CRLF ending or a lone one
+     * inside a line, becomes the visible [CR_MARKER] and is never turned into, or swallowed by, a break.
+     */
+    fun body(result: GitDiffResult): String =
+        if (result.binary) "" else result.patch.split('\n').joinToString("\n") { VisibleText.revealMultiline(it) }
 }

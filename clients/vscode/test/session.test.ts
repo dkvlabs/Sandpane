@@ -756,6 +756,43 @@ describe('Core remediation hints and canonical repositories (Core update)', () =
   });
 });
 
+describe('confirmRepoRoot reveals Core-registered repository paths (I7)', () => {
+  it('the matched canonical repository is shown revealed in the modal provenance line', async () => {
+    const repo = '/repo/at\u202Elas';
+    const core = new ScriptedCore();
+    core.p1Repositories = [repo];
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const { session } = makeSession(core, state);
+    stub.workspaceFolders = [{ uri: Uri.file(repo), name: 'atlas' }];
+    await session.attach();
+    await settle();
+    await session.reviewChanges('task-a'); // no answer scripted → declined after the prompt
+    const prompt = stub.infos.find((m) => m.includes('repository root')) ?? '';
+    const provenance = /registered in Core \((.*)\)\./.exec(prompt)?.[1] ?? '';
+    expect(provenance).toBe('/repo/at\\u202Elas');
+    session.dispose();
+  });
+
+  it("an unmatched project's repositories are listed revealed in the warning", async () => {
+    const core = new ScriptedCore();
+    core.p1Repositories = ['/repo/x\u202Ey', '/repo/z\u2028w'];
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const { session } = makeSession(core, state);
+    stub.workspaceFolders = [{ uri: Uri.file('/repo/other'), name: 'other' }];
+    await session.attach();
+    await settle();
+    await session.reviewChanges('task-a');
+    const prompt = stub.infos.find((m) => m.includes('repository root')) ?? '';
+    const warning = /no open folder matches the project's repositories in Core \((.*)\)\./.exec(prompt)?.[1] ?? '';
+    expect(warning).toContain('/repo/x\\u202Ey');
+    expect(warning).toContain('/repo/z\\u2028w');
+    expect(warning).not.toMatch(/[\u202E\u2028]/);
+    session.dispose();
+  });
+});
+
 describe('stale responses after a project switch (review W1)', () => {
   function startInP1(): { core: ScriptedCore; state: MemoryState } {
     const core = new ScriptedCore();

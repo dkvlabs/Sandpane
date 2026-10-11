@@ -128,6 +128,55 @@ fn replay_safe(method: Method) -> bool {
     )
 }
 
+/// Methods that never change state in Core, sandbox or repository: a lost
+/// answer to one of these cannot have "applied" anything, so [`after_write`]
+/// never adds [`MAY_HAVE_BEEN_APPLIED_SUFFIX`] to it. This is NOT the
+/// replay-safe set: `git.diff` and `conversation.export` are reads that stay
+/// out of [`replay_safe`] (a lost answer is surfaced, never re-sent), yet
+/// saying "may have been applied" about them would be false (A5 review W4).
+/// Every replay-safe method is read-only (tested), never the reverse.
+///
+/// An exhaustive `match` with no wildcard: a new `Method` variant does not
+/// compile until someone decides whether it can change state.
+fn is_read_only(method: Method) -> bool {
+    match method {
+        Method::SystemProbe
+        | Method::ProjectList
+        | Method::SandboxList
+        | Method::ConversationList
+        | Method::ConversationHistory
+        | Method::ConversationExport
+        | Method::TaskList
+        | Method::TaskSubscribe
+        | Method::GitReview
+        | Method::GitDiff => true,
+        Method::ProjectCreate
+        | Method::ProjectUpdate
+        | Method::ProjectArchive
+        | Method::ProjectUnarchive
+        | Method::ProjectDelete
+        | Method::ProjectAddRepository
+        | Method::ProjectRemoveRepository
+        | Method::SandboxCreate
+        | Method::SandboxStop
+        | Method::SandboxRemove
+        | Method::ConversationCreate
+        | Method::ConversationSend
+        | Method::ConversationRename
+        | Method::ConversationArchive
+        | Method::ConversationUnarchive
+        | Method::ConversationDelete
+        | Method::TaskCancel
+        | Method::GitApply => false,
+    }
+}
+
+/// Appended by [`after_write`] to a lost answer for a method that may change
+/// state. `src/lib/core-client.ts` mirrors it as
+/// `PROXY_MAY_HAVE_BEEN_APPLIED_SUFFIX` (drift-tested), so read-only copy can
+/// prove it never shows it.
+pub const MAY_HAVE_BEEN_APPLIED_SUFFIX: &str = " — the request had already been delivered to Core, so it may have been applied. Re-read state before retrying.";
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyError {
@@ -428,15 +477,12 @@ fn validate_response(line: &str, expected_id: &str) -> Result<(), ProxyError> {
     Ok(())
 }
 
-/// Mark an error that happened after a state-changing frame was written.
+/// Mark an error that happened after a state-changing frame was written. A
+/// read ([`is_read_only`]) is never marked, even when it is not replay-safe.
 fn after_write(method: Method, mut err: ProxyError) -> ProxyError {
-    if !replay_safe(method) {
+    if !is_read_only(method) {
         err.may_have_been_applied = true;
-        err.message = format!(
-            "{} — the request had already been delivered to Core, so it may have been applied. \
-             Re-read state before retrying.",
-            err.message
-        );
+        err.message = format!("{}{MAY_HAVE_BEEN_APPLIED_SUFFIX}", err.message);
     }
     err
 }
@@ -963,6 +1009,40 @@ mod tests {
         let read = after_write(Method::TaskList, ProxyError::new("TIMEOUT", "t"));
         assert!(!read.may_have_been_applied);
         assert_eq!(read.message, "t");
+    }
+
+    /// A5 review W4: a lost answer to a READ never says "may have been
+    /// applied", even when the read is not replay-safe (`git.diff`,
+    /// `conversation.export`). `is_read_only` is its own set: replay-safe
+    /// implies read-only, never the reverse.
+    #[test]
+    fn lost_answer_to_a_read_never_says_it_may_have_been_applied() {
+        for m in [
+            Method::GitDiff,
+            Method::GitReview,
+            Method::ConversationExport,
+            Method::TaskList,
+            Method::SystemProbe,
+        ] {
+            for code in ["TIMEOUT", "CONNECTION_CLOSED", "MALFORMED_FRAME"] {
+                let lost = after_write(m, ProxyError::new(code, "Core closed the connection"));
+                assert!(!lost.may_have_been_applied, "{m:?} {code}");
+                assert_eq!(lost.message, "Core closed the connection", "{m:?} {code}");
+                assert!(!lost.message.contains(MAY_HAVE_BEEN_APPLIED_SUFFIX.trim()));
+            }
+        }
+        assert!(!replay_safe(Method::GitDiff));
+        assert!(is_read_only(Method::GitDiff));
+        for m in Method::ALL {
+            if replay_safe(m) {
+                assert!(
+                    is_read_only(m),
+                    "{m:?} is replay-safe, so it must be read-only"
+                );
+            }
+        }
+        let write = after_write(Method::ConversationSend, ProxyError::new("TIMEOUT", "t"));
+        assert_eq!(write.message, format!("t{MAY_HAVE_BEEN_APPLIED_SUFFIX}"));
     }
 
     #[test]

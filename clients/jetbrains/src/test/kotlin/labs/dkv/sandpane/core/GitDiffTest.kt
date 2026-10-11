@@ -185,6 +185,51 @@ class GitDiffTest {
     }
 
     @Test
+    fun theSymlinkLineNeedsTheExactHunkHeaderAndExactlyOneAddedLine() {
+        val ok = result(path = "link", status = FileChangeStatus.UNTRACKED.reported(), patch = symlinkPatch("link", "t"))
+        assertEquals("symlink \u2192 t", GitDiffText.symlinkTarget(ok))
+        // Any other hunk header (a two-line add, a context hunk) is not Core's symlink shape.
+        assertNull(GitDiffText.symlinkTarget(ok.copy(patch = ok.patch.replace("@@ -0,0 +1 @@", "@@ -0,0 +1,2 @@"))))
+        assertNull(GitDiffText.symlinkTarget(ok.copy(patch = ok.patch.replace("@@ -0,0 +1 @@", "@@ -0,0 +1 @@ x"))))
+        // Two `+` lines: no longer a single link target.
+        assertNull(GitDiffText.symlinkTarget(ok.copy(patch = ok.patch.replace("+t\n", "+t\n+u\n"))))
+        // Zero `+` lines.
+        assertNull(GitDiffText.symlinkTarget(ok.copy(patch = ok.patch.replace("+t\n", ""))))
+        // The mode must be on line 2 exactly (not merely somewhere in the patch).
+        assertNull(GitDiffText.symlinkTarget(ok.copy(patch = ok.patch.replace("new file mode 120000\n", "new file mode 100644\nnew file mode 120000\n"))))
+    }
+
+    @Test
+    fun aCrlfPatchShowsEveryCarriageReturnAndDisclosesHowMany() {
+        val patch = "diff --git a/w.txt b/w.txt\n@@ -1,2 +1,2 @@\n-old\r\n-two\r\n+new\r\n+two\n"
+        val r = result(path = "w.txt", patch = patch)
+        val body = GitDiffText.body(r)
+        assertFalse(body.contains('\r'), "no raw carriage return reaches the text area")
+        assertEquals(3, body.split("\n").count { it.endsWith(GitDiffText.CR_MARKER) }, body)
+        val m = GitDiffText.CR_MARKER
+        assertEquals("diff --git a/w.txt b/w.txt\n@@ -1,2 +1,2 @@\n-old$m\n-two$m\n+new$m\n+two\n", body, "an LF-only line gets no marker")
+        assertEquals(patch.count { it == '\n' }, body.count { it == '\n' }, "line breaks are kept, one per patch line")
+        val disclosures = GitDiffText.disclosures(r, null)
+        assertTrue(
+            disclosures.contains("contains 3 lines with carriage returns (CRLF) \u2014 shown as ${GitDiffText.CR_MARKER}"),
+            disclosures.toString(),
+        )
+        assertEquals("contains 1 line with carriage returns (CRLF) \u2014 shown as ${GitDiffText.CR_MARKER}", GitDiffText.crlfCopy(1))
+        // No CRLF, no CRLF disclosure; a binary answer has no body to describe.
+        assertTrue(GitDiffText.disclosures(result(), null).none { it.contains("CRLF") })
+        assertTrue(GitDiffText.disclosures(r.copy(binary = true), null).none { it.contains("CRLF") })
+    }
+
+    @Test
+    fun aLoneCarriageReturnIsShownAndCannotOverwriteVisibleText() {
+        val patch = "diff --git a/p b/p\n@@ -1 +1 @@\n-a\n+harmless\rEVIL\n"
+        val body = GitDiffText.body(result(path = "p", patch = patch))
+        assertFalse(body.contains('\r'), "a lone CR is never obeyed")
+        assertTrue(body.contains("+harmless${GitDiffText.CR_MARKER}EVIL"), body)
+        assertTrue(GitDiffText.disclosures(result(path = "p", patch = patch), null).none { it.contains("CRLF") })
+    }
+
+    @Test
     fun theViewerIsNamedFromTheJsonPathNeverThePatchHeader() {
         val r = result(path = "real\tname\n.kt", patch = "diff --git a/evil b/evil\n@@ -1 +1 @@\n-a\n+b\n")
         val title = GitDiffText.title(r)

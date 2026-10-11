@@ -69,7 +69,8 @@ export const MAX_SCOPING_ID_LEN = 200;
  * stay lowercase snake_case (`project.add_repository`).
  *
  * A3b (design §3.3) added the five conversation lifecycle methods; they sit
- * right after `conversation.history` in `Method::ALL` (27 in total).
+ * right after `conversation.history` in `Method::ALL` (27 in total then; A5's
+ * `git.diff` makes 28).
  */
 export const CORE_METHODS = [
   'system.probe',

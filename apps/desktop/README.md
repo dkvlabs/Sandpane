@@ -32,12 +32,12 @@ result, except where a row says it was not re-run:
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **20 files, 607 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm test` (`vitest run`) | OK — **20 files, 614 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
 | `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
 | `cd src-tauri && cargo fmt --check` | OK — no diff |
 | `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b / A4 / A5 passes (`clippy --all-targets` below compiles the crate) |
 | `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
-| `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 28; the six A3a project methods, the five A3b conversation methods and A5's `git.diff` are allowlisted and never replay-safe; the A3a and A3b methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s, and `git.review` / `git.diff` are at 43 s) |
+| `cd src-tauri && cargo test --offline` | OK — **33 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 28; the six A3a project methods, the five A3b conversation methods and A5's `git.diff` are allowlisted and never replay-safe; the A3a and A3b methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s, and `git.review` / `git.diff` are at 43 s; a lost answer to an `is_read_only` method — `git.diff` and `conversation.export` included — is never marked maybe-applied) |
 | `make desktop-check` (repo root) | NOT re-run in the A3b / A4 / A5 passes (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
 | `npm run lint --if-present` | No `lint` script in this package — nothing ran |
 
@@ -160,7 +160,7 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 
 ### A3b conversation lifecycle — what the desktop does, and status
 
-- **Methods.** `METHODS` is the 27 names of `Method::ALL`, in order. The five new ones follow
+- **Methods.** `METHODS` was the 27 names of `Method::ALL` at A3b (28 since A5, below), in order. The five new ones follow
   `conversation.history`: `conversation.rename`, `conversation.archive`, `conversation.unarchive`,
   `conversation.delete`, `conversation.export`. None is replay-safe (TS `REPLAY_SAFE_METHODS` and
   the Rust `replay_safe` are unchanged); all five use the default deadlines (webview 15 s, proxy
@@ -246,25 +246,35 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 - **Rendering.** The patch is untrusted text: a read-only monospace `<pre>` of React text
   children (never `dangerouslySetInnerHTML`), split on LF, each line revealed (hidden, control,
   bidi characters, CR and U+2028 become `\u` escapes; the line is marked "!"; tabs stay), capped at
-  2 000 lines × 1 000 characters with the rest counted. File names come from the JSON
+  2 000 lines × 1 000 characters per whole line (tabs included, counted before escaping) with the
+  rest counted. File names come from the JSON
   `path` / `oldPath` only. A Copy button copies the patch exactly as Core returned it and reports
-  failure honestly. The view says it is display only; the patch is never applied, written to
-  the repository or run.
+  failure honestly; after a copy the note says how many lines of the whole patch hold hidden
+  characters (when any) and "Never apply this patch — it may create symlinks." The view says it is
+  display only; the patch is never applied, written to the repository or run.
 - **Disclosures.** `binary`: "treated as binary (possibly by repository attributes) — no text diff
   shown"; `truncated`: "diff truncated at N bytes"; `lossy`: "contains bytes that are not valid
-  UTF-8; shown with replacement characters"; renames `oldPath → path`; a `new file mode 120000`
-  header (read only before the first hunk) as "symlink → target"; `baseBlob` as a short id; an
+  UTF-8; shown with replacement characters"; renames `oldPath → path`; "symlink → target" only
+  for Core's exact untracked symlink shape (status `untracked`, not binary or truncated, line 2
+  exactly `new file mode 120000`, hunk header exactly `@@ -0,0 +1 @@`, exactly one `+` line —
+  the JetBrains rule), otherwise no symlink line (a target containing a newline, a typechange); `baseBlob` as a short id; an
   empty non-binary patch as "Core returned an empty patch …". Never "no changes".
 - **Honest copy.** Core's exact refusals (path not in the change list, listed twice, not valid
   UTF-8, work tree redirected, no Git context, worktree removed, submodules, and the untracked
   read refusals ending "; nothing was read") map to "Nothing was read — …" (drift-tested against
-  `sandpane-service`, `git.rs`, `diff.rs`). A timeout is "Core did not answer in time — no file was
+  `sandpane-service`, `git.rs`, `diff.rs`). The two pattern matches (the submodule prefix and the
+  "; nothing was read" suffix) apply only to an error that answered `git.review` / `git.diff`
+  (`CoreRequestError.method`); the same text from any other method gets the generic copy. A timeout is "Core did not answer in time — no file was
   changed (git.diff is read-only)"; INTERNAL is "Core could not produce the diff — no file was
-  changed …". `git.diff` failures never use the "may have been applied" wording of writes.
+  changed …". `git.diff` failures never use the "may have been applied" wording of writes: the
+  proxy's `after_write` adds its suffix only for methods outside `is_read_only` (an exhaustive
+  `match`, separate from `replay_safe`: `git.diff` and `conversation.export` are reads that are
+  still not re-sent), and `diffFailureCopy` strips both the webview's and the proxy's suffix
+  (drift-tested against `MAY_HAVE_BEEN_APPLIED_SUFFIX`).
 
 | Item | Status |
 | --- | --- |
-| Frames, gating, decoding, disclosures, copy, deadlines, SSR of the diff view | Functional headless: `tests/git-diff.test.ts` (24 tests) against an in-memory FakeCore. **UNVERIFIED live** — never run against a real A5 Core, never in the running desktop app |
+| Frames, gating, decoding, disclosures, copy, deadlines, SSR of the diff view | Functional headless: `tests/git-diff.test.ts` (31 tests) against an in-memory FakeCore. **UNVERIFIED live** — never run against a real A5 Core, never in the running desktop app |
 | FakeCore `git.review` (exact paths, `repoPath`, `oldPath`) / `git.diff` (path + status gate, truncation, binary, refusals) | **Modeled** on `sandpane-service/src/lib.rs` (working tree, §3.5), **not captured** |
 | A diff of a real task | **UNVERIFIED and not reachable over the wire today**: no wire-created task has Git context until A4b, so a real Core answers "task has no Git context" |
 | The Diff button, the open diff and Copy inside `ReviewPanel` | `ReviewPanel` is not SSR-rendered in this suite; `DiffView` and the pure helpers are tested, the wiring is **UNVERIFIED** |
@@ -448,8 +458,8 @@ React view  →  CoreClient (src/lib/core-client.ts)      ← framing, id correl
 - **Wire contract is shared, not re-invented.** `src/lib/protocol.ts` mirrors
   `core/crates/sandpane-protocol` exactly: camelCase payload fields, `snake_case` statuses and
   workspace modes, `SCREAMING_SNAKE_CASE` error codes, `{v,id,…}` frames, the `AgentEvent`
-  tagged union, and the 27-name `Method` surface of Rust `Method::ALL` (A3a added six project
-  methods, A3b five conversation methods). `schemas/*.json` is
+  tagged union, and the 28-name `Method` surface of Rust `Method::ALL` (A3a added six project
+  methods, A3b five conversation methods, A5 `git.diff`). `schemas/*.json` is
   the third copy; they move together, and `tests/protocol-drift.test.ts` reads the Rust crate and
   the schemas to prove it.
 - **Feature detection, never assumption.** Every additive read is gated on

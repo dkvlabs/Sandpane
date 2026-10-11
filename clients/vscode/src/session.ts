@@ -2669,9 +2669,9 @@ export class SandpaneSession {
       : coreRepo
         ? `WARNING: no open folder is the task's repository reported by Core (${plainText(coreRepo, 500)}).`
         : matched
-          ? `This folder is one of the project's repositories registered in Core (${matched.canonical}).`
+          ? `This folder is one of the project's repositories registered in Core (${plainText(matched.canonical, 500)}).`
           : project?.repositories && project.repositories.length > 0
-            ? `WARNING: no open folder matches the project's repositories in Core (${project.repositories.join(', ')}).`
+            ? `WARNING: no open folder matches the project's repositories in Core (${project.repositories.map((r) => plainText(r, 500)).join(', ')}).`
             : 'Core reports no repository for the selected project.';
     const answer = await vscode.window.showInformationMessage(
       `Diff the ${changeSet.changes.length} reported change(s) against the task base ` +
