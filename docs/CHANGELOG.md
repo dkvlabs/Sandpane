@@ -701,4 +701,37 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0034 — Protocol A3b: conversation lifecycle
+
+- **date:** 2026-10-11
+- **phase:** C2 (conversation half; C2 complete) / protocol v1 addition A3b ([design §3.3](plans/2026-10-09-protocol-v1-additions.md)), with all three clients.
+- **commit:** `f44ab4c` (feat(protocol): conversation lifecycle (A3b))
+- **details:**
+  - **Core methods (27 total):** `conversation.rename`, `conversation.archive`, `conversation.unarchive`, `conversation.delete` (A1 two-step token, bound to the conversation id), `conversation.export`; `conversation.list {includeArchived?}`; `Conversation.archivedAt?`/`sandboxId?`; feature `conversation-sandbox-id`; migration v6 with backup and downgrade refusal.
+  - **Delete:** one transaction; refuses while unfinished tasks exist; never touches host files, worktrees, branches or sandboxes (impact lines say so).
+  - **Archived conversations** refuse send and rename (a behaviour change: send used to answer NOT_FOUND); history and export still serve them; the project-archived message wins when both apply.
+  - **Export:** paged like history (`MAX_HISTORY_BYTES` counted on raw rows under the lock); always redacted after the lock is released; messages only.
+  - **Redaction:** new `sandpane-core::redact`, seven kinds, never lengthens text; overlapping matches are merged so a PEM block is never dropped; the title is counted on the first page only.
+  - **Dependencies:** `regex` 1.13.1 (pinned exactly, default features off) → `regex-automata` 0.4.18, `regex-syntax` 0.8.11; all MIT OR Apache-2.0. `aho-corasick` 1.1.5 appears in `Cargo.lock` but is not compiled.
+  - **Clients:** 27-method pins; probe-gated rename, archive/unarchive, "Show archived", A1-pattern delete and export; validators drift-tested against `Validator::conversation_title`; create titles normalized so a multi-line first prompt never fails create; single-flight delete and export; an unknown delete outcome is settled by an archived-inclusive re-read only when `conversation.archive` is advertised; JetBrains never moves the send target to a conversation the user did not pick.
+  - **Deviations:**
+    - the new methods sit after `conversation.history` in `Method::ALL`, not at the end;
+    - regex features are trimmed;
+    - two `#[doc(hidden)]` test seams;
+    - a new `MSG_TITLE_BLANK` refusal for rename;
+    - the desktop export is a read-only preview + Copy (no file save; `@tauri-apps/plugin-dialog` is not a dependency), accepted and disclosed.
+- **files:**
+  - `core/crates/**` (new `redact.rs`, `conversation_lifecycle.rs` and its test), `core/Cargo.lock`, `schemas/rpc-request.schema.json`, `schemas/core-capabilities.schema.json`, `schemas/README.md`
+  - `clients/vscode/**`, `clients/jetbrains/**`, `apps/desktop/**`
+  - `docs/plans/*`, `docs/specs/02_ARCHITECTURE_AND_DATA.md`, `docs/compatibility.md`, `README.md`
+- **verification:**
+  - `make check` exit 0: Core 364; schemas in sync (27 methods, 3 features); VS Code 552; desktop 557 + 8 opt-in skipped; Tauri 32.
+  - JetBrains alone: 376; `verifyPlugin` Compatible.
+  - Live, isolated Core with no `sbx`: VS Code 60/60, desktop 8/8.
+  - 0 raw invisible characters in 77 files; the secret gate matched only synthetic redaction-test fixtures.
+  - UNVERIFIED: never run against real `sbx` or in a real editor, app or IDE; live scripts check the advertisement, not the A3b calls; `cargo-audit` and `cargo-deny` are not installed.
+- **review:** [audit/0034-protocol-a3b-conversation-lifecycle-review.md](audit/0034-protocol-a3b-conversation-lifecycle-review.md) — `security-reviewer` on Core (BLOCK; C1, W1, W2, I2, I3 fixed) plus one combined security/phase pass on the clients (PASS-WITH-WARNINGS; W1–W3 and four Info items fixed); no Critical remains
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
