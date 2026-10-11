@@ -215,9 +215,9 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
     ).toMatchObject({ params: { taskId: 't1', expectedBase: 'refs/heads/main' } });
   });
 
-  it('exposes exactly the 22 allowlisted methods and nothing else', () => {
-    expect(CORE_METHODS).toHaveLength(22);
-    expect(new Set(CORE_METHODS).size).toBe(22);
+  it('exposes exactly the 27 allowlisted methods and nothing else', () => {
+    expect(CORE_METHODS).toHaveLength(27);
+    expect(new Set(CORE_METHODS).size).toBe(27);
     expect(CORE_METHODS).not.toContain('shell.exec');
     expect(CORE_METHODS).not.toContain('sbx.raw');
     expect(CORE_METHODS).not.toContain('sandbox.start');
@@ -247,6 +247,12 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
       conversationSend: 'conversation.send',
       conversationList: 'conversation.list',
       conversationHistory: 'conversation.history',
+      conversationRename: 'conversation.rename',
+      conversationArchive: 'conversation.archive',
+      conversationUnarchive: 'conversation.unarchive',
+      conversationDeleteRequest: 'conversation.delete',
+      conversationDeleteConfirm: 'conversation.delete',
+      conversationExport: 'conversation.export',
       taskCancel: 'task.cancel',
       taskList: 'task.list',
       taskSubscribe: 'task.subscribe',

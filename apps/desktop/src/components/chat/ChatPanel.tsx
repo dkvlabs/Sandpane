@@ -1,17 +1,39 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   capabilitiesOf,
+  useConversationDeletionFlow,
+  useConversationExport,
+  useConversationLifecycleGates,
   useCoreConversations,
   useCoreLink,
   useCreateConversation,
+  useSandboxes,
   useSessionConversations,
   useKeyedSend,
 } from "../../lib/hooks";
+import {
+  conversationArchivedLabel,
+  conversationCreateTitle,
+  conversationWriteBlock,
+  isConversationArchived,
+  mergeConversationRows,
+  sandboxChosenAtCreation,
+} from "../../lib/conversation-lifecycle";
+import { displayRevealed } from "../../lib/reducers";
+import { validateConversationTitle } from "../../lib/wizard";
+import {
+  ConversationActions,
+  ConversationDeleteDialog,
+  ConversationDeletionNotices,
+  ConversationExportPanel,
+  SandboxChosenLabel,
+} from "./ConversationLifecycle";
 import { clearSentDraft, foldAgentView, taskStatusView, withDraft } from "../../lib/reducers";
 import type { Conversation } from "../../lib/protocol";
 import { ConversationTranscript } from "./ConversationTranscript";
 import { FeatureChip } from "../ui/feature-gate";
 import {
+  Badge,
   Button,
   EmptyState,
   Field,
@@ -43,11 +65,17 @@ export function ChatPanel({
   projectId,
   selectedConversationId,
   onSelectConversation,
+  onConversationGone,
   archivedReason = null,
 }: {
   projectId: string;
   selectedConversationId: string | null;
   onSelectConversation: (id: string) => void;
+  /**
+   * A3b: Core no longer has the open conversation (deleted, or gone after an
+   * unknown outcome): leave it, so the route stops naming a deleted chat.
+   */
+  onConversationGone?: () => void;
   /**
    * A3a: set when Core reports this project archived. New chats and sends are
    * disabled with Core's reason (Core refuses both); reading stays available.
@@ -57,17 +85,23 @@ export function ChatPanel({
   const link = useCoreLink();
   const capabilities = capabilitiesOf(link);
   const session = useSessionConversations();
-  const coreChats = useCoreConversations(projectId);
-  const conversations: Conversation[] = useMemo(() => {
-    const seen = new Set<string>();
-    const out: Conversation[] = [];
-    for (const c of [...coreChats.conversations, ...session]) {
-      if (c.projectId !== projectId || seen.has(c.id)) continue;
-      seen.add(c.id);
-      out.push(c);
-    }
-    return out;
-  }, [coreChats.conversations, session, projectId]);
+  const lifecycle = useConversationLifecycleGates();
+  // A3b "show archived": only a Core advertising conversation.archive is asked.
+  const [showArchivedChoice, setShowArchived] = useState(false);
+  const showArchived = showArchivedChoice && lifecycle.showArchived.state === "supported";
+  const coreChats = useCoreConversations(projectId, true, showArchived);
+  const conversations: Conversation[] = useMemo(
+    () =>
+      mergeConversationRows(coreChats.conversations, session, { projectId, showArchived }).map(
+        (row) => row.conversation,
+      ),
+    [coreChats.conversations, session, projectId, showArchived],
+  );
+  const deletion = useConversationDeletionFlow({
+    selectedConversationId,
+    onClearSelection: () => onConversationGone?.(),
+  });
+  const { controller: exporter, state: exportState } = useConversationExport();
   const createConversation = useCreateConversation();
   const { write: sendWrite, state: send } = useKeyedSend();
   const keysAdvertised = idempotencyKeysAdvertised(capabilities);
@@ -75,6 +109,10 @@ export function ChatPanel({
   const agents = capabilities?.agents ?? [];
   const [agentId, setAgentId] = useState<string>("");
   const [title, setTitle] = useState("");
+  // A new chat's title is the user's own field, checked with Core's rule; a
+  // blank one is sent as "" so Core stores its "Untitled conversation".
+  const createTitle = conversationCreateTitle(title);
+  const titleError = validateConversationTitle(createTitle, "create");
   // One draft per conversation: switching tabs never carries text into
   // another chat, and switching back restores what was typed there.
   const [drafts, setDrafts] = useState<Readonly<Record<string, string>>>({});
@@ -86,6 +124,16 @@ export function ChatPanel({
     const { conversationId, content } = send.params;
     setDrafts((current) => clearSentDraft(current, conversationId, content));
   }, [send]);
+  // An export belongs to one conversation: switching drops it (and its text).
+  useEffect(() => {
+    exporter.reset();
+  }, [exporter, selectedConversationId]);
+  const selectedSandboxId =
+    conversations.find((c) => c.id === selectedConversationId)?.sandboxId ?? null;
+  // `sandbox.list` is read only to place a stored sandbox name; never otherwise.
+  const sandboxList = useSandboxes(
+    link.kind === "attached" && lifecycle.sandboxIdPersisted === true && selectedSandboxId !== null,
+  );
 
   if (link.kind !== "attached") {
     return (
@@ -106,6 +154,23 @@ export function ChatPanel({
   const sendIsForSelected =
     selected !== null && send.kind !== "idle" && send.params.conversationId === selected.id;
   const sending = send.kind === "sending";
+  // Core's check order: the archived PROJECT first, then the archived chat.
+  const sendBlocked =
+    archivedReason ?? (selected === null ? null : conversationWriteBlock(selected, false, "send"));
+  const sandboxView =
+    selected === null
+      ? null
+      : sandboxChosenAtCreation(
+          selected,
+          lifecycle.sandboxIdPersisted,
+          sandboxList.loaded && sandboxList.error === null
+            ? sandboxList.sandboxes.map((s) => s.name)
+            : null,
+        );
+  const panelExportState =
+    exportState.kind !== "idle" && selected !== null && exportState.conversationId === selected.id
+      ? exportState
+      : ({ kind: "idle" } as const);
 
   return (
     <Panel
@@ -118,10 +183,20 @@ export function ChatPanel({
       actions={
         <div className="row-actions">
           <FeatureChip gate={coreChats.gate} method="conversation.list" />
+          <label className="row-actions" title={lifecycle.showArchived.note}>
+            <input
+              type="checkbox"
+              checked={showArchived}
+              disabled={lifecycle.showArchived.state !== "supported"}
+              onChange={(event) => setShowArchived(event.target.checked)}
+            />{" "}
+            Show archived
+          </label>
           <Button
           variant="primary"
           disabled={
             archivedReason !== null ||
+            titleError !== null ||
             agents.length === 0 ||
             effectiveAgent.length === 0 ||
             createConversation.isPending
@@ -131,7 +206,7 @@ export function ChatPanel({
             createConversation.mutate({
               projectId,
               agentId: effectiveAgent,
-              title: title.trim().length > 0 ? title.trim() : "Untitled chat",
+              title: createTitle,
             })
           }
         >
@@ -141,6 +216,13 @@ export function ChatPanel({
       }
     >
       {archivedReason !== null && <p className="muted">{archivedReason}</p>}
+      {lifecycle.showArchived.state === "unsupported" && (
+        <p className="muted">{lifecycle.showArchived.note}</p>
+      )}
+      <ConversationDeletionNotices state={deletion.state} flow={deletion.flow} />
+      {deletion.state.kind === "confirming" && (
+        <ConversationDeleteDialog confirmation={deletion.state.confirmation} flow={deletion.flow} />
+      )}
       {agents.length === 0 && (
         <Warning tone="danger" title="Core reported no agent adapters">
           No <Mono>agents</Mono> capability came back from <Mono>system.probe</Mono>, so a chat
@@ -149,13 +231,14 @@ export function ChatPanel({
       )}
 
       <div className="row-actions">
-        <Field label="Conversation title (optional)">
+        <Field label="Conversation title (optional)" error={titleError ?? undefined}>
           {(id) => (
             <TextInput
               id={id}
               value={title}
+              invalid={titleError !== null}
               onChange={(event) => setTitle(event.target.value)}
-              placeholder="Untitled chat"
+              placeholder="Untitled conversation"
             />
           )}
         </Field>
@@ -207,11 +290,43 @@ export function ChatPanel({
               className={`tab${conversation.id === selected?.id ? " tab--active" : ""}`}
               onClick={() => onSelectConversation(conversation.id)}
             >
-              {conversation.title}
-              <span className="tab__meta">{conversation.agentId}</span>
+              {displayRevealed(conversation.title, 200).text}
+              <span className="tab__meta">
+                {conversation.agentId}
+                {isConversationArchived(conversation) && (
+                  <>
+                    {" "}
+                    <Badge tone="attention">{conversationArchivedLabel(conversation)}</Badge>
+                  </>
+                )}
+              </span>
             </button>
           ))}
         </div>
+      )}
+
+      {selected !== null && (
+        <details className="stack">
+          <summary>Conversation settings — rename, archive, delete, export</summary>
+          <SandboxChosenLabel view={sandboxView} />
+          <ConversationActions
+            conversation={selected}
+            projectArchived={archivedReason !== null}
+            gates={lifecycle}
+            deletion={deletion}
+          />
+          <ConversationExportPanel
+            gate={lifecycle.export}
+            state={panelExportState}
+            onStart={() => {
+              // One export at a time; another chat's running export is not joined.
+              if (exportState.kind === "exporting") return;
+              void exporter.start(selected.id);
+            }}
+            onCopy={() => void exporter.copy()}
+            onDismiss={() => exporter.reset()}
+          />
+        </details>
       )}
 
       {selected !== null && <ConversationTranscript conversationId={selected.id} />}
@@ -221,7 +336,7 @@ export function ChatPanel({
           className="composer"
           onSubmit={(event) => {
             event.preventDefault();
-            if (draft.trim().length === 0 || sending) return;
+            if (draft.trim().length === 0 || sending || sendBlocked !== null) return;
             const conversationId = selected.id;
             const content = draft;
             // One Send = one user action = one fresh key (A2), and no key at all
@@ -247,8 +362,8 @@ export function ChatPanel({
             <Button
               variant="primary"
               type="submit"
-              disabled={archivedReason !== null || draft.trim().length === 0 || sending}
-              title={archivedReason ?? undefined}
+              disabled={sendBlocked !== null || draft.trim().length === 0 || sending}
+              title={sendBlocked ?? undefined}
             >
               Send
             </Button>
@@ -256,6 +371,7 @@ export function ChatPanel({
               Creates a task in Core (conversation.send). Closing this tab never cancels it.
             </span>
           </div>
+          {sendBlocked !== null && archivedReason === null && <p className="muted">{sendBlocked}</p>}
           {sendIsForSelected && send.kind === "sending" && send.retry && (
             <p className="muted" role="status">
               Retrying safely — re-checking Core, then resending the identical message with the same

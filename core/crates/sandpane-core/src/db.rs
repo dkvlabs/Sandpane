@@ -28,7 +28,7 @@ pub struct Database {
 }
 
 /// Newest schema version this build understands.
-pub const LATEST_SCHEMA_VERSION: i64 = 5;
+pub const LATEST_SCHEMA_VERSION: i64 = 6;
 
 /// Schema v1: the entity set from specs/02 §3.
 const MIGRATION_V1: &str = r#"
@@ -227,6 +227,15 @@ CREATE TABLE idempotency_keys (
 CREATE INDEX idx_idempotency_keys_created ON idempotency_keys(created_at);
 "#;
 
+/// Schema v6 (A3b, design 2026-10-09 §3.3 item 3): the sandbox NAME chosen
+/// when a conversation was created (`conversation.create` validates it with
+/// `Validator::sandbox_name`; it was previously discarded). A stored name,
+/// not a binding or identity: nothing checks the sandbox still exists. Rows
+/// created before v6 stay NULL — never back-filled or guessed.
+const MIGRATION_V6: &str = r#"
+ALTER TABLE conversations ADD COLUMN sandbox_id TEXT;
+"#;
+
 impl Database {
     /// Open (or create) the database at `path` and migrate to the latest
     /// schema. Refuses databases from a newer schema version.
@@ -297,6 +306,9 @@ impl Database {
         }
         if current < 5 {
             self.apply_migration(5, MIGRATION_V5)?;
+        }
+        if current < 6 {
+            self.apply_migration(6, MIGRATION_V6)?;
         }
         Ok(())
     }
@@ -664,7 +676,7 @@ mod tests {
             .unwrap();
         }
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let binding: String = db
             .conn()
             .query_row(
@@ -717,8 +729,117 @@ mod tests {
         }
         drop(db);
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         assert!(!dir.path().join("core.sqlite3.pre-v5.bak.1").exists());
+    }
+
+    /// A3b migration: a REAL v5 file (v1..v5 SQL, a conversation written the
+    /// pre-A3b way) upgrades forward to v6: the row intact with `sandbox_id`
+    /// NULL (never back-filled), a consistent `.pre-v6.bak` of the v5 file
+    /// taken, and the new column writable.
+    #[test]
+    fn v5_database_migrates_forward_to_v6_with_conversation_sandbox_id_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in [
+                MIGRATION_V1,
+                MIGRATION_V2,
+                MIGRATION_V3,
+                MIGRATION_V4,
+                MIGRATION_V5,
+            ] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 5).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO conversations (id,project_id,title,agent_id,created_at)
+                     VALUES ('c1','p1','Old chat','codex','t');
+                 INSERT INTO idempotency_keys (method,key,params_hash,state,result_json,created_at)
+                     VALUES ('conversation.send','k1','h','done','{}','t');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(LATEST_SCHEMA_VERSION, 6);
+        assert_eq!(db.schema_version().unwrap(), 6);
+        let row: (String, Option<String>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT title, archived_at, sandbox_id FROM conversations WHERE id='c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("Old chat".into(), None, None), "never back-filled");
+        let keys: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM idempotency_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(keys, 1, "v5 rows intact");
+        let backup = dir.path().join("core.sqlite3.pre-v6.bak");
+        assert!(backup.exists());
+        let b = Connection::open(&backup).unwrap();
+        let v: i64 = b
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 5);
+        let has_col: i64 = b
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('conversations') WHERE name='sandbox_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 0, "the backup is the untouched v5 schema");
+        db.conn()
+            .execute(
+                "UPDATE conversations SET sandbox_id='atlas-auth' WHERE id='c1'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 6);
+        assert!(!dir.path().join("core.sqlite3.pre-v6.bak.1").exists());
+    }
+
+    /// A3b: a database written by a NEWER Core (v7) is refused untouched —
+    /// no pragma, no backup, no migration (no silent downgrade).
+    #[test]
+    fn v7_database_is_refused_by_a_v6_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+        let err = Database::open(&path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::TooNew {
+                    found: 7,
+                    supported: 6
+                }
+            ),
+            "{err}"
+        );
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains(".bak")),
+            "no backup taken: {names:?}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 7, "left untouched");
     }
 
     #[test]

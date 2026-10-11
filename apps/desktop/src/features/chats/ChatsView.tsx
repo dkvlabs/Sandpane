@@ -1,10 +1,17 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
+  useConversationLifecycleGates,
   useCoreConversations,
   useCoreLink,
   useProjects,
   useSessionConversations,
 } from "../../lib/hooks";
+import {
+  conversationArchivedLabel,
+  isConversationArchived,
+  mergeConversationRows,
+} from "../../lib/conversation-lifecycle";
+import { displayRevealed } from "../../lib/reducers";
 import { AppShell, ViewHeader } from "../../components/layout/AppShell";
 import {
   ConnectionBanner,
@@ -29,8 +36,9 @@ import type { Conversation } from "../../lib/protocol";
  * Chats index.
  *
  * `conversation.list` (ADDITIVE v1) makes the real cross-client list possible:
- * Core holds every non-archived conversation, including chats started in VS Code
- * or JetBrains. Support is still probed rather than assumed — a Core that does
+ * Core holds every conversation, including chats started in VS Code or
+ * JetBrains; archived ones are listed only with "Show archived" on (A3b,
+ * `includeArchived`, sent only to a Core that advertises `conversation.archive`). Support is still probed rather than assumed — a Core that does
  * not advertise the method falls back to the conversations this window created,
  * and the view says which of the two it is showing. Message history comes from
  * `conversation.history` inside the workspace, not from a local cache.
@@ -40,29 +48,24 @@ export function ChatsView({ route }: { route: Route }) {
   const refetch = useProbeRefetch();
   const { projects } = useProjects();
   const session = useSessionConversations();
-  const core = useCoreConversations(null);
+  const lifecycle = useConversationLifecycleGates();
+  const [showArchivedChoice, setShowArchived] = useState(false);
+  const showArchived = showArchivedChoice && lifecycle.showArchived.state === "supported";
+  const core = useCoreConversations(null, true, showArchived);
   const current = useRoute();
 
-  const rows: (Conversation & { fromCore: boolean })[] = useMemo(() => {
-    const seen = new Set<string>();
-    const out: (Conversation & { fromCore: boolean })[] = [];
-    // Core's list wins; the local list only adds rows Core has not returned yet
-    // (a conversation created seconds ago, before the next read).
-    for (const conversation of core.conversations) {
-      if (seen.has(conversation.id)) continue;
-      seen.add(conversation.id);
-      out.push({ ...conversation, fromCore: true });
-    }
-    for (const conversation of session) {
-      if (seen.has(conversation.id)) continue;
-      seen.add(conversation.id);
-      out.push({ ...conversation, fromCore: false });
-    }
-    return out;
-  }, [core.conversations, session]);
+  // Core's list wins; the local list only adds rows Core has not returned yet
+  // (a conversation created seconds ago, before the next read).
+  const rows: (Conversation & { fromCore: boolean })[] = useMemo(
+    () =>
+      mergeConversationRows(core.conversations, session, { projectId: null, showArchived }).map(
+        (row) => ({ ...row.conversation, fromCore: row.fromCore }),
+      ),
+    [core.conversations, session, showArchived],
+  );
 
   const projectName = (projectId: string): string =>
-    projects.find((p) => p.id === projectId)?.name ?? "unknown project";
+    displayRevealed(projects.find((p) => p.id === projectId)?.name ?? "unknown project", 120).text;
 
   return (
     <AppShell
@@ -115,11 +118,29 @@ export function ChatsView({ route }: { route: Route }) {
         }
         description={
           core.gate.state === "supported"
-            ? "Read through conversation.list. Archived chats are excluded by Core, so everything here can actually be reopened."
+            ? showArchived
+              ? "Read through conversation.list with includeArchived: true — archived chats are labelled; their history and export stay readable, sending and renaming are refused by Core."
+              : "Read through conversation.list. Core lists live chats only unless archived ones are asked for."
             : "Core has not answered conversation.list, so this is only what THIS window created — never the whole picture, and never sample data."
         }
-        actions={<FeatureChip gate={core.gate} method="conversation.list" />}
+        actions={
+          <div className="row-actions">
+            <FeatureChip gate={core.gate} method="conversation.list" />
+            <label className="row-actions" title={lifecycle.showArchived.note}>
+              <input
+                type="checkbox"
+                checked={showArchived}
+                disabled={lifecycle.showArchived.state !== "supported"}
+                onChange={(event) => setShowArchived(event.target.checked)}
+              />{" "}
+              Show archived
+            </label>
+          </div>
+        }
       >
+        {lifecycle.showArchived.state === "unsupported" && (
+          <p className="muted">{lifecycle.showArchived.note}</p>
+        )}
         {core.isLoading && core.gate.state === "supported" ? (
           <p className="muted">Reading conversations from Core…</p>
         ) : rows.length === 0 ? (
@@ -148,8 +169,14 @@ export function ChatsView({ route }: { route: Route }) {
                   }
                 >
                   <span className="row__title">
-                    {conversation.title}{" "}
+                    {displayRevealed(conversation.title, 200).text}{" "}
                     <span className="muted">· {projectName(conversation.projectId)}</span>
+                    {isConversationArchived(conversation) && (
+                      <>
+                        {" "}
+                        <Badge tone="attention">{conversationArchivedLabel(conversation)}</Badge>
+                      </>
+                    )}
                   </span>
                   <span className="row__meta">
                     <Badge tone="neutral">agent {conversation.agentId}</Badge> ·{" "}
@@ -168,8 +195,14 @@ export function ChatsView({ route }: { route: Route }) {
       <Warning tone="neutral" title="What this build still cannot do">
         <ul className="bullets">
           <li>
-            Search, archive and export of Sandpane-owned history (specs/05 §3.A): no Core method
-            exists for any of the three, so no UI is faked.
+            Search of Sandpane-owned history (specs/05 §3.A): no Core method exists for it, so no UI
+            is faked. Rename, archive, delete and export live in each conversation's settings inside
+            its project workspace, gated on what this Core advertises.
+          </li>
+          <li>
+            Export to a file: not implemented in the desktop (it needs the Tauri dialog plugin, which
+            is not shipped). The redacted export is shown read-only with a Copy action instead.
+            Redaction is best-effort; review the export before sharing it.
           </li>
           <li>
             Transcript paging is bounded by Core: <Mono>conversation.history</Mono> answers up to{" "}

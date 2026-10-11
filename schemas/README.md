@@ -55,7 +55,16 @@ state) — are pinned by the Rust protocol tests only: client adoption pending
 `Project.archivedAt` — are likewise defined by the Rust types; only their
 six method names are in `rpc-request`'s enum (gated by `schema-drift`).
 They are pinned by the Rust protocol and service tests only: client adoption
-pending (A3a client step). The `docs/specs/02 §2` contract blocks are the
+pending (A3a client step). The A3b conversation-lifecycle shapes —
+`ConversationRenameParams`, `ConversationIdParams`,
+`ConversationDeleteParams` / `ConversationDeleteResult` (the §2 token flow,
+`external: false`), `ConversationExportParams` / `ConversationExportResult`
+/ `ExportRedaction`, `ConversationListParams.includeArchived` and
+`Conversation.archivedAt` / `sandboxId` — are likewise defined by the Rust
+types; their five method names are in `rpc-request`'s enum and the
+`conversation-sandbox-id` feature is in `core-capabilities` (both gated by
+`schema-drift`). Client adoption pending (A3b client step). The
+`docs/specs/02 §2` contract blocks are the
 human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7
 generated-bindings deliverable, not here.

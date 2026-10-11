@@ -56,6 +56,13 @@ class SandpaneSettings : PersistentStateComponent<SandpaneSettings.State> {
          * pre-A3a Core cannot list archived projects, and the toggle then says so.
          */
         var showArchivedProjects: Boolean = false
+
+        /**
+         * A3b view setting: the chat picker also lists ARCHIVED conversations
+         * (`conversation.list {includeArchived:true}`), each labeled archived. Only honoured when Core
+         * advertises `conversation.archive`. A view preference only — no conversation id is stored.
+         */
+        var showArchivedConversations: Boolean = false
     }
 
     private var state = State()
@@ -85,6 +92,12 @@ class SandpaneSettings : PersistentStateComponent<SandpaneSettings.State> {
         state.showArchivedProjects = value
     }
 
+    val showArchivedConversations: Boolean get() = state.showArchivedConversations
+
+    fun setShowArchivedConversations(value: Boolean) {
+        state.showArchivedConversations = value
+    }
+
     /** Clamped so a bad persisted value can never stall the UI or blow up memory. */
     val streamFlushIntervalMs: Int get() = state.streamFlushIntervalMs.coerceIn(MIN_STREAM_FLUSH_MS, MAX_STREAM_FLUSH_MS)
 
@@ -100,6 +113,7 @@ class SandpaneSettings : PersistentStateComponent<SandpaneSettings.State> {
         clean.socketPathOverride = socketPathOverride.trim()
         clean.autoConnect = autoConnect
         clean.showArchivedProjects = showArchivedProjects
+        clean.showArchivedConversations = showArchivedConversations
         clean.streamFlushIntervalMs = streamFlushIntervalMs.orDefault(DEFAULT_STREAM_FLUSH_MS).coerceIn(MIN_STREAM_FLUSH_MS, MAX_STREAM_FLUSH_MS)
         clean.eventPollIntervalMs = eventPollIntervalMs.orDefault(DEFAULT_EVENT_POLL_MS).coerceIn(MIN_EVENT_POLL_MS, MAX_EVENT_POLL_MS)
         clean.retainedEventCap = retainedEventCap.orDefault(DEFAULT_RETAINED_EVENTS).coerceIn(MIN_RETAINED_EVENTS, MAX_RETAINED_EVENTS)

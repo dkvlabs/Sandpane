@@ -12,6 +12,8 @@ import com.intellij.notification.NotificationType
 import labs.dkv.sandpane.actions.ActionIds
 import labs.dkv.sandpane.core.AgentGate
 import labs.dkv.sandpane.core.ConnectionManager
+import labs.dkv.sandpane.core.ConversationOutcomes
+import labs.dkv.sandpane.core.ConversationUiState
 import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.core.KeyedCall
 import labs.dkv.sandpane.core.KeyedWrites
@@ -84,6 +86,9 @@ import javax.swing.event.DocumentListener
  *    panel never fabricates a conversation to send to.
  *  - transcript rows recovered from `conversation.history` are Core's stored messages, rendered
  *    as plain text; a truncated page says so and gives the cursor that continues it.
+ *  - A3b: rename / archive / unarchive / delete / export and "show archived" live in
+ *    [ConversationControls] under the pickers. An ARCHIVED conversation keeps its readable history;
+ *    the composer (send) and Rename are disabled with Core's reason, decided from `archivedAt` only.
  *
  * Text safety (security review S1): every label and renderer here that shows Core- or
  * user-provided text has Swing HTML rendering disabled ([PlainText]); tooltips carrying such text
@@ -224,6 +229,19 @@ class ChatPanel(
     private var hostMapping: SandpaneContextProvider.HostMapping =
         SandpaneContextProvider.HostMapping.Unsupported("host/path mapping not resolved yet")
 
+    /** A3b conversation-lifecycle controls; every host callback runs on the EDT. */
+    private val conversationControls = ConversationControls(
+        project,
+        object : ConversationControls.Host {
+            override fun selectedConversation(): Conversation? = conversationModel.selectedItem as? Conversation
+            override fun selectedProject(): SandpaneProject? = projectModel.selectedItem as? SandpaneProject
+            override fun reloadConversations(includeArchived: Boolean) = onSelectedProjectChanged(includeArchived)
+            override fun forgetConversation(conversationId: String) = forgetDeletedConversation(conversationId)
+            override fun systemRow(text: String) = addSystemRow(text)
+            override fun onEdt(block: () -> Unit) = this@ChatPanel.onEdt(block)
+        },
+    )
+
     init {
         name = "SandpanePanel"
         border = BorderFactory.createEmptyBorder(4, 6, 4, 6)
@@ -270,7 +288,7 @@ class ChatPanel(
      * kept BY ID when Core still lists it, and the transcript is then reconciled with whatever ends
      * up selected (review bug 3).
      */
-    private fun onSelectedProjectChanged() {
+    private fun onSelectedProjectChanged(includeArchivedOverride: Boolean = false) {
         val selected = projectModel.selectedItem as? SandpaneProject
         repopulate {
             sandboxModel.removeAllElements()
@@ -286,7 +304,10 @@ class ChatPanel(
             return
         }
         conversationState = "loading conversations from Core…"
-        sbx.enumerateConversations(selected.id).whenComplete { enumeration, error ->
+        // A3b: "show archived" (or an unknown-outcome re-read) lists archived conversations too — only
+        // on a Core that can honour it; SbxService never sends the flag otherwise.
+        val includeArchived = (settings.showArchivedConversations || includeArchivedOverride) && sbx.canListArchivedConversations()
+        sbx.enumerateConversations(selected.id, includeArchived).whenComplete { enumeration, error ->
             onEdt {
                 // A newer project selection / refresh superseded this answer: drop it.
                 if (generation != enumerationGeneration) return@onEdt
@@ -298,7 +319,11 @@ class ChatPanel(
 
                     enumeration is SbxService.ConversationEnumeration.Available -> {
                         conversationState = if (enumeration.conversations.isEmpty()) {
-                            "Core reports no open conversations for this project"
+                            if (includeArchived) {
+                                "Core reports no conversations for this project (archived included)"
+                            } else {
+                                "Core reports no open conversations for this project"
+                            }
                         } else {
                             enumeration.explain()
                         }
@@ -331,10 +356,18 @@ class ChatPanel(
                     conversationModel.selectedItem = outcome.choice
                 }
                 conversationsProjectId = selected.id
-                outcome.vanishedId?.let { gone ->
+                val listedByCore = error == null && enumeration is SbxService.ConversationEnumeration.Available
+                outcome.vanishedId?.takeUnless { listedByCore }?.let { gone ->
+                    addSystemRow(
+                        "Core's conversation list could not be read, so the conversation previously selected " +
+                            "(${gone.take(8)}) is not selected now and Send is disabled \u2014 select a conversation to continue.",
+                    )
+                }
+                outcome.vanishedId?.takeIf { listedByCore }?.let { gone ->
                     addSystemRow(
                         "The conversation previously selected (${gone.take(8)}) is no longer " +
-                            "listed by Core for this project; the selection changed and the transcript follows it.",
+                            "listed by Core for this project (it may have been archived or deleted). Nothing is selected " +
+                            "now, so Send is disabled \u2014 select a conversation to continue.",
                     )
                 }
                 conversationPicker.toolTipText = PlainText.tooltip(conversationState)
@@ -381,7 +414,11 @@ class ChatPanel(
             selected?.let { "Send posts to Core conversation ${it.id} · agent ${it.agentId}" }
                 ?: "No conversation is selected; Send will refuse rather than invent one.",
         )
-        if (!ConversationSelection.transcriptOutOfSync(selected?.id, displayedConversationId)) return
+        conversationControls.refresh()
+        if (!ConversationSelection.transcriptOutOfSync(selected?.id, displayedConversationId)) {
+            refreshGateUI()
+            return
+        }
         if (selected == null) {
             clearTranscript()
             displayedConversationId = null
@@ -416,9 +453,10 @@ class ChatPanel(
                 // The user (or a refresh) moved on to another conversation: drop this page.
                 if (generation != historyGeneration) return@onEdt
                 if (error != null) {
-                    // NOT_FOUND on an archived or unknown conversation is Core's verdict and is
+                    // NOT_FOUND on an unknown (e.g. deleted) conversation is Core's verdict and is
                     // shown as such — not turned into an empty transcript that reads as "no
                     // messages". A refusal this plugin raised before sending says so instead.
+                    // Since A3b Core serves archived conversations' history too.
                     addSystemRow(ErrorAttribution.describe(CoreMethods.CONVERSATION_HISTORY, error))
                     return@onEdt
                 }
@@ -434,6 +472,7 @@ class ChatPanel(
                     )
                 }
                 page.truncationNote()?.let { addSystemRow(it) }
+                ConversationUiState.composerBlocker(conversation)?.let { addSystemRow(it) }
                 addSystemRow(
                     "transcript from Core: ${page.messages.size} message(s)${
                         if (page.truncated) " (truncated — resume after sequence ${page.nextSequence})" else ""
@@ -455,7 +494,7 @@ class ChatPanel(
             .createActionToolbar("SandpaneToolWindow", group, true)
             .apply { targetComponent = this@ChatPanel }
 
-        val pickers = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
+        val pickerRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
             add(PlainText.label("Project"))
             add(projectPicker.apply { preferredSize = Dimension(170, 26) })
             add(PlainText.label("Chat"))
@@ -464,6 +503,11 @@ class ChatPanel(
             add(sandboxPicker.apply { preferredSize = Dimension(180, 26) })
             add(PlainText.label("Agent"))
             add(agentPicker.apply { preferredSize = Dimension(150, 26) })
+        }
+        val pickers = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            add(pickerRow.apply { alignmentX = java.awt.Component.LEFT_ALIGNMENT })
+            add(conversationControls.component.apply { alignmentX = java.awt.Component.LEFT_ALIGNMENT })
         }
 
         projectPicker.renderer = PlainTextListRenderer { value ->
@@ -498,8 +542,13 @@ class ChatPanel(
             if (conversation == null) {
                 "no conversation" to "conversation.list is not advertised by this Core, or it lists none"
             } else {
-                ConversationSelection.displayName(conversation) to
-                    "Core conversation ${conversation.id} · agent ${conversation.agentId} · created ${conversation.createdAt}"
+                // A3b: archived conversations (listed only with "Show archived") are labeled; Core
+                // strings are capped here and revealed by the renderer.
+                DisplayCap.cap(ConversationUiState.label(conversation)) to
+                    DisplayCap.cap(
+                        "Core conversation ${conversation.id} · agent ${conversation.agentId} · created ${conversation.createdAt}" +
+                            (conversation.archivedAt?.let { "\narchived at $it (Core)" } ?: ""),
+                    )
             }
         }
 
@@ -671,6 +720,7 @@ class ChatPanel(
             ?: (mapping as? SandpaneContextProvider.HostMapping.Unsupported)?.reason
             ?: gate.reasonForUser().takeUnless { gate.chatEnabled }
             ?: archivedBlocker()
+            ?: selectionBlocker()
 
         val blocked = blocker != null
         composer.isEnabled = !blocked
@@ -679,6 +729,7 @@ class ChatPanel(
         composer.toolTipText = PlainText.tooltip(blocker ?: "Type a message for the selected conversation")
         banner.text = blocker
             ?: "projects and sandboxes ${sbx.currentSnapshot().describeAge()}"
+        conversationControls.refresh()
     }
 
     /**
@@ -830,6 +881,8 @@ class ChatPanel(
             onEdt {
                 if (error != null) {
                     val text = KeyedWrites.describe(CoreMethods.CONVERSATION_SEND, KeyedWrites.classify(error), call.keyed)
+                    // A3b: an archived conversation (or project) is Core's exact VALIDATION_FAILED, not NOT_FOUND.
+                    ConversationOutcomes.sendRefusalHint(error)?.let { addSystemRow(it) }
                     addSystemRow(text.body)
                     if (text.offerRetrySafely) offerRetrySafely(call.params, text)
                 } else if (result != null) {
@@ -928,6 +981,20 @@ class ChatPanel(
      * A3a: Core refuses conversation.create / conversation.send on an ARCHIVED project, so the
      * composer says so up front (Core's own reason) instead of sending a request Core will refuse.
      */
+    /**
+     * Review W1: with nothing selected the composer is disabled, saying why (pick one when there are
+     * rows; otherwise why there is nothing to pick). With a selection, Core's archived rule applies.
+     */
+    private fun selectionBlocker(): String? {
+        val selected = conversationModel.selectedItem as? Conversation
+            ?: return ConversationUiState.noSelectionBlocker(
+                conversationModel.size,
+                conversationState,
+                projectSelected = projectModel.selectedItem is SandpaneProject,
+            )
+        return ConversationUiState.composerBlocker(selected)
+    }
+
     private fun archivedBlocker(): String? {
         val selected = projectModel.selectedItem as? SandpaneProject ?: return null
         val archivedAt = selected.archivedAt ?: return null
@@ -936,9 +1003,36 @@ class ChatPanel(
             "messages until it is unarchived. Nothing was sent."
     }
 
+    /**
+     * A3b: Core CONFIRMED [conversationId] is gone (`deleted: true`, step-2 NOT_FOUND, or an unknown
+     * outcome whose full re-read no longer lists it): drop this window's in-memory state for it — the
+     * picker row, the transcript if shown, and its tracked task rows. Nothing is persisted per
+     * conversation by this plugin, so there is nothing on disk to clear. EDT-only.
+     */
+    private fun forgetDeletedConversation(conversationId: String) {
+        val dropped = tasks.forgetConversations(listOf(conversationId))
+        val listed = (0 until conversationModel.size).map { conversationModel.getElementAt(it) }
+        val wasSelected = (conversationModel.selectedItem as? Conversation)?.id == conversationId
+        repopulate {
+            listed.firstOrNull { it.id == conversationId }?.let { conversationModel.removeElement(it) }
+            if (wasSelected) conversationModel.selectedItem = null
+        }
+        if (displayedConversationId == conversationId) {
+            clearTranscript()
+            displayedConversationId = null
+            historyGeneration++
+        }
+        addSystemRow(
+            "Conversation ${conversationId.take(8)} is gone from Core; this window dropped its selection, transcript " +
+                "and $dropped tracked task row(s) for it.",
+        )
+        onConversationSelectionChanged()
+    }
+
     private fun onComposerChanged() {
         val gateAllows = connection.connectionProblem() == null && connection.agentGate().chatEnabled &&
-            hostMapping is SandpaneContextProvider.HostMapping.Supported && archivedBlocker() == null
+            hostMapping is SandpaneContextProvider.HostMapping.Supported && archivedBlocker() == null &&
+            selectionBlocker() == null
         sendButton.isEnabled = gateAllows && composer.text.isNotBlank()
     }
 

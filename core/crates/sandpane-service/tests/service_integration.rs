@@ -3240,7 +3240,11 @@ fn features_are_advertised_from_the_single_const_list() {
     );
     assert_eq!(
         caps["features"],
-        serde_json::json!(["idempotency-keys", "sandbox-create-agent"])
+        serde_json::json!([
+            "idempotency-keys",
+            "sandbox-create-agent",
+            "conversation-sandbox-id"
+        ])
     );
 }
 

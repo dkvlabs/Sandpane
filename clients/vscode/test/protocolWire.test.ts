@@ -144,13 +144,13 @@ describe('wire names match the Rust protocol crate', () => {
     expect(serviceLib).toContain('pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;');
   });
 
-  it('declares exactly the 22 method names Core parses, in Method::ALL order', () => {
+  it('declares exactly the 27 method names Core parses, in Method::ALL order', () => {
     // (1) every `"dotted.name" =>` arm of Rust's `Method::parse` (segments are
     // lowercase snake_case since A3a: `project.add_repository`).
     const fromRust = [...rustProtocol.matchAll(/"([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)" =>/g)].map((m) => m[1]);
     expect(fromRust.sort()).toEqual([...CORE_METHODS].sort());
-    expect(new Set(fromRust).size).toBe(22);
-    expect(CORE_METHODS).toHaveLength(22);
+    expect(new Set(fromRust).size).toBe(27);
+    expect(CORE_METHODS).toHaveLength(27);
     // (2) the advertisement list itself, including ORDER — `CoreCapabilities.methods`
     // is derived from it, and a name that renames in Rust must break here.
     expect(methodAllWireNames()).toEqual([...CORE_METHODS]);
@@ -184,6 +184,17 @@ describe('wire names match the Rust protocol crate', () => {
       'project.add_repository',
       'project.remove_repository',
     ]);
+    // A3b: the five conversation lifecycle methods sit right after
+    // conversation.history (NOT at the end of the list).
+    expect(CORE_METHODS.slice(16, 22)).toEqual([
+      'conversation.history',
+      'conversation.rename',
+      'conversation.archive',
+      'conversation.unarchive',
+      'conversation.delete',
+      'conversation.export',
+    ]);
+    expect(CORE_METHODS.slice(22)).toEqual(['task.cancel', 'task.list', 'task.subscribe', 'git.review', 'git.apply']);
     expect(CORE_METHODS).not.toContain('sandbox.start');
     expect(rustProtocol).not.toContain('"sandbox.start" =>');
   });
@@ -307,6 +318,52 @@ describe('wire names match the Rust protocol crate', () => {
     );
   });
 
+  it('A3b: conversation lifecycle wire fields match the Rust structs and the TS client', () => {
+    const conversation = /pub struct Conversation \{[\s\S]*?\n\}/.exec(rustProtocol)?.[0] ?? '';
+    for (const field of ['pub archived_at: Option<String>', 'pub sandbox_id: Option<String>']) {
+      expect(conversation, field).toContain(field);
+    }
+    // Both are absent-tolerant (skipped when None) — the client reads absence as live / none recorded.
+    expect(conversation).toMatch(/skip_serializing_if = "Option::is_none"\)\]\n\s+pub archived_at/);
+    expect(conversation).toMatch(/skip_serializing_if = "Option::is_none"\)\]\n\s+pub sandbox_id/);
+    const list = /pub struct ConversationListParams \{[\s\S]*?\n\}/.exec(rustProtocol)?.[0] ?? '';
+    expect(list).toContain('pub include_archived: Option<bool>');
+    for (const rust of [
+      'pub struct ConversationRenameParams',
+      'pub struct ConversationIdParams',
+      'pub struct ConversationDeleteParams',
+      'pub struct ConversationDeleteResult',
+      'pub struct ConversationExportParams',
+      'pub struct ExportRedaction',
+      'pub struct ConversationExportResult',
+      'pub best_effort: bool',
+      'pub replacements: u64',
+      'pub by_kind: std::collections::BTreeMap<String, u64>',
+      'pub exported_at: String',
+      'pub next_sequence: i64',
+    ]) {
+      expect(rustProtocol, rust).toContain(rust);
+    }
+    const exportParams = /pub struct ConversationExportParams \{[\s\S]*?\n\}/.exec(rustProtocol)?.[0] ?? '';
+    expect(exportParams).toContain('pub after_sequence: i64');
+    expect(exportParams).toContain('pub limit: Option<u32>');
+    const tsClient = read('clients/vscode/src/core-client/protocol.ts');
+    for (const wire of [
+      'archivedAt?: string | null',
+      'sandboxId?: string | null',
+      'includeArchived?: boolean',
+      'export interface ConversationRenameParams',
+      'export interface ConversationDeleteResult',
+      'export interface ConversationExportParams',
+      'export interface ConversationExportResult',
+      'bestEffort: boolean',
+      'byKind: Record<string, number>',
+      'nextSequence: number',
+    ]) {
+      expect(tsClient, wire).toContain(wire);
+    }
+  });
+
   it('pins the sbx agent allowlist to the create-spec schema', () => {
     const specSchema = JSON.parse(read('schemas/sandbox-create-spec.schema.json')) as {
       properties: { agent?: { enum: string[] } };
@@ -320,7 +377,7 @@ describe('wire names match the Rust protocol crate', () => {
   });
 
   it('pins the method advertisement (`Method::ALL` → `CoreCapabilities.methods`)', () => {
-    expect(rustProtocol).toContain('pub const ALL: [Method; 22]');
+    expect(rustProtocol).toContain('pub const ALL: [Method; 27]');
     // Derived, never hand-written: `wire_names()` maps over ALL…
     expect(rustProtocol).toMatch(/pub fn wire_names\(\) -> Vec<&'static str> \{[\s\S]*Self::ALL\.iter\(\)/);
     // …and the probe answers with it.

@@ -1,6 +1,7 @@
 package labs.dkv.sandpane.core
 
 import labs.dkv.sandpane.model.CoreErrorCodes
+import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.ConversationHistoryResult
 import labs.dkv.sandpane.model.DEFAULT_LIST_LIMIT
@@ -86,6 +87,7 @@ class ProtocolDriftGuardTest {
     private val validation by lazy { read("core/crates/sandpane-core/src/validation.rs") }
     private val confirm by lazy { read("core/crates/sandpane-service/src/confirm.rs") }
     private val projectLifecycle by lazy { read("core/crates/sandpane-service/src/project_lifecycle.rs") }
+    private val conversationLifecycle by lazy { read("core/crates/sandpane-service/src/conversation_lifecycle.rs") }
     private val requestSchema by lazy { read("schemas/rpc-request.schema.json") }
     private val capabilitiesSchema by lazy { read("schemas/core-capabilities.schema.json") }
     private val sandboxSpecSchema by lazy { read("schemas/sandbox-create-spec.schema.json") }
@@ -205,7 +207,7 @@ class ProtocolDriftGuardTest {
     fun kotlinMethodsMatchRustMethodAllExactlyIncludingOrder() {
         val fromAll = methodAllWireNames()
         assertEquals(CoreMethods.ALL, fromAll, "CoreMethods.ALL drifted from Method::ALL (order included)")
-        assertEquals(22, fromAll.size, "addition A3a advertises 22 methods")
+        assertEquals(27, fromAll.size, "addition A3b advertises 27 methods")
 
         // parse() must accept every advertised name, and the schema enum must carry the same set.
         val parsed = parseArms().toSet()
@@ -223,6 +225,8 @@ class ProtocolDriftGuardTest {
             "task.list", "conversation.list", "conversation.history", "sandbox.stop", "sandbox.remove",
             "project.update", "project.archive", "project.unarchive", "project.delete",
             "project.add_repository", "project.remove_repository",
+            "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
+            "conversation.export",
         ).forEach { added ->
             assertTrue(fromAll.contains(added), "Rust no longer advertises $added")
             assertTrue(CoreMethods.ALL.contains(added), "the Kotlin mirror dropped $added")
@@ -239,7 +243,7 @@ class ProtocolDriftGuardTest {
     @Test
     fun methodAdvertisementIsDerivedNotHandWritten() {
         assertTrue(
-            rust.contains("pub const ALL: [Method; 22]"),
+            rust.contains("pub const ALL: [Method; 27]"),
             "Method::ALL's declared length changed — update CoreMethods.ALL and this gate",
         )
         assertTrue(
@@ -324,6 +328,11 @@ class ProtocolDriftGuardTest {
             "pub archived_at: Option<String>" to "@SerialName(\"archivedAt\")",
             "pub include_archived: Option<bool>" to "@SerialName(\"includeArchived\")",
             "pub deleted: Option<bool>" to "val deleted: Boolean? = null",
+            // A3b
+            "pub sandbox_id: Option<String>" to "@SerialName(\"sandboxId\") val sandboxId: String? = null",
+            "pub best_effort: bool" to "@SerialName(\"bestEffort\")",
+            "pub by_kind: std::collections::BTreeMap<String, u64>" to "@SerialName(\"byKind\")",
+            "pub exported_at: String" to "@SerialName(\"exportedAt\")",
             // A1
             "pub agent: Option<String>" to "val agent: String? = null",
             "pub confirm_token: Option<String>" to "confirmToken",
@@ -356,6 +365,13 @@ class ProtocolDriftGuardTest {
             "pub struct ProjectDeleteParams",
             "pub struct ProjectDeleteResult",
             "pub struct ProjectRepositoryParams",
+            "pub struct ConversationRenameParams",
+            "pub struct ConversationIdParams",
+            "pub struct ConversationDeleteParams",
+            "pub struct ConversationDeleteResult",
+            "pub struct ConversationExportParams",
+            "pub struct ConversationExportResult",
+            "pub struct ExportRedaction",
         )) {
             assertTrue(rust.contains(struct), "Rust no longer defines $struct")
         }
@@ -621,6 +637,115 @@ class ProtocolDriftGuardTest {
         assertEquals(2, Regex("""delete_blocker\(inner, [^\n]*\)\? \{\s*return Err\(conflict\(m\)\);""").findAll(projectLifecycle).count(), "a delete blocker is no longer raised as conflict(m)")
         assertTrue(Regex("""fn conflict\([^)]*\)[^{]*\{[\s\S]{0,120}ErrorCode::Conflict""").containsMatchIn(projectLifecycle), "conflict() no longer raises CONFLICT")
         assertTrue(Regex("""fn not_found\(\)[\s\S]{0,160}ErrorCode::NotFound[\s\S]{0,80}MSG_PROJECT_NOT_FOUND""").containsMatchIn(projectLifecycle))
+    }
+
+    // ------------------------------------------------------------------
+    // A3b: conversation lifecycle — exact messages, validator, wire shapes
+    // ------------------------------------------------------------------
+
+    /** Every exact message the client words is Core's constant, byte for byte, raised under the paired code. */
+    @Test
+    fun conversationLifecycleMessagesMatchCore() {
+        val pairs = listOf(
+            "MSG_CONVERSATION_ARCHIVED" to ConversationOutcomes.MSG_CONVERSATION_ARCHIVED,
+            "MSG_CONVERSATION_HAS_TASKS" to ConversationOutcomes.MSG_CONVERSATION_HAS_TASKS,
+            "MSG_CONVERSATION_NOT_FOUND" to ConversationOutcomes.MSG_CONVERSATION_NOT_FOUND,
+            "MSG_TITLE_BLANK" to ConversationOutcomes.MSG_TITLE_BLANK,
+        )
+        for ((name, kotlin) in pairs) {
+            assertEquals(rustStringConst(conversationLifecycle, name), kotlin, "$name drifted from conversation_lifecycle.rs")
+        }
+        // Every `pub const MSG_*` Core declares there is mirrored (a new refusal must not ship unworded).
+        val rustNames = Regex("""pub const (MSG_[A-Z_]+): &str""").findAll(conversationLifecycle).map { it.groupValues[1] }.toSet()
+        assertEquals(pairs.map { it.first }.toSet(), rustNames, "conversation_lifecycle.rs gained or lost a message const")
+        // The worded set = these four + A3a's project message, which Core raises FIRST in an archived project.
+        assertEquals(pairs.map { it.second }.toSet() + ProjectOutcomes.MSG_PROJECT_ARCHIVED, ConversationOutcomes.KNOWN_MESSAGES)
+        assertEquals(rustStringConst(projectLifecycle, "MSG_PROJECT_ARCHIVED"), ConversationOutcomes.MSG_PROJECT_ARCHIVED)
+        assertEquals(rustStringConst(conversationLifecycle, "CONVERSATION_DELETE_ACTION"), CoreMethods.CONVERSATION_DELETE)
+        assertEquals(rustStringConst(rust, "CONVERSATION_EXPORT_FORMAT"), labs.dkv.sandpane.model.CONVERSATION_EXPORT_FORMAT)
+
+        // The code each message is raised under, read from its use sites.
+        val expectedCode = mapOf(
+            "MSG_CONVERSATION_ARCHIVED" to "ValidationFailed",
+            "MSG_CONVERSATION_HAS_TASKS" to "Conflict",
+            "MSG_CONVERSATION_NOT_FOUND" to "NotFound",
+            "MSG_TITLE_BLANK" to "ValidationFailed",
+        )
+        for ((const, code) in expectedCode) {
+            val sites = Regex("""\b$const\.to_string\(\)""").findAll(conversationLifecycle).map { it.range.first }.toList()
+            assertTrue(sites.isNotEmpty(), "$const is never raised")
+            for (at in sites) {
+                val before = conversationLifecycle.substring(maxOf(0, at - 120), at)
+                assertTrue(before.contains("ErrorCode::$code"), "$const is raised without ErrorCode::$code nearby: …${before.takeLast(80)}")
+            }
+            val method = if (const == "MSG_CONVERSATION_HAS_TASKS") CoreMethods.CONVERSATION_DELETE else CoreMethods.CONVERSATION_RENAME
+            val known = ConversationOutcomes.describeFailure(method, CoreRpcException(wireCode(code), rustStringConst(conversationLifecycle, const)), true)
+            assertTrue(known.body.contains("nothing was"), "the client does not word $const under ${wireCode(code)}")
+        }
+        // Check order: the PROJECT refusal comes first for send/rename (require_writable_conversation).
+        val writable = Regex("""fn require_writable_conversation\([\s\S]*?\n\}""").find(conversationLifecycle)?.value
+            ?: fail("require_writable_conversation not found")
+        assertTrue(
+            writable.indexOf("require_live_project") in 0 until writable.indexOf("MSG_CONVERSATION_ARCHIVED"),
+            "Core no longer checks the project before the conversation — ConversationUiState must follow",
+        )
+        // Unarchive is refused in an archived project; archive is not.
+        assertTrue(
+            Regex("""if !archive \{\s*project_lifecycle::require_live_project""").containsMatchIn(conversationLifecycle),
+            "Core's archive/unarchive project rule changed",
+        )
+        // The step-2 token rejection is A1's message and still starts with the matched prefix.
+        assertTrue(conversationLifecycle.contains("confirm::TOKEN_REJECTED_MESSAGE.to_string()"))
+        // external is always false for a conversation.
+        assertTrue(conversationLifecycle.contains("external: false,"), "conversation.delete may now be marked external")
+    }
+
+    /** `Validator::conversation_title` + rename's whitespace-only refusal, mirrored exactly. */
+    @Test
+    fun conversationTitleValidatorMirrorsCore() {
+        val max = Regex("""pub const MAX_CONVERSATION_TITLE_CHARS: usize = (\d+);""").find(validation)?.groupValues?.get(1)?.toInt()
+            ?: fail("validation.rs has no MAX_CONVERSATION_TITLE_CHARS")
+        assertEquals(max, ConversationGuards.MAX_TITLE_CHARS)
+        val fn = Regex("""pub fn conversation_title\(value: &str\)[\s\S]*?\n    \}""").find(validation)?.value
+            ?: fail("Validator::conversation_title not found")
+        assertTrue(fn.contains("Self::bounded(value, MAX_CONVERSATION_TITLE_CHARS)?"), "conversation_title's bound changed")
+        assertTrue(fn.contains(".find(|c| c.is_control() || is_spoofing_format_char(*c))"), "conversation_title's char rule changed")
+        assertFalse(fn.contains("trim"), "Core started trimming titles in the validator — the client must follow")
+        // Rename: whitespace-only (Rust `trim`, Unicode White_Space) is refused BEFORE the validator.
+        val rename = Regex("""pub\(crate\) fn conversation_rename\([\s\S]*?\n\}""").find(conversationLifecycle)?.value
+            ?: fail("conversation_rename not found")
+        val blank = rename.indexOf("if p.title.trim().is_empty()")
+        assertTrue(blank >= 0, "rename's whitespace-only check changed")
+        assertTrue(blank < rename.indexOf("Validator::conversation_title(&p.title)"), "rename now validates before the blank check")
+        // The spoofing set is the one ProjectGuards mirrors (pinned in projectValidatorsMirrorCoreExactly).
+        assertTrue(validation.contains("fn is_spoofing_format_char(c: char) -> bool"))
+    }
+
+    /** A3b wire shapes: Kotlin encodes the same camelCase keys Rust (rename_all) expects. */
+    @Test
+    fun conversationLifecycleParamsUseCoresWireNames() {
+        assertTrue(Regex("""pub struct ConversationRenameParams \{\s*pub conversation_id: String,\s*pub title: String,""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ConversationIdParams \{\s*pub conversation_id: String,\s*\}""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ConversationDeleteParams \{\s*pub conversation_id: String,[\s\S]{0,120}pub confirm_token: Option<String>""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ConversationDeleteResult \{[\s\S]{0,120}pub confirmation: Option<ConfirmationRequest>,[\s\S]{0,120}pub deleted: Option<bool>""").containsMatchIn(rust))
+        assertTrue(Regex("""pub struct ConversationExportParams \{\s*pub conversation_id: String,\s*#\[serde\(default\)\]\s*pub after_sequence: i64,""").containsMatchIn(rust))
+        val result = Regex("""pub struct ConversationExportResult \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1)
+            ?: fail("ConversationExportResult not found")
+        val fields = Regex("""pub ([a-z_]+):""").findAll(result).map { it.groupValues[1] }.toList()
+        assertEquals(listOf("format", "exported_at", "conversation", "messages", "truncated", "next_sequence", "redaction"), fields)
+        assertFalse(result.contains("serde(default"), "an export page field became optional — the Kotlin mirror requires them")
+        assertTrue(Regex("""pub struct ConversationListParams \{[\s\S]*?pub include_archived: Option<bool>""").containsMatchIn(rust))
+        // Conversation gains archivedAt / sandboxId, both absent-tolerant.
+        val conv = Regex("""pub struct Conversation \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1) ?: fail("Conversation not found")
+        assertTrue(Regex("""#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\s*pub archived_at: Option<String>""").containsMatchIn(conv))
+        assertTrue(Regex("""#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\s*pub sandbox_id: Option<String>""").containsMatchIn(conv))
+        // Decoding a pre-A3b row and an A3b row with the Kotlin mirror.
+        val old = CoreJson.decodeFromString(labs.dkv.sandpane.model.Conversation.serializer(), """{"id":"c","projectId":"p","title":"t","agentId":"a","createdAt":"x"}""")
+        assertEquals(null, old.archivedAt)
+        assertEquals(null, old.sandboxId)
+        // The redaction kinds the client may display are Core's (by name only; byKind keys are not enumerated client-side).
+        val kinds = read("core/crates/sandpane-core/src/redact.rs")
+        assertTrue(kinds.contains("pub const KINDS: [&str; 7]"), "Core's redaction kind list changed size")
     }
 
     private fun wireCode(rustVariant: String): String = when (rustVariant) {

@@ -96,6 +96,13 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
 /// Archive/unarchive are idempotent in effect, but a blind re-send would still
 /// hide a lost answer from the user, so they follow the same rule.
 ///
+/// The five A3b conversation-lifecycle methods (`conversation.rename`,
+/// `conversation.archive`, `conversation.unarchive`, `conversation.delete`,
+/// `conversation.export`) are excluded as well (design 2026-10-09 §3.3 item 9):
+/// the first four write Core's database, `conversation.delete`'s step 1 mints a
+/// single-use token and step 2 deletes, and `conversation.export` — a read —
+/// stays out for uniformity, so a lost export answer is surfaced, not re-sent.
+///
 /// `src/lib/core-client.ts` mirrors this list as `REPLAY_SAFE_METHODS`; the
 /// drift test parses this `matches!` and fails if the two ever differ.
 fn replay_safe(method: Method) -> bool {
@@ -696,13 +703,18 @@ mod tests {
             "project.delete",
             "project.add_repository",
             "project.remove_repository",
+            "conversation.rename",
+            "conversation.archive",
+            "conversation.unarchive",
+            "conversation.delete",
+            "conversation.export",
         ] {
             assert!(
                 validate_frame(&frame(method)).is_ok(),
                 "{method} must be allowlisted because Core's crate parses it"
             );
         }
-        assert_eq!(Method::ALL.len(), 22);
+        assert_eq!(Method::ALL.len(), 27);
         // Wire names are lowercase snake_case segments; camelCase is not a method.
         assert_eq!(
             validate_frame(&frame("project.addRepository"))
@@ -808,6 +820,11 @@ mod tests {
             Method::ProjectDelete,
             Method::ProjectAddRepository,
             Method::ProjectRemoveRepository,
+            Method::ConversationRename,
+            Method::ConversationArchive,
+            Method::ConversationUnarchive,
+            Method::ConversationDelete,
+            Method::ConversationExport,
         ] {
             assert!(!replay_safe(m), "{m:?} must never be re-sent");
         }
@@ -875,6 +892,13 @@ mod tests {
             Method::ProjectUnarchive,
             Method::ProjectDelete,
             Method::ProjectRemoveRepository,
+            // A3b: the five conversation-lifecycle methods are Core DB work
+            // (export redacts after the DB lock is released) — default budget.
+            Method::ConversationRename,
+            Method::ConversationArchive,
+            Method::ConversationUnarchive,
+            Method::ConversationDelete,
+            Method::ConversationExport,
         ] {
             assert_eq!(proxy_deadline_ms(m), PROXY_DEADLINE_MS, "{m:?}");
         }

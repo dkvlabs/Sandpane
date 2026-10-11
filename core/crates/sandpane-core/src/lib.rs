@@ -9,6 +9,7 @@ pub mod events;
 pub mod git;
 pub mod idempotency;
 pub mod process;
+pub mod redact;
 pub mod sbx;
 pub mod scheduler;
 pub mod task;

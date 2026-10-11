@@ -116,8 +116,10 @@ val CoreJson: Json = Json {
  * is derived from — because [labs.dkv.sandpane.core.ProtocolDriftGuardTest] compares order as well as
  * membership. The three additive protocol-v1 discovery methods (`conversation.list`,
  * `conversation.history`, `task.list`), the two A1 sandbox-lifecycle methods (`sandbox.stop`,
- * `sandbox.remove`) and the six A3a project-lifecycle methods (`project.update` …
- * `project.remove_repository`) sit at their Rust positions; nothing existing was renamed or removed.
+ * `sandbox.remove`), the six A3a project-lifecycle methods (`project.update` …
+ * `project.remove_repository`) and the five A3b conversation-lifecycle methods (`conversation.rename`
+ * … `conversation.export`, right after `conversation.history` — NOT at the end) sit at their Rust
+ * positions; nothing existing was renamed or removed.
  *
  * There is deliberately NO `sandbox.start`: sbx v0.47 has no `start` command (restart is the
  * interactive `sbx run --name`), so Core does not dispatch one and this client never sends one —
@@ -149,13 +151,24 @@ object CoreMethods {
     const val CONVERSATION_SEND: String = "conversation.send"
     const val CONVERSATION_LIST: String = "conversation.list"
     const val CONVERSATION_HISTORY: String = "conversation.history"
+
+    // A3b conversation lifecycle (design 2026-10-09 §3.3).
+    const val CONVERSATION_RENAME: String = "conversation.rename"
+    const val CONVERSATION_ARCHIVE: String = "conversation.archive"
+    const val CONVERSATION_UNARCHIVE: String = "conversation.unarchive"
+
+    /** Two-step server-side confirmation (design §2), bound to the conversation id. */
+    const val CONVERSATION_DELETE: String = "conversation.delete"
+
+    /** Read-only, always redacted (best-effort), paged like `conversation.history`. */
+    const val CONVERSATION_EXPORT: String = "conversation.export"
     const val TASK_CANCEL: String = "task.cancel"
     const val TASK_LIST: String = "task.list"
     const val TASK_SUBSCRIBE: String = "task.subscribe"
     const val GIT_REVIEW: String = "git.review"
     const val GIT_APPLY: String = "git.apply"
 
-    /** Wire order of `Method::ALL` — 22 methods as of protocol-v1 addition A3a. */
+    /** Wire order of `Method::ALL` — 27 methods as of protocol-v1 addition A3b. */
     val ALL: List<String> = listOf(
         SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST,
         PROJECT_UPDATE, PROJECT_ARCHIVE, PROJECT_UNARCHIVE, PROJECT_DELETE,
@@ -163,6 +176,8 @@ object CoreMethods {
         SANDBOX_LIST, SANDBOX_CREATE,
         SANDBOX_STOP, SANDBOX_REMOVE,
         CONVERSATION_CREATE, CONVERSATION_SEND, CONVERSATION_LIST, CONVERSATION_HISTORY,
+        CONVERSATION_RENAME, CONVERSATION_ARCHIVE, CONVERSATION_UNARCHIVE, CONVERSATION_DELETE,
+        CONVERSATION_EXPORT,
         TASK_CANCEL, TASK_LIST, TASK_SUBSCRIBE, GIT_REVIEW, GIT_APPLY,
     )
 
@@ -181,12 +196,18 @@ object CoreMethods {
         PROJECT_ADD_REPOSITORY, PROJECT_REMOVE_REPOSITORY,
     )
 
+    /** The methods addition A3b ADDED (design §3.3); a pre-A3b Core does NOT dispatch them. */
+    val ADDITIVE_A3B: Set<String> = setOf(
+        CONVERSATION_RENAME, CONVERSATION_ARCHIVE, CONVERSATION_UNARCHIVE, CONVERSATION_DELETE,
+        CONVERSATION_EXPORT,
+    )
+
     /**
      * Every method beyond the eleven-method v1 baseline. Feature detection is mandatory for exactly
      * these — see [CoreCapabilities.advertises]: a call is refused locally, before a byte is written,
      * when the connected Core's `system.probe` does not list it (design 2026-10-09 §1 rule 3).
      */
-    val REQUIRES_ADVERTISEMENT: Set<String> = ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A
+    val REQUIRES_ADVERTISEMENT: Set<String> = ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A + ADDITIVE_A3B
 
     /**
      * The honest unsupported state for starting a sandbox (design 2026-10-09 §3 row A1). Shown to the
@@ -530,7 +551,14 @@ object CoreFeatures {
     /** `sandbox.create` honours `agent` (A1). Replaces the old "sandbox.remove is advertised" inference. */
     const val SANDBOX_CREATE_AGENT: String = "sandbox-create-agent"
 
-    val KNOWN: List<String> = listOf(IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT)
+    /**
+     * A3b: `conversation.create` persists `sandboxId` and every `Conversation` carries it when one was
+     * stored. Only when this is advertised may [Conversation.sandboxId] be read as "persisted"; without
+     * it, "no sandbox chosen" and "an older Core discarded the choice" look the same.
+     */
+    const val CONVERSATION_SANDBOX_ID: String = "conversation-sandbox-id"
+
+    val KNOWN: List<String> = listOf(IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT, CONVERSATION_SANDBOX_ID)
 }
 
 /**
@@ -636,7 +664,22 @@ data class Conversation(
     val title: String,
     @SerialName("agentId") val agentId: String,
     @SerialName("createdAt") val createdAt: String,
-)
+    /**
+     * A3b, additive: RFC 3339 time the conversation was archived; ABSENT when it is live (and from a
+     * pre-A3b Core). Core then refuses `conversation.send` and `conversation.rename`; history, export
+     * and task reads keep working.
+     */
+    @SerialName("archivedAt") val archivedAt: String? = null,
+    /**
+     * A3b, additive: the sandbox NAME chosen when the conversation was created — a stored name, NOT a
+     * binding or an identity (Core does not check the sandbox still exists; a same-named replacement
+     * is indistinguishable). Read it as persisted only when Core advertises
+     * [CoreFeatures.CONVERSATION_SANDBOX_ID]; shown as "sandbox chosen at creation", never as live.
+     */
+    @SerialName("sandboxId") val sandboxId: String? = null,
+) {
+    val isArchived: Boolean get() = archivedAt != null
+}
 
 /**
  * `conversation.list` params — read-only chat enumeration (ADDITIVE protocol v1).
@@ -650,6 +693,12 @@ data class ConversationListParams(
     @SerialName("projectId") val projectId: String? = null,
     /** Rows to return; Core clamps to `1..=[MAX_LIST_LIMIT]` and defaults to 200. */
     val limit: Int? = null,
+    /**
+     * A3b, additive: also list archived conversations. NULL keeps the key off the wire (live only —
+     * what every older client gets); sent only when Core advertises `conversation.archive`, since a
+     * pre-A3b Core would silently ignore it.
+     */
+    @SerialName("includeArchived") val includeArchived: Boolean? = null,
 )
 
 /**
@@ -714,6 +763,83 @@ data class ConversationHistoryResult(
                 "limit or the ${MAX_HISTORY_BYTES / 1024 / 1024} MiB content ceiling — the frame " +
                 "does not say which). Continue from sequence $nextSequence."
     }
+}
+
+// ---------------------------------------------------------------------------
+// conversation lifecycle (A3b, design 2026-10-09 §3.3)
+// ---------------------------------------------------------------------------
+
+/** `conversation.rename` params. [title] follows `Validator::conversation_title`; blank is refused. */
+@Serializable
+data class ConversationRenameParams(
+    @SerialName("conversationId") val conversationId: String,
+    val title: String,
+)
+
+/** `conversation.archive` / `conversation.unarchive` params (both idempotent in Core). */
+@Serializable
+data class ConversationIdParams(@SerialName("conversationId") val conversationId: String)
+
+/** `conversation.delete` (two-step confirmation): no token at step 1, Core's token at step 2. */
+@Serializable
+data class ConversationDeleteParams(
+    @SerialName("conversationId") val conversationId: String,
+    @SerialName("confirmToken") val confirmToken: String? = null,
+) {
+    /** The token is a single-use secret: never printed, even from a debug or error path. */
+    override fun toString(): String =
+        "ConversationDeleteParams(conversationId=$conversationId, confirmToken=${if (confirmToken == null) "absent" else "<redacted>"})"
+}
+
+/** `conversation.delete` result: [confirmation] at step 1 (nothing changed), [deleted] at step 2. */
+@Serializable
+data class ConversationDeleteResult(
+    val confirmation: ConfirmationRequest? = null,
+    val deleted: Boolean? = null,
+)
+
+/** `conversation.export` params — `conversation.history`'s paging (cursor, clamped limit, byte ceiling). */
+@Serializable
+data class ConversationExportParams(
+    @SerialName("conversationId") val conversationId: String,
+    @SerialName("afterSequence") val afterSequence: Long = 0,
+    val limit: Int? = null,
+)
+
+/** The `format` tag of every `conversation.export` page (`CONVERSATION_EXPORT_FORMAT` in Rust). */
+const val CONVERSATION_EXPORT_FORMAT: String = "sandpane.conversation-export.v1"
+
+/**
+ * What Core's best-effort redaction replaced on ONE export page. [byKind] OMITS kinds with zero
+ * replacements (absent = 0). The title is redacted on every page but counted only on the first, so
+ * pages are summed as they are. [bestEffort] is always true: redaction can miss secrets.
+ */
+@Serializable
+data class ExportRedaction(
+    @SerialName("bestEffort") val bestEffort: Boolean,
+    val replacements: Long,
+    @SerialName("byKind") val byKind: Map<String, Long>,
+)
+
+/**
+ * One redacted `conversation.export` page. Every field is REQUIRED (Rust always serialises them):
+ * a page missing one is a broken answer, never an empty export. Scope: the conversation metadata and
+ * its messages only — task events, artifacts and verification output are not included.
+ */
+@Serializable
+data class ConversationExportResult(
+    val format: String,
+    @SerialName("exportedAt") val exportedAt: String,
+    val conversation: Conversation,
+    val messages: List<MessageRecord>,
+    val truncated: Boolean,
+    @SerialName("nextSequence") val nextSequence: Long,
+    val redaction: ExportRedaction,
+) {
+    /** Export content is never printed, even from a debug or error path: counts only. */
+    override fun toString(): String =
+        "ConversationExportResult(format=$format, messages=${messages.size}, truncated=$truncated, " +
+            "nextSequence=$nextSequence, replacements=${redaction.replacements})"
 }
 
 @Serializable

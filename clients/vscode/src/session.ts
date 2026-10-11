@@ -14,12 +14,15 @@
 
 import * as vscode from 'vscode';
 import { realpath } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import {
   CoreCommands,
   verifiedAgents,
   CoreValidationError,
   errorCodeOf,
   validateAddressableSandboxName,
+  validateConversationRenameTitle,
 } from './core-client/commands';
 import {
   CoreConnection,
@@ -35,6 +38,7 @@ import type {
   ChangeSet,
   ConfirmationRequest,
   Conversation,
+  ConversationListParams,
   ConversationSendParams,
   CoreCapabilities,
   CoreFeature,
@@ -46,7 +50,7 @@ import type {
   SandboxSummary,
   SbxAgent,
 } from './core-client/protocol';
-import { coreAdvertisesFeature, coreAdvertisesMethod, MAX_LIST_LIMIT } from './core-client/protocol';
+import { coreAdvertisesFeature, coreAdvertisesMethod, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT } from './core-client/protocol';
 import {
   REPLAY_NOTICE,
   RETRY_SAFELY,
@@ -57,6 +61,7 @@ import {
   newIdempotencyKey,
 } from './core-client/idempotency';
 import { TASK_STATUSES, isTerminalStatus } from './core-client/events';
+import { EXPORT_BEST_EFFORT_COPY, collectConversationExport } from './core-client/conversationExport';
 import { EMPTY_STATE, reduceTaskView, selectTasks, type TaskViewState } from './state/reducer';
 import {
   authorizeSend,
@@ -90,6 +95,19 @@ import {
   projectPickItem,
 } from './vscode/projectActions';
 import {
+  ARCHIVED_CONVERSATION_LABEL,
+  DELETE_CONVERSATION_BUTTON,
+  MSG_CONVERSATION_ARCHIVED,
+  conversationDeleteView,
+  conversationErrorCopy,
+  conversationSandboxLabel,
+  conversationTitleProblem,
+  exportFileName,
+  isConversationArchived,
+  isConversationNotFound,
+  titleFromMessage,
+} from './vscode/conversationActions';
+import {
   DEFAULT_CONTEXT_POLICY,
   planContextAttachments,
   type ContextPlan,
@@ -100,6 +118,9 @@ import {
   emptySidebarState,
   type ConnectionTone,
   type ContextPlanView,
+  type ConversationAction,
+  type ConversationActionState,
+  type ConversationListView,
   type SidebarState,
   type WebviewToExtension,
 } from './webview/bridge';
@@ -110,7 +131,12 @@ const UI_KEYS = {
   conversation: 'sandpane.ui.conversation',
   /** A3a UI preference: include archived projects in lists (`includeArchived`). */
   showArchived: 'sandpane.ui.showArchivedProjects',
+  /** A3b UI preference: include archived conversations in the chat list. */
+  showArchivedConversations: 'sandpane.ui.showArchivedConversations',
 } as const;
+
+/** Rows asked for when settling an unknown delete outcome (Core's MAX_LIST_LIMIT). */
+const SETTLE_LIST_LIMIT = MAX_LIST_LIMIT;
 
 /** `task.subscribe` re-pull interval while a task is non-terminal (Core never pushes). */
 export const EVENT_POLL_INTERVAL_MS = 2_000;
@@ -152,13 +178,19 @@ export class SandpaneSession {
   private capabilities: CoreCapabilities | null = null;
   private projects: Project[] = [];
   private sandboxes: SandboxSummary[] = [];
+  /** Whether the last `sandbox.list` succeeded (A3b label: never "not in the list" without one). */
+  private sandboxListRead = false;
   private conversation: Conversation | null = null;
-  /** Sandbox selected when `conversation` was created (Core's record has no sandbox field). */
+  /**
+   * UI scope key of `conversation`: the sandbox selected when it was created
+   * or opened here. Never Core's `sandboxId` (a stored name, not a binding).
+   */
   private conversationSandbox: string | null = null;
   /**
    * `conversation.list` hydration — Core's own enumeration, cached only for this
    * session's display. Not a database: it is re-read on every refresh, and an
-   * archived conversation is absent because Core filters it (specs/02 §1).
+   * archived conversation is absent unless "show archived" is on (A3b,
+   * `includeArchived`) — Core filters it (specs/02 §1).
    */
   private conversations: Conversation[] = [];
   private selectedProjectId: string | null = null;
@@ -182,6 +214,7 @@ export class SandpaneSession {
     this.selectedProjectId = context.workspaceState.get<string>(UI_KEYS.selectedProject) ?? null;
     this.selectedSandbox = context.workspaceState.get<string>(UI_KEYS.selectedSandbox) ?? null;
     this.showArchived = context.workspaceState.get<boolean>(UI_KEYS.showArchived) === true;
+    this.showArchivedConversations = context.workspaceState.get<boolean>(UI_KEYS.showArchivedConversations) === true;
     const storedConversation = context.workspaceState.get<ConversationPreference>(UI_KEYS.conversation);
     if (storedConversation) {
       // A restored selection is a UI preference; it is re-pointed at Core's
@@ -576,8 +609,574 @@ export class SandpaneSession {
   }
 
   // -----------------------------------------------------------------------
-  // Core operations (each is a typed RPC)
+  // A3b conversation lifecycle (design 2026-10-09 §3.3)
   // -----------------------------------------------------------------------
+
+  /** UI preference (workspaceState): include archived conversations in the chat list. */
+  private showArchivedConversations = false;
+
+  /**
+   * `conversation.list` params for the chat list: `includeArchived: true` only
+   * when "show archived" is on AND this Core advertises `conversation.archive`
+   * (an older Core would ignore the flag silently).
+   */
+  private conversationListParams(projectId: string): ConversationListParams {
+    return this.showArchivedConversations && this.coreAdvertises('conversation.archive')
+      ? { projectId, includeArchived: true }
+      : { projectId };
+  }
+
+  /**
+   * Take Core's list as the chat list. A selected conversation is re-pointed at
+   * Core's record (archived state, title) or dropped when Core does not list
+   * it; the stored preference is cleared only on Core's verdict (a successful
+   * list without it), never on a transient failure.
+   */
+  private applyConversationList(conversations: Conversation[], listed: boolean): void {
+    this.conversations = conversations;
+    if (!this.conversation) return;
+    const live = conversations.find((c) => c.id === this.conversation?.id);
+    if (live) {
+      this.conversation = live;
+      return;
+    }
+    if (listed && conversations.length >= DEFAULT_LIST_LIMIT) {
+      // A FULL page without it proves nothing (Core's list is bounded): keep
+      // the selection; a send to a conversation Core no longer has answers
+      // NOT_FOUND, which is reported, never hidden.
+      return;
+    }
+    this.conversation = null;
+    if (listed) {
+      this.conversationSandbox = null;
+      void this.context.workspaceState.update(UI_KEYS.conversation, undefined);
+    }
+  }
+
+  /** Re-read the selected project's conversations after a change. False = not re-read. */
+  private async refreshConversations(): Promise<boolean> {
+    const projectId = this.selectedProjectId;
+    if (!projectId || !this.coreAdvertises('conversation.list')) return false;
+    let conversations: Conversation[];
+    try {
+      conversations = await this.commands.conversationList(this.conversationListParams(projectId));
+    } catch (error) {
+      this.log(`conversation.list after a conversation change failed: ${describe(error)} — the list may be stale`);
+      return false;
+    }
+    if (this.selectedProjectId !== projectId) return false; // stale answer (W1)
+    this.applyConversationList(conversations, true);
+    this.emit();
+    return true;
+  }
+
+  /** "Show archived" in the chat list (A3b), gated on `conversation.archive`. */
+  async toggleShowArchivedConversations(): Promise<void> {
+    if (!(await this.ensureAdvertised('conversation.archive', 'Show archived conversations'))) return;
+    this.showArchivedConversations = !this.showArchivedConversations;
+    void this.context.workspaceState.update(UI_KEYS.showArchivedConversations, this.showArchivedConversations);
+    const listed = await this.refreshConversations();
+    this.setStatus(
+      'info',
+      (this.showArchivedConversations
+        ? 'Archived conversations are shown (labeled ARCHIVED).'
+        : 'Archived conversations are hidden.') + (listed ? '' : ' The conversation list could not be re-read.'),
+    );
+    this.emit();
+  }
+
+  /**
+   * A conversation the WEBVIEW named must be one Core listed for the selected
+   * project (like `selectSandbox`, review S3); anything else is refused here.
+   */
+  private listedConversation(id: string, action: string): Conversation | undefined {
+    const conversation = this.conversations.find((c) => c.id === id);
+    if (conversation) return conversation;
+    const text = `${action}: that conversation is not listed by Core for the selected project; nothing was sent. Refresh to re-read the list.`;
+    void vscode.window.showWarningMessage(text);
+    this.setStatus('error', text);
+    this.emit();
+    return undefined;
+  }
+
+  /** Select a Core-listed conversation; `''` = the next send starts a new one. */
+  selectConversation(id: string): void {
+    if (id.length === 0) {
+      this.conversation = null;
+      this.conversationSandbox = null;
+      void this.context.workspaceState.update(UI_KEYS.conversation, undefined);
+      this.setStatus('info', 'No conversation selected — the next send starts a new conversation.');
+      this.emit();
+      return;
+    }
+    const conversation = this.conversations.find((c) => c.id === id);
+    if (!conversation) {
+      this.setStatus('error', 'That conversation is not listed by Core for the selected project; selection unchanged.');
+      this.emit();
+      return;
+    }
+    this.conversation = conversation;
+    // The UI scope of the selection is the CURRENT sandbox (the user chose to
+    // continue it here). Core's `sandboxId` is a stored name, never a binding,
+    // so it never feeds the scope check.
+    this.conversationSandbox = this.selectedSandbox;
+    const preference: ConversationPreference = {
+      id: conversation.id,
+      projectId: conversation.projectId,
+      title: conversation.title,
+      agentId: conversation.agentId,
+      sandboxName: this.conversationSandbox,
+    };
+    void this.context.workspaceState.update(UI_KEYS.conversation, preference);
+    this.emit();
+  }
+
+  private projectOf(conversation: Pick<Conversation, 'projectId'>): Project | undefined {
+    return this.projects.find((p) => p.id === conversation.projectId);
+  }
+
+  private static readonly PROJECT_ARCHIVED_REASON = `Core refuses this in an archived project ("${MSG_PROJECT_ARCHIVED}")`;
+  private static readonly CONVERSATION_ARCHIVED_REASON = `Core refuses it for an archived conversation ("${MSG_CONVERSATION_ARCHIVED}")`;
+
+  /**
+   * Local pre-check in Core's own order (§3.3 item 4): an archived PROJECT
+   * first, then (unless allowed) an archived conversation. Shows the refusal
+   * with Core's reason and returns true; nothing is sent.
+   */
+  private refuseConversationEdit(conversation: Conversation, action: string, allowArchivedConversation: boolean): boolean {
+    const project = this.projectOf(conversation);
+    let text: string | null = null;
+    if (project && isArchived(project)) {
+      text = `${action} is not available: ${SandpaneSession.PROJECT_ARCHIVED_REASON}. Unarchive the project first. Nothing was sent.`;
+    } else if (!allowArchivedConversation && isConversationArchived(conversation)) {
+      text = `${action} is not available: ${SandpaneSession.CONVERSATION_ARCHIVED_REASON}. Unarchive it first. Nothing was sent.`;
+    }
+    if (text === null) return false;
+    void vscode.window.showWarningMessage(text);
+    this.setStatus('error', text);
+    this.emit();
+    return true;
+  }
+
+  /** Why the composer cannot send right now (Core's own reason), or null. */
+  private composerBlockedReason(): string | null {
+    const project = this.projects.find((p) => p.id === this.selectedProjectId);
+    if (project && isArchived(project)) {
+      return `Sending is disabled: Core refuses sends in an archived project ("${MSG_PROJECT_ARCHIVED}"). Unarchive the project first.`;
+    }
+    if (this.conversation && isConversationArchived(this.conversation)) {
+      return (
+        `Sending is disabled: Core refuses sends to an archived conversation ("${MSG_CONVERSATION_ARCHIVED}"). ` +
+        'Unarchive it, or choose "New conversation". Its history stays readable.'
+      );
+    }
+    return null;
+  }
+
+  /** Core's exact A3b/A3a refusals get honest copy; no answer = UNKNOWN + re-read. */
+  private reportConversationError(error: unknown, operation: string): void {
+    if (isUnknownOutcome(error)) {
+      this.reportError(
+        error,
+        operation,
+        'Outcome UNKNOWN: Core did not confirm whether this changed anything. Re-reading the conversation list from Core; not retried.',
+      );
+    } else {
+      this.reportError(error, operation, conversationErrorCopy(error) ?? projectErrorCopy(error) ?? undefined);
+    }
+    void this.refreshConversations();
+  }
+
+  private async conversationMutation(
+    method: CoreMethodName,
+    run: () => Promise<Conversation>,
+    done: (updated: Conversation) => string,
+  ): Promise<Conversation | undefined> {
+    try {
+      const updated = await run();
+      const listed = await this.refreshConversations();
+      this.setStatus('ok', done(updated) + (listed ? '' : ' (the conversation list could not be re-read; it may be stale)'));
+      this.emit();
+      return updated;
+    } catch (error) {
+      this.reportConversationError(error, method);
+      return undefined;
+    }
+  }
+
+  /**
+   * Rename (A3b): gated on the probe; disabled with Core's reason on an
+   * archived project / conversation (nothing sent); a native input box whose
+   * validator mirrors Core exactly (incl. the whitespace-only refusal).
+   */
+  async renameConversation(id: string): Promise<Conversation | undefined> {
+    const conversation = this.listedConversation(id, 'Rename conversation');
+    if (!conversation) return undefined;
+    if (!(await this.ensureAdvertised('conversation.rename', 'Rename conversation'))) return undefined;
+    if (this.refuseConversationEdit(conversation, 'Rename conversation', false)) return undefined;
+    // A stored title from before A3b may hold characters Core now refuses (or
+    // hides): never prefill those into an editable field.
+    const prefill = conversationTitleProblem(conversation.title) === undefined ? conversation.title : '';
+    const title = await vscode.window.showInputBox({
+      title: `Rename conversation "${plainText(conversation.title, 200)}"`,
+      prompt: 'New title (1–200 characters, one line; Core stores it exactly as typed)',
+      value: prefill,
+      validateInput: conversationTitleProblem,
+    });
+    if (title === undefined || title === conversation.title) {
+      this.setStatus('info', 'Rename cancelled — nothing was sent.');
+      this.emit();
+      return undefined;
+    }
+    try {
+      validateConversationRenameTitle(title);
+    } catch (error) {
+      this.reportError(error, 'conversation.rename', 'Nothing was sent.');
+      return undefined;
+    }
+    return this.conversationMutation(
+      'conversation.rename',
+      () => this.commands.conversationRename({ conversationId: conversation.id, title }),
+      (c) => `Conversation renamed to "${plainText(c.title, 200)}" in Core.`,
+    );
+  }
+
+  /** Archive (A3b): allowed in an archived project too; idempotent in Core. */
+  async archiveConversation(id: string): Promise<Conversation | undefined> {
+    const conversation = this.listedConversation(id, 'Archive conversation');
+    if (!conversation) return undefined;
+    if (!(await this.ensureAdvertised('conversation.archive', 'Archive conversation'))) return undefined;
+    const wasSelected = this.conversation?.id === conversation.id;
+    return this.conversationMutation(
+      'conversation.archive',
+      () => this.commands.conversationArchive(conversation.id),
+      (c) => {
+        const base = `Conversation "${plainText(c.title, 200)}" archived in Core — Core now refuses sends and renames for it until it is unarchived; its history stays readable.`;
+        if (this.showArchivedConversations) return base;
+        return `${base} It is hidden from the list${wasSelected ? ' and was deselected' : ''}; turn on "Show archived" to see it.`;
+      },
+    );
+  }
+
+  /** Unarchive (A3b): refused locally in an archived project (Core's reason). */
+  async unarchiveConversation(id: string): Promise<Conversation | undefined> {
+    const conversation = this.listedConversation(id, 'Unarchive conversation');
+    if (!conversation) return undefined;
+    if (!(await this.ensureAdvertised('conversation.unarchive', 'Unarchive conversation'))) return undefined;
+    if (this.refuseConversationEdit(conversation, 'Unarchive conversation', true)) return undefined;
+    return this.conversationMutation(
+      'conversation.unarchive',
+      () => this.commands.conversationUnarchive(conversation.id),
+      (c) => `Conversation "${plainText(c.title, 200)}" unarchived in Core.`,
+    );
+  }
+
+  /**
+   * Forget every client-side reference to a deleted conversation (UI state
+   * only): the list row, the selection and its stored preference, and the
+   * deleted tasks still painted (the view is re-hydrated from Core).
+   */
+  private async forgetConversation(id: string): Promise<void> {
+    this.conversations = this.conversations.filter((c) => c.id !== id);
+    if (this.conversation?.id === id) {
+      this.conversation = null;
+      this.conversationSandbox = null;
+      void this.context.workspaceState.update(UI_KEYS.conversation, undefined);
+    }
+    // `taskList` hydration merges, so the deleted conversation's tasks would
+    // stay painted: reset the task view and re-read it from Core.
+    this.stopFeed();
+    this.view = EMPTY_STATE;
+    await this.reloadScope();
+  }
+
+  /**
+   * `conversation.delete` (A3b) with the A1 two-step pattern: step 1 → native
+   * modal (title, id, capped impact, expiry) → only "Delete conversation",
+   * re-checked for expiry at click time (fail closed), sends step 2 with the
+   * token. Cancel sends nothing. Neither step is retried; the token is never
+   * logged or shown. `external` is always false for conversations.
+   */
+  async deleteConversation(id: string): Promise<boolean> {
+    return this.singleFlight('Delete conversation', () => this.deleteConversationOnce(id));
+  }
+
+  /** The conversation delete/export currently running (one at a time), if any. */
+  private conversationOpInFlight: string | null = null;
+
+  /**
+   * Delete and export are single-flight: a second one while one runs is
+   * refused visibly and sends nothing (no second step-1 request, no second
+   * page loop). The guard is taken synchronously, before any await.
+   */
+  private async singleFlight(action: string, work: () => Promise<boolean>): Promise<boolean> {
+    if (this.conversationOpInFlight !== null) {
+      const text = `${action}: "${this.conversationOpInFlight}" is already in progress; wait for it to finish. Nothing was sent.`;
+      void vscode.window.showWarningMessage(text);
+      this.setStatus('info', text);
+      this.emit();
+      return false;
+    }
+    this.conversationOpInFlight = action;
+    try {
+      return await work();
+    } finally {
+      this.conversationOpInFlight = null;
+    }
+  }
+
+  private async deleteConversationOnce(id: string): Promise<boolean> {
+    const conversation = this.listedConversation(id, 'Delete conversation');
+    if (!conversation) return false;
+    if (!(await this.ensureAdvertised('conversation.delete', 'Delete conversation'))) return false;
+    let confirmation: ConfirmationRequest;
+    try {
+      confirmation = await this.commands.conversationDeleteRequest(conversation.id);
+    } catch (error) {
+      // Step 1 changes nothing in Core, whatever happened.
+      this.reportError(
+        error,
+        'conversation.delete (confirmation request)',
+        conversationErrorCopy(error) ?? projectErrorCopy(error) ?? 'Nothing was deleted.',
+      );
+      return false;
+    }
+    const view = conversationDeleteView(confirmation, this.now());
+    const answer = await vscode.window.showWarningMessage(view.message, { modal: true, detail: view.detail }, DELETE_CONVERSATION_BUTTON);
+    if (answer !== DELETE_CONVERSATION_BUTTON) {
+      this.setStatus('info', 'Delete not confirmed — nothing was sent; the confirmation expires on its own.');
+      this.emit();
+      return false;
+    }
+    const expiresAt = Date.parse(confirmation.expiresAt);
+    if (!Number.isFinite(expiresAt) || this.now() >= expiresAt) {
+      this.setStatus('info', 'Confirmation expired — nothing was sent; run Delete Conversation again.');
+      this.emit();
+      return false;
+    }
+    let deleted: boolean;
+    try {
+      const result = await this.commands.conversationDeleteConfirm(conversation.id, confirmation.token);
+      deleted = result.deleted === true;
+    } catch (error) {
+      if (isUnknownOutcome(error)) {
+        this.reportError(
+          error,
+          'conversation.delete',
+          'Outcome UNKNOWN: Core did not confirm whether the conversation was deleted. Re-reading the conversation list (including archived) from Core; not retried.',
+        );
+        // A Core-answered INTERNAL means Core finished that request; a
+        // timeout / closed / failed write means it may still be running.
+        await this.settleConversationDelete(conversation, error instanceof CoreRpcError);
+        return false;
+      }
+      this.reportError(error, 'conversation.delete', conversationErrorCopy(error, { delete: true }) ?? projectErrorCopy(error) ?? undefined);
+      // Core says the conversation no longer exists (deleted elsewhere): drop
+      // it from UI state exactly as a confirmed delete does.
+      if (isConversationNotFound(error)) await this.forgetConversation(conversation.id);
+      await this.refreshConversations();
+      this.emit();
+      return false;
+    }
+    if (deleted) {
+      await this.forgetConversation(conversation.id);
+      const listed = await this.refreshConversations();
+      this.setStatus(
+        'ok',
+        `Core deleted conversation "${plainText(confirmation.target.name, 200)}" (its Core records only: messages, tasks and their events, artifacts and verification records; host files, worktrees, branches and sandboxes were not touched).` +
+          (listed ? '' : ' (the conversation list could not be re-read; it may be stale)'),
+      );
+    } else {
+      this.setStatus('error', 'Core did not report the deletion — its state is unknown; re-reading the conversation list.');
+      await this.settleConversationDelete(conversation, true);
+    }
+    this.emit();
+    return deleted;
+  }
+
+  /**
+   * After an unknown delete outcome, let Core's own list (scoped to the
+   * conversation's project, archived included) say what it shows NOW. "It
+   * was not deleted" only when Core answered the step-2 request; absence from
+   * a FULL page proves nothing, so the outcome then stays UNKNOWN.
+   */
+  private async settleConversationDelete(conversation: Conversation, coreFinished: boolean): Promise<void> {
+    // Without `conversation.archive` the re-read is LIVE-only: an absent row
+    // may be archived rather than deleted, so absence proves nothing then.
+    const includesArchived = this.coreAdvertises('conversation.archive');
+    let all: Conversation[];
+    try {
+      all = await this.commands.conversationList({
+        projectId: conversation.projectId,
+        limit: SETTLE_LIST_LIMIT,
+        ...(includesArchived ? { includeArchived: true } : {}),
+      });
+    } catch (error) {
+      this.log(`conversation.list after an unknown delete failed: ${describe(error)}`);
+      this.setStatus(
+        'error',
+        'The conversation list could not be re-read after the unknown outcome; whether the conversation was deleted is UNKNOWN.',
+      );
+      this.emit();
+      return;
+    }
+    if (all.some((c) => c.id === conversation.id)) {
+      this.setStatus(
+        'info',
+        coreFinished
+          ? 'Core still lists the conversation as of this re-read — it was not deleted (Core answered the delete request, so that request has finished).'
+          : 'Core still lists the conversation as of this re-read. Core never answered the delete request, so it may still finish — re-read before acting; not retried.',
+      );
+    } else if (all.length >= SETTLE_LIST_LIMIT) {
+      this.setStatus(
+        'error',
+        `Core's re-read returned a full page (${SETTLE_LIST_LIMIT} conversations) without this one — absence from a full page proves nothing; whether it was deleted is still UNKNOWN.`,
+      );
+    } else if (!includesArchived) {
+      // Keep every local reference (and skip the live-only list refresh, which
+      // would drop the selection on the same non-proof).
+      this.setStatus(
+        'error',
+        'Core\'s re-read lists live conversations only (this Core does not advertise conversation.archive), so its absence proves nothing; whether it was deleted is still UNKNOWN.',
+      );
+      this.emit();
+      return;
+    } else {
+      await this.forgetConversation(conversation.id);
+      this.setStatus('info', 'Core no longer lists this conversation; the outcome of this request was not confirmed.');
+    }
+    await this.refreshConversations();
+    this.emit();
+  }
+
+  /**
+   * `conversation.export` (A3b): every page is read and checked first (any page
+   * failure → no file, no dialog); then the native save dialog proposes
+   * `<redacted-title>-export.json`; the ONE JSON document is written only to
+   * the URI the user chose. Cancel writes nothing. The content is never logged.
+   */
+  async exportConversation(id: string): Promise<boolean> {
+    return this.singleFlight('Export conversation', () => this.exportConversationOnce(id));
+  }
+
+  private async exportConversationOnce(id: string): Promise<boolean> {
+    const conversation = this.listedConversation(id, 'Export conversation');
+    if (!conversation) return false;
+    if (!(await this.ensureAdvertised('conversation.export', 'Export conversation'))) return false;
+    this.setStatus('info', `Exporting "${plainText(conversation.title, 200)}" from Core (redacted by Core). ${EXPORT_BEST_EFFORT_COPY}`);
+    this.emit();
+    const outcome = await collectConversationExport(conversation.id, (afterSequence) =>
+      this.commands.conversationExport({ conversationId: conversation.id, afterSequence }),
+    );
+    if (!outcome.ok) {
+      const copy = conversationErrorCopy(outcome.error);
+      this.reportError(outcome.error, 'conversation.export', `No file was written.${copy ? ` ${copy}` : ''}`);
+      return false;
+    }
+    const { file } = outcome;
+    const partial =
+      outcome.incomplete === null
+        ? ''
+        : outcome.incomplete === 'page-cap'
+          ? ` PARTIAL: stopped after ${outcome.pages} pages (the client's page cap); later messages are not included.`
+          : ' PARTIAL: Core\'s paging cursor stopped advancing; later messages may be missing.';
+    const kinds = Object.entries(file.redaction.byKind)
+      .map(([kind, count]) => `${plainText(kind, 64)}: ${count}`)
+      .join(', ');
+    const counts =
+      `${file.messages.length} message(s), ${file.redaction.replacements} redaction replacement(s)` +
+      (kinds.length > 0 ? ` (${kinds})` : '');
+    const folder = (vscode.workspace.workspaceFolders ?? []).find((f) => f.uri.scheme === 'file');
+    const defaultUri = vscode.Uri.file(join(folder?.uri.fsPath ?? homedir(), exportFileName(file.conversation.title)));
+    const target = await vscode.window.showSaveDialog({
+      defaultUri,
+      filters: { JSON: ['json'] },
+      saveLabel: 'Save redacted export',
+      title: `Save redacted export — ${counts}.${partial} ${EXPORT_BEST_EFFORT_COPY}`,
+    });
+    if (!target) {
+      this.setStatus('info', 'Export not saved — nothing was written.');
+      this.emit();
+      return false;
+    }
+    try {
+      await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(`${JSON.stringify(file, null, 2)}\n`));
+    } catch (error) {
+      this.reportError(error, 'conversation.export (write)', 'The export could not be written to the chosen file.');
+      return false;
+    }
+    // Counts only — the export content is never logged.
+    this.log(`conversation.export wrote ${file.messages.length} message(s), complete=${file.complete}`);
+    const text = `Redacted export written to ${plainText(target.fsPath, 500)}: ${counts}.${partial} ${EXPORT_BEST_EFFORT_COPY}`;
+    this.setStatus(outcome.incomplete === null ? 'ok' : 'info', text);
+    void vscode.window.showInformationMessage(text);
+    this.emit();
+    return true;
+  }
+
+  /** One row's action states: enabled, or disabled with the reason shown. */
+  private conversationActionStates(conversation: Conversation): Record<ConversationAction, ConversationActionState> {
+    const unsupported = (method: CoreMethodName): string | null =>
+      this.capabilities === null
+        ? 'Core is not attached'
+        : this.coreAdvertises(method)
+          ? null
+          : `not supported by the attached Sandpane Core (it does not advertise "${method}")`;
+    const state = (reason: string | null): ConversationActionState => ({ enabled: reason === null, reason });
+    const project = this.projectOf(conversation);
+    const projectArchived = project !== undefined && isArchived(project);
+    const archived = isConversationArchived(conversation);
+    const projectReason = `${SandpaneSession.PROJECT_ARCHIVED_REASON}; unarchive the project first`;
+    const conversationReason = `${SandpaneSession.CONVERSATION_ARCHIVED_REASON}; unarchive it first`;
+    return {
+      rename: state(unsupported('conversation.rename') ?? (projectArchived ? projectReason : archived ? conversationReason : null)),
+      archive: state(unsupported('conversation.archive') ?? (archived ? 'already archived' : null)),
+      unarchive: state(unsupported('conversation.unarchive') ?? (!archived ? 'not archived' : projectArchived ? projectReason : null)),
+      export: state(unsupported('conversation.export')),
+      delete: state(unsupported('conversation.delete')),
+    };
+  }
+
+  private conversationListView(): ConversationListView {
+    const listAdvertised = this.coreAdvertises('conversation.list');
+    const archiveAdvertised = this.coreAdvertises('conversation.archive');
+    const showArchived = this.showArchivedConversations && archiveAdvertised;
+    const featureAdvertised = this.coreHasFeature('conversation-sandbox-id');
+    const sandboxNames = this.sandboxListRead ? this.sandboxes.map((s) => s.name) : null;
+    const rows = this.conversations.map((conversation) => {
+      const archived = isConversationArchived(conversation);
+      return {
+        id: conversation.id,
+        title: plainText(conversation.title, 200),
+        archived,
+        selected: this.conversation?.id === conversation.id,
+        sandboxLabel: conversationSandboxLabel(conversation, featureAdvertised, sandboxNames),
+        statusNote: archived
+          ? `${ARCHIVED_CONVERSATION_LABEL} — send and rename are disabled: Core says "${MSG_CONVERSATION_ARCHIVED}". Its history stays readable.`
+          : null,
+        actions: this.conversationActionStates(conversation),
+      };
+    });
+    const note =
+      this.capabilities === null
+        ? null
+        : !listAdvertised
+          ? 'This Core does not advertise conversation.list — conversations cannot be listed (no fake list).'
+          : this.selectedProjectId === null
+            ? 'Select a project to list its conversations.'
+            : rows.length === 0
+              ? showArchived
+                ? 'Core lists no conversation for this project.'
+                : 'Core lists no live conversation for this project (archived ones are hidden).'
+              : null;
+    return {
+      supported: listAdvertised && this.selectedProjectId !== null,
+      note,
+      showArchived,
+      showArchivedSupported: archiveAdvertised,
+      rows,
+    };
+  }
 
   // -----------------------------------------------------------------------
   // Core operations (each is a typed RPC)
@@ -627,6 +1226,7 @@ export class SandpaneSession {
       this.log(`project.list failed: ${describe(projects.reason)}`);
     }
     const sandboxes = results[1];
+    this.sandboxListRead = sandboxes.status === 'fulfilled';
     if (sandboxes.status === 'fulfilled') {
       this.sandboxes = sandboxes.value;
       if (!this.selectedSandbox && this.sandboxes.length === 1) {
@@ -705,25 +1305,13 @@ export class SandpaneSession {
       let listed = false;
       let conversations: Conversation[] = [];
       try {
-        conversations = await this.commands.conversationList({ projectId });
+        conversations = await this.commands.conversationList(this.conversationListParams(projectId));
         listed = true;
       } catch (error) {
         this.log(`conversation.list failed: ${describe(error)}`);
       }
       if (this.selectedProjectId !== projectId) return; // stale answer (W1)
-      this.conversations = conversations;
-      // Re-point a restored UI preference at Core's live record when the id still
-      // exists; otherwise drop it rather than rendering a conversation Core does
-      // not have. The stored preference is cleared only on Core's verdict (a
-      // successful list without it), not on a transient failure.
-      if (this.conversation) {
-        const live = this.conversations.find((c) => c.id === this.conversation?.id);
-        this.conversation = live ?? null;
-        if (!live && listed) {
-          this.conversationSandbox = null;
-          void this.context.workspaceState.update(UI_KEYS.conversation, undefined);
-        }
-      }
+      this.applyConversationList(conversations, listed);
     } else {
       this.conversations = [];
       this.log(
@@ -945,6 +1533,7 @@ export class SandpaneSession {
   async listSandboxOptions(): Promise<SandboxSummary[]> {
     try {
       this.sandboxes = await this.commands.sandboxList();
+      this.sandboxListRead = true;
     } catch (error) {
       this.log(`sandbox.list failed while picking: ${describe(error)} — using the last snapshot`);
     }
@@ -995,6 +1584,7 @@ export class SandpaneSession {
   private async refreshSandboxList(): Promise<boolean> {
     try {
       this.sandboxes = await this.commands.sandboxList();
+      this.sandboxListRead = true;
     } catch (error) {
       this.log(`sandbox.list after a lifecycle action failed: ${describe(error)} — the list may be stale`);
       return false;
@@ -1235,6 +1825,14 @@ export class SandpaneSession {
     planId: number | null,
     origin: 'sidebar' | 'command',
   ): Promise<void> {
+    // A3b: an archived project / conversation — Core would refuse the send;
+    // say so with Core's own reason and send nothing.
+    const blocked = this.composerBlockedReason();
+    if (blocked !== null) {
+      this.setStatus('error', `Not sent: ${blocked}`);
+      this.emit();
+      return;
+    }
     const authorization = authorizeSend(
       this.contextPlan ? { id: this.contextPlanId, mode: this.contextPlan.mode } : null,
       { writable, planId },
@@ -1284,7 +1882,10 @@ export class SandpaneSession {
           projectId,
           agentId,
           ...(this.selectedSandbox ? { sandboxId: this.selectedSandbox } : {}),
-          title: text.slice(0, 80),
+          // A3b: Core validates titles with `Validator::conversation_title`
+          // (no \n / \t / bidi controls): derive one valid line, or '' for
+          // Core's "Untitled conversation".
+          title: titleFromMessage(text),
         });
         this.conversationSandbox = this.selectedSandbox;
         const preference: ConversationPreference = {
@@ -1356,6 +1957,9 @@ export class SandpaneSession {
         () => this.retrySend(params, ctx),
         () => this.reloadScope(),
       );
+      // A3b: Core refused because the conversation was archived (or deleted)
+      // elsewhere — re-read so the list and composer show Core's state.
+      if (conversationErrorCopy(error) !== null) void this.refreshConversations();
     }
   }
 
@@ -1580,8 +2184,41 @@ export class SandpaneSession {
       case 'reviewTask':
         void this.reviewChanges(message.taskId);
         break;
+      case 'selectConversation':
+        this.selectConversation(message.conversationId);
+        break;
+      case 'toggleArchivedConversations':
+        void this.toggleShowArchivedConversations();
+        break;
+      case 'conversationAction':
+        void this.runConversationAction(message.action, message.conversationId);
+        break;
       default: {
         const _exhaustive: never = message;
+        void _exhaustive;
+      }
+    }
+  }
+
+  private async runConversationAction(action: ConversationAction, id: string): Promise<void> {
+    switch (action) {
+      case 'rename':
+        await this.renameConversation(id);
+        return;
+      case 'archive':
+        await this.archiveConversation(id);
+        return;
+      case 'unarchive':
+        await this.unarchiveConversation(id);
+        return;
+      case 'export':
+        await this.exportConversation(id);
+        return;
+      case 'delete':
+        await this.deleteConversation(id);
+        return;
+      default: {
+        const _exhaustive: never = action;
         void _exhaustive;
       }
     }
@@ -1633,8 +2270,15 @@ export class SandpaneSession {
       }),
       selectedSandbox: this.selectedSandbox,
       conversation: this.conversation
-        ? { id: this.conversation.id, title: this.conversation.title, agentId: this.conversation.agentId }
+        ? {
+            id: this.conversation.id,
+            title: this.conversation.title,
+            agentId: this.conversation.agentId,
+            archived: isConversationArchived(this.conversation),
+          }
         : null,
+      conversations: this.conversationListView(),
+      composerBlocked: this.composerBlockedReason(),
       lines: transcript.lines.map((line) => ({
         role: line.role,
         text: line.text,
@@ -1874,7 +2518,7 @@ export class SandpaneSession {
   reportError(error: unknown, operation: string, contextArg?: string): void {
     // Core's exact A3a refusals (archived project, unregistered repository …)
     // get their honest copy wherever they surface.
-    const context = contextArg ?? projectErrorCopy(error) ?? undefined;
+    const context = contextArg ?? projectErrorCopy(error) ?? conversationErrorCopy(error) ?? undefined;
     const failure = toFailure(error);
     const guidance = explainFailure(error);
     const coreMessage =

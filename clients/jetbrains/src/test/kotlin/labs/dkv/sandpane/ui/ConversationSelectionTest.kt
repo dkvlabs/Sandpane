@@ -21,10 +21,13 @@ class ConversationSelectionTest {
     }
 
     @Test
-    fun aVanishedSelectionFallsBackToCoresFirstAndNoneWhenEmpty() {
+    fun aVanishedSelectionSelectsNothingNeverAnotherConversation() {
         val a = conv("conv-a")
-        assertEquals(a, ConversationSelection.choose("gone", listOf(a)))
+        // A3b review W1: the Send target never silently moves to a conversation the user did not pick.
+        assertNull(ConversationSelection.choose("gone", listOf(a)))
         assertNull(ConversationSelection.choose("gone", emptyList()))
+        // Only the initial load (no previous selection) may pick Core's first conversation.
+        assertEquals(a, ConversationSelection.choose(null, listOf(a)))
         assertNull(ConversationSelection.choose(null, emptyList()))
     }
 
@@ -73,7 +76,36 @@ class ConversationReconcileTest {
     fun aChatCoreStoppedListingInTheSameProjectIsReported() {
         val a = conv("conv-a")
         val outcome = ConversationSelection.reconcile("conv-gone", "p1", "p1", listOf(a))
-        assertEquals(a, outcome.choice)
+        assertNull(outcome.choice, "nothing is selected; another conversation is never substituted")
         assertEquals("conv-gone", outcome.vanishedId)
+    }
+
+    /**
+     * A3b review W1: archive the open conversation with "Show archived" off. The re-read omits it;
+     * the picker must select NOTHING (and stay so on later refreshes) and the composer must say to
+     * select a conversation — the next message can never go to a conversation the user did not pick.
+     */
+    @Test
+    fun theSendTargetNeverMovesToAConversationTheUserDidNotPick() {
+        val archivedOne = conv("conv-a")
+        val other = conv("conv-b")
+        // Initial load of p1: Core's first conversation is shown (no previous selection).
+        assertEquals(archivedOne, ConversationSelection.reconcile(null, null, "p1", listOf(archivedOne, other)).choice)
+        // The user archived conv-a; the re-read (archived hidden) lists only conv-b.
+        val afterArchive = ConversationSelection.reconcile("conv-a", "p1", "p1", listOf(other))
+        assertNull(afterArchive.choice)
+        assertEquals("conv-a", afterArchive.vanishedId)
+        // Any later refresh of the same project keeps nothing selected until the user picks.
+        val later = ConversationSelection.reconcile(null, "p1", "p1", listOf(other))
+        assertNull(later.choice)
+        assertNull(later.vanishedId)
+        // With nothing selected the composer is blocked, saying what to do.
+        val blocker = labs.dkv.sandpane.core.ConversationUiState.composerBlocker(null)
+        assertTrue(blocker != null && blocker.contains("select a conversation to continue"), blocker.toString())
+        assertEquals("→ no conversation selected", ConversationSelection.targetLine(later.choice))
+        // The user's own pick is kept on refresh.
+        assertEquals(other, ConversationSelection.reconcile("conv-b", "p1", "p1", listOf(other)).choice)
+        // A different project is a new initial load.
+        assertEquals(other, ConversationSelection.reconcile(null, "p1", "p2", listOf(other)).choice)
     }
 }

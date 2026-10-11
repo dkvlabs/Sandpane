@@ -77,12 +77,54 @@ export interface ContextPlanView {
   excluded: { label: string; reason: string }[];
 }
 
+/** One action on a conversation row: enabled, or disabled with the reason shown. */
+export interface ConversationActionState {
+  enabled: boolean;
+  /** Why it is disabled (Core's own reason, or "not supported by this Core"). */
+  reason: string | null;
+}
+
+export const CONVERSATION_ACTIONS = ['rename', 'archive', 'unarchive', 'export', 'delete'] as const;
+
+export type ConversationAction = (typeof CONVERSATION_ACTIONS)[number];
+
+/** A conversation Core listed (A3b). Every string is already plain text. */
+export interface ConversationRow {
+  id: string;
+  title: string;
+  archived: boolean;
+  selected: boolean;
+  /** "sandbox chosen at creation: …" — only when Core advertises the feature. */
+  sandboxLabel: string | null;
+  /** Archived note incl. Core's reason send/rename are disabled; null when live. */
+  statusNote: string | null;
+  actions: Record<ConversationAction, ConversationActionState>;
+}
+
+export interface ConversationListView {
+  /** `conversation.list` advertised and a project selected. */
+  supported: boolean;
+  /** Why the list is empty/unavailable, when it is. */
+  note: string | null;
+  showArchived: boolean;
+  /** `conversation.archive` advertised (the toggle is otherwise unsupported). */
+  showArchivedSupported: boolean;
+  rows: ConversationRow[];
+}
+
 export interface SidebarState {
   connection: ConnectionTone;
   header: HeaderContext;
   sandboxes: SandboxOption[];
   selectedSandbox: string | null;
-  conversation: { id: string; title: string; agentId: string } | null;
+  conversation: { id: string; title: string; agentId: string; archived: boolean } | null;
+  /** A3b: Core's conversation list (rows, archived labels, per-row actions). */
+  conversations: ConversationListView;
+  /**
+   * Why the composer cannot send right now (archived project / conversation,
+   * Core's own reason); null = sending is allowed. Send is disabled while set.
+   */
+  composerBlocked: string | null;
   lines: ChatLine[];
   /** What the stream shows: one conversation, or every task of the project. */
   transcript: { scope: 'conversation' | 'project'; label: string };
@@ -114,7 +156,12 @@ export type WebviewToExtension =
    */
   | { type: 'send'; text: string; writable: boolean; planId: number | null }
   | { type: 'cancelTask'; taskId: string }
-  | { type: 'reviewTask'; taskId: string };
+  | { type: 'reviewTask'; taskId: string }
+  /** A3b: select a Core-listed conversation; `''` = start a new one on the next send. */
+  | { type: 'selectConversation'; conversationId: string }
+  /** A3b: one lifecycle action on a Core-listed conversation (native dialogs follow). */
+  | { type: 'conversationAction'; action: ConversationAction; conversationId: string }
+  | { type: 'toggleArchivedConversations' };
 
 export type ExtensionToWebview = { type: 'state'; state: SidebarState };
 
@@ -126,7 +173,19 @@ export const WEBVIEW_MESSAGE_KINDS: readonly string[] = [
   'send',
   'cancelTask',
   'reviewTask',
+  'selectConversation',
+  'conversationAction',
+  'toggleArchivedConversations',
 ];
+
+/** Upper bound on a conversation id from the webview (Core's scoping-id bound). */
+const MAX_WEBVIEW_ID_CHARS = 200;
+
+function webviewId(value: unknown, allowEmpty: boolean): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  if (value.length === 0) return allowEmpty ? value : undefined;
+  return value.length <= MAX_WEBVIEW_ID_CHARS ? value : undefined;
+}
 
 /** Runtime gate for inbound webview messages — unknown kinds are dropped. */
 export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefined {
@@ -137,6 +196,18 @@ export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefine
     case 'ready':
     case 'refresh':
       return { type };
+    case 'toggleArchivedConversations':
+      return { type };
+    case 'selectConversation': {
+      const id = webviewId((raw as { conversationId?: unknown }).conversationId, true);
+      return id === undefined ? undefined : { type: 'selectConversation', conversationId: id };
+    }
+    case 'conversationAction': {
+      const r = raw as { action?: unknown; conversationId?: unknown };
+      const id = webviewId(r.conversationId, false);
+      const action = (CONVERSATION_ACTIONS as readonly unknown[]).includes(r.action) ? (r.action as ConversationAction) : undefined;
+      return id === undefined || action === undefined ? undefined : { type: 'conversationAction', action, conversationId: id };
+    }
     case 'previewContext':
       return { type: 'previewContext', writable: (raw as { writable?: unknown }).writable === true };
     case 'selectSandbox': {
@@ -181,6 +252,8 @@ export function emptySidebarState(connection: ConnectionTone): SidebarState {
     sandboxes: [],
     selectedSandbox: null,
     conversation: null,
+    conversations: { supported: false, note: null, showArchived: false, showArchivedSupported: false, rows: [] },
+    composerBlocked: null,
     lines: [],
     transcript: { scope: 'project', label: 'Transcript of all tasks in this project (no conversation selected)' },
     tasks: [],

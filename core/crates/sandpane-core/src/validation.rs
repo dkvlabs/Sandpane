@@ -33,6 +33,10 @@ pub const MAX_PROJECT_DESCRIPTION_CHARS: usize = 2000;
 /// Project name cap (`project.create` / `project.update`), in characters.
 pub const MAX_PROJECT_NAME_CHARS: usize = 120;
 
+/// Conversation title cap (`conversation.create` / `conversation.rename`,
+/// A3b §3.3 item 7), in characters.
+pub const MAX_CONVERSATION_TITLE_CHARS: usize = 200;
+
 /// Unicode format characters that can hide or reorder displayed text
 /// (review I1): line/paragraph separators (Zl/Zp) and the bidi controls —
 /// LRM/RLM, ALM, the embeddings/overrides U+202A-202E and the isolates
@@ -343,7 +347,25 @@ impl Validator {
         Ok(value)
     }
 
-    /// Conversation titles, message content and other human text destined
+    /// A conversation title (A3b §3.3 item 7, `conversation.create` and
+    /// `conversation.rename`): non-empty, at most
+    /// [`MAX_CONVERSATION_TITLE_CHARS`] characters, with exactly the
+    /// [`Self::project_name`] refusals — a title is shown on one line in every
+    /// client and in the delete confirmation's impact line 0. Whitespace-only
+    /// handling is the caller's (create substitutes "Untitled conversation",
+    /// rename refuses). Titles stored before this rule are not rewritten.
+    pub fn conversation_title(value: &str) -> Result<&str, ValidationError> {
+        Self::bounded(value, MAX_CONVERSATION_TITLE_CHARS)?;
+        if let Some(c) = value
+            .chars()
+            .find(|c| c.is_control() || is_spoofing_format_char(*c))
+        {
+            return Err(ValidationError::DisallowedChar { found: c });
+        }
+        Ok(value)
+    }
+
+    /// Message content and other human text destined
     /// for storage (not for CLI args). Non-empty, at most `max` characters.
     /// Refuses the C0 controls EXCEPT `\n` and `\t`, and DEL; it does NOT
     /// refuse C1 controls, line/paragraph separators or bidi controls (use
@@ -761,6 +783,42 @@ mod tests {
             assert!(
                 matches!(
                     Validator::project_name(v),
+                    Err(ValidationError::DisallowedChar { .. })
+                ),
+                "accepted: {v:?}"
+            );
+        }
+    }
+
+    /// A3b §3.3 item 7: conversation titles — 1..=200 chars, the project-name
+    /// refusals (every Cc incl. `\n`/`\t`, C1, U+2028/2029, LRM/RLM, ALM,
+    /// U+202A-202E, U+2066-2069).
+    #[test]
+    fn conversation_title_uses_the_project_name_refusals_at_200_chars() {
+        assert_eq!(
+            Validator::conversation_title("Atlas Demo — ü 漢字 ✓").unwrap(),
+            "Atlas Demo — ü 漢字 ✓"
+        );
+        assert!(Validator::conversation_title(&"é".repeat(MAX_CONVERSATION_TITLE_CHARS)).is_ok());
+        assert_eq!(MAX_CONVERSATION_TITLE_CHARS, 200);
+        assert!(matches!(
+            Validator::conversation_title(&"x".repeat(201)),
+            Err(ValidationError::TooLong { max: 200 })
+        ));
+        assert!(matches!(
+            Validator::conversation_title(""),
+            Err(ValidationError::Empty)
+        ));
+        let mut bad: Vec<String> = ["\n", "\t", "\r", "\u{0}", "\u{7f}", "\u{85}", "\u{9b}"]
+            .iter()
+            .map(|c| format!("a{c}b"))
+            .collect();
+        bad.extend(SPOOFING.iter().map(|c| format!("a{c}b")));
+        bad.extend(["a\u{2066}b".to_string(), "a\u{2069}b".to_string()]);
+        for v in &bad {
+            assert!(
+                matches!(
+                    Validator::conversation_title(v),
                     Err(ValidationError::DisallowedChar { .. })
                 ),
                 "accepted: {v:?}"

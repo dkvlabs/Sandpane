@@ -105,7 +105,9 @@ export const ERROR_CODES: readonly ErrorCode[] = [
  * with `coreAdvertisesMethod` instead of assuming (AGENTS rule 5). So are the A1
  * lifecycle methods `sandbox.stop` and `sandbox.remove` (design 2026-10-09 §3).
  * There is deliberately NO `sandbox.start`: sbx v0.47 has no `start` command.
- * The six A3a project-lifecycle methods (design §3.2) are additive too.
+ * The six A3a project-lifecycle methods (design §3.2) are additive too, and so
+ * are the five A3b conversation-lifecycle methods (design §3.3), which sit right
+ * after `conversation.history` — not at the end.
  */
 export const METHODS = [
   "system.probe",
@@ -125,6 +127,11 @@ export const METHODS = [
   "conversation.send",
   "conversation.list",
   "conversation.history",
+  "conversation.rename",
+  "conversation.archive",
+  "conversation.unarchive",
+  "conversation.delete",
+  "conversation.export",
   "task.cancel",
   "task.list",
   "task.subscribe",
@@ -224,13 +231,23 @@ export interface CoreCapabilities {
 export const FEATURE_IDEMPOTENCY_KEYS = "idempotency-keys" as const;
 /** `sandbox.create` honours `agent` (A1). */
 export const FEATURE_SANDBOX_CREATE_AGENT = "sandbox-create-agent" as const;
+/**
+ * `conversation.create` persists `sandboxId` and every `Conversation` carries
+ * it when one was stored (A3b, §3.3 item 2). Without it a client cannot tell
+ * "no sandbox was chosen" from "an older Core discarded the choice".
+ */
+export const FEATURE_CONVERSATION_SANDBOX_ID = "conversation-sandbox-id" as const;
 
 /**
  * Every feature this desktop build knows, in Rust `FEATURES` order
  * (drift-tested against `sandpane_protocol::FEATURES` and the schema's
  * `features.items.examples`). Unknown advertised strings are ignored.
  */
-export const KNOWN_FEATURES = [FEATURE_IDEMPOTENCY_KEYS, FEATURE_SANDBOX_CREATE_AGENT] as const;
+export const KNOWN_FEATURES = [
+  FEATURE_IDEMPOTENCY_KEYS,
+  FEATURE_SANDBOX_CREATE_AGENT,
+  FEATURE_CONVERSATION_SANDBOX_ID,
+] as const;
 export type KnownFeature = (typeof KNOWN_FEATURES)[number];
 
 /** Does THIS Core advertise `feature`? Absent/empty list = no. */
@@ -496,6 +513,97 @@ export interface Conversation {
   title: string;
   agentId: string;
   createdAt: string;
+  /**
+   * A3b (additive): RFC 3339 instant the conversation was archived. ABSENT
+   * when it is live, and from a Core older than A3b. Core refuses
+   * `conversation.send` and `conversation.rename` on an archived conversation;
+   * history, export and task reads keep working.
+   */
+  archivedAt?: string;
+  /**
+   * A3b (additive): the sandbox NAME chosen when the conversation was created
+   * — a stored name, NOT a binding or an identity (Core does not check it
+   * still exists; a same-named replacement looks identical). Rely on it only
+   * when `system.probe` advertises `conversation-sandbox-id`.
+   */
+  sandboxId?: string;
+}
+
+/** The five A3b conversation-lifecycle methods, in `Method::ALL` order. */
+export const CONVERSATION_LIFECYCLE_METHODS = [
+  "conversation.rename",
+  "conversation.archive",
+  "conversation.unarchive",
+  "conversation.delete",
+  "conversation.export",
+] as const;
+
+export type ConversationLifecycleMethod = (typeof CONVERSATION_LIFECYCLE_METHODS)[number];
+
+/** `conversation.rename` params (A3b). */
+export interface ConversationRenameParams {
+  conversationId: string;
+  title: string;
+}
+
+/**
+ * `conversation.delete` result as this client decodes it: exactly one of
+ * `confirmation` (step 1, nothing changed) or `deleted: true` (step 2).
+ */
+export type ConversationDeleteResult =
+  | { kind: "confirmation"; confirmation: ConfirmationRequest }
+  | { kind: "deleted" };
+
+/** `conversation.export` params (A3b): `conversation.history`'s paging. */
+export interface ConversationExportParams {
+  conversationId: string;
+  afterSequence?: number;
+  limit?: number;
+}
+
+/** The `format` tag of every `conversation.export` page (drift-tested). */
+export const CONVERSATION_EXPORT_FORMAT = "sandpane.conversation-export.v1" as const;
+
+/**
+ * Redaction kind names Core reports in `byKind`, in Core's tie-break priority
+ * order (`sandpane_core::redact::KINDS`, drift-tested). Display only: a kind
+ * Core adds later is kept and shown, never refused.
+ */
+export const REDACTION_KINDS = [
+  "private-key",
+  "auth-header",
+  "url-credentials",
+  "url-secret-param",
+  "jwt",
+  "token",
+  "env-secret",
+] as const;
+
+/**
+ * What best-effort redaction replaced. `byKind` OMITS kinds with zero
+ * replacements (absent = 0). The title's replacements count only on the first
+ * page, so pages are summed directly.
+ */
+export interface ExportRedaction {
+  bestEffort: true;
+  replacements: number;
+  byKind: Record<string, number>;
+}
+
+/**
+ * One `conversation.export` page (A3b). Always redacted (best-effort); scope is
+ * the conversation metadata and its messages only — task events, artifacts and
+ * verification output are NOT included. `truncated` / `nextSequence` follow
+ * `conversation.history`'s rules.
+ */
+export interface ConversationExportPage {
+  format: typeof CONVERSATION_EXPORT_FORMAT;
+  exportedAt: string;
+  conversation: Conversation;
+  messages: MessageRecord[];
+  truncated: boolean;
+  nextSequence: number;
+  redaction: ExportRedaction;
 }
 
 export interface ContextRef {
@@ -564,6 +672,11 @@ export interface ConversationListParams {
   projectId?: string;
   /** Rows to return; Core clamps to 1..=500 and defaults to 200. */
   limit?: number;
+  /**
+   * A3b (additive): also list archived conversations. Sent ONLY as `true`, and
+   * only to a Core that advertises `conversation.archive`; absent = live only.
+   */
+  includeArchived?: boolean;
 }
 
 /** `conversation.history` params — bounded transcript read (ADDITIVE v1). */

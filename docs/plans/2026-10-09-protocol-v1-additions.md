@@ -236,7 +236,8 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
    - **Shape:** `{format: "sandpane.conversation-export.v1", exportedAt, conversation, messages, truncated, nextSequence, redaction: {bestEffort: true, replacements, byKind}}`.
      - `conversation` is a `Conversation` with its title redacted.
      - `messages` are `MessageRecord`s with their content redacted.
-     - `byKind` maps a kind name to its count.
+     - `byKind` maps a kind name to its count and omits kinds with zero replacements.
+     - The title is redacted on every page but counted only on the first page (`afterSequence` absent or 0), so clients sum page counts directly.
      - There is no unredacted mode.
    - **Scope:** only the conversation metadata and its messages. Task events, artifacts and verification output are **not included**. Clients say so on the export surface and in the saved file.
    - **Paging and bounds:** identical to `conversation.history`.
@@ -247,16 +248,26 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
      - Each match is replaced by `[REDACTED:<kind>]` when the matched span is at least that long. Otherwise it becomes one `*` per character.
      - Markers are ASCII and need no JSON escaping, so a redacted row never serializes longer than the raw row. The ceiling counted under the lock therefore still bounds the page, and the 4 MiB frame cap holds.
      - A test pins "output never longer than input" with a page made of short matches.
-   - **Engine:** the `regex` crate (1.13.1, MIT OR Apache-2.0, pinned exactly like `sha2`). It guarantees linear-time matching on hostile input, which a hand-written scanner would not. Patterns are compiled once with a size limit.
+     - Overlapping matches are merged into one region, attributed to the highest-priority kind among them. A multi-line `private-key` block is therefore never dropped because a single-line match started earlier on its BEGIN line (A3b review C1).
+   - **Engine:** the `regex` crate (1.13.1, MIT OR Apache-2.0, pinned exactly like `sha2`). Its patterns are fixed and trusted and it has no catastrophic backtracking, which a hand-written scanner would not guarantee. Worst-case iteration over all matches is documented as O(m·n²); it was measured roughly linear on hostile 2 MiB inputs (at most 37 ms). Patterns are compiled once with a size limit.
    - **Kinds (best-effort, specs/06 §"Redact tokens, Authorization headers, .env values, SSH keys and private URLs"):**
      - `auth-header`: `Authorization` / `Proxy-Authorization` values.
      - `private-key`: PEM `PRIVATE KEY` blocks; an unterminated block is redacted to the end of the message.
      - `token`: well-known prefixes, including GitHub `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_`, GitLab `glpat-`, Slack `xox?-`, OpenAI and Anthropic `sk-`, AWS `AKIA`, Google `AIza`, npm `npm_`, Hugging Face `hf_` and Docker `dckr_pat_`.
      - `jwt`: three base64url segments beginning `eyJ`.
      - `env-secret`: `NAME=value` / `NAME: value` lines whose name contains SECRET, TOKEN, PASSWORD, PASSWD, API_KEY, ACCESS_KEY, PRIVATE_KEY or CREDENTIAL (case-insensitive). Only the value is replaced.
-     - `url-credentials`: the `user:pass@` userinfo in a URL.
-     - `url-secret-param`: query values of `token`, `access_token`, `api_key`, `apikey`, `key`, `secret`, `password`, `sig`, `signature` and `X-Amz-Signature` / `X-Amz-Credential`.
+     - `url-credentials`: the `user:pass@` userinfo in a URL, including an empty user (`redis://:pass@host`).
+     - `url-secret-param`: query values of `token`, `access_token`, `api_key`, `apikey`, `key`, `secret`, `password`, `sig`, `signature` and `X-Amz-Signature` / `X-Amz-Credential`, plus any parameter whose name contains an `env-secret` keyword (e.g. `client_secret`, `refresh_token`).
      - Host names and paths are **not** redacted. Clients must say: "Redaction is best-effort; review the export before sharing it."
+     - **Known unmatched shapes (A3b review I1, accepted):**
+       - PGP `PRIVATE KEY BLOCK` and lowercase PEM;
+       - AWS `ASIA…` keys, Slack `xapp-` tokens and `X-Amz-Security-Token`;
+       - `x-api-key` / `apiKey` names and space-separated `--password value`;
+       - the last two segments of a 5-segment JWE;
+       - token prefixes glued after `_` or a digit;
+       - a token-only URL user name with no password;
+       - a folded `Authorization:` header;
+       - a raw `@`, `/` or `#` inside a URL password.
 7. **Titles.**
    - New `Validator::conversation_title`: 1..=200 characters, with the same refusals as `Validator::project_name` (every Cc including `\n` and `\t`, C1, U+2028/2029, U+200E/200F, U+061C, U+202A–202E, U+2066–2069).
    - `conversation.create` uses it in place of `display_text`. An empty or whitespace-only title on create still becomes "Untitled conversation".
@@ -290,7 +301,7 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
    - `ConversationSendParams.mode?: "task" | "discuss"` (`Option`, `skip_serializing_if`). Absent means `"task"`.
    - **Hash stability:** Core normalizes an explicit `"task"` to absent *before* the idempotency fingerprint is computed. Every A2 hash stays stable, and two clients that differ only in sending `"task"` explicitly get a replay, not a `CONFLICT`. Any other value is `VALIDATION_FAILED` (`mode must be "task" or "discuss"`).
    - `TaskSummary.mode?: string` is present on every task created from A4 on (`"task"` or `"discuss"`) and absent on older rows. Clients decode it as an **open string**, never a strict enum (§1 table): an unknown value is displayed as-is, never a decode failure.
-   - Migration v7 adds `tasks.mode TEXT` (same backup and downgrade-refusal rules).
+   - Migration v7 adds `tasks.mode TEXT` and `tasks.sandbox_name TEXT` (item 3), with the same backup and downgrade-refusal rules.
    - `features` gains `"conversation-send-mode"`. Clients send `mode` only when it is advertised, because a pre-A4 Core silently drops the field and would treat a discussion as a task.
 2. **What `discuss` means.**
    - A `discuss` task never gets a writable workspace. The internal `create_task` API refuses `discuss` with any workspace request other than none or `mountless` (`VALIDATION_FAILED`, "a discuss task never gets a writable workspace; nothing was run").

@@ -18,6 +18,8 @@ import {
   PROTOCOL_VERSION,
   isMethod,
   type Conversation,
+  type ConversationExportPage,
+  type ConversationExportParams,
   type ConversationHistoryParams,
   type ConversationHistoryResult,
   type ConversationListParams,
@@ -40,6 +42,9 @@ import {
 import { FrameTooLargeError, MalformedFrameError, encodeFrame } from "./framing";
 import {
   decodeChangeSet,
+  decodeConversation,
+  decodeConversationDeleteResult,
+  decodeConversationExportPage,
   decodeConversationHistory,
   decodeConversations,
   decodeCoreCapabilities,
@@ -56,7 +61,12 @@ import {
 } from "./decode";
 import {
   CoreValidationError,
+  buildConversationDeleteConfirmParams,
+  buildConversationDeleteRequestParams,
+  buildConversationExportParams,
   buildConversationHistoryParams,
+  buildConversationIdParams,
+  buildConversationRenameParams,
   buildConversationListParams,
   buildProjectDeleteConfirmParams,
   buildProjectDeleteRequestParams,
@@ -182,7 +192,8 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
  * the proxy's own budget for that method (`proxy_deadline_ms` in ipc_client.rs:
  * 320 s / 40 s / 350 s / 390 s), per-method drift-tested. `project.create` and
  * `project.add_repository` run Core's git canonicalization of a repository path
- * (up to 30 s): 45 s here, 43 s in the proxy.
+ * (up to 30 s): 45 s here, 43 s in the proxy. The five A3b conversation methods
+ * keep the default (design §3.3 item 9).
  */
 export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
   "sandbox.create": 330_000,
@@ -206,7 +217,9 @@ export function requestTimeoutFor(method: Method): number {
  *
  * `sandbox.stop` and `sandbox.remove` are deliberately absent — including
  * remove's step 1: it mints a single-use token in Core, and step 2 acts. Neither
- * step is ever re-sent automatically.
+ * step is ever re-sent automatically. The A3a project methods and the five A3b
+ * conversation methods are absent too; `conversation.export` is a read but
+ * stays out for uniformity (design §3.3 item 9).
  */
 export const REPLAY_SAFE_METHODS: ReadonlySet<Method> = new Set<Method>([
   "system.probe",
@@ -536,7 +549,7 @@ export class CoreClient {
     return project;
   }
 
-  /** One A3a write exchange; Core `INTERNAL` becomes an unknown outcome. */
+  /** One A3a / A3b write exchange; Core `INTERNAL` becomes an unknown outcome. */
   private async projectRequest(method: Method, params: Record<string, unknown>): Promise<unknown> {
     try {
       return await this.request(method, params);
@@ -770,7 +783,8 @@ export class CoreClient {
 
   /**
    * `conversation.list` — chat enumeration (ADDITIVE v1, feature-gated).
-   * Core excludes archived conversations, so this is what a sidebar may reopen.
+   * Core excludes archived conversations unless `includeArchived: true` (A3b,
+   * sent only to a Core that advertises `conversation.archive`).
    */
   async listConversations(
     params: ConversationListParams = {},
@@ -781,6 +795,136 @@ export class CoreClient {
         preflight(() => buildConversationListParams(params)),
       ),
     );
+  }
+
+  // -- A3b conversation lifecycle (design 2026-10-09 §3.3) ----------------
+
+  /** `conversation.rename`: the title is checked with Core's rule first. */
+  async renameConversation(conversationId: string, title: string): Promise<Conversation> {
+    const params = preflight(() => buildConversationRenameParams(conversationId, title));
+    return this.conversationWrite("conversation.rename", params);
+  }
+
+  /** `conversation.archive` (idempotent: Core keeps the original `archivedAt`). */
+  async archiveConversation(conversationId: string): Promise<Conversation> {
+    const params = preflight(() => buildConversationIdParams(conversationId));
+    return this.conversationWrite("conversation.archive", params);
+  }
+
+  /** `conversation.unarchive` (idempotent). */
+  async unarchiveConversation(conversationId: string): Promise<Conversation> {
+    const params = preflight(() => buildConversationIdParams(conversationId));
+    return this.conversationWrite("conversation.unarchive", params);
+  }
+
+  /**
+   * One A3b conversation write answering a `Conversation`. Same honesty rules
+   * as `projectWrite`: INTERNAL or a lost answer is an unknown outcome, and an
+   * answer this build cannot read — or one about a DIFFERENT conversation — is
+   * reported the same way (Core answered, so it may have applied it). The
+   * payload is never echoed.
+   */
+  private async conversationWrite(
+    method: "conversation.rename" | "conversation.archive" | "conversation.unarchive",
+    params: { conversationId: string },
+  ): Promise<Conversation> {
+    const raw = await this.projectRequest(method, params);
+    let conversation: Conversation;
+    try {
+      conversation = decodeConversation(raw);
+    } catch {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        `Core answered ${method}, but this desktop build could not read the answer. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
+        { mayHaveBeenApplied: true },
+      );
+    }
+    if (conversation.id !== params.conversationId) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        `Core answered ${method} about a different conversation than the one asked about. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
+        { mayHaveBeenApplied: true },
+      );
+    }
+    return conversation;
+  }
+
+  /**
+   * `conversation.delete` STEP 1: sends exactly `{ conversationId }`. Core
+   * changes nothing and answers a confirmation bound to the conversation ID.
+   * A confirmation for any other id (or `external: true`, or another action)
+   * is refused, so a token can never be confirmed against the wrong target.
+   * `target.name` is Core's stored title and may differ from the list after a
+   * rename — it is shown, never compared.
+   */
+  async requestConversationDeletion(conversationId: string): Promise<ConfirmationRequest> {
+    const params = preflight(() => buildConversationDeleteRequestParams(conversationId));
+    const raw = await this.request("conversation.delete", params);
+    let result: ReturnType<typeof decodeConversationDeleteResult>;
+    try {
+      result = decodeConversationDeleteResult(raw);
+    } catch (err) {
+      // Step 1 changes nothing in Core; an answer this build refuses (wrong
+      // action, `external: true`, both or neither field) is a client-plane
+      // MALFORMED_FRAME. The decoder's text names the field, never the token.
+      throw asCoreRequestError(err);
+    }
+    if (result.kind !== "confirmation") {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "conversation.delete step 1 answered `deleted` without a confirmation token; re-read the conversation list",
+        { mayHaveBeenApplied: true },
+      );
+    }
+    if (result.confirmation.target.id !== params.conversationId) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "conversation.delete step 1 answered a confirmation for a different conversation; refusing to use it",
+      );
+    }
+    return result.confirmation;
+  }
+
+  /**
+   * `conversation.delete` STEP 2: `{ conversationId, confirmToken }`, sent
+   * once. Only `deleted: true` is a success; any answer this build cannot read
+   * is an UNKNOWN outcome — never "nothing was deleted".
+   */
+  async confirmConversationDeletion(
+    conversationId: string,
+    confirmToken: string,
+  ): Promise<{ deleted: true }> {
+    const params = preflight(() => buildConversationDeleteConfirmParams(conversationId, confirmToken));
+    const raw = await this.projectRequest("conversation.delete", params);
+    let deleted = false;
+    try {
+      deleted = decodeConversationDeleteResult(raw).kind === "deleted";
+    } catch {
+      deleted = false;
+    }
+    if (!deleted) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        `Core answered conversation.delete step 2, but not with \`deleted: true\` in a form this build can read. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
+        { mayHaveBeenApplied: true },
+      );
+    }
+    return { deleted: true };
+  }
+
+  /**
+   * One `conversation.export` page (read-only in Core). Always redacted by
+   * Core, best-effort. The page is decoded strictly; its content is never put
+   * into an error message or a log.
+   */
+  async exportConversationPage(params: ConversationExportParams): Promise<ConversationExportPage> {
+    const payload = preflight(() => buildConversationExportParams(params));
+    return decodeConversationExportPage(await this.request("conversation.export", payload), payload.conversationId);
   }
 
   /**

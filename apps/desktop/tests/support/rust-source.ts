@@ -229,6 +229,8 @@ export function repoFile(relative: string): string {
 export const PROJECT_LIFECYCLE_RUST = "core/crates/sandpane-service/src/project_lifecycle.rs";
 export const CONFIRM_RUST = "core/crates/sandpane-service/src/confirm.rs";
 export const VALIDATION_RUST = "core/crates/sandpane-core/src/validation.rs";
+export const CONVERSATION_LIFECYCLE_RUST = "core/crates/sandpane-service/src/conversation_lifecycle.rs";
+export const REDACT_RUST = "core/crates/sandpane-core/src/redact.rs";
 
 /**
  * The value of `pub const NAME: &str = "…";` in `relative`, decoded as Rust

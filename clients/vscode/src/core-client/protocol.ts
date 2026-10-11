@@ -67,6 +67,9 @@ export const MAX_SCOPING_ID_LEN = 200;
  *
  * A3a (design §3.2) added the six project lifecycle methods; their segments
  * stay lowercase snake_case (`project.add_repository`).
+ *
+ * A3b (design §3.3) added the five conversation lifecycle methods; they sit
+ * right after `conversation.history` in `Method::ALL` (27 in total).
  */
 export const CORE_METHODS = [
   'system.probe',
@@ -86,6 +89,11 @@ export const CORE_METHODS = [
   'conversation.send',
   'conversation.list',
   'conversation.history',
+  'conversation.rename',
+  'conversation.archive',
+  'conversation.unarchive',
+  'conversation.delete',
+  'conversation.export',
   'task.cancel',
   'task.list',
   'task.subscribe',
@@ -205,9 +213,13 @@ export interface CoreCapabilities {
  * `core-capabilities.features.items.examples`; drift-tested).
  *  - `idempotency-keys`: `sandbox.create` / `conversation.send` honour
  *    `idempotencyKey` (a replay returns the first result, never runs twice);
- *  - `sandbox-create-agent`: `sandbox.create` honours `agent`.
+ *  - `sandbox-create-agent`: `sandbox.create` honours `agent`;
+ *  - `conversation-sandbox-id` (A3b): `conversation.create` persists
+ *    `sandboxId` and every `Conversation` carries it when one was stored. Only
+ *    then may `Conversation.sandboxId` be read as "the sandbox NAME chosen at
+ *    creation" — never as a live binding.
  */
-export const KNOWN_FEATURES = ['idempotency-keys', 'sandbox-create-agent'] as const;
+export const KNOWN_FEATURES = ['idempotency-keys', 'sandbox-create-agent', 'conversation-sandbox-id'] as const;
 
 export type CoreFeature = (typeof KNOWN_FEATURES)[number];
 
@@ -432,6 +444,73 @@ export interface Conversation {
   title: string;
   agentId: string;
   createdAt: string;
+  /**
+   * A3b, additive: RFC 3339 time the conversation was archived; ABSENT when
+   * live (and from an older Core). Archived = Core refuses `conversation.send`
+   * and `conversation.rename`; history, export and task reads keep working.
+   */
+  archivedAt?: string | null;
+  /**
+   * A3b, additive: the sandbox NAME chosen when the conversation was created —
+   * a stored name, NOT a binding: Core does not check it still exists and a
+   * same-named replacement is indistinguishable. Absent when none was stored
+   * (also for rows created before A3b and from an older Core). Read it only
+   * when Core advertises the `conversation-sandbox-id` feature.
+   */
+  sandboxId?: string | null;
+}
+
+/** `conversation.rename` params (A3b). Title: `Validator::conversation_title`, not blank. */
+export interface ConversationRenameParams {
+  conversationId: string;
+  title: string;
+}
+
+/** `conversation.delete` result: `confirmation` for step 1, `deleted: true` for step 2. */
+export interface ConversationDeleteResult {
+  confirmation?: ConfirmationRequest | null;
+  deleted?: boolean | null;
+}
+
+/** `conversation.export` params (A3b) — `conversation.history`'s paging. */
+export interface ConversationExportParams {
+  conversationId: string;
+  /** Messages strictly after this sequence; negative is normalised to 0. */
+  afterSequence: number;
+  /** Rows per page; Core clamps to 1..=500 and defaults to 200. */
+  limit?: number | null;
+}
+
+/** `sandpane_protocol::CONVERSATION_EXPORT_FORMAT` — the `format` of every export page. */
+export const CONVERSATION_EXPORT_FORMAT = 'sandpane.conversation-export.v1';
+
+/**
+ * What best-effort redaction replaced on ONE export page. `byKind` OMITS kinds
+ * with zero replacements (absent = 0); `replacements` is the sum of `byKind`.
+ * The title is redacted on every page but counted only on the first, so a
+ * client sums pages directly. `bestEffort` is always true: redaction is
+ * pattern-based and can miss secrets.
+ */
+export interface ExportRedaction {
+  bestEffort: boolean;
+  replacements: number;
+  byKind: Record<string, number>;
+}
+
+/**
+ * `conversation.export` result: ONE page of an always-redacted export. Scope:
+ * conversation metadata and messages only — task events, artifacts and
+ * verification output are NOT included. Page until `truncated` is false,
+ * requiring `nextSequence` to strictly increase.
+ */
+export interface ConversationExportResult {
+  format: string;
+  exportedAt: string;
+  conversation: Conversation;
+  messages: MessageRecord[];
+  truncated: boolean;
+  nextSequence: number;
+  redaction: ExportRedaction;
 }
 
 export const CONTEXT_REF_KINDS = ['file', 'selection', 'diagnostics', 'diff_range'] as const;
@@ -504,6 +583,12 @@ export interface ConversationListParams {
   projectId?: string | null;
   /** Rows to return; Core clamps to 1..=500 and defaults to 200. */
   limit?: number | null;
+  /**
+   * A3b: also list archived conversations. Sent only when true (and callers
+   * send it only when Core advertises `conversation.archive`; an older Core
+   * would silently ignore it).
+   */
+  includeArchived?: boolean;
 }
 
 /** `conversation.history` params — bounded transcript read. */

@@ -225,6 +225,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
         onSelectConversation={(id) =>
           navigate("conversation", { projectId, conversationId: id })
         }
+        onConversationGone={() => navigate("project-workspace", { projectId })}
         archivedReason={archivedReason}
       />
 

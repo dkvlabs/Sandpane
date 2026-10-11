@@ -468,12 +468,19 @@ class ConnectionManager(private val application: Application?) : Disposable {
      * it. Chat enumeration was impossible before the discovery revision; it is Core's data, not a
      * client-side list.
      */
-    fun listConversations(projectId: String): CompletableFuture<List<Conversation>> =
-        commands.conversationList(ConversationListParams(projectId = projectId))
+    fun listConversations(
+        projectId: String,
+        includeArchived: Boolean = false,
+        limit: Int? = null,
+    ): CompletableFuture<List<Conversation>> =
+        commands.conversationList(
+            ConversationListParams(projectId = projectId, limit = limit, includeArchived = if (includeArchived) true else null),
+        )
 
     /**
      * The conversation page after [afterSequence], with Core's own truncation disclosure.
-     * Archived or unknown conversations come back as `NOT_FOUND` — never an empty page.
+     * An unknown conversation comes back as `NOT_FOUND` — never an empty page. Since A3b Core also
+     * serves ARCHIVED conversations here (their history stays readable).
      */
     fun conversationHistory(
         conversationId: String,

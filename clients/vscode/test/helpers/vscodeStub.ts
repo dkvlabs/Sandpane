@@ -64,6 +64,18 @@ export const stub = {
   clicks: [] as ((value: string | undefined) => void)[],
   /** Next answers for modal prompts, by button label the code offers. */
   answers: new Map<string, string | undefined>(),
+  /** Next answers of `showInputBox`, in order (`undefined` = Escape). */
+  inputs: [] as (string | undefined)[],
+  /** Every `showInputBox` call with its options (incl. `validateInput`). */
+  inputCalls: [] as InputBoxCall[],
+  /** Answer of `showSaveDialog` (`undefined` = cancelled). */
+  saveUri: undefined as StubUri | undefined,
+  /** Every `showSaveDialog` call with its options. */
+  saveCalls: [] as SaveDialogCall[],
+  /** Every `workspace.fs.writeFile` call. */
+  fileWrites: [] as { uri: StubUri; bytes: Uint8Array }[],
+  /** When set, `workspace.fs.writeFile` rejects with it. */
+  writeError: null as Error | null,
   reset(): void {
     this.config.clear();
     this.remoteName = undefined;
@@ -77,8 +89,28 @@ export const stub = {
     this.answers.clear();
     this.manual.clear();
     this.clicks.length = 0;
+    this.inputs.length = 0;
+    this.inputCalls.length = 0;
+    this.saveUri = undefined;
+    this.saveCalls.length = 0;
+    this.fileWrites.length = 0;
+    this.writeError = null;
   },
 };
+
+export interface InputBoxCall {
+  title?: string;
+  prompt?: string;
+  value?: string;
+  validateInput?: (value: string) => string | undefined | null;
+}
+
+export interface SaveDialogCall {
+  defaultUri?: StubUri;
+  filters?: Record<string, string[]>;
+  saveLabel?: string;
+  title?: string;
+}
 
 function answer(items: unknown[]): Promise<string | undefined> {
   if (items.some((item) => typeof item === 'string' && stub.manual.has(item))) {
@@ -114,6 +146,13 @@ export const workspace = {
   get workspaceFolders() {
     return stub.workspaceFolders;
   },
+  fs: {
+    writeFile: (uri: StubUri, bytes: Uint8Array): Promise<void> => {
+      if (stub.writeError) return Promise.reject(stub.writeError);
+      stub.fileWrites.push({ uri, bytes });
+      return Promise.resolve();
+    },
+  },
 };
 
 export const window = {
@@ -133,6 +172,14 @@ export const window = {
   showInformationMessage: (message: string, ...items: unknown[]) => {
     stub.infos.push(message);
     return answer(items);
+  },
+  showInputBox: (options: InputBoxCall) => {
+    stub.inputCalls.push(options);
+    return Promise.resolve(stub.inputs.shift());
+  },
+  showSaveDialog: (options: SaveDialogCall) => {
+    stub.saveCalls.push(options);
+    return Promise.resolve(stub.saveUri);
   },
   showErrorMessage: (message: string, ...items: unknown[]) => {
     stub.errors.push(message);

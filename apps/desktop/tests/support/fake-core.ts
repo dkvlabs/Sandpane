@@ -18,6 +18,13 @@
 
 import { encodeFrame } from "../../src/lib/framing";
 import {
+  MSG_CONVERSATION_ARCHIVED,
+  MSG_CONVERSATION_HAS_TASKS,
+  MSG_CONVERSATION_NOT_FOUND,
+  MSG_TITLE_BLANK,
+} from "../../src/lib/conversation-messages";
+import { isRustWhitespace, validateConversationTitle } from "../../src/lib/wizard";
+import {
   MSG_PROJECT_ARCHIVED,
   MSG_PROJECT_NOT_FOUND,
   MSG_REPOSITORY_IN_USE,
@@ -133,6 +140,31 @@ export const A3A_CORE_METHODS: readonly string[] = [
 ];
 
 /**
+ * Every method the A3b Core dispatches (27), in `Method::ALL` order: the five
+ * conversation-lifecycle methods sit right after `conversation.history`.
+ */
+export const A3B_CORE_METHODS: readonly string[] = (() => {
+  const at = A3A_CORE_METHODS.indexOf("conversation.history") + 1;
+  return [
+    ...A3A_CORE_METHODS.slice(0, at),
+    "conversation.rename",
+    "conversation.archive",
+    "conversation.unarchive",
+    "conversation.delete",
+    "conversation.export",
+    ...A3A_CORE_METHODS.slice(at),
+  ];
+})();
+
+/** `TaskStateMachine::is_terminal` (sandpane-core); anything else blocks a delete. */
+const TERMINAL_TASK_STATUSES = new Set(["completed", "rejected", "failed", "cancelled", "interrupted"]);
+
+/** Redaction the double applies to an export (scripted; the regexes are Core's, not modeled). */
+export interface FakeRedaction {
+  byKind: Record<string, number>;
+}
+
+/**
  * A project the double's Core holds. The A3a project-lifecycle behaviour below
  * is MODELED on `sandpane-service/src/project_lifecycle.rs` as read from the
  * working tree (design §3.2) — NOT captured from a live Core run.
@@ -170,10 +202,15 @@ export interface FakeSandbox {
   agent?: string;
 }
 
+/**
+ * A conversation the double's Core holds (`archivedAt` / `sandboxId` as the
+ * A3b wire carries them). The A3b behaviour below is MODELED on
+ * `sandpane-service/src/conversation_lifecycle.rs` as read from the working
+ * tree (design §3.3) — NOT captured from a live Core run.
+ */
 export interface FakeConversation extends Conversation {
   /** Rows Core holds in `messages`; `conversation.history` pages over these. */
   messages: { sequence: number; role: string; content: string }[];
-  archived?: boolean;
 }
 
 export class FakeCore {
@@ -205,6 +242,19 @@ export class FakeCore {
   public projectFault: ProjectFault | null = null;
   /** Extra impact lines appended to every confirmation (hostile-content tests). */
   public extraImpact: string[] = [];
+  /** MODELED A3b conversation-delete tokens → bound conversation id. */
+  private readonly conversationTokens = new Map<string, { id: string; expiresAtMs: number }>();
+  private conversationSeq = 0;
+  /**
+   * MODELED `conversation.export` page size (rows). Stands in for Core's byte
+   * ceiling cutting a page short; `null` = the clamped `limit` only.
+   */
+  public exportPageRows: number | null = null;
+  /** SCRIPTED title redaction for `conversation.export` (applied on every page, counted on the first). */
+  public titleRedaction: { title: string; byKind: Record<string, number> } | null = null;
+  /** SCRIPTED per-message redaction for `conversation.export`. */
+  public messageRedaction: ((content: string) => { content: string; byKind: Record<string, number> }) | null =
+    null;
   /**
    * MODELED A2 key store: `${method}\u0000${key}` → state. `done` holds the
    * FIRST response and the params fingerprint (params minus the key).
@@ -613,16 +663,16 @@ export class FakeCore {
         const limit = this.clampLimit(params.limit);
         const projectId =
           typeof params.projectId === "string" ? params.projectId : undefined;
+        // A3b (MODELED): archived rows only with `includeArchived: true`.
+        const includeArchived = params.includeArchived === true;
         return ok(
           this.conversations
-            .filter((c) => !c.archived && (projectId === undefined || c.projectId === projectId))
-            .map(({ id, projectId: pid, title, agentId, createdAt }) => ({
-              id,
-              projectId: pid,
-              title,
-              agentId,
-              createdAt,
-            }))
+            .filter(
+              (c) =>
+                (includeArchived || c.archivedAt === undefined) &&
+                (projectId === undefined || c.projectId === projectId),
+            )
+            .map((c) => this.conversationWire(c))
             .slice(0, limit),
         );
       }
@@ -642,8 +692,9 @@ export class FakeCore {
         const conversation = this.conversations.find(
           (c) => c.id === params.conversationId,
         );
-        if (conversation === undefined || conversation.archived) {
-          return err("NOT_FOUND", "conversation not found");
+        // A3b: history serves archived conversations too.
+        if (conversation === undefined) {
+          return err("NOT_FOUND", MSG_CONVERSATION_NOT_FOUND);
         }
         const limit = this.clampLimit(params.limit);
         const after = Math.max(0, Number(params.afterSequence ?? 0));
@@ -699,6 +750,14 @@ export class FakeCore {
         });
       case "conversation.send":
         return this.keyed(request.method, params, ok, err, () => {
+          // A3b (MODELED): checked AFTER the key lookup, so a keyed replay to
+          // a since-archived conversation still returns the stored answer.
+          // An unknown conversation stays lenient here (pre-A3b double).
+          const conversation = this.conversations.find((c) => c.id === params.conversationId);
+          if (conversation !== undefined) {
+            const refusal = this.writableRefusal(conversation);
+            if (refusal !== null) return { refused: refusal };
+          }
           const id = `task-${this.requestCount}`;
           const task: TaskSummary = {
             id,
@@ -782,9 +841,189 @@ export class FakeCore {
         this.sandboxes.splice(index, 1);
         return ok({ removed: true });
       }
+      // -- A3b conversation lifecycle (MODELED, see FakeConversation) ---------
+
+      case "conversation.create": {
+        const projectId = String(params.projectId ?? "");
+        const project = this.projects.find((p) => p.id === projectId);
+        if (project?.archivedAt !== undefined) return err("VALIDATION_FAILED", MSG_PROJECT_ARCHIVED);
+        const rawTitle = typeof params.title === "string" ? params.title : "";
+        const blank = Array.from(rawTitle).every((ch) => isRustWhitespace(ch.codePointAt(0) ?? 0));
+        if (!blank) {
+          const problem = validateConversationTitle(rawTitle, "create");
+          if (problem !== null) return err("VALIDATION_FAILED", `title: ${problem}`);
+        }
+        this.conversationSeq += 1;
+        const row: FakeConversation = {
+          id: `conv-${this.conversationSeq}`,
+          projectId,
+          title: blank ? "Untitled conversation" : rawTitle,
+          agentId: String(params.agentId ?? ""),
+          createdAt: new Date(this.nowMs).toISOString().replace(".000Z", "Z"),
+          ...(typeof params.sandboxId === "string" ? { sandboxId: params.sandboxId } : {}),
+          messages: [],
+        };
+        this.conversations.push(row);
+        return ok(this.conversationWire(row));
+      }
+      case "conversation.rename": {
+        const title = typeof params.title === "string" ? params.title : "";
+        if (Array.from(title).every((ch) => isRustWhitespace(ch.codePointAt(0) ?? 0))) {
+          return err("VALIDATION_FAILED", MSG_TITLE_BLANK);
+        }
+        const problem = validateConversationTitle(title, "rename");
+        if (problem !== null) return err("VALIDATION_FAILED", `title: ${problem}`);
+        const conversation = this.conversations.find((c) => c.id === params.conversationId);
+        if (conversation === undefined) return err("NOT_FOUND", MSG_CONVERSATION_NOT_FOUND);
+        const refusal = this.writableRefusal(conversation);
+        if (refusal !== null) return err(...refusal);
+        conversation.title = title;
+        return ok(this.conversationWire(conversation));
+      }
+      case "conversation.archive":
+      case "conversation.unarchive": {
+        const conversation = this.conversations.find((c) => c.id === params.conversationId);
+        if (conversation === undefined) return err("NOT_FOUND", MSG_CONVERSATION_NOT_FOUND);
+        if (request.method === "conversation.unarchive") {
+          const project = this.projects.find((p) => p.id === conversation.projectId);
+          if (project?.archivedAt !== undefined) return err("VALIDATION_FAILED", MSG_PROJECT_ARCHIVED);
+          delete conversation.archivedAt;
+        } else if (conversation.archivedAt === undefined) {
+          conversation.archivedAt = new Date(this.nowMs).toISOString().replace(".000Z", "Z");
+        }
+        return ok(this.conversationWire(conversation));
+      }
+      case "conversation.delete": {
+        const id = String(params.conversationId ?? "");
+        const token = params.confirmToken;
+        if (token === undefined) {
+          const conversation = this.conversations.find((c) => c.id === id);
+          if (conversation === undefined) return err("NOT_FOUND", MSG_CONVERSATION_NOT_FOUND);
+          if (this.hasUnfinishedTasks(id)) return err("CONFLICT", MSG_CONVERSATION_HAS_TASKS);
+          this.tokenSeq += 1;
+          const minted = (0x2000 + this.tokenSeq).toString(16).padStart(64, "0");
+          const expiresAtMs = this.nowMs + 120_000;
+          this.conversationTokens.set(minted, { id, expiresAtMs });
+          const tasks = this.tasks.filter((t) => t.conversationId === id).length;
+          const messages = conversation.messages.length;
+          return ok({
+            confirmation: {
+              token: minted,
+              expiresAt: new Date(Math.floor(expiresAtMs / 1000) * 1000)
+                .toISOString()
+                .replace(".000Z", "Z"),
+              action: "conversation.delete",
+              target: { name: conversation.title, id },
+              impact: [
+                `deletes conversation ${conversation.title} and all of its Core records; this cannot be undone`,
+                `${messages} ${messages === 1 ? "message" : "messages"} and ${tasks} ${tasks === 1 ? "task" : "tasks"} are deleted, with their task events, artifacts and verification records`,
+                "0 Core-allocated worktree directories and 0 task branches in host repositories are left in place; Core never touches host files, worktrees or branches",
+                conversation.sandboxId === undefined
+                  ? "no sandbox was chosen at creation; no sandbox is touched"
+                  : `the sandbox chosen at creation (${conversation.sandboxId}) is not touched`,
+                ...this.extraImpact,
+              ],
+              external: false,
+            },
+          });
+        }
+        // Step 2: the token is consumed FIRST, whatever happens next.
+        const bound = typeof token === "string" ? this.conversationTokens.get(token) : undefined;
+        if (typeof token === "string") this.conversationTokens.delete(token);
+        if (bound === undefined || bound.id !== id || this.nowMs >= bound.expiresAtMs) {
+          return err("VALIDATION_FAILED", TOKEN_REJECTED_MESSAGE);
+        }
+        const index = this.conversations.findIndex((c) => c.id === id);
+        if (index < 0) return err("NOT_FOUND", MSG_CONVERSATION_NOT_FOUND);
+        if (this.hasUnfinishedTasks(id)) return err("CONFLICT", MSG_CONVERSATION_HAS_TASKS);
+        const taskIds = new Set(this.tasks.filter((t) => t.conversationId === id).map((t) => t.id));
+        for (let i = this.tasks.length - 1; i >= 0; i -= 1) {
+          if (taskIds.has(this.tasks[i]?.id ?? "")) this.tasks.splice(i, 1);
+        }
+        for (let i = this.events.length - 1; i >= 0; i -= 1) {
+          if (taskIds.has(this.events[i]?.taskId ?? "")) this.events.splice(i, 1);
+        }
+        this.conversations.splice(index, 1);
+        return ok({ deleted: true });
+      }
+      case "conversation.export": {
+        const refusal = this.scopingRefusal(params.conversationId, "conversationId");
+        if (refusal !== null) return err("VALIDATION_FAILED", refusal);
+        const conversation = this.conversations.find((c) => c.id === params.conversationId);
+        if (conversation === undefined) return err("NOT_FOUND", MSG_CONVERSATION_NOT_FOUND);
+        const limit = Math.min(this.clampLimit(params.limit), this.exportPageRows ?? MAX_LIST_LIMIT);
+        const after = Math.max(0, Number(params.afterSequence ?? 0));
+        const rows = conversation.messages.filter((m) => m.sequence > after);
+        const pageRows = rows.slice(0, limit);
+        const byKind = new Map<string, number>();
+        const add = (counts: Record<string, number>) => {
+          for (const [kind, n] of Object.entries(counts)) {
+            if (n > 0) byKind.set(kind, (byKind.get(kind) ?? 0) + n);
+          }
+        };
+        // The title is redacted on every page, COUNTED only on the first.
+        const title = this.titleRedaction?.title ?? conversation.title;
+        if (after === 0 && this.titleRedaction !== null) add(this.titleRedaction.byKind);
+        const messages = pageRows.map((m) => {
+          const redacted = this.messageRedaction?.(m.content);
+          if (redacted !== undefined) add(redacted.byKind);
+          return {
+            id: `m-${conversation.id}-${m.sequence}`,
+            conversationId: conversation.id,
+            role: m.role,
+            content: redacted?.content ?? m.content,
+            sequence: m.sequence,
+          };
+        });
+        const kinds = Object.fromEntries(byKind);
+        return ok({
+          format: "sandpane.conversation-export.v1",
+          exportedAt: new Date(this.nowMs).toISOString().replace(".000Z", "Z"),
+          conversation: { ...this.conversationWire(conversation), title },
+          messages,
+          truncated: rows.length > pageRows.length,
+          nextSequence: pageRows.length > 0 ? pageRows[pageRows.length - 1]?.sequence ?? after : after,
+          redaction: {
+            bestEffort: true,
+            replacements: [...byKind.values()].reduce((a, b) => a + b, 0),
+            byKind: kinds,
+          },
+        });
+      }
       default:
         return err("VALIDATION_FAILED", `unknown method ${request.method}`);
     }
+  }
+
+  /** `Conversation` as Core serializes it: `archivedAt` / `sandboxId` only when set. */
+  private conversationWire(c: FakeConversation): Record<string, unknown> {
+    return {
+      id: c.id,
+      projectId: c.projectId,
+      title: c.title,
+      agentId: c.agentId,
+      createdAt: c.createdAt,
+      ...(c.archivedAt === undefined ? {} : { archivedAt: c.archivedAt }),
+      ...(c.sandboxId === undefined ? {} : { sandboxId: c.sandboxId }),
+    };
+  }
+
+  /**
+   * `require_writable_conversation` (MODELED): the PROJECT refusal first (an
+   * unknown project stays lenient), then the archived conversation.
+   */
+  private writableRefusal(conversation: FakeConversation): [string, string] | null {
+    const project = this.projects.find((p) => p.id === conversation.projectId);
+    if (project?.archivedAt !== undefined) return ["VALIDATION_FAILED", MSG_PROJECT_ARCHIVED];
+    if (conversation.archivedAt !== undefined) return ["VALIDATION_FAILED", MSG_CONVERSATION_ARCHIVED];
+    return null;
+  }
+
+  /** §3.3 item 5: any non-terminal (or unreadable) task status blocks a delete. */
+  private hasUnfinishedTasks(conversationId: string): boolean {
+    return this.tasks.some(
+      (t) => t.conversationId === conversationId && !TERMINAL_TASK_STATUSES.has(String(t.status)),
+    );
   }
 
   /**
@@ -820,8 +1059,14 @@ export class FakeCore {
         return ok({ ...(stored.result as Record<string, unknown>), replayed: true });
       }
     }
-    this.ran[method] = (this.ran[method] ?? 0) + 1;
     const result = run();
+    // A refusal from the run is Core's verdict before any write: nothing is
+    // counted as run and nothing is stored under the key.
+    if (Array.isArray(result.refused)) {
+      const [code, message] = result.refused as [string, string];
+      return err(code, message);
+    }
+    this.ran[method] = (this.ran[method] ?? 0) + 1;
     if (slot !== null) this.idempotency.set(slot, { state: "done", hash, result });
     return ok(result);
   }

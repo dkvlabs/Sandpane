@@ -1,10 +1,10 @@
 /**
- * Typed wrappers for **exactly** the 22 Core methods (`sandpane_protocol::Method`
+ * Typed wrappers for **exactly** the 27 Core methods (`sandpane_protocol::Method`
  * / `Method::ALL`). Every wrapper maps to one Core method; `sandbox.remove` has
  * two wrappers because its two confirmation steps are deliberately separate
  * calls (`sandboxRemoveRequest` never carries a token, `sandboxRemoveConfirm`
- * always does); `project.delete` likewise (`projectDeleteRequest` /
- * `projectDeleteConfirm`).
+ * always does); `project.delete` and `conversation.delete` likewise
+ * (`…DeleteRequest` / `…DeleteConfirm`).
  *
  * Every payload key is written in the wire spelling (camelCase), every enum in
  * its wire spelling (snake_case / SCREAMING_SNAKE). Unknown methods are
@@ -33,9 +33,13 @@ import type {
   ChangeSet,
   Conversation,
   ConversationCreateParams,
+  ConversationDeleteResult,
+  ConversationExportParams,
+  ConversationExportResult,
   ConversationHistoryParams,
   ConversationHistoryResult,
   ConversationListParams,
+  ConversationRenameParams,
   ConversationSendParams,
   ConfirmationRequest,
   CoreCapabilities,
@@ -206,6 +210,70 @@ export function validateProjectDescription(value: string, field = 'description')
     }
   }
   return value;
+}
+
+/** `MAX_CONVERSATION_TITLE_CHARS` in sandpane-core (A3b). */
+export const MAX_CONVERSATION_TITLE_CHARS = 200;
+
+/**
+ * Rust `char::is_whitespace` (Unicode White_Space) — what `str::trim` strips.
+ * Deliberately NOT JavaScript's `trim()`: JS also strips U+FEFF, which Rust
+ * keeps, so a JS-trim blank check would refuse a title Core accepts.
+ */
+export function isRustWhitespace(cp: number): boolean {
+  return (
+    (cp >= 0x09 && cp <= 0x0d) ||
+    cp === 0x20 ||
+    cp === 0x85 ||
+    cp === 0xa0 ||
+    cp === 0x1680 ||
+    (cp >= 0x2000 && cp <= 0x200a) ||
+    cp === 0x2028 ||
+    cp === 0x2029 ||
+    cp === 0x202f ||
+    cp === 0x205f ||
+    cp === 0x3000
+  );
+}
+
+/** Rust `value.trim().is_empty()`. */
+export function isRustBlank(value: string): boolean {
+  for (const ch of value) {
+    if (!isRustWhitespace(ch.codePointAt(0) ?? 0)) return false;
+  }
+  return true;
+}
+
+/**
+ * `Validator::conversation_title` exactly (A3b): non-empty, at most 200 chars
+ * (Unicode scalar values), no Cc at all (incl. `\n`, `\t`, DEL, C1), no
+ * spoofing format character — the `project_name` refusals. Not trimmed.
+ */
+export function validateConversationTitle(value: string, field = 'title'): string {
+  if (typeof value !== 'string' || value.length === 0) throw new CoreValidationError(field, 'value is empty');
+  const points = Array.from(value);
+  if (points.length > MAX_CONVERSATION_TITLE_CHARS) {
+    throw new CoreValidationError(field, `value exceeds max length ${MAX_CONVERSATION_TITLE_CHARS}`);
+  }
+  for (const ch of points) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (isRustControl(cp) || isSpoofingFormatChar(cp) || isLoneSurrogate(cp)) {
+      throw new CoreValidationError(field, `contains a disallowed character ${hex(cp)}`);
+    }
+  }
+  return value;
+}
+
+/**
+ * The `conversation.rename` rule: Core first refuses an empty or
+ * whitespace-only title (`p.title.trim().is_empty()`, Rust's White_Space), then
+ * applies `Validator::conversation_title`.
+ */
+export function validateConversationRenameTitle(value: string, field = 'title'): string {
+  if (typeof value === 'string' && isRustBlank(value)) {
+    throw new CoreValidationError(field, 'must not be empty or whitespace-only');
+  }
+  return validateConversationTitle(value, field);
 }
 
 /** Core's `Validator::idempotency_key` bound (A2). */
@@ -701,12 +769,15 @@ export class CoreCommands {
       const agentId = validateDisplayText(params.agentId, 64, 'agentId');
       const payload: Record<string, unknown> = { projectId, agentId };
       if (typeof params.sandboxId === 'string' && params.sandboxId.length > 0) {
-        payload['sandboxId'] = validateSandboxName(params.sandboxId);
+        // Core validates it with `Validator::sandbox_name` (the addressable
+        // rule), so an sbx-named sandbox such as `Atlas.Demo` is accepted.
+        payload['sandboxId'] = validateAddressableSandboxName(params.sandboxId, 'sandboxId');
       }
+      // A3b: Core stores "Untitled conversation" for an empty or whitespace-only
+      // title (Rust trim) and applies `Validator::conversation_title` to
+      // anything else, unchanged — so a non-blank title is validated as is.
       payload['title'] =
-        typeof params.title === 'string' && params.title.trim().length > 0
-          ? validateDisplayText(params.title.trim(), 200, 'title')
-          : '';
+        typeof params.title === 'string' && !isRustBlank(params.title) ? validateConversationTitle(params.title) : '';
       return this.connection.request<Conversation>('conversation.create', payload);
     });
   }
@@ -794,9 +865,11 @@ export class CoreCommands {
   }
 
   /**
-   * `{projectId?, limit?}` → `Conversation[]`. Archived conversations are
-   * excluded by Core (`archived_at IS NULL`), so this is what the sidebar may
-   * actually reopen. ADDITIVE v1 method — feature-detect before calling.
+   * `{projectId?, limit?, includeArchived?}` → `Conversation[]`. Without
+   * `includeArchived` Core lists live conversations only (exactly the pre-A3b
+   * answer); `includeArchived: true` is sent only when asked for — callers ask
+   * only when Core advertises `conversation.archive`. ADDITIVE v1 method —
+   * feature-detect before calling.
    */
   conversationList(params: ConversationListParams = {}): Promise<Conversation[]> {
     return guarded(() => {
@@ -805,7 +878,89 @@ export class CoreCommands {
       if (projectId !== undefined) payload['projectId'] = projectId;
       const limit = clampLimit(params.limit);
       if (limit !== undefined) payload['limit'] = limit;
+      if (params.includeArchived === true) payload['includeArchived'] = true;
       return this.connection.request<Conversation[]>('conversation.list', payload);
+    });
+  }
+
+  /**
+   * A3b: `{conversationId, title}` → `Conversation`. Title per
+   * `validateConversationRenameTitle` (Core's rule); Core refuses it on an
+   * archived conversation or project. Default deadline.
+   */
+  conversationRename(params: ConversationRenameParams): Promise<Conversation> {
+    return guarded(() =>
+      this.connection.request<Conversation>('conversation.rename', {
+        conversationId: validateScopingId(params.conversationId, 'conversationId'),
+        title: validateConversationRenameTitle(params.title),
+      }),
+    );
+  }
+
+  /** A3b: `{conversationId}` → `Conversation`. Idempotent; allowed in an archived project. */
+  conversationArchive(conversationId: string): Promise<Conversation> {
+    return guarded(() =>
+      this.connection.request<Conversation>('conversation.archive', {
+        conversationId: validateScopingId(conversationId, 'conversationId'),
+      }),
+    );
+  }
+
+  /** A3b: `{conversationId}` → `Conversation`. Idempotent; refused in an archived project. */
+  conversationUnarchive(conversationId: string): Promise<Conversation> {
+    return guarded(() =>
+      this.connection.request<Conversation>('conversation.unarchive', {
+        conversationId: validateScopingId(conversationId, 'conversationId'),
+      }),
+    );
+  }
+
+  /**
+   * `conversation.delete` STEP 1: `{conversationId}` (never a token) → a
+   * checked `ConfirmationRequest` for this conversation id. The target NAME is
+   * not required to match: Core binds the token by id, and a rename between
+   * the steps is legal. Core changes nothing.
+   */
+  conversationDeleteRequest(conversationId: string): Promise<ConfirmationRequest> {
+    return guarded(async () => {
+      const id = validateScopingId(conversationId, 'conversationId');
+      const raw = await this.connection.request<unknown>('conversation.delete', { conversationId: id });
+      return parseConfirmationRequest(raw, { action: 'conversation.delete', id });
+    });
+  }
+
+  /**
+   * `conversation.delete` STEP 2: `{conversationId, confirmToken}` →
+   * `{deleted: true}`. Only after the user explicitly confirmed step 1. Never
+   * retried; never touches host files, worktrees, branches or sandboxes.
+   */
+  conversationDeleteConfirm(conversationId: string, confirmToken: string): Promise<ConversationDeleteResult> {
+    return guarded(() =>
+      this.connection.request<ConversationDeleteResult>('conversation.delete', {
+        conversationId: validateScopingId(conversationId, 'conversationId'),
+        confirmToken: validateConfirmToken(confirmToken),
+      }),
+    );
+  }
+
+  /**
+   * A3b: `{conversationId, afterSequence, limit?}` → ONE redacted export page.
+   * Read-only. The page is shape-checked by `collectConversationExport`, which
+   * owns the paging loop; this wrapper never logs or inspects the content.
+   */
+  conversationExport(params: ConversationExportParams): Promise<ConversationExportResult> {
+    return guarded(() => {
+      if (typeof params.afterSequence !== 'number' || !Number.isFinite(params.afterSequence)) {
+        throw new CoreValidationError('afterSequence', 'must be a finite number');
+      }
+      const payload: Record<string, unknown> = {
+        conversationId: validateScopingId(params.conversationId, 'conversationId'),
+        // Core normalises a negative cursor to 0; the client does the same.
+        afterSequence: Math.max(0, Math.trunc(params.afterSequence)),
+      };
+      const limit = clampLimit(params.limit);
+      if (limit !== undefined) payload['limit'] = limit;
+      return this.connection.request<ConversationExportResult>('conversation.export', payload);
     });
   }
 
@@ -813,8 +968,9 @@ export class CoreCommands {
    * `{conversationId, afterSequence?, limit?}` → `ConversationHistoryResult` —
    * an OBJECT, not an array: `truncated` discloses whether the row limit OR the
    * byte ceiling cut the scan short, and `nextSequence` is the cursor for the
-   * following page. An unknown/archived conversation is Core's `NOT_FOUND`,
-   * never an empty-but-successful answer that reads as "no messages".
+   * following page. An unknown conversation is Core's `NOT_FOUND`, never an
+   * empty-but-successful answer that reads as "no messages"; since A3b an
+   * ARCHIVED conversation's history is served (it stays readable).
    */
   conversationHistory(params: ConversationHistoryParams): Promise<ConversationHistoryResult> {
     return guarded(() => {

@@ -70,7 +70,12 @@ import {
   RemovalDialog,
   StopDialog,
 } from "../src/components/sandbox/SandboxLifecycle";
-import { MAX_LIST_LIMIT, PROJECT_LIFECYCLE_METHODS, TASK_STATUSES } from "../src/lib/protocol";
+import {
+  CONVERSATION_LIFECYCLE_METHODS,
+  MAX_LIST_LIMIT,
+  PROJECT_LIFECYCLE_METHODS,
+  TASK_STATUSES,
+} from "../src/lib/protocol";
 import { MAX_REASON_CHARS, TERMINAL_STATUSES, describeCoreError } from "../src/lib/reducers";
 import { A1_CORE_METHODS, FakeCore, TOKEN_REJECTED_MESSAGE } from "./support/fake-core";
 import {
@@ -160,10 +165,15 @@ describe("A1 pinned lists", () => {
     ]);
     expect(rustMethodAll().names).toEqual([...METHODS]);
     expect(schemaMethodEnum()).toEqual([...METHODS]);
-    expect(METHODS).toHaveLength(22);
-    // The A1 Core's set is today's minus the six A3a project methods.
+    expect(METHODS).toHaveLength(27);
+    // The A1 Core's set is today's minus the six A3a project methods and the
+    // five A3b conversation methods.
     expect(A1_CORE_METHODS).toEqual(
-      METHODS.filter((m) => !(PROJECT_LIFECYCLE_METHODS as readonly string[]).includes(m)),
+      METHODS.filter(
+        (m) =>
+          !(PROJECT_LIFECYCLE_METHODS as readonly string[]).includes(m) &&
+          !(CONVERSATION_LIFECYCLE_METHODS as readonly string[]).includes(m),
+      ),
     );
   });
 

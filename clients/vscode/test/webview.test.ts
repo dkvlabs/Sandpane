@@ -132,6 +132,40 @@ describe('webview message whitelist', () => {
     expect(WEBVIEW_MESSAGE_KINDS).not.toContain('shell');
   });
 
+  it('A3b: parses the conversation messages strictly (allowlisted action, bounded id)', () => {
+    expect(parseWebviewMessage({ type: 'selectConversation', conversationId: 'c1' })).toEqual({
+      type: 'selectConversation',
+      conversationId: 'c1',
+    });
+    expect(parseWebviewMessage({ type: 'selectConversation', conversationId: '' })).toEqual({
+      type: 'selectConversation',
+      conversationId: '',
+    });
+    expect(parseWebviewMessage({ type: 'toggleArchivedConversations', extra: 1 })).toEqual({ type: 'toggleArchivedConversations' });
+    for (const action of ['rename', 'archive', 'unarchive', 'export', 'delete']) {
+      expect(parseWebviewMessage({ type: 'conversationAction', action, conversationId: 'c1' })).toEqual({
+        type: 'conversationAction',
+        action,
+        conversationId: 'c1',
+      });
+    }
+    for (const bad of [
+      { type: 'conversationAction', action: 'send', conversationId: 'c1' },
+      { type: 'conversationAction', action: 'delete', conversationId: '' },
+      { type: 'conversationAction', action: 'delete', conversationId: 'x'.repeat(201) },
+      { type: 'conversationAction', action: 'delete' },
+      { type: 'conversationAction', action: 'delete', conversationId: 7 },
+      { type: 'selectConversation' },
+      { type: 'selectConversation', conversationId: 'x'.repeat(201) },
+      { type: 'conversationAction', action: 'toString', conversationId: 'c1' },
+    ]) {
+      expect(parseWebviewMessage(bad), JSON.stringify(bad)).toBeUndefined();
+    }
+    const empty = emptySidebarState('online');
+    expect(empty.conversations).toEqual({ supported: false, note: null, showArchived: false, showArchivedSupported: false, rows: [] });
+    expect(empty.composerBlocked).toBeNull();
+  });
+
   it('starts from an honest empty state with the VS2 gate stated', () => {
     const state = emptySidebarState('offline');
     expect(state.connection).toBe('offline');

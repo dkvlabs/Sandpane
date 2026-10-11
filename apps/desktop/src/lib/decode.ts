@@ -17,6 +17,7 @@
 import {
   AGENT_EVENT_TYPES,
   CONFIRM_TOKEN_PATTERN,
+  CONVERSATION_EXPORT_FORMAT,
   CORE_EVENT_KINDS,
   ERROR_CODES,
   FILE_CHANGE_STATUSES,
@@ -29,6 +30,8 @@ import {
   type ConfirmationRequest,
   type ProjectDeleteResult,
   type Conversation,
+  type ConversationDeleteResult,
+  type ConversationExportPage,
   type ConversationHistoryResult,
   type CoreCapabilities,
   type ErrorCode,
@@ -444,41 +447,144 @@ export function decodeTaskSummaries(value: unknown): TaskSummary[] {
  */
 export function decodeConversationHistory(value: unknown): ConversationHistoryResult {
   const rec = asRecord(value, "ConversationHistoryResult");
-  const messages: MessageRecord[] = arr(rec, "messages", "ConversationHistoryResult").map(
-    (item) => {
-      const m = asRecord(item, "MessageRecord");
-      const sequence = num(m, "sequence", "MessageRecord");
-      if (!Number.isInteger(sequence) || sequence < 1) {
-        throw new MalformedFrameError("MessageRecord.sequence must be an integer >= 1");
-      }
-      return {
-        id: str(m, "id", "MessageRecord"),
-        conversationId: str(m, "conversationId", "MessageRecord"),
-        role: str(m, "role", "MessageRecord"),
-        content: str(m, "content", "MessageRecord"),
-        sequence,
-      };
-    },
-  );
-  const nextSequence = num(rec, "nextSequence", "ConversationHistoryResult");
-  if (!Number.isInteger(nextSequence) || nextSequence < 0) {
-    throw new MalformedFrameError("ConversationHistoryResult.nextSequence must be >= 0");
-  }
   return {
-    messages,
+    messages: decodeMessageRecords(rec, "ConversationHistoryResult"),
     truncated: bool(rec, "truncated", "ConversationHistoryResult"),
-    nextSequence,
+    nextSequence: decodeNextSequence(rec, "ConversationHistoryResult"),
   };
+}
+
+/** `messages[]` with `conversation.history`'s rules (shared by A3b export pages). */
+function decodeMessageRecords(rec: Rec, what: string): MessageRecord[] {
+  return arr(rec, "messages", what).map((item) => {
+    const m = asRecord(item, "MessageRecord");
+    const sequence = num(m, "sequence", "MessageRecord");
+    if (!Number.isInteger(sequence) || sequence < 1) {
+      throw new MalformedFrameError("MessageRecord.sequence must be an integer >= 1");
+    }
+    return {
+      id: str(m, "id", "MessageRecord"),
+      conversationId: str(m, "conversationId", "MessageRecord"),
+      role: str(m, "role", "MessageRecord"),
+      content: str(m, "content", "MessageRecord"),
+      sequence,
+    };
+  });
+}
+
+function decodeNextSequence(rec: Rec, what: string): number {
+  const nextSequence = num(rec, "nextSequence", what);
+  if (!Number.isInteger(nextSequence) || nextSequence < 0) {
+    throw new MalformedFrameError(`${what}.nextSequence must be >= 0`);
+  }
+  return nextSequence;
 }
 
 export function decodeConversation(value: unknown): Conversation {
   const c = asRecord(value, "Conversation");
+  // A3b, additive: absent/null = live / none stored (and every pre-A3b Core).
+  // A present non-string is malformed like any other mistyped field.
+  const archivedAt = optStr(c, "archivedAt", "Conversation");
+  const sandboxId = optStr(c, "sandboxId", "Conversation");
   return {
     id: str(c, "id", "Conversation"),
     projectId: str(c, "projectId", "Conversation"),
     title: str(c, "title", "Conversation"),
     agentId: str(c, "agentId", "Conversation"),
     createdAt: str(c, "createdAt", "Conversation"),
+    ...(archivedAt === null ? {} : { archivedAt }),
+    ...(sandboxId === null ? {} : { sandboxId }),
+  };
+}
+
+/**
+ * `conversation.delete` result (A3b): exactly one of `confirmation` (step 1)
+ * or `deleted: true` (step 2). A conversation exists only in Core, so its
+ * confirmation is always `external: false`; anything else is refused rather
+ * than rendered, because no client copy exists for it.
+ */
+export function decodeConversationDeleteResult(value: unknown): ConversationDeleteResult {
+  const r = asRecord(value, "ConversationDeleteResult");
+  const hasConfirmation = r.confirmation !== undefined && r.confirmation !== null;
+  const hasDeleted = r.deleted !== undefined && r.deleted !== null;
+  if (hasConfirmation === hasDeleted) {
+    throw new MalformedFrameError(
+      "conversation.delete must answer exactly one of confirmation / deleted",
+    );
+  }
+  if (hasDeleted) {
+    if (r.deleted !== true) {
+      throw new MalformedFrameError("ConversationDeleteResult.deleted must be true when present");
+    }
+    return { kind: "deleted" };
+  }
+  const confirmation = decodeConfirmationRequest(r.confirmation, "conversation.delete");
+  if (confirmation.external) {
+    throw new MalformedFrameError(
+      "a conversation.delete confirmation must have external: false; refusing to use this token",
+    );
+  }
+  return { kind: "confirmation", confirmation };
+}
+
+/** A non-negative integer count (`u64` on the Rust side). */
+function count(value: unknown, what: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new MalformedFrameError(`${what} must be a non-negative integer`);
+  }
+  return value;
+}
+
+/**
+ * One `conversation.export` page (A3b). Strict: the format tag must be the v1
+ * one, `bestEffort` must be `true`, counts must be non-negative integers.
+ * `byKind` keys are kept as Core sent them (a kind added later is shown, not
+ * refused). Error text names the field, never the payload — an export page is
+ * the user's conversation and must not leak into an error surface.
+ */
+/**
+ * One `conversation.export` page, decoded strictly. `requestedId` is the
+ * conversation that was asked for: a page whose conversation, or ANY of whose
+ * messages, names another one is refused (the ids are not echoed).
+ */
+export function decodeConversationExportPage(value: unknown, requestedId: string): ConversationExportPage {
+  const rec = asRecord(value, "ConversationExportPage");
+  const format = str(rec, "format", "ConversationExportPage");
+  if (format !== CONVERSATION_EXPORT_FORMAT) {
+    throw new MalformedFrameError(
+      `ConversationExportPage.format is not ${CONVERSATION_EXPORT_FORMAT}`,
+    );
+  }
+  const redaction = asRecord(rec.redaction, "ConversationExportPage.redaction");
+  if (redaction.bestEffort !== true) {
+    throw new MalformedFrameError("ExportRedaction.bestEffort must be true");
+  }
+  const byKindRaw = asRecord(redaction.byKind, "ExportRedaction.byKind");
+  // `fromEntries` defines own data properties, so even a `__proto__` key from
+  // Core stays a plain entry instead of touching the prototype.
+  const byKind: Record<string, number> = Object.fromEntries(
+    Object.entries(byKindRaw).map(([kind, n]) => [kind, count(n, "ExportRedaction.byKind value")]),
+  );
+  const conversation = decodeConversation(rec.conversation);
+  if (conversation.id !== requestedId) {
+    throw new MalformedFrameError("ConversationExportPage.conversation is not the requested conversation");
+  }
+  const messages = decodeMessageRecords(rec, "ConversationExportPage");
+  if (messages.some((m) => m.conversationId !== requestedId)) {
+    throw new MalformedFrameError("ConversationExportPage.messages name a conversation other than the requested one");
+  }
+  return {
+    format: CONVERSATION_EXPORT_FORMAT,
+    exportedAt: str(rec, "exportedAt", "ConversationExportPage"),
+    conversation,
+    messages,
+    truncated: bool(rec, "truncated", "ConversationExportPage"),
+    nextSequence: decodeNextSequence(rec, "ConversationExportPage"),
+    redaction: {
+      bestEffort: true,
+      replacements: count(redaction.replacements, "ExportRedaction.replacements"),
+      byKind,
+    },
   };
 }
 

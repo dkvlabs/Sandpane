@@ -42,6 +42,30 @@ function state(overrides: Record<string, unknown> = {}): Record<string, unknown>
     capabilities: null,
     contextPlan: null,
     notices: [],
+    conversations: { supported: true, note: null, showArchived: false, showArchivedSupported: true, rows: [] },
+    composerBlocked: null,
+    ...overrides,
+  };
+}
+
+const ENABLED = { enabled: true, reason: null };
+const ARCHIVED_REASON = 'Core refuses it for an archived conversation ("conversation is archived; unarchive it first; nothing was changed"); unarchive it first';
+
+function convRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'c1',
+    title: 'Auth',
+    archived: false,
+    selected: false,
+    sandboxLabel: null,
+    statusNote: null,
+    actions: {
+      rename: ENABLED,
+      archive: ENABLED,
+      unarchive: { enabled: false, reason: 'not archived' },
+      export: ENABLED,
+      delete: ENABLED,
+    },
     ...overrides,
   };
 }
@@ -269,5 +293,128 @@ describe('in-flight send (review W3) and draft clearing (S2)', () => {
     h.push(state({ acceptedSends: 1 }));
     h.flushFrame();
     expect(input.value).toBe('next message being typed');
+  });
+});
+
+describe('A3b conversation list and archived state', () => {
+  function withRows(rows: Record<string, unknown>[], extra: Record<string, unknown> = {}) {
+    const h = loadSidebar();
+    h.push(state({ conversations: { supported: true, note: null, showArchived: true, showArchivedSupported: true, rows }, ...extra }));
+    h.flushFrame();
+    return h;
+  }
+
+  it('lists Core\'s conversations with ARCHIVED labels, the sandbox label and the archived note', () => {
+    const archived = convRow({
+      id: 'c2',
+      title: 'Old',
+      archived: true,
+      statusNote: 'ARCHIVED — send and rename are disabled: Core says "conversation is archived; unarchive it first; nothing was changed". Its history stays readable.',
+      sandboxLabel: 'sandbox chosen at creation: gone-box (not in the current sandbox list)',
+      actions: {
+        rename: { enabled: false, reason: ARCHIVED_REASON },
+        archive: { enabled: false, reason: 'already archived' },
+        unarchive: ENABLED,
+        export: ENABLED,
+        delete: ENABLED,
+      },
+    });
+    const h = withRows([convRow({ selected: true }), archived]);
+    const region = h.byId('sp-conversations');
+    expect(region.textContent).toContain('Auth');
+    expect(region.textContent).toContain('ARCHIVED');
+    expect(region.textContent).toContain('sandbox chosen at creation: gone-box (not in the current sandbox list)');
+    expect(region.textContent).toContain('conversation is archived; unarchive it first; nothing was changed');
+    expect(h.byId('sp-conv-open-c1').getAttribute('aria-pressed')).toBe('true');
+    expect(h.byId('sp-conv-open-c2').getAttribute('aria-pressed')).toBe('false');
+    // Rename of the archived row is disabled with Core's reason; Unarchive replaces Archive.
+    const rename = h.byId('sp-conv-rename-c2');
+    expect(rename.disabled).toBe(true);
+    expect(rename.getAttribute('title')).toBe(ARCHIVED_REASON);
+    expect(() => h.byId('sp-conv-archive-c2')).toThrow();
+    expect(h.byId('sp-conv-unarchive-c2').disabled).toBe(false);
+    expect(() => h.byId('sp-conv-unarchive-c1')).toThrow();
+  });
+
+  it('row buttons post whitelisted messages; disabled ones post nothing', () => {
+    const h = withRows([
+      convRow(),
+      convRow({ id: 'c2', title: 'Old', archived: true, actions: { ...convRow()['actions'] as object, rename: { enabled: false, reason: ARCHIVED_REASON }, unarchive: ENABLED } }),
+    ]);
+    const before = h.posted.length;
+    h.byId('sp-conv-open-c1').click();
+    h.byId('sp-conv-rename-c1').click();
+    h.byId('sp-conv-archive-c1').click();
+    h.byId('sp-conv-export-c1').click();
+    h.byId('sp-conv-delete-c1').click();
+    h.byId('sp-conv-rename-c2').click(); // disabled: nothing
+    h.byId('sp-conv-unarchive-c2').click();
+    h.byId('sp-conv-new').click();
+    h.byId('sp-conv-archived').click();
+    expect(h.posted.slice(before)).toEqual([
+      { type: 'selectConversation', conversationId: 'c1' },
+      { type: 'conversationAction', action: 'rename', conversationId: 'c1' },
+      { type: 'conversationAction', action: 'archive', conversationId: 'c1' },
+      { type: 'conversationAction', action: 'export', conversationId: 'c1' },
+      { type: 'conversationAction', action: 'delete', conversationId: 'c1' },
+      { type: 'conversationAction', action: 'unarchive', conversationId: 'c2' },
+      { type: 'selectConversation', conversationId: '' },
+      { type: 'toggleArchivedConversations' },
+    ]);
+  });
+
+  it('unsupported actions and toggle are visibly unsupported (disabled with the reason, never hidden)', () => {
+    const unsupported = { enabled: false, reason: 'not supported by the attached Sandpane Core (it does not advertise "conversation.rename")' };
+    const h = loadSidebar();
+    h.push(state({
+      conversations: {
+        supported: true,
+        note: null,
+        showArchived: false,
+        showArchivedSupported: false,
+        rows: [convRow({ actions: { rename: unsupported, archive: unsupported, unarchive: unsupported, export: unsupported, delete: unsupported } })],
+      },
+    }));
+    h.flushFrame();
+    const toggle = h.byId('sp-conv-archived');
+    expect(toggle.disabled).toBe(true);
+    expect(toggle.getAttribute('title')).toMatch(/not supported/);
+    expect(h.byId('sp-conv-rename-c1').disabled).toBe(true);
+    expect(h.byId('sp-conversations').textContent).toMatch(/not supported by the attached Sandpane Core/);
+  });
+
+  it('an archived conversation (or project) disables Send and shows Core\'s reason; history stays painted', () => {
+    const reason = 'Sending is disabled: Core refuses sends to an archived conversation ("conversation is archived; unarchive it first; nothing was changed").';
+    const h = loadSidebar();
+    h.push(state({
+      composerBlocked: reason,
+      contextPlan: plan({ planId: 1, mode: 'read_only' }),
+      lines: [{ role: 'user', text: 'earlier message' }],
+      transcript: { scope: 'conversation', label: 'Conversation "Old"' },
+    }));
+    h.flushFrame();
+    const send = h.byId('sp-send');
+    expect(send.disabled).toBe(true);
+    expect(h.byId('sp-composer-note').textContent).toBe(reason);
+    expect(h.byId('sp-stream').textContent).toContain('earlier message');
+    h.byId('sp-input').value = 'try anyway';
+    const before = h.posted.length;
+    send.click();
+    expect(h.posted.slice(before)).toEqual([]);
+    // A later push that clears the block re-enables Send (and a busy send still disables it).
+    h.push(state({ composerBlocked: null, contextPlan: plan({ planId: 1, mode: 'read_only' }) }));
+    h.flushFrame();
+    expect(send.disabled).toBe(false);
+    expect(h.byId('sp-composer-note').textContent).toBe('');
+    h.push(state({ composerBlocked: null, sending: true }));
+    h.flushFrame();
+    expect(send.disabled).toBe(true);
+  });
+
+  it('shows Core\'s note when the list is unavailable', () => {
+    const h = loadSidebar();
+    h.push(state({ conversations: { supported: false, note: 'This Core does not advertise conversation.list — conversations cannot be listed (no fake list).', showArchived: false, showArchivedSupported: false, rows: [] } }));
+    h.flushFrame();
+    expect(h.byId('sp-conversations').textContent).toContain('does not advertise conversation.list');
   });
 });

@@ -42,6 +42,30 @@ export function forgetProjectConversations(projectId: string): void {
   for (const listener of [...listeners]) listener();
 }
 
+/**
+ * A3b: keep this window's copy in step with Core's answer to a rename /
+ * archive / unarchive (Core's row replaces it wholesale). Otherwise the merged
+ * lists would re-add a stale copy — an archived chat reappearing as live, or
+ * an old title. A conversation this window did not create is not added.
+ */
+export function replaceConversation(conversation: Conversation): void {
+  const index = snapshot.findIndex((c) => c.id === conversation.id);
+  if (index < 0) return;
+  snapshot = snapshot.map((c, i) => (i === index ? conversation : c));
+  for (const listener of [...listeners]) listener();
+}
+
+/**
+ * A3b: after Core confirms `conversation.delete` (or no longer lists it after
+ * an unknown outcome), drop this window's copy so no view offers it again.
+ */
+export function forgetConversation(conversationId: string): void {
+  const kept = snapshot.filter((c) => c.id !== conversationId);
+  if (kept.length === snapshot.length) return;
+  snapshot = kept;
+  for (const listener of [...listeners]) listener();
+}
+
 /** Test/reload seam: a window restart drops this in-memory view by design. */
 export function clearConversations(): void {
   snapshot = [];

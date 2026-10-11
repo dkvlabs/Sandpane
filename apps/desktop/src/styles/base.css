@@ -1362,3 +1362,19 @@ button.chip {
   font-weight: 600;
   color: var(--text-strong);
 }
+
+/* A3b conversation export: a read-only, bounded preview (no file save). */
+.export-preview {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface-1);
+  color: var(--text-strong);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre;
+  user-select: text;
+}

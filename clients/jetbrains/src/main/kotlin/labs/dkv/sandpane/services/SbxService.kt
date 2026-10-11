@@ -110,6 +110,13 @@ class SbxService(private val project: Project) {
     fun listProjects(includeArchived: Boolean = false): CompletableFuture<List<SandpaneProject>> =
         connection.commands.projectList(includeArchived)
 
+    /** Can this Core list archived conversations at all (A3b advertised)? */
+    fun canListArchivedConversations(): Boolean = connection.commands.advertises(CoreMethods.CONVERSATION_ARCHIVE)
+
+    /** Does this Core persist the sandbox chosen at conversation creation (A3b feature)? */
+    fun reportsConversationSandbox(): Boolean =
+        connection.capabilities?.hasFeature(labs.dkv.sandpane.model.CoreFeatures.CONVERSATION_SANDBOX_ID) == true
+
     /** Can this Core list archived projects at all (A3a advertised)? */
     fun canListArchived(): Boolean = connection.commands.advertises(CoreMethods.PROJECT_ARCHIVE)
 
@@ -178,13 +185,15 @@ class SbxService(private val project: Project) {
     /**
      * `conversation.list` for [projectId], or a failed [ConversationEnumeration] when this Core
      * does not advertise the method. Chat enumeration was impossible before the discovery
-     * revision; the list is Core's, including its exclusion of archived conversations.
+     * revision; the list is Core's. With [includeArchived] (A3b "show archived"), archived
+     * conversations are listed too — asked for only when Core can honour it
+     * ([canListArchivedConversations]); otherwise Core's live-only list is returned.
      */
-    fun enumerateConversations(projectId: String): CompletableFuture<ConversationEnumeration> {
+    fun enumerateConversations(projectId: String, includeArchived: Boolean = false): CompletableFuture<ConversationEnumeration> {
         if (!connection.commands.advertises(CoreMethods.CONVERSATION_LIST)) {
             return CompletableFuture.completedFuture(ConversationEnumeration.Unavailable)
         }
-        return connection.listConversations(projectId)
+        return connection.listConversations(projectId, includeArchived && canListArchivedConversations())
             .thenApply<ConversationEnumeration> { ConversationEnumeration.Available(it) }
             .exceptionally { err ->
                 // Attributed, not assumed: this can be a refusal this plugin raised before sending.
@@ -282,13 +291,19 @@ class SbxService(private val project: Project) {
     fun stopSandbox(name: String): CompletableFuture<SandboxStopResult> =
         connection.commands.sandboxStop(name).also { afterMutation(it) }
 
-    /** Creating a conversation mutates Core state; called only from an explicit user action. */
+    /**
+     * Creating a conversation mutates Core state; called only from an explicit user action. A3b: Core
+     * now applies `Validator::conversation_title` on create, so the title is normalised first
+     * ([labs.dkv.sandpane.core.ConversationGuards.titleForCreate]) — a multi-line or over-long title
+     * can never make the create fail; blank lets Core store "Untitled conversation".
+     */
     fun createConversation(params: ConversationCreateParams): CompletableFuture<Conversation> {
         SbxClientValidation.requireOpaqueId(params.projectId, "projectId")
         SbxClientValidation.requireOpaqueId(params.agentId, "agentId")
+        val safe = params.copy(title = labs.dkv.sandpane.core.ConversationGuards.titleForCreate(params.title))
         return connection.call(
             CoreMethods.CONVERSATION_CREATE,
-            CoreJson.encodeToJsonElement(ConversationCreateParams.serializer(), params),
+            CoreJson.encodeToJsonElement(ConversationCreateParams.serializer(), safe),
             Conversation.serializer(),
         )
     }

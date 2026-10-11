@@ -1,6 +1,7 @@
 package labs.dkv.sandpane.ui
 
 import labs.dkv.sandpane.model.Conversation
+import labs.dkv.sandpane.text.DisplayCap
 
 /**
  * Review bug 3: after a refresh the chat picker silently jumped to the first conversation while
@@ -12,11 +13,13 @@ object ConversationSelection {
 
     /**
      * Which conversation the picker should select after Core re-enumerated [available]:
-     * the previously selected one (matched by id, never by position) when Core still lists it,
-     * otherwise the first one Core lists, otherwise none.
+     * - a previous selection is kept by id (never by position) when Core still lists it, and when Core
+     *   no longer lists it NOTHING is selected (A3b review W1: e.g. it was just archived while "Show
+     *   archived" is off) — another conversation is never substituted, so Send cannot silently move;
+     * - only with no previous selection (an initial load) is Core's first conversation shown.
      */
     fun choose(previousId: String?, available: List<Conversation>): Conversation? =
-        previousId?.let { id -> available.firstOrNull { it.id == id } } ?: available.firstOrNull()
+        if (previousId != null) available.firstOrNull { it.id == previousId } else available.firstOrNull()
 
     /** Outcome of applying one `conversation.list` answer to the picker. */
     data class Reconciled(
@@ -33,7 +36,10 @@ object ConversationSelection {
      * may have picked another chat in between, and that pick wins. [modelProjectId] is the project
      * whose conversations the picker currently holds: when it differs from [answeredProjectId]
      * the old selection belongs to another project, so it is neither kept nor reported as
-     * vanished.
+     * vanished, and Core's first conversation is shown (an initial load of that project).
+     *
+     * Within the same project nothing is ever auto-selected (A3b review W1): a selection Core no longer
+     * lists becomes NONE, and NONE stays NONE on later refreshes until the user picks.
      */
     fun reconcile(
         currentSelectedId: String?,
@@ -41,11 +47,10 @@ object ConversationSelection {
         answeredProjectId: String,
         listed: List<Conversation>,
     ): Reconciled {
-        val sameProject = modelProjectId == answeredProjectId
-        val keep = if (sameProject) currentSelectedId else null
+        if (modelProjectId != answeredProjectId) return Reconciled(choose(null, listed), null)
+        val keep = currentSelectedId ?: return Reconciled(null, null)
         val choice = choose(keep, listed)
-        val vanished = if (keep != null && choice?.id != keep) keep else null
-        return Reconciled(choice, vanished)
+        return Reconciled(choice, if (choice == null) keep else null)
     }
 
     /**
@@ -62,7 +67,10 @@ object ConversationSelection {
             "→ " + displayName(selected) + " (" + selected.id.take(8) + ")"
         }
 
-    /** Core's title when it has one, else a short id. Never markup — callers render it literally. */
+    /**
+     * Core's title when it has one, else a short id, capped at [DisplayCap.MAX_CODE_POINTS] (Core does
+     * not bound titles stored before A3b). Never markup — callers render it literally.
+     */
     fun displayName(conversation: Conversation): String =
-        conversation.title.takeIf { it.isNotBlank() } ?: conversation.id.take(8)
+        DisplayCap.cap(conversation.title.takeIf { it.isNotBlank() } ?: conversation.id.take(8))
 }

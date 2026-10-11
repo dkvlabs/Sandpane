@@ -25,7 +25,7 @@ interface Frame {
   params: Record<string, unknown>;
 }
 
-/** `Method::ALL` order — what an A3a Core advertises (22 methods). */
+/** `Method::ALL` order — what an A3b Core advertises (27 methods). */
 const ALL_METHODS = [
   'system.probe', 'project.create', 'project.list',
   'project.update', 'project.archive', 'project.unarchive', 'project.delete',
@@ -33,11 +33,15 @@ const ALL_METHODS = [
   'sandbox.list', 'sandbox.create',
   'sandbox.stop', 'sandbox.remove',
   'conversation.create', 'conversation.send', 'conversation.list', 'conversation.history',
+  'conversation.rename', 'conversation.archive', 'conversation.unarchive', 'conversation.delete', 'conversation.export',
   'task.cancel', 'task.list', 'task.subscribe', 'git.review', 'git.apply',
 ];
 
+/** A pre-A3b (A3a) Core: the 22 methods before the conversation lifecycle. */
+const PRE_A3B_METHODS = ALL_METHODS.filter((m) => !/^conversation\.(rename|archive|unarchive|delete|export)$/.test(m));
+
 /** A pre-A3a Core: the 16 methods before the project lifecycle. */
-const PRE_A3A_METHODS = ALL_METHODS.filter((m) => !/^project\.(update|archive|unarchive|delete|add_repository|remove_repository)$/.test(m));
+const PRE_A3A_METHODS = PRE_A3B_METHODS.filter((m) => !/^project\.(update|archive|unarchive|delete|add_repository|remove_repository)$/.test(m));
 
 /** A pre-A1 Core: the 14 methods before sandbox.stop / sandbox.remove. */
 const PRE_A1_METHODS = PRE_A3A_METHODS.filter((m) => m !== 'sandbox.stop' && m !== 'sandbox.remove');
@@ -65,6 +69,24 @@ class ScriptedCore {
     action: 'project.delete',
     target: { name: 'Atlas Demo', id: 'p1' },
     impact: ['deletes 1 conversation(s), 3 message(s) and 1 task(s)', 'task branches in the host repositories are left in place'],
+    external: false,
+  };
+  /** A3b conversation state of this fake (Core's rows, by id). */
+  readonly conversations = new Map<string, Record<string, unknown>>([
+    ['c1', { id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', createdAt: '' }],
+  ]);
+  /** Step 2 deletes the conversation and THEN answers the forced error (lost answer). */
+  deleteConversationBeforeForcedError = false;
+  /** When set, `conversation.export` answers these pages in order (else one page from the row). */
+  exportPages: unknown[] | null = null;
+  conversationConfirmation: Record<string, unknown> = {
+    token: TOKEN,
+    expiresAt: '2026-10-10T12:02:00Z',
+    action: 'conversation.delete',
+    impact: [
+      'deletes conversation Auth and all of its Core records; this cannot be undone',
+      '3 messages and 1 task are deleted, with their task events, artifacts and verification records',
+    ],
     external: false,
   };
   /** Future-Core shape: task.list rows carry `sandboxName`. Today's Core never sets it. */
@@ -258,6 +280,8 @@ class ScriptedCore {
         return {
           ok: [...this.taskProject.entries()]
             .filter(([, project]) => p['projectId'] === undefined || project === p['projectId'])
+            // A deleted conversation's tasks are deleted with it (A3b).
+            .filter(([, project]) => project !== 'p1' || this.conversations.has('c1'))
             .map(([id, project]) => ({
               id,
               conversationId: project === 'p1' ? 'c1' : 'c2',
@@ -267,23 +291,87 @@ class ScriptedCore {
               ...(this.taskSandboxNames ? { sandboxName: project === 'p1' ? 'atlas-box' : 'nova-live' } : {}),
             })),
         };
-      case 'conversation.list':
-        return { ok: p['projectId'] === 'p1' ? [{ id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', createdAt: '' }] : [] };
+      case 'conversation.list': {
+        const forced = this.takeForced('conversation.list');
+        if (forced) return forced;
+        return {
+          ok: [...this.conversations.values()]
+            .filter((c) => p['projectId'] === undefined || c['projectId'] === p['projectId'])
+            .filter((c) => p['includeArchived'] === true || c['archivedAt'] === undefined)
+            .slice(0, typeof p['limit'] === 'number' ? p['limit'] : 200),
+        };
+      }
+      case 'conversation.rename':
+      case 'conversation.archive':
+      case 'conversation.unarchive': {
+        const forced = this.takeForced(frame.method);
+        if (forced) return forced;
+        const row = this.conversations.get(String(p['conversationId']));
+        if (!row) return { err: { code: 'NOT_FOUND', message: 'conversation not found' } };
+        if (frame.method === 'conversation.rename') row['title'] = p['title'];
+        if (frame.method === 'conversation.archive' && row['archivedAt'] === undefined) row['archivedAt'] = '2026-10-11T11:00:00Z';
+        if (frame.method === 'conversation.unarchive') delete row['archivedAt'];
+        return { ok: { ...row } };
+      }
+      case 'conversation.delete': {
+        const id = String(p['conversationId']);
+        if (p['confirmToken'] === undefined) {
+          const forced = this.takeForced('conversation.delete.step1');
+          if (forced) return forced;
+          return { ok: { confirmation: { ...this.conversationConfirmation, target: { name: String(this.conversations.get(id)?.['title'] ?? '?'), id } } } };
+        }
+        if (this.deleteConversationBeforeForcedError) this.conversations.delete(id);
+        const forced = this.takeForced('conversation.delete');
+        if (forced) return forced;
+        this.conversations.delete(id);
+        return { ok: { deleted: true } };
+      }
+      case 'conversation.export': {
+        const forced = this.takeForced('conversation.export');
+        if (forced) return forced;
+        if (this.exportPages) {
+          const next = this.exportPages.shift();
+          return next === undefined ? { err: { code: 'INTERNAL', message: 'no scripted page' } } : { ok: next };
+        }
+        const row = this.conversations.get(String(p['conversationId']));
+        if (!row) return { err: { code: 'NOT_FOUND', message: 'conversation not found' } };
+        return {
+          ok: {
+            format: 'sandpane.conversation-export.v1',
+            exportedAt: '2026-10-11T12:00:00Z',
+            conversation: { ...row },
+            messages: [{ id: 'm1', conversationId: row['id'], role: 'user', content: 'PRIVATE-MESSAGE-BODY', sequence: 1 }],
+            truncated: false,
+            nextSequence: 1,
+            redaction: { bestEffort: true, replacements: 0, byKind: {} },
+          },
+        };
+      }
       case 'task.subscribe': {
         const project = p['projectId'];
         const taskId = p['taskId'];
         const cursors = (p['afterSequences'] ?? {}) as Record<string, number>;
         const out = [...this.events.entries()]
           .filter(([id]) => this.taskProject.get(id) === project && (taskId === undefined || taskId === id))
+          // A deleted conversation's task events are deleted with it (A3b).
+          .filter(([id]) => id !== 'task-a' || this.conversations.has('c1'))
           .flatMap(([id, list]) =>
             list.filter((e) => e.sequence > (taskId ? Number(p['afterSequence']) : (cursors[id] ?? Number(p['afterSequence'])))),
           );
         return { ok: out };
       }
-      case 'conversation.create':
+      case 'conversation.create': {
         this.convCounter += 1;
-        return { ok: { id: `conv-new-${this.convCounter}`, projectId: p['projectId'], title: 't', agentId: 'codex', createdAt: '' } };
+        const row: Record<string, unknown> = { id: `conv-new-${this.convCounter}`, projectId: p['projectId'], title: 't', agentId: 'codex', createdAt: '' };
+        if (typeof p['sandboxId'] === 'string') row['sandboxId'] = p['sandboxId'];
+        this.conversations.set(String(row['id']), row);
+        return { ok: { ...row } };
+      }
       case 'conversation.send': {
+        const target = this.conversations.get(String(p['conversationId']));
+        if (target && target['archivedAt'] !== undefined && !this.forced.has('conversation.send')) {
+          return { err: { code: 'VALIDATION_FAILED', message: 'conversation is archived; unarchive it first; nothing was changed' } };
+        }
         const stored = this.replayFor(frame);
         if (stored) return stored;
         const forced = this.takeForced(frame.method);
@@ -1640,6 +1728,573 @@ describe('A3a project lifecycle', () => {
     expect(stub.errors.at(-1)).toContain(
       'The repository was unregistered from the project while the sandbox was being prepared; nothing was run.',
     );
+    session.dispose();
+  });
+});
+
+describe('A3b conversation lifecycle', () => {
+  const ARCHIVED_MSG = 'conversation is archived; unarchive it first; nothing was changed';
+  const PROJECT_ARCHIVED_MSG = 'project is archived; unarchive it first; nothing was changed';
+
+  /** Online session scoped to p1; `c1` optionally selected (sandbox scope: none). */
+  async function online(core = new ScriptedCore(), state = new MemoryState(), opts: { selectC1?: boolean } = {}) {
+    if (!state.values.has('sandpane.ui.selectedProject')) state.values.set('sandpane.ui.selectedProject', 'p1');
+    if (opts.selectC1) {
+      state.values.set('sandpane.ui.conversation', { id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', sandboxName: null });
+    }
+    const made = makeSession(core, state);
+    const logged: string[] = [];
+    made.session.setOutputChannel({ appendLine: (line: string) => logged.push(line) } as unknown as vscode.OutputChannel);
+    await made.session.attach();
+    await settle();
+    return { core, logged, ...made };
+  }
+  const row = (session: SandpaneSession, id: string) => session.snapshot().conversations.rows.find((r) => r.id === id);
+  const archivedRow = (id: string, title: string): Record<string, unknown> => ({
+    id, projectId: 'p1', title, agentId: 'codex', createdAt: '', archivedAt: '2026-10-11T10:00:00Z',
+  });
+  const A3B_FRAMES = ['conversation.rename', 'conversation.archive', 'conversation.unarchive', 'conversation.delete', 'conversation.export'];
+
+  it('every action is refused visibly — no frame — when this Core does not advertise it', async () => {
+    const core = new ScriptedCore();
+    core.methods = PRE_A3B_METHODS;
+    const { session } = await online(core);
+    await session.renameConversation('c1');
+    await session.archiveConversation('c1');
+    await session.unarchiveConversation('c1');
+    await session.deleteConversation('c1');
+    await session.exportConversation('c1');
+    await session.toggleShowArchivedConversations();
+    for (const m of A3B_FRAMES) expect(core.calls(m), m).toHaveLength(0);
+    expect(stub.warnings.filter((w) => /not supported by the attached Sandpane Core/.test(w))).toHaveLength(6);
+    expect(stub.inputCalls).toHaveLength(0);
+    expect(stub.saveCalls).toHaveLength(0);
+    expect(core.calls('conversation.list').every((f) => !('includeArchived' in f.params))).toBe(true);
+    const r = row(session, 'c1');
+    for (const action of ['rename', 'archive', 'export', 'delete'] as const) {
+      expect(r?.actions[action].enabled, action).toBe(false);
+      expect(r?.actions[action].reason, action).toMatch(/not supported by the attached Sandpane Core/);
+    }
+    expect(session.snapshot().conversations.showArchivedSupported).toBe(false);
+    session.dispose();
+  });
+
+  it('"show archived" sends includeArchived:true only when on (and advertised), persists as a UI preference, labels archived rows', async () => {
+    const core = new ScriptedCore();
+    core.conversations.set('c2', archivedRow('c2', 'Old'));
+    const { session, state } = await online(core);
+    expect(session.snapshot().conversations.rows.map((r) => r.id)).toEqual(['c1']);
+    expect(core.calls('conversation.list').every((f) => !('includeArchived' in f.params))).toBe(true);
+
+    await session.toggleShowArchivedConversations();
+    expect(core.calls('conversation.list').at(-1)?.params).toEqual({ projectId: 'p1', includeArchived: true });
+    expect(state.values.get('sandpane.ui.showArchivedConversations')).toBe(true);
+    const old = row(session, 'c2');
+    expect(old?.archived).toBe(true);
+    expect(old?.statusNote).toContain('ARCHIVED');
+    expect(old?.actions.rename).toEqual({ enabled: false, reason: expect.stringContaining(ARCHIVED_MSG) as unknown });
+    expect(old?.actions.unarchive.enabled).toBe(true);
+    expect(row(session, 'c1')?.archived).toBe(false);
+
+    await session.toggleShowArchivedConversations();
+    expect(core.calls('conversation.list').at(-1)?.params).toEqual({ projectId: 'p1' });
+    expect(session.snapshot().conversations.rows.map((r) => r.id)).toEqual(['c1']);
+    session.dispose();
+  });
+
+  it('without conversation.archive advertised, "show archived" is refused and includeArchived is never sent', async () => {
+    const core = new ScriptedCore();
+    core.methods = ALL_METHODS.filter((m) => m !== 'conversation.archive');
+    const { session } = await online(core);
+    await session.toggleShowArchivedConversations();
+    expect(session.snapshot().conversations.showArchived).toBe(false);
+    expect(core.calls('conversation.list').every((f) => !('includeArchived' in f.params))).toBe(true);
+    expect(stub.warnings.at(-1)).toMatch(/"conversation\.archive"/);
+    session.dispose();
+  });
+
+  it('rename: native input box with Core\'s validator, exact frame, then conversation.list is re-read', async () => {
+    const { core, session } = await online();
+    stub.inputs.push('Auth v2');
+    const before = core.calls('conversation.list').length;
+    await session.renameConversation('c1');
+    const call = stub.inputCalls[0];
+    expect(call?.value).toBe('Auth');
+    expect(call?.validateInput?.('   ')).toMatch(/whitespace-only/);
+    expect(call?.validateInput?.('a\nb')).toMatch(/Core would refuse this title/);
+    expect(call?.validateInput?.('Auth v2')).toBeUndefined();
+    expect(core.calls('conversation.rename').map((f) => f.params)).toEqual([{ conversationId: 'c1', title: 'Auth v2' }]);
+    expect(core.calls('conversation.list').length).toBeGreaterThan(before);
+    expect(row(session, 'c1')?.title).toBe('Auth v2');
+    expect(session.snapshot().status?.text).toBe('Conversation renamed to "Auth v2" in Core.');
+    session.dispose();
+  });
+
+  it('rename cancelled or unchanged sends nothing; a stored title Core would refuse is not prefilled', async () => {
+    const core = new ScriptedCore();
+    (core.conversations.get('c1') as Record<string, unknown>)['title'] = 'Auth\tlegacy';
+    const { session } = await online(core);
+    stub.inputs.push(undefined);
+    await session.renameConversation('c1');
+    expect(stub.inputCalls[0]?.value).toBe('');
+    stub.inputs.push('Auth\tlegacy');
+    await session.renameConversation('c1');
+    expect(core.calls('conversation.rename')).toHaveLength(0);
+    expect(session.snapshot().status?.text).toMatch(/nothing was sent/);
+    session.dispose();
+  });
+
+  it('an archived conversation: send and rename are disabled with Core\'s reason; nothing is sent; history stays shown', async () => {
+    const core = new ScriptedCore();
+    (core.conversations.get('c1') as Record<string, unknown>)['archivedAt'] = '2026-10-11T10:00:00Z';
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.showArchivedConversations', true);
+    const { session } = await online(core, state, { selectC1: true });
+    const snap = session.snapshot();
+    expect(snap.conversation).toMatchObject({ id: 'c1', archived: true });
+    expect(snap.composerBlocked).toContain(ARCHIVED_MSG);
+    expect(snap.lines.map((l) => l.text)).toEqual(['from p1']);
+    await session.renameConversation('c1');
+    expect(stub.inputCalls).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toContain(ARCHIVED_MSG);
+    const plan = session.previewContext(false);
+    await session.send('hello', false, plan.planId);
+    expect(core.calls('conversation.send')).toHaveLength(0);
+    expect(core.calls('conversation.create')).toHaveLength(0);
+    expect(session.snapshot().status?.text).toContain(ARCHIVED_MSG);
+    for (const m of ['conversation.rename']) expect(core.calls(m)).toHaveLength(0);
+    session.dispose();
+  });
+
+  it('archived project AND archived conversation: the PROJECT reason comes first; unarchive is refused locally', async () => {
+    const core = new ScriptedCore();
+    core.archived.add('p1');
+    (core.conversations.get('c1') as Record<string, unknown>)['archivedAt'] = '2026-10-11T10:00:00Z';
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.showArchivedProjects', true);
+    state.values.set('sandpane.ui.showArchivedConversations', true);
+    const { session } = await online(core, state, { selectC1: true });
+    expect(session.snapshot().composerBlocked).toContain(PROJECT_ARCHIVED_MSG);
+    expect(session.snapshot().composerBlocked).not.toContain(ARCHIVED_MSG);
+    await session.renameConversation('c1');
+    expect(stub.warnings.at(-1)).toContain(PROJECT_ARCHIVED_MSG);
+    await session.unarchiveConversation('c1');
+    expect(stub.warnings.at(-1)).toContain(PROJECT_ARCHIVED_MSG);
+    expect(row(session, 'c1')?.actions.unarchive).toEqual({ enabled: false, reason: expect.stringContaining(PROJECT_ARCHIVED_MSG) as unknown });
+    // Archive and delete stay allowed in an archived project.
+    expect(row(session, 'c1')?.actions.delete.enabled).toBe(true);
+    for (const m of ['conversation.rename', 'conversation.unarchive']) expect(core.calls(m), m).toHaveLength(0);
+    session.dispose();
+  });
+
+  it('archiving the selected conversation while archived ones are hidden deselects it and clears the preference', async () => {
+    const { core, session, state } = await online(new ScriptedCore(), new MemoryState(), { selectC1: true });
+    expect(session.snapshot().conversation?.id).toBe('c1');
+    await session.archiveConversation('c1');
+    expect(core.calls('conversation.archive').map((f) => f.params)).toEqual([{ conversationId: 'c1' }]);
+    expect(session.snapshot().conversation).toBeNull();
+    expect(state.values.has('sandpane.ui.conversation')).toBe(false);
+    expect(session.snapshot().status?.text).toMatch(/archived in Core.*hidden from the list/);
+    session.dispose();
+  });
+
+  it('archiving while archived ones are shown keeps it selected, labeled; unarchive re-enables send', async () => {
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.showArchivedConversations', true);
+    const { core, session } = await online(new ScriptedCore(), state, { selectC1: true });
+    await session.archiveConversation('c1');
+    expect(session.snapshot().conversation).toMatchObject({ id: 'c1', archived: true });
+    expect(session.snapshot().composerBlocked).toContain(ARCHIVED_MSG);
+    await session.unarchiveConversation('c1');
+    expect(core.calls('conversation.unarchive').map((f) => f.params)).toEqual([{ conversationId: 'c1' }]);
+    expect(session.snapshot().conversation).toMatchObject({ id: 'c1', archived: false });
+    expect(session.snapshot().composerBlocked).toBeNull();
+    session.dispose();
+  });
+
+  it('a send Core refuses because the conversation was archived elsewhere gets honest copy and re-reads the list', async () => {
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedSandbox', 'atlas-box');
+    state.values.set('sandpane.ui.conversation', { id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', sandboxName: 'atlas-box' });
+    const { core, session } = await online(new ScriptedCore(), state);
+    (core.conversations.get('c1') as Record<string, unknown>)['archivedAt'] = '2026-10-11T10:00:00Z';
+    const lists = core.calls('conversation.list').length;
+    const plan = session.previewContext(true);
+    await session.send('edit it', true, plan.planId);
+    await settle();
+    expect(core.calls('conversation.send')).toHaveLength(1);
+    expect(stub.errors.at(-1)).toContain('This conversation is archived. Unarchive it first; nothing was changed.');
+    expect(stub.errors.at(-1)).not.toMatch(/conversation not found/);
+    expect(core.calls('conversation.list').length).toBeGreaterThan(lists);
+    session.dispose();
+  });
+
+  it('a new conversation\'s title is derived Core-valid from a multi-line first message (no \\n, cut by code point)', async () => {
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedSandbox', 'atlas-box');
+    const { core, session } = await online(new ScriptedCore(), state);
+    const text = `fix\nthe\tbug ${'a'.repeat(70)}${String.fromCodePoint(0x1f600)}tail`;
+    const plan = session.previewContext(true);
+    await session.send(text, true, plan.planId);
+    await settle();
+    const title = String(core.calls('conversation.create')[0]?.params['title']);
+    expect(title).not.toMatch(/[\n\t]/);
+    expect(Array.from(title).length).toBeLessThanOrEqual(80);
+    expect(title.startsWith('fix the bug ')).toBe(true);
+    expect(core.calls('conversation.send')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it('"sandbox chosen at creation" appears only when the feature is advertised; a missing sandbox is flagged', async () => {
+    const core = new ScriptedCore();
+    core.features = ['idempotency-keys', 'sandbox-create-agent', 'conversation-sandbox-id'];
+    (core.conversations.get('c1') as Record<string, unknown>)['sandboxId'] = 'gone-box';
+    core.conversations.set('c3', { id: 'c3', projectId: 'p1', title: 'Box', agentId: 'codex', createdAt: '', sandboxId: 'atlas-box' });
+    core.conversations.set('c4', { id: 'c4', projectId: 'p1', title: 'None', agentId: 'codex', createdAt: '' });
+    const { session } = await online(core);
+    expect(row(session, 'c1')?.sandboxLabel).toBe('sandbox chosen at creation: gone-box (not in the current sandbox list)');
+    expect(row(session, 'c3')?.sandboxLabel).toBe('sandbox chosen at creation: atlas-box');
+    expect(row(session, 'c4')?.sandboxLabel).toBe('no sandbox recorded at creation');
+    session.dispose();
+
+    const noSbx = new ScriptedCore();
+    noSbx.features = ['conversation-sandbox-id'];
+    noSbx.sandboxListError = { code: 'NOT_INSTALLED', message: 'sbx CLI not found' };
+    (noSbx.conversations.get('c1') as Record<string, unknown>)['sandboxId'] = 'atlas-box';
+    const failed = await online(noSbx);
+    expect(row(failed.session, 'c1')?.sandboxLabel).toBe('sandbox chosen at creation: atlas-box (the sandbox list could not be read)');
+    failed.session.dispose();
+
+    const older = new ScriptedCore();
+    (older.conversations.get('c1') as Record<string, unknown>)['sandboxId'] = 'atlas-box';
+    const second = await online(older);
+    expect(row(second.session, 'c1')?.sandboxLabel).toBeNull();
+    second.session.dispose();
+  });
+
+  it('selecting a conversation from the list: only ids Core listed; "" starts a new one', async () => {
+    const { session, state } = await online();
+    session.selectConversation('c1');
+    expect(session.snapshot().conversation?.id).toBe('c1');
+    expect(row(session, 'c1')?.selected).toBe(true);
+    expect((state.values.get('sandpane.ui.conversation') as { id: string }).id).toBe('c1');
+    session.selectConversation('c-unknown');
+    expect(session.snapshot().conversation?.id).toBe('c1');
+    expect(session.snapshot().status?.text).toMatch(/not listed by Core/);
+    session.selectConversation('');
+    expect(session.snapshot().conversation).toBeNull();
+    expect(state.values.has('sandpane.ui.conversation')).toBe(false);
+    session.dispose();
+  });
+
+  it('webview messages route to the actions; an unlisted id sends nothing', async () => {
+    const { core, session } = await online();
+    session.handleWebviewMessage({ type: 'conversationAction', action: 'archive', conversationId: 'c-unknown' });
+    await settle();
+    expect(core.calls('conversation.archive')).toHaveLength(0);
+    session.handleWebviewMessage({ type: 'conversationAction', action: 'archive', conversationId: 'c1' });
+    await settle();
+    expect(core.calls('conversation.archive')).toHaveLength(1);
+    session.handleWebviewMessage({ type: 'toggleArchivedConversations' });
+    await settle();
+    expect(session.snapshot().conversations.showArchived).toBe(true);
+    session.dispose();
+  });
+
+  // --- delete (A1 two-step pattern) ---
+
+  it('delete: step 1 {conversationId} → native modal; confirm sends step 2 with that token; client state and its tasks are dropped', async () => {
+    const { core, session, state } = await online(new ScriptedCore(), new MemoryState(), { selectC1: true });
+    expect(session.snapshot().tasks.map((t) => t.taskId)).toEqual(['task-a']);
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    expect(await session.deleteConversation('c1')).toBe(true);
+    expect(core.calls('conversation.delete').map((f) => f.params)).toEqual([
+      { conversationId: 'c1' },
+      { conversationId: 'c1', confirmToken: TOKEN },
+    ]);
+    const modal = stub.warningCalls.find((c) => c.items.includes('Delete conversation'));
+    expect(modal?.options?.modal).toBe(true);
+    expect(modal?.message).toBe('Delete conversation "Auth"?');
+    expect(modal?.options?.detail).toContain('Conversation id: c1');
+    expect(modal?.options?.detail).toContain('• 3 messages and 1 task are deleted');
+    expect(modal?.options?.detail).not.toContain(TOKEN);
+    await settle();
+    const snap = session.snapshot();
+    expect(snap.conversation).toBeNull();
+    expect(state.values.has('sandpane.ui.conversation')).toBe(false);
+    expect(snap.conversations.rows.map((r) => r.id)).toEqual([]);
+    expect(snap.tasks.map((t) => t.taskId)).toEqual([]);
+    expect(snap.status?.text).toMatch(/^Core deleted conversation "Auth" \(its Core records only/);
+    session.dispose();
+  });
+
+  it('delete cancelled sends step 1 only; an expired confirmation at click time sends nothing more', async () => {
+    const { core, session } = await online();
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(core.calls('conversation.delete')).toHaveLength(1);
+    expect(session.snapshot().status?.text).toMatch(/nothing was sent/);
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    clock.after = { reads: clock.reads.length + 1, now: Date.parse('2026-10-10T12:02:00Z') };
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(core.calls('conversation.delete').filter((f) => f.params['confirmToken'] !== undefined)).toHaveLength(0);
+    expect(session.snapshot().status?.text).toBe('Confirmation expired — nothing was sent; run Delete Conversation again.');
+    session.dispose();
+  });
+
+  it('an unreadable expiry fails closed at click time (nothing sent)', async () => {
+    const core = new ScriptedCore();
+    core.conversationConfirmation = { ...core.conversationConfirmation, expiresAt: 'soon' };
+    const { session } = await online(core);
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(core.calls('conversation.delete')).toHaveLength(1);
+    session.dispose();
+  });
+
+  it.each([
+    ['CONFLICT', 'conversation has tasks that are not finished; cancel or finish them first; nothing was deleted', 'The conversation has unfinished tasks. Cancel or finish them first; nothing was deleted.'],
+    ['VALIDATION_FAILED', 'confirmation token is invalid, expired, already used, or not for this action and target; request a new confirmation', 'Core refused the confirmation (invalid, expired or already used). Nothing was deleted — run Delete Conversation again for a fresh confirmation.'],
+  ])('delete step 2 %s "%s" → honest copy, no retry, selection kept', async (code, message, copy) => {
+    const core = new ScriptedCore();
+    core.forced.set('conversation.delete', { code, message });
+    const { session, state } = await online(core, new MemoryState(), { selectC1: true });
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(core.calls('conversation.delete')).toHaveLength(2);
+    expect(stub.errors.at(-1)).toContain(copy);
+    expect(stub.errors.at(-1)).toContain(`Core said: ${code}: ${message}`);
+    expect(state.values.has('sandpane.ui.conversation')).toBe(true);
+    session.dispose();
+  });
+
+  it('delete step 1 CONFLICT (unfinished tasks) → copy, no modal, nothing deleted', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('conversation.delete.step1', { code: 'CONFLICT', message: 'conversation has tasks that are not finished; cancel or finish them first; nothing was deleted' });
+    const { session } = await online(core);
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(stub.warningCalls.some((c) => c.items.includes('Delete conversation'))).toBe(false);
+    expect(stub.errors.at(-1)).toContain('The conversation has unfinished tasks. Cancel or finish them first; nothing was deleted.');
+    session.dispose();
+  });
+
+  it('delete step 2 NOT_FOUND (deleted elsewhere) forgets the conversation like deleted:true', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('conversation.delete', { code: 'NOT_FOUND', message: 'conversation not found' });
+    core.deleteConversationBeforeForcedError = true;
+    const { session, state } = await online(core, new MemoryState(), { selectC1: true });
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(stub.errors.at(-1)).toContain('Core has no such conversation (it may have been deleted); nothing was changed.');
+    expect(state.values.has('sandpane.ui.conversation')).toBe(false);
+    expect(session.snapshot().conversation).toBeNull();
+    session.dispose();
+  });
+
+  it('delete step 2 INTERNAL is UNKNOWN (never "nothing was deleted"); a project-scoped includeArchived re-read settles it', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('conversation.delete', { code: 'INTERNAL', message: 'database is locked' });
+    const { session, state } = await online(core, new MemoryState(), { selectC1: true });
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    expect(await session.deleteConversation('c1')).toBe(false);
+    const shown = stub.errors.at(-1) ?? '';
+    expect(shown).toContain('Outcome UNKNOWN');
+    expect(shown).not.toMatch(/nothing was deleted/i);
+    expect(core.calls('conversation.list').some((f) => JSON.stringify(f.params) === JSON.stringify({ projectId: 'p1', limit: 500, includeArchived: true }))).toBe(true);
+    expect(core.calls('conversation.delete')).toHaveLength(2);
+    expect(session.snapshot().status?.text).toBe(
+      'Core still lists the conversation as of this re-read — it was not deleted (Core answered the delete request, so that request has finished).',
+    );
+    expect(state.values.has('sandpane.ui.conversation')).toBe(true);
+    session.dispose();
+  });
+
+  it('delete step 2 INTERNAL after Core did delete: the re-read settles it and client state is dropped, no retry', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('conversation.delete', { code: 'INTERNAL', message: 'database is locked' });
+    core.deleteConversationBeforeForcedError = true;
+    const { session, state } = await online(core, new MemoryState(), { selectC1: true });
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(core.calls('conversation.delete')).toHaveLength(2);
+    expect(session.snapshot().status?.text).toBe('Core no longer lists this conversation; the outcome of this request was not confirmed.');
+    expect(session.snapshot().status?.text).not.toMatch(/took effect/);
+    expect(state.values.has('sandpane.ui.conversation')).toBe(false);
+    expect(session.snapshot().conversation).toBeNull();
+    session.dispose();
+  });
+
+  it('delete step 2 with no answer (timeout): "still lists as of this re-read", never "not deleted"', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('conversation.delete', { code: 'INTERNAL', message: 'never delivered' });
+    core.hold = (f) => f.method === 'conversation.delete' && f.params['confirmToken'] !== undefined;
+    const { session, timers } = await online(core);
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    const pending = session.deleteConversation('c1');
+    await settle();
+    const timer = timers.pending.find((t) => t.ms === 15_000);
+    if (!timer) throw new Error('no pending 15 s timer');
+    timers.clear(timer.id);
+    timer.fn();
+    expect(await pending).toBe(false);
+    await settle();
+    expect(stub.errors.at(-1)).toContain('Outcome UNKNOWN');
+    const text = session.snapshot().status?.text ?? '';
+    expect(text).toBe(
+      'Core still lists the conversation as of this re-read. Core never answered the delete request, so it may still finish — re-read before acting; not retried.',
+    );
+    expect(core.calls('conversation.delete')).toHaveLength(2);
+    session.dispose();
+  });
+
+  it('an unknown outcome whose re-read returns a FULL page without the id stays UNKNOWN (absence from a full page is no proof)', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('conversation.delete', { code: 'INTERNAL', message: 'database is locked' });
+    core.deleteConversationBeforeForcedError = true;
+    for (let i = 0; i < 500; i += 1) {
+      core.conversations.set(`f${i}`, { id: `f${i}`, projectId: 'p1', title: `F${i}`, agentId: 'codex', createdAt: '' });
+    }
+    const { session, state } = await online(core, new MemoryState(), { selectC1: true });
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(session.snapshot().status?.text).toMatch(/full page.*UNKNOWN/);
+    expect(state.values.has('sandpane.ui.conversation')).toBe(true);
+    session.dispose();
+  });
+
+  it('Info 1: without conversation.archive the settle re-read is live-only — absence proves nothing, the conversation is NOT forgotten', async () => {
+    const core = new ScriptedCore();
+    core.methods = ALL_METHODS.filter((m) => m !== 'conversation.archive');
+    core.forced.set('conversation.delete', { code: 'INTERNAL', message: 'database is locked' });
+    // Core archived it (not deleted) — a live-only list cannot tell the difference.
+    const { session, state } = await online(core, new MemoryState(), { selectC1: true });
+    (core.conversations.get('c1') as Record<string, unknown>)['archivedAt'] = '2026-10-11T10:00:00Z';
+    stub.answers.set('Delete conversation', 'Delete conversation');
+    expect(await session.deleteConversation('c1')).toBe(false);
+    const settleList = core.calls('conversation.list').find((f) => f.params['limit'] === 500);
+    expect(settleList?.params).toEqual({ projectId: 'p1', limit: 500 });
+    const text = session.snapshot().status?.text ?? '';
+    expect(text).toMatch(/UNKNOWN/);
+    expect(text).not.toMatch(/took effect|no longer lists/);
+    expect(state.values.has('sandpane.ui.conversation')).toBe(true);
+    expect(session.snapshot().conversation?.id).toBe('c1');
+    session.dispose();
+  });
+
+  it('Info 2: delete and export are single-flight — a second request while one is in flight sends nothing', async () => {
+    const core = new ScriptedCore();
+    const { session } = await online(core);
+    core.hold = (f) => f.method === 'conversation.delete' && f.params['confirmToken'] === undefined;
+    const first = session.deleteConversation('c1');
+    expect(await session.deleteConversation('c1')).toBe(false);
+    expect(await session.exportConversation('c1')).toBe(false);
+    session.handleWebviewMessage({ type: 'conversationAction', action: 'delete', conversationId: 'c1' });
+    await settle();
+    expect(core.calls('conversation.delete')).toHaveLength(1);
+    expect(core.calls('conversation.export')).toHaveLength(0);
+    expect(stub.warnings.filter((w) => /already in progress/.test(w)).length).toBeGreaterThanOrEqual(2);
+    core.hold = null;
+    core.release();
+    expect(await first).toBe(false); // modal not confirmed
+    // Once the first finished, the next one runs normally.
+    stub.saveUri = undefined;
+    expect(await session.exportConversation('c1')).toBe(false);
+    expect(core.calls('conversation.export')).toHaveLength(1);
+    session.dispose();
+  });
+
+  // --- export ---
+
+  it('export: pages are collected, the native save dialog proposes <redacted-title>-export.json, the file is written ONLY to the chosen URI', async () => {
+    const core = new ScriptedCore();
+    const page = (seqs: number[], truncated: boolean, next: number, byKind: Record<string, number>) => ({
+      format: 'sandpane.conversation-export.v1',
+      exportedAt: '2026-10-11T12:00:00Z',
+      conversation: { id: 'c1', projectId: 'p1', title: '[REDACTED:token] Auth', agentId: 'codex', createdAt: '' },
+      messages: seqs.map((n) => ({ id: `m${n}`, conversationId: 'c1', role: 'user', content: `PRIVATE-BODY-${n}`, sequence: n })),
+      truncated,
+      nextSequence: next,
+      redaction: { bestEffort: true, replacements: Object.values(byKind).reduce((a, b) => a + b, 0), byKind },
+    });
+    core.exportPages = [page([1, 2], true, 2, { token: 2 }), page([3], false, 3, { jwt: 1, token: 1 })];
+    const { session, logged } = await online(core);
+    stub.saveUri = Uri.file('/chosen/dir/my-export.json');
+    expect(await session.exportConversation('c1')).toBe(true);
+    expect(core.calls('conversation.export').map((f) => f.params)).toEqual([
+      { conversationId: 'c1', afterSequence: 0 },
+      { conversationId: 'c1', afterSequence: 2 },
+    ]);
+    const dialog = stub.saveCalls[0];
+    expect(dialog?.defaultUri?.fsPath.endsWith('/REDACTED-token-Auth-export.json')).toBe(true);
+    expect(dialog?.filters).toEqual({ JSON: ['json'] });
+    expect(dialog?.title).toContain('Redaction is best-effort; review the export before sharing it.');
+    expect(stub.fileWrites).toHaveLength(1);
+    expect(stub.fileWrites[0]?.uri).toBe(stub.saveUri);
+    const file = JSON.parse(new TextDecoder().decode(stub.fileWrites[0]?.bytes)) as Record<string, unknown>;
+    expect(file['complete']).toBe(true);
+    expect(file['redaction']).toEqual({ bestEffort: true, replacements: 4, byKind: { jwt: 1, token: 3 } });
+    expect((file['messages'] as unknown[]).length).toBe(3);
+    expect(file['note']).toBe('Redaction is best-effort; review before sharing. Task events, artifacts and verification output are not included.');
+    const status = session.snapshot().status?.text ?? '';
+    expect(status).toContain('4 redaction replacement(s)');
+    expect(status).toContain('Redaction is best-effort; review the export before sharing it.');
+    expect(status).toContain('/chosen/dir/my-export.json');
+    // The export content is never logged.
+    expect(logged.join('\n')).not.toContain('PRIVATE-BODY');
+    session.dispose();
+  });
+
+  it('export: cancelling the save dialog writes nothing', async () => {
+    const { core, session } = await online();
+    stub.saveUri = undefined;
+    expect(await session.exportConversation('c1')).toBe(false);
+    expect(core.calls('conversation.export')).toHaveLength(1);
+    expect(stub.saveCalls).toHaveLength(1);
+    expect(stub.fileWrites).toHaveLength(0);
+    expect(session.snapshot().status?.text).toMatch(/nothing was written/);
+    session.dispose();
+  });
+
+  it('export: a page failure writes no file and never asks where to save', async () => {
+    const core = new ScriptedCore();
+    core.forced.set('conversation.export', { code: 'INTERNAL', message: 'redaction engine unavailable; nothing was exported (Core never exports unredacted text)' });
+    const { session } = await online(core);
+    stub.saveUri = Uri.file('/chosen/x.json');
+    expect(await session.exportConversation('c1')).toBe(false);
+    expect(stub.saveCalls).toHaveLength(0);
+    expect(stub.fileWrites).toHaveLength(0);
+    expect(stub.errors.at(-1)).toMatch(/No file was written/);
+    session.dispose();
+  });
+
+  it('export: a cursor that does not advance is written as a disclosed PARTIAL export (complete:false)', async () => {
+    const core = new ScriptedCore();
+    const base = {
+      format: 'sandpane.conversation-export.v1',
+      exportedAt: '2026-10-11T12:00:00Z',
+      conversation: { id: 'c1', projectId: 'p1', title: 'Auth', agentId: 'codex', createdAt: '' },
+      redaction: { bestEffort: true, replacements: 0, byKind: {} },
+    };
+    core.exportPages = [
+      { ...base, messages: [{ id: 'm1', conversationId: 'c1', role: 'user', content: 'x', sequence: 1 }], truncated: true, nextSequence: 1 },
+      { ...base, messages: [], truncated: true, nextSequence: 1 },
+    ];
+    const { session } = await online(core);
+    stub.saveUri = Uri.file('/chosen/partial.json');
+    expect(await session.exportConversation('c1')).toBe(true);
+    const file = JSON.parse(new TextDecoder().decode(stub.fileWrites[0]?.bytes)) as Record<string, unknown>;
+    expect(file['complete']).toBe(false);
+    expect(stub.saveCalls[0]?.title).toMatch(/PARTIAL/);
+    expect(session.snapshot().status?.text).toMatch(/PARTIAL/);
+    session.dispose();
+  });
+
+  it('export: a failed write is reported honestly', async () => {
+    const { session } = await online();
+    stub.saveUri = Uri.file('/read-only/x.json');
+    stub.writeError = new Error('EACCES: permission denied');
+    expect(await session.exportConversation('c1')).toBe(false);
+    expect(stub.errors.at(-1)).toMatch(/could not be written/);
+    expect(session.snapshot().status?.text).not.toMatch(/Redacted export written to/);
     session.dispose();
   });
 });

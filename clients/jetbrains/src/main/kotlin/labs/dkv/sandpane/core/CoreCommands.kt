@@ -4,8 +4,8 @@
 //   * NOTHING is sent that the guards in [CoreGuards] refuse — an invalid id, limit or cursor
 //     map never reaches the socket, and the returned future fails with [CoreValidationException],
 //     which is this client's word, never a Core verdict (AGENTS.md rule 5).
-//   * The additive methods (the three v1 reads, the A1 sandbox lifecycle and the A3a project
-//     lifecycle) are gated on
+//   * The additive methods (the three v1 reads, the A1 sandbox lifecycle, the A3a project
+//     lifecycle and the A3b conversation lifecycle) are gated on
 //     ADVERTISEMENT (`CoreCapabilities.methods`), not on a version number: `protocolVersion` stayed
 //     1 across these revisions, so assuming a method from it would send a request an older Core
 //     answers with VALIDATION_FAILED.
@@ -14,9 +14,15 @@
 package labs.dkv.sandpane.core
 
 import labs.dkv.sandpane.model.Conversation
+import labs.dkv.sandpane.model.ConversationDeleteParams
+import labs.dkv.sandpane.model.ConversationDeleteResult
+import labs.dkv.sandpane.model.ConversationExportParams
+import labs.dkv.sandpane.model.ConversationExportResult
 import labs.dkv.sandpane.model.ConversationHistoryParams
 import labs.dkv.sandpane.model.ConversationHistoryResult
+import labs.dkv.sandpane.model.ConversationIdParams
 import labs.dkv.sandpane.model.ConversationListParams
+import labs.dkv.sandpane.model.ConversationRenameParams
 import labs.dkv.sandpane.model.CoreCapabilities
 import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.model.CoreErrorCodes
@@ -78,8 +84,8 @@ class CoreCommands(
      * Refusing locally keeps a pre-revision Core from answering for a surface it never promised,
      * and keeps the refusal out of the wire entirely. The eleven original methods need no gate —
      * they are the protocol-v1 baseline every Core dispatches; everything in
-     * [CoreMethods.REQUIRES_ADVERTISEMENT] (the discovery reads, the A1 sandbox lifecycle and the A3a
-     * project lifecycle) does.
+     * [CoreMethods.REQUIRES_ADVERTISEMENT] (the discovery reads, the A1 sandbox lifecycle, the A3a
+     * project lifecycle and the A3b conversation lifecycle) does.
      */
     fun advertisementGap(method: String): MethodNotSupportedException? {
         if (!CoreMethods.REQUIRES_ADVERTISEMENT.contains(method)) return null
@@ -132,17 +138,31 @@ class CoreCommands(
     // -----------------------------------------------------------------------
 
     /**
-     * `conversation.list` → the conversations Core says may be reopened. Archived rows are
-     * excluded by Core, so this is exactly what the UI may offer.
+     * `conversation.list` → Core's conversations for the scope. Live ones only unless
+     * [ConversationListParams.includeArchived] is true — which is sent ONLY when Core advertises
+     * `conversation.archive` (A3b): a pre-A3b Core silently ignores the flag, so sending it there would
+     * present a live-only list as "including archived". Without it the frame is unchanged.
      */
     fun conversationList(
         params: ConversationListParams = ConversationListParams(),
     ): CompletableFuture<List<Conversation>> {
         advertisementGap(CoreMethods.CONVERSATION_LIST)?.let { return CompletableFuture.failedFuture(it) }
+        if (params.includeArchived == true) {
+            advertisementGap(CoreMethods.CONVERSATION_ARCHIVE)?.let {
+                return CompletableFuture.failedFuture(
+                    MethodNotSupportedException(
+                        CoreMethods.CONVERSATION_LIST,
+                        "listing archived conversations needs ${CoreMethods.CONVERSATION_ARCHIVE}, which this Core does not advertise. Nothing was sent.",
+                    ),
+                )
+            }
+        }
         val payload = try {
             buildJsonObject {
                 CoreGuards.optionalScopingId(params.projectId, "projectId")?.let { put("projectId", it) }
                 params.limit?.let { put("limit", CoreGuards.clampLimit(it)) }
+                // Never `false` on the wire: absent already means live-only.
+                if (params.includeArchived == true) put("includeArchived", true)
             }
         } catch (e: CoreValidationException) {
             return CompletableFuture.failedFuture(e)
@@ -156,8 +176,8 @@ class CoreCommands(
      *
      * The result is an OBJECT (`messages` / `truncated` / `nextSequence`), never a bare array: a
      * page that stopped early must say so and hand back the cursor that continues it. An unknown
-     * or archived conversation is Core's `NOT_FOUND` — surfaced as a failed future, not turned
-     * into an empty list that reads as "no messages".
+     * conversation is Core's `NOT_FOUND` — surfaced as a failed future, not turned into an empty list
+     * that reads as "no messages". Since A3b Core also serves ARCHIVED conversations here.
      */
     fun conversationHistory(
         params: ConversationHistoryParams,
@@ -417,6 +437,131 @@ class CoreCommands(
             throw CoreValidationException("confirmToken", "not the shape Core issues; nothing was sent")
         }
         return CoreJson.encodeToJsonElement(ProjectDeleteParams.serializer(), ProjectDeleteParams(id, token))
+    }
+
+    // -----------------------------------------------------------------------
+    // conversation lifecycle (A3b)
+    // -----------------------------------------------------------------------
+
+    /**
+     * `conversation.rename {conversationId, title}` → Core's updated [Conversation]. The title must
+     * pass [ConversationGuards.renameTitleProblem] (Core's rule exactly, blank refused) or nothing is sent.
+     */
+    fun conversationRename(conversationId: String, title: String): CompletableFuture<Conversation> =
+        conversationCall(CoreMethods.CONVERSATION_RENAME) { buildConversationRenamePayload(conversationId, title) }
+
+    /** `conversation.archive {conversationId}` (idempotent in Core; allowed in an archived project). */
+    fun conversationArchive(conversationId: String): CompletableFuture<Conversation> =
+        conversationCall(CoreMethods.CONVERSATION_ARCHIVE) { buildConversationIdPayload(conversationId) }
+
+    /** `conversation.unarchive {conversationId}` (idempotent in Core; refused in an archived project). */
+    fun conversationUnarchive(conversationId: String): CompletableFuture<Conversation> =
+        conversationCall(CoreMethods.CONVERSATION_UNARCHIVE) { buildConversationIdPayload(conversationId) }
+
+    /**
+     * Step 1 of `conversation.delete`: `{conversationId}` with NO `confirmToken` key. Core deletes
+     * nothing and answers a confirmation, which must pass [ConversationDeleteCheck.decide] first.
+     */
+    fun conversationDeleteRequest(conversationId: String): CompletableFuture<ConversationDeleteResult> {
+        advertisementGap(CoreMethods.CONVERSATION_DELETE)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildConversationDeletePayload(conversationId, token = null)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.CONVERSATION_DELETE, payload).thenApply(::decodeConversationDeleteAnswer)
+    }
+
+    /**
+     * Step 2 of `conversation.delete`. Takes an [IssuedConversationDelete] — which only
+     * [ConversationDeleteCheck.decide] can make — so no token that did not come from step 1 for this
+     * conversation id can be sent.
+     */
+    fun conversationDeleteConfirm(issued: IssuedConversationDelete): CompletableFuture<ConversationDeleteResult> {
+        advertisementGap(CoreMethods.CONVERSATION_DELETE)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildConversationDeletePayload(issued.conversationId, token = issued.token)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.CONVERSATION_DELETE, payload).thenApply(::decodeConversationDeleteAnswer)
+    }
+
+    /**
+     * One `conversation.export` page (read-only, always redacted by Core, best-effort). An answer that
+     * does not decode is turned into fixed text: export content is never echoed into an error.
+     */
+    fun conversationExport(
+        conversationId: String,
+        afterSequence: Long = 0,
+        limit: Int? = null,
+    ): CompletableFuture<ConversationExportResult> {
+        advertisementGap(CoreMethods.CONVERSATION_EXPORT)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            buildConversationExportPayload(conversationId, afterSequence, limit)
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.CONVERSATION_EXPORT, payload)
+            .thenApply { ok ->
+                decodeOrFixed(CoreMethods.CONVERSATION_EXPORT) {
+                    CoreJson.decodeFromJsonElement(ConversationExportResult.serializer(), ok)
+                }
+            }
+    }
+
+    private fun conversationCall(method: String, build: () -> JsonElement): CompletableFuture<Conversation> {
+        advertisementGap(method)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            build()
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(method, payload)
+            .thenApply { ok -> decodeOrFixed(method) { CoreJson.decodeFromJsonElement(Conversation.serializer(), ok) } }
+    }
+
+    /** As [decodeDeleteAnswer]: a delete answer can carry a token, so it is never echoed. */
+    private fun decodeConversationDeleteAnswer(ok: JsonElement): ConversationDeleteResult = try {
+        CoreJson.decodeFromJsonElement(ConversationDeleteResult.serializer(), ok)
+    } catch (_: Exception) {
+        throw CoreRpcException(
+            CoreErrorCodes.INTERNAL,
+            "Core's ${CoreMethods.CONVERSATION_DELETE} answer did not have the expected shape; its content " +
+                "is not shown because it may carry a confirmation token",
+            raisedByCore = false,
+        )
+    }
+
+    /** `{conversationId, title}` after the id guard and Core's title rule (blank refused). */
+    internal fun buildConversationRenamePayload(conversationId: String, title: String): JsonElement {
+        val id = CoreGuards.requireId(conversationId, "conversationId")
+        ConversationGuards.renameTitleProblem(title)?.let { throw CoreValidationException("title", it) }
+        return CoreJson.encodeToJsonElement(ConversationRenameParams.serializer(), ConversationRenameParams(id, title))
+    }
+
+    internal fun buildConversationIdPayload(conversationId: String): JsonElement =
+        CoreJson.encodeToJsonElement(
+            ConversationIdParams.serializer(),
+            ConversationIdParams(CoreGuards.requireId(conversationId, "conversationId")),
+        )
+
+    /** `{conversationId}` (step 1, key ABSENT) or `{conversationId, confirmToken}` (step 2, Core's shape only). */
+    internal fun buildConversationDeletePayload(conversationId: String, token: String?): JsonElement {
+        val id = CoreGuards.requireId(conversationId, "conversationId")
+        if (token != null && !CoreGuards.isConfirmTokenShape(token)) {
+            throw CoreValidationException("confirmToken", "not the shape Core issues; nothing was sent")
+        }
+        return CoreJson.encodeToJsonElement(ConversationDeleteParams.serializer(), ConversationDeleteParams(id, token))
+    }
+
+    /** `{conversationId, afterSequence[, limit]}` — the cursor normalised like Core (negative ⇒ 0). */
+    internal fun buildConversationExportPayload(conversationId: String, afterSequence: Long, limit: Int?): JsonElement {
+        val id = CoreGuards.requireId(conversationId, "conversationId")
+        return CoreJson.encodeToJsonElement(
+            ConversationExportParams.serializer(),
+            ConversationExportParams(id, afterSequence.coerceAtLeast(0L), limit?.let { CoreGuards.clampLimit(it) }),
+        )
     }
 
     // -----------------------------------------------------------------------

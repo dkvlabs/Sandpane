@@ -56,7 +56,7 @@ Implemented contract (protocol v1, additively revised — see the revision note 
 
 ```ts
 interface SandpaneRpc {
-  'system.probe': { request: {}; response: CoreCapabilities /* + methods: string[] (feature discovery); + features: string[] (A2: "idempotency-keys", "sandbox-create-agent"; unknown strings are ignored) */ };
+  'system.probe': { request: {}; response: CoreCapabilities /* + methods: string[] (feature discovery); + features: string[] (A2: "idempotency-keys", "sandbox-create-agent"; A3b: "conversation-sandbox-id"; unknown strings are ignored) */ };
   'project.create': { request: { name: string; repositories: string[] }; response: Project /* + repositories: string[] */ };
   'project.list': { request: { includeArchived?: boolean /* A3a; default false */ }; response: Project[] /* + archivedAt? (A3a) */ };
   'project.update': { request: { projectId: string; name?: string; description?: string }; response: Project };
@@ -69,10 +69,15 @@ interface SandpaneRpc {
   'sandbox.create': { request: SandboxCreateSpec /* + agent?: built-in sbx agent, default "shell"; + idempotencyKey?: 1..=128 [A-Za-z0-9._-] (A2) */; response: SandboxSummary /* + agent?: as sbx reports it; + replayed?: true on a keyed replay */ };
   'sandbox.stop': { request: { name: string }; response: { stopped: true; requeried?: SandboxSummary /* ABSENT = not listed or re-query failed: state unknown */ } };
   'sandbox.remove': { request: { name: string; confirmToken?: string }; response: { confirmation?: ConfirmationRequest /* step 1: nothing changed */; removed?: true /* step 2 */ } /* two-step token flow: docs/plans/2026-10-09-protocol-v1-additions.md §2 */ };
-  'conversation.create': { request: { projectId: string; agentId: string; sandboxId?: string }; response: Conversation };
+  'conversation.create': { request: { projectId: string; agentId: string; sandboxId?: string /* A3b: persisted as the chosen sandbox NAME, not a binding */; title?: string }; response: Conversation /* + sandboxId?, archivedAt? (A3b) */ };
   'conversation.send': { request: { conversationId: string; content: string; attachments?: ContextRef[]; idempotencyKey?: string /* A2 */ }; response: TaskSummary /* + replayed?: true on a keyed replay */ };
-  'conversation.list': { request: { projectId?: string; limit?: number }; response: Conversation[] };
-  'conversation.history': { request: { conversationId: string; afterSequence?: number; limit?: number }; response: { messages: MessageRecord[]; truncated: boolean; nextSequence: number } };
+  'conversation.list': { request: { projectId?: string; limit?: number; includeArchived?: boolean /* A3b; default false */ }; response: Conversation[] };
+  'conversation.history': { request: { conversationId: string; afterSequence?: number; limit?: number }; response: { messages: MessageRecord[]; truncated: boolean; nextSequence: number } /* A3b: also serves archived conversations */ };
+  'conversation.rename': { request: { conversationId: string; title: string }; response: Conversation };
+  'conversation.archive': { request: { conversationId: string }; response: Conversation };
+  'conversation.unarchive': { request: { conversationId: string }; response: Conversation };
+  'conversation.delete': { request: { conversationId: string; confirmToken?: string }; response: { confirmation?: ConfirmationRequest; deleted?: true } /* §2 token flow; never touches host files, worktrees, branches or sandboxes */ };
+  'conversation.export': { request: { conversationId: string; afterSequence?: number; limit?: number }; response: { format: 'sandpane.conversation-export.v1'; exportedAt: string; conversation: Conversation; messages: MessageRecord[]; truncated: boolean; nextSequence: number; redaction: { bestEffort: true; replacements: number; byKind: Record<string, number> } } /* always redacted, best-effort; messages only */ };
   'task.cancel': { request: { taskId: string }; response: { requested: boolean } };
   'task.list': { request: { projectId?: string; statuses?: TaskStatus[]; limit?: number }; response: TaskSummary[] };
   'task.subscribe': { request: { projectId?: string; taskId?: string; afterSequence?: number; afterSequences?: Record<string, number> }; response: TaskEvent[] };
@@ -83,7 +88,7 @@ interface SandpaneRpc {
 
 Neither prompts nor file paths are executable commands. CLI operations are implemented as specific backend methods with strictly constructed argument arrays.
 
-**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 22-method v1 surface (`docs/CHANGELOG.md` 0010; `sandbox.stop` and `sandbox.remove` added by A1 and the six project lifecycle methods by A3a of `docs/plans/2026-10-09-protocol-v1-additions.md`; there is no `sandbox.start` because sbx v0.47 has none). Rules that keep it honest:
+**Revision note (entry 0010, as-built).** This block was previously an "example proposed contract" of 10 methods; it now documents the **implemented** 27-method v1 surface (`docs/CHANGELOG.md` 0010; `sandbox.stop` and `sandbox.remove` added by A1 the six project lifecycle methods by A3a and the five conversation lifecycle methods by A3b of `docs/plans/2026-10-09-protocol-v1-additions.md`; there is no `sandbox.start` because sbx v0.47 has none). Rules that keep it honest:
 
 - **Idempotency keys (A2).** A keyed `sandbox.create` / `conversation.send` is stored durably for 24 h; a replay with identical params returns the first response plus `replayed: true` (not current state), different params or an unfinished/unknown earlier attempt give `CONFLICT` and run nothing new. Decisions: `docs/plans/2026-10-09-protocol-v1-additions.md` §3.1.
 - **`PROTOCOL_VERSION` stays `1`** — the revision is additive only: new methods, new optional request fields, new response fields that are absent-tolerant (`#[serde(default)]`). Nothing was renamed or removed, so an older client's frames still parse.
@@ -101,7 +106,7 @@ SQLite: WAL mode, foreign keys, indexed events and migrations. Store Sandpane's 
 | `projects` | id, name, description, created_at, archived_at | user-owned; stable ID |
 | `repositories` | id, project_id, canonical_path, remote_url | canonicalize before use |
 | `sandbox_bindings` | id, project_id, sandbox_name, workspace_mode, repo_id, sbx_id, removed_at | SBX state always probed before actions; `sbx_id` + `removed_at` added in schema v4 — rows are marked removed, never deleted |
-| `conversations` | id, project_id, title, agent_id, created_at, archived_at | more than one per project |
+| `conversations` | id, project_id, title, agent_id, created_at, archived_at, sandbox_id (v6, A3b: chosen sandbox name, not a binding) | more than one per project |
 | `messages` | id, conversation_id, role, content, sequence | redact or encrypt optional sensitive history |
 | `agent_sessions` | id, conversation_id, provider, native_session_id, capability_snapshot | native session may be unavailable |
 | `tasks` | id, conversation_id, sandbox_binding_id, repo_id, base_commit, task_branch, status | each task owns exact Git context |

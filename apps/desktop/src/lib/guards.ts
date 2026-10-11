@@ -22,13 +22,18 @@ import {
   MAX_SCOPING_ID_LEN,
   MAX_SUBSCRIBE_CURSORS,
   TASK_STATUSES,
+  type ConversationExportParams,
   type ConversationHistoryParams,
   type ConversationListParams,
   type TaskListParams,
   type TaskStatus,
   type TaskSubscribeParams,
 } from "./protocol";
-import { validateProjectDescription, validateProjectName } from "./wizard";
+import {
+  validateConversationTitle,
+  validateProjectDescription,
+  validateProjectName,
+} from "./wizard";
 import type { ProjectUpdateParams } from "./protocol";
 
 /** A refusal raised by this client. It is NOT a Core verdict and never claims one. */
@@ -290,7 +295,12 @@ export function buildTaskListParams(params: TaskListParams = {}): Record<string,
   return payload;
 }
 
-/** `conversation.list` params. */
+/**
+ * `conversation.list` params. `includeArchived` (A3b) is put on the wire ONLY
+ * as `true`: `false`/absent are the same to Core, and omitting it keeps the
+ * default frame exactly what every pre-A3b build sent (`{}` / `{projectId}`).
+ * Whether to ask at all is the caller's gate (`conversation.archive` advertised).
+ */
 export function buildConversationListParams(
   params: ConversationListParams = {},
 ): Record<string, unknown> {
@@ -299,6 +309,7 @@ export function buildConversationListParams(
   if (projectId !== undefined) payload.projectId = projectId;
   const limit = clampLimit(params.limit);
   if (limit !== undefined) payload.limit = limit;
+  if (params.includeArchived === true) payload.includeArchived = true;
   return payload;
 }
 
@@ -516,4 +527,66 @@ export function buildProjectRepositoryParams(
     throw new CoreValidationError("path", "repository path must be absolute (start with /)");
   }
   return { projectId: checked, path };
+}
+
+// ---------------------------------------------------------------------------
+// A3b conversation lifecycle (design 2026-10-09 §3.3)
+// ---------------------------------------------------------------------------
+
+function requireConversationId(conversationId: string): string {
+  return requiredId(conversationId, "conversationId");
+}
+
+/** `conversation.archive` / `conversation.unarchive` params: exactly `{ conversationId }`. */
+export function buildConversationIdParams(conversationId: string): { conversationId: string } {
+  return { conversationId: requireConversationId(conversationId) };
+}
+
+/**
+ * `conversation.rename` params: the title is checked with Core's exact rule
+ * (`Validator::conversation_title` + the whitespace-only refusal) and sent
+ * exactly as typed — never trimmed or rewritten. The refusal never echoes it.
+ */
+export function buildConversationRenameParams(
+  conversationId: string,
+  title: string,
+): { conversationId: string; title: string } {
+  const checked = requireConversationId(conversationId);
+  if (typeof title !== "string") throw new CoreValidationError("title", "value is required");
+  const problem = validateConversationTitle(title, "rename");
+  if (problem !== null) throw new CoreValidationError("title", problem);
+  return { conversationId: checked, title };
+}
+
+/** `conversation.delete` STEP 1: exactly `{ conversationId }` — no `confirmToken` key. */
+export function buildConversationDeleteRequestParams(conversationId: string): { conversationId: string } {
+  return { conversationId: requireConversationId(conversationId) };
+}
+
+/** `conversation.delete` STEP 2: `{ conversationId, confirmToken }`; token shape checked, never echoed. */
+export function buildConversationDeleteConfirmParams(
+  conversationId: string,
+  confirmToken: string,
+): { conversationId: string; confirmToken: string } {
+  const checked = requireConversationId(conversationId);
+  if (typeof confirmToken !== "string" || !CONFIRM_TOKEN_PATTERN.test(confirmToken)) {
+    throw new CoreValidationError(
+      "confirmToken",
+      "must be the 64-character lowercase hex token Core issued in step 1",
+    );
+  }
+  return { conversationId: checked, confirmToken };
+}
+
+/** `conversation.export` params: `conversation.history`'s cursor and limit rules. */
+export function buildConversationExportParams(
+  params: ConversationExportParams,
+): { conversationId: string } & Record<string, unknown> {
+  const payload: { conversationId: string } & Record<string, unknown> = {
+    conversationId: requireConversationId(params.conversationId),
+    afterSequence: normalizeSequence(params.afterSequence),
+  };
+  const limit = clampLimit(params.limit);
+  if (limit !== undefined) payload.limit = limit;
+  return payload;
 }

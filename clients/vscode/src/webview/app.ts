@@ -85,12 +85,41 @@ interface ContextPlanView {
   excluded: { label: string; reason: string }[];
 }
 
+type ConversationAction = 'rename' | 'archive' | 'unarchive' | 'export' | 'delete';
+
+interface ConversationActionState {
+  enabled: boolean;
+  reason: string | null;
+}
+
+/** A3b: one row of Core's conversation list (strings already plain text). */
+interface ConversationRow {
+  id: string;
+  title: string;
+  archived: boolean;
+  selected: boolean;
+  sandboxLabel: string | null;
+  statusNote: string | null;
+  actions: Record<ConversationAction, ConversationActionState>;
+}
+
+interface ConversationListView {
+  supported: boolean;
+  note: string | null;
+  showArchived: boolean;
+  showArchivedSupported: boolean;
+  rows: ConversationRow[];
+}
+
 interface SidebarState {
   connection: 'online' | 'connecting' | 'reconnecting' | 'offline' | 'unsupported';
   header: HeaderContext;
   sandboxes: SandboxOption[];
   selectedSandbox: string | null;
-  conversation: { id: string; title: string; agentId: string } | null;
+  conversation: { id: string; title: string; agentId: string; archived: boolean } | null;
+  conversations: ConversationListView;
+  /** Why Send is disabled (Core's own reason), or null. */
+  composerBlocked: string | null;
   lines: ChatLine[];
   transcript: { scope: 'conversation' | 'project'; label: string };
   tasks: TaskRow[];
@@ -118,6 +147,7 @@ interface SidebarRefs {
   meta: HTMLElement;
   select: HTMLSelectElement;
   notices: HTMLElement;
+  conversations: HTMLElement;
   stream: HTMLElement;
   tasks: HTMLElement;
   plan: HTMLElement;
@@ -125,6 +155,7 @@ interface SidebarRefs {
   writable: HTMLInputElement;
   preview: HTMLElement;
   send: HTMLButtonElement;
+  composerNote: HTMLElement;
   status: HTMLElement;
 }
 
@@ -133,6 +164,8 @@ interface PaintMemo {
   header: string;
   sandboxes: string;
   notices: string;
+  conversations: string;
+  composerNote: string;
   lineKeys: string[];
   transcriptLabel: string;
   tasks: string;
@@ -231,6 +264,12 @@ function buildSkeleton(
   notices.id = 'sp-notices';
   root.appendChild(notices);
 
+  // --- A3b: Core's conversation list (rows, archived labels, actions) ---
+  const conversations = el('div', 'sp-conversations');
+  conversations.id = 'sp-conversations';
+  conversations.setAttribute('aria-label', 'Conversations Core lists for this project');
+  root.appendChild(conversations);
+
   // --- message stream ---
   const stream = el('div', 'sp-stream');
   stream.id = 'sp-stream';
@@ -281,9 +320,11 @@ function buildSkeleton(
     paintSendLabel(send, current(), writable.checked);
   });
   send.addEventListener('click', () => {
-    // The extension refuses a second in-flight send anyway (review W3); the
-    // disabled button and this check keep the UI from even asking.
-    if (send.disabled || current()?.sending === true) return;
+    // The extension refuses a second in-flight send anyway (review W3), and an
+    // archived project/conversation (A3b); the disabled button and this check
+    // keep the UI from even asking.
+    const now = current();
+    if (send.disabled || now?.sending === true || (now?.composerBlocked ?? null) !== null) return;
     const text = input.value;
     if (text.trim().length === 0) return;
     const plan = matchingPlan(current(), writable.checked);
@@ -307,12 +348,36 @@ function buildSkeleton(
   actions.appendChild(send);
   root.appendChild(actions);
 
+  // --- why Send is disabled (Core's own reason), when it is ---
+  const composerNote = el('div', 'sp-status');
+  composerNote.id = 'sp-composer-note';
+  composerNote.setAttribute('data-tone', 'error');
+  composerNote.setAttribute('role', 'note');
+  root.appendChild(composerNote);
+
   // --- status line ---
   const status = el('div', 'sp-status');
   status.id = 'sp-status';
   root.appendChild(status);
 
-  return { dot, project, coreMeta, meta, select, notices, stream, tasks, plan, input, writable, preview, send, status };
+  return {
+    dot,
+    project,
+    coreMeta,
+    meta,
+    select,
+    notices,
+    conversations,
+    stream,
+    tasks,
+    plan,
+    input,
+    writable,
+    preview,
+    send,
+    composerNote,
+    status,
+  };
 }
 
 function paintSendLabel(send: HTMLElement, state: SidebarState | null, writable: boolean): string {
@@ -330,6 +395,88 @@ function rebuildRegion(region: HTMLElement, children: HTMLElement[]): void {
     const again = document.getElementById(focusedId);
     if (again instanceof HTMLElement) again.focus();
   }
+}
+
+const ACTION_LABELS: ReadonlyArray<[ConversationAction, string]> = [
+  ['rename', 'Rename'],
+  ['archive', 'Archive'],
+  ['unarchive', 'Unarchive'],
+  ['export', 'Export'],
+  ['delete', 'Delete'],
+];
+
+/**
+ * The conversation list (A3b). Every action is a whitelisted message; the
+ * extension shows the native dialog, gates on Core's advertisement and decides.
+ * A disabled action keeps its reason visible (title + text), never hidden.
+ */
+function conversationChildren(view: ConversationListView, api: VsCodeApi): HTMLElement[] {
+  const children: HTMLElement[] = [];
+  const head = el('div', 'sp-picker');
+  head.appendChild(el('strong', undefined, 'Conversations'));
+  const fresh = el('button', 'secondary', 'New conversation');
+  fresh.id = 'sp-conv-new';
+  fresh.setAttribute('title', 'The next send starts a new conversation in this project.');
+  fresh.addEventListener('click', () => api.postMessage({ type: 'selectConversation', conversationId: '' }));
+  head.appendChild(fresh);
+  const toggle = el('button', 'secondary', view.showArchived ? 'Hide archived' : 'Show archived');
+  toggle.id = 'sp-conv-archived';
+  toggle.setAttribute('aria-pressed', view.showArchived ? 'true' : 'false');
+  if (!view.showArchivedSupported) {
+    toggle.disabled = true;
+    toggle.setAttribute('title', 'not supported by the attached Sandpane Core (it does not advertise "conversation.archive")');
+  }
+  toggle.addEventListener('click', () => api.postMessage({ type: 'toggleArchivedConversations' }));
+  head.appendChild(toggle);
+  children.push(head);
+  if (view.note !== null) children.push(el('div', 'sp-empty', view.note));
+
+  for (const row of view.rows) {
+    const token = idToken(row.id);
+    const box = el('div', 'sp-conv-row');
+    box.setAttribute('data-archived', row.archived ? 'true' : 'false');
+    box.setAttribute('data-selected', row.selected ? 'true' : 'false');
+    const titleRow = el('div', 'sp-picker');
+    const open = el('button', 'secondary sp-conv-title', row.title);
+    open.id = `sp-conv-open-${token}`;
+    open.setAttribute('aria-pressed', row.selected ? 'true' : 'false');
+    open.setAttribute('aria-label', `Open conversation ${row.title}${row.archived ? ' (archived)' : ''}`);
+    open.addEventListener('click', () => api.postMessage({ type: 'selectConversation', conversationId: row.id }));
+    titleRow.appendChild(open);
+    if (row.archived) titleRow.appendChild(el('span', 'sp-chip', 'ARCHIVED'));
+    box.appendChild(titleRow);
+    if (row.sandboxLabel !== null) box.appendChild(el('div', 'sp-empty', row.sandboxLabel));
+    if (row.statusNote !== null) box.appendChild(el('div', 'sp-empty', row.statusNote));
+
+    const actions = el('div', 'sp-picker');
+    const unavailable: string[] = [];
+    for (const [action, label] of ACTION_LABELS) {
+      // Only the archive toggle that applies is offered.
+      if (action === 'archive' && row.archived) continue;
+      if (action === 'unarchive' && !row.archived) continue;
+      const state = row.actions[action];
+      const button = el('button', 'secondary', label);
+      button.id = `sp-conv-${action}-${token}`;
+      if (!state.enabled) {
+        button.disabled = true;
+        if (state.reason !== null) {
+          button.setAttribute('title', state.reason);
+          button.setAttribute('aria-label', `${label}: unavailable — ${state.reason}`);
+          unavailable.push(`${label}: ${state.reason}`);
+        }
+      } else {
+        button.setAttribute('aria-label', `${label} conversation ${row.title}`);
+      }
+      button.addEventListener('click', () =>
+        api.postMessage({ type: 'conversationAction', action, conversationId: row.id }),
+      );
+      actions.appendChild(button);
+    }
+    box.appendChild(actions);
+    if (unavailable.length > 0) box.appendChild(el('div', 'sp-empty', `Not available — ${unavailable.join(' · ')}`));
+    children.push(box);
+  }
+  return children;
 }
 
 function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsCodeApi): void {
@@ -404,6 +551,20 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
   if (noticesKey !== memo.notices) {
     memo.notices = noticesKey;
     refs.notices.replaceChildren(...state.notices.map((notice) => el('div', 'sp-empty', notice)));
+  }
+
+  // --- conversation list (A3b): rebuilt only when it changed; stable ids keep focus ---
+  const conversationView: ConversationListView = state.conversations ?? {
+    supported: false,
+    note: null,
+    showArchived: false,
+    showArchivedSupported: false,
+    rows: [],
+  };
+  const conversationsKey = JSON.stringify(conversationView);
+  if (conversationsKey !== memo.conversations) {
+    memo.conversations = conversationsKey;
+    rebuildRegion(refs.conversations, conversationChildren(conversationView, api));
   }
 
   // --- message stream: append when the transcript only grew ---
@@ -502,7 +663,14 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
     if (memo.sentText !== null && refs.input.value === memo.sentText) refs.input.value = '';
     memo.sentText = null;
   }
-  if (refs.send.disabled !== state.sending) refs.send.disabled = state.sending;
+  const blocked = state.composerBlocked ?? null;
+  const sendDisabled = state.sending || blocked !== null;
+  if (refs.send.disabled !== sendDisabled) refs.send.disabled = sendDisabled;
+  const noteText = blocked ?? '';
+  if (noteText !== memo.composerNote) {
+    memo.composerNote = noteText;
+    refs.composerNote.textContent = noteText;
+  }
   memo.sendLabel = paintSendLabel(refs.send, state, refs.writable.checked);
 
   // --- status line ---
@@ -526,6 +694,8 @@ function bootSandpaneSidebar(): void {
     header: '',
     sandboxes: '',
     notices: '',
+    conversations: '',
+    composerNote: '',
     lineKeys: [],
     transcriptLabel: '',
     tasks: '',

@@ -389,6 +389,84 @@ export function validateProjectDescription(description: string): string | null {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Conversation titles (A3b §3.3 item 7) — mirrors Validator::conversation_title
+// plus `conversation_rename`'s blank refusal.
+// ---------------------------------------------------------------------------
+
+/** `MAX_CONVERSATION_TITLE_CHARS` in `sandpane_core::validation` (drift-tested). */
+export const CONVERSATION_TITLE_MAX = 200;
+
+/**
+ * Rust `char::is_whitespace` — the Unicode `White_Space` property, which is
+ * what `str::trim()` strips. NOT JavaScript's `trim()`: JS also strips U+FEFF
+ * (not White_Space, so Core keeps it) and does not strip U+0085 (which Rust
+ * does). Using JS `trim()` would refuse a title Core accepts.
+ */
+export function isRustWhitespace(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x09 && codePoint <= 0x0d) ||
+    codePoint === 0x20 ||
+    codePoint === 0x85 ||
+    codePoint === 0xa0 ||
+    codePoint === 0x1680 ||
+    (codePoint >= 0x2000 && codePoint <= 0x200a) ||
+    codePoint === 0x2028 ||
+    codePoint === 0x2029 ||
+    codePoint === 0x202f ||
+    codePoint === 0x205f ||
+    codePoint === 0x3000
+  );
+}
+
+/** `title.trim().is_empty()` exactly as Rust evaluates it. */
+export function isRustBlank(value: string): boolean {
+  for (const ch of value) {
+    if (!isRustWhitespace(ch.codePointAt(0) ?? 0)) return false;
+  }
+  return true;
+}
+
+/**
+ * A conversation title, checked with Core's exact rule before the frame is
+ * written:
+ * - `rename`: an empty or whitespace-only title (Rust `White_Space`) is
+ *   refused, as `conversation_rename` refuses it with `MSG_TITLE_BLANK`;
+ * - `create`: a blank title is left to Core, which stores
+ *   "Untitled conversation" instead;
+ * - otherwise `Validator::conversation_title`: at most 200 CHARACTERS (scalar
+ *   values, as Rust counts), no control character at all (every Cc including
+ *   `\n` and `\t`, DEL, C1), no line/paragraph separator or bidi control.
+ *
+ * Never stricter than Core: anything Core accepts passes. The refusal names
+ * the code point; it never echoes the character or the title.
+ */
+export function validateConversationTitle(
+  title: string,
+  mode: "create" | "rename",
+): string | null {
+  if (isRustBlank(title)) {
+    return mode === "rename" ? "Title must not be empty or whitespace-only." : null;
+  }
+  const chars = Array.from(title);
+  if (chars.length > CONVERSATION_TITLE_MAX) {
+    return `Title must be at most ${CONVERSATION_TITLE_MAX} characters.`;
+  }
+  for (const ch of chars) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (isLoneSurrogate(code)) {
+      return `Title contains an unpaired surrogate (${codePointLabel(code)}), which is not valid text.`;
+    }
+    if (isRustControl(code)) {
+      return `Title contains a control character (${codePointLabel(code)}); titles are one line.`;
+    }
+    if (isSpoofingFormatChar(code)) {
+      return `Title contains a hidden or direction-changing character (${codePointLabel(code)}).`;
+    }
+  }
+  return null;
+}
+
 export function validateRepositoryPaths(paths: readonly string[]): string | null {
   for (const p of paths) {
     if (p.trim().length === 0) return "Repository paths must not be blank.";

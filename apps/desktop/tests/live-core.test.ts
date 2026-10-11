@@ -22,7 +22,14 @@
 import net from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CoreClient, type CoreTransport } from "../src/lib/core-client";
-import { METHODS, coreAdvertisesMethod, type Method } from "../src/lib/protocol";
+import {
+  CONVERSATION_LIFECYCLE_METHODS,
+  FEATURE_CONVERSATION_SANDBOX_ID,
+  METHODS,
+  coreAdvertisesFeature,
+  coreAdvertisesMethod,
+  type Method,
+} from "../src/lib/protocol";
 import { validateCursorMap } from "../src/lib/guards";
 
 // This suite pins the WIRE against the real Core: every call goes through the
@@ -100,15 +107,21 @@ describeLive("real Core answers the way the mirror claims", () => {
       "task.list",
       "conversation.list",
       "conversation.history",
+      // A3b: the five conversation-lifecycle methods (27 in all).
+      ...CONVERSATION_LIFECYCLE_METHODS,
     ];
     for (const method of additive) {
       expect(coreAdvertisesMethod(outcome.capabilities, method)).toBe(true);
     }
-    // Every advertised name must be one this client is allowed to call.
+    // Every advertised name must be one this client is allowed to call, and an
+    // A3b Core advertises exactly this client's 27, in Method::ALL order.
     const allowlist: readonly string[] = METHODS;
     for (const advertised of outcome.capabilities.methods ?? []) {
       expect(allowlist).toContain(advertised);
     }
+    expect(outcome.capabilities.methods).toEqual([...METHODS]);
+    expect(METHODS).toHaveLength(27);
+    expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SANDBOX_ID)).toBe(true);
   });
 
   it("returns repositories on project.list and an array from conversation.list", async () => {

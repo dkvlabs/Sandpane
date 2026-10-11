@@ -17,6 +17,14 @@ rusqlite = { workspace = true }
 # Apache-2.0; pinned exactly like getrandom. No default features (alloc/oid
 # are not needed for a one-shot digest).
 sha2 = { version = "=0.11.0", default-features = false }
+# Best-effort secret redaction for `conversation.export` (A3b, design
+# 2026-10-09 §3.3 item 6): linear-time matching on hostile input, which a
+# hand-written scanner would not guarantee. MIT OR Apache-2.0, pinned exactly
+# like sha2. Default features are OFF so `perf-literal` (which would add
+# aho-corasick, "Unlicense OR MIT") is not built; every other perf feature
+# only enables code in regex-automata. New crates: regex, regex-automata,
+# regex-syntax — all MIT OR Apache-2.0.
+regex = { version = "=1.13.1", default-features = false, features = ["std", "unicode", "perf-cache", "perf-dfa", "perf-onepass", "perf-backtrack", "perf-inline"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

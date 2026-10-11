@@ -20,22 +20,24 @@ an earlier revision of this README claimed that while the crate did not compile 
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A3a project-lifecycle pass, 2026-10-10
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A3b conversation-lifecycle pass, 2026-10-11
 
-Run fresh after the A3a project-lifecycle client work (protocol design 2026-10-09 §3.2), against
-the A3a Core + schema in the working tree, on top of the A2 idempotency work and its review fixes
+Run fresh after the A3b conversation-lifecycle client work (protocol design 2026-10-09 §3.3), against
+the A3b Core + schema in the working tree, on top of the A3a project-lifecycle work (§3.2), the A2 idempotency work and its review fixes
 (W1–W4, I4, I5) and the A1 sandbox-lifecycle work and its review fixes. Every row below is a command that was actually run, with its actual
 result, except where a row says it was not re-run:
 
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **17 files, 484 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm test` (`vitest run`) | OK — **18 files, 557 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
 | `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
-| `cd src-tauri && cargo check --offline` | OK — `Finished dev profile` |
+| `cd src-tauri && cargo fmt --check` | OK — no diff |
+| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b pass (`clippy --all-targets` below compiles the crate) |
 | `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
-| `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 22 and the six A3a project methods are allowlisted, never replay-safe, and on the default 12 s budget except `project.create` / `project.add_repository` at 43 s) |
-| `make desktop-check` (repo root) | OK — runs all of the above except `npm run build`; now includes `cargo fmt --check`, `check`, `clippy`, `test` for `src-tauri` |
+| `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 27; the six A3a project methods and the five A3b conversation methods are allowlisted and never replay-safe; all five A3b methods and the A3a methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s) |
+| `make desktop-check` (repo root) | NOT re-run in the A3b pass (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
+| `npm run lint --if-present` | No `lint` script in this package — nothing ran |
 
 **Correction of an earlier claim.** A previous revision of this table reported `cargo check` OK
 and "7 passed" for `src-tauri`. That was false at the time: since commit `fbc45e2` the crate failed
@@ -98,7 +100,7 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 
 ### A3a project lifecycle — what the desktop does, and status
 
-- **Methods.** `METHODS` is the 22 names of `Method::ALL`, in order (drift-tested against the
+- **Methods.** `METHODS` was the 22 names of `Method::ALL` at A3a (27 since A3b, below), in order (drift-tested against the
   Rust crate and `schemas/rpc-request.schema.json`). The six new ones — `project.update`,
   `project.archive`, `project.unarchive`, `project.delete`, `project.add_repository`,
   `project.remove_repository` — are NOT replay-safe (TS `REPLAY_SAFE_METHODS` and the Rust
@@ -153,6 +155,75 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 | Native folder picker for "Add a repository" | **Not implemented — accepted deviation**: `@tauri-apps/plugin-dialog` is not a dependency; a typed path is used and Core validates it |
 | Click handlers, focus, the dialog's countdown in a real webview | No DOM test (no jsdom); the pure controllers and SSR markup are tested |
 | New chat / Send disabled on an archived project (`ChatPanel` `archivedReason`) | The reason string is tested; `ChatPanel` itself cannot be SSR-rendered in this suite (its external-store hooks have no server snapshot), so the disabled buttons are **UNVERIFIED** |
+
+### A3b conversation lifecycle — what the desktop does, and status
+
+- **Methods.** `METHODS` is the 27 names of `Method::ALL`, in order. The five new ones follow
+  `conversation.history`: `conversation.rename`, `conversation.archive`, `conversation.unarchive`,
+  `conversation.delete`, `conversation.export`. None is replay-safe (TS `REPLAY_SAFE_METHODS` and
+  the Rust `replay_safe` are unchanged); all five use the default deadlines (webview 15 s, proxy
+  12 s). Drift-tested against the Rust crate, the proxy and `schemas/`.
+- **Gating.** Each control is gated per method on `system.probe` `methods` (not probed yet / not
+  supported, with the reason). "Show archived" is offered only when `conversation.archive` is
+  advertised; `includeArchived: true` is then the only addition to `conversation.list` (it is never
+  sent as `false`). The "sandbox chosen at creation" line needs the `conversation-sandbox-id`
+  feature; without it the desktop says "not reported by this Core".
+- **Where.** Chat panel → "Conversation settings" (per selected chat): the sandbox chosen at
+  creation (revealed name, with the caveat that it is a record of the choice, not a live
+  binding; "not in the current sandbox list" or "sandbox list unavailable" when that is what is
+  known), Rename (Core's `conversation_title` rule mirrored exactly — 200 characters counted as
+  Rust counts them, controls / C1 / U+2028–2029 / bidi controls refused, blank refused on rename
+  only; blank on create becomes Core's "Untitled conversation"). A stored title Core would refuse,
+  or one with invisible characters, is never prefilled raw into the rename field: the field
+  starts empty and the title is shown revealed beside it. Archive / Unarchive, Delete…,
+  and Export…. Tabs and the Chats view show revealed titles and an "archived" badge.
+- **Archived.** On an archived conversation Rename and Send are disabled with Core's reason
+  ("conversation is archived; unarchive it first; nothing was changed"); history stays readable,
+  Unarchive and Delete stay available. On an archived project the project reason comes first.
+  Since A3b Core answers a send to an archived conversation with `VALIDATION_FAILED` and that
+  message (it used to be `NOT_FOUND`); the desktop maps it to "Nothing was changed — the
+  conversation is archived".
+- **Create title.** The title of a new chat is the user's own one-line field, checked with Core's
+  rule before "New chat" is enabled. It is never derived from a message (no slicing of a prompt,
+  so no multi-line or split-surrogate title can reach Core). A title that is blank as Rust judges
+  it (Unicode White_Space, not JS `trim()`) is sent as `""`, so Core stores its own "Untitled
+  conversation" — the same as the VS Code client. (Before A3b this build sent "Untitled chat".)
+- **Delete** uses the A1/A3a two-step pattern bound to the conversation id: step 1 shows Core's
+  impact lines (revealed, capped) and the expiry; Cancel is the default and sends nothing; step 2
+  is sent once, never retried. A confirmation for another id, a step-1 answer that already says
+  `deleted`, or `external: true` is refused. "Deleted" only on `deleted: true`; then the chat,
+  its cached history, its tasks' list rows and replay projections are dropped locally and the
+  list is re-read. If step 2's outcome is UNKNOWN (INTERNAL, lost answer, unreadable answer) the
+  desktop re-reads `conversation.list {projectId, includeArchived: true, limit: 500}` — only when
+  `conversation.archive` is advertised (a live-only list cannot tell archived from deleted, so
+  without it the outcome simply stays unknown and nothing is read): absent from a non-full page →
+  "Core no longer lists this conversation" and it is forgotten locally; still listed, a full page
+  (500 rows) or a failed read → the outcome stays unknown. Exact Core
+  refusals (unfinished tasks, not found, token rejected) say "Nothing was deleted / changed — …".
+- **Export.** Pages `conversation.export` from `afterSequence: 0` until `truncated: false`;
+  `nextSequence` must strictly increase (else the export is marked PARTIAL, "cursor"), at most
+  200 pages (else PARTIAL, "page-cap"). Any page failure → "Export failed — no export was
+  produced; nothing was copied" (no document, no partial text). A page whose conversation or
+  any message names another conversation id is refused by the decoder. Redaction counts are summed
+  across pages (Core counts the title on the first page only); `redaction.bestEffort: true` is
+  required on every page. The assembled JSON escapes hidden characters as `\uXXXX`. **There is
+  no file save**: the desktop shows a read-only, revealed preview capped at 400 lines × 300
+  characters (the rest disclosed as "…N more lines") and a Copy button
+  (`navigator.clipboard.writeText`), with a notice to review the text before sharing it —
+  Core's redaction is best-effort. Export text is never logged and is dropped when the chat
+  changes.
+- **Honest copy.** Exact Core messages are matched on code AND text (drift-tested against
+  `conversation_lifecycle.rs`); anything else gets the generic copy, never "nothing was …".
+  The delete token is never logged, displayed or persisted; decode errors never echo payloads.
+
+| Item | Status |
+| --- | --- |
+| Wire frames, gating, validators, delete flow, re-check, export paging/assembly/preview, copy | Functional headless: unit-tested against an in-memory FakeCore (`tests/conversation-lifecycle.test.ts`, 73 tests, incl. SSR markup of the actions, delete dialog and export panel). **UNVERIFIED live** — never run against a real A3b Core, never in the running desktop app |
+| FakeCore `conversation.rename` / `archive` / `unarchive` / `delete` / `export`, `includeArchived`, archived send refusal | **Modeled** on `sandpane-service/src/conversation_lifecycle.rs` (working tree, §3.3), **not captured** from a live run |
+| Save export to a file | **Not implemented — accepted deviation**: `@tauri-apps/plugin-dialog` / `plugin-fs` are not dependencies; a preview + Copy is offered instead |
+| Clipboard write inside the Tauri webview | **UNVERIFIED** — the Copy path is tested with an injected clipboard; WebKit permission behaviour in the native window was never exercised |
+| `ChatPanel` wiring (settings section, disabled Send on an archived chat) | Not SSR-renderable in this suite (external-store hooks); the pieces it composes are tested, the panel itself is **UNVERIFIED** |
+| `tests/live-core.test.ts` A3b pins (27 methods, `conversation-sandbox-id` advertised) | Updated, **not run** (skips without `SANDPANE_SOCKET`) |
 
 ### Live Core run (earlier evidence — NOT re-run in the review-fix pass)
 
@@ -218,6 +289,9 @@ What that run measured (not asserted from prose):
   for each client's native folder picker; `@tauri-apps/plugin-dialog` is not a dependency of
   this app, so the path is a typed absolute path that Core validates (Git top level, denylist).
   Adding the plugin (and its capability) is a separate, reviewed change.
+- **Deviation (A3b, accepted): no file save for `conversation.export`.** The design leaves the
+  save mechanism to each client; this app has no dialog/fs plugin, so it shows a capped,
+  read-only preview with Copy. Adding a save path is a separate, reviewed change.
 - Performance targets (idle CPU/memory, 30-chat retention): never measured.
 - **App icon:** `src-tauri/icons/*.png` are minimal generated placeholders created to satisfy
   `tauri::generate_context!`, which refuses to compile without them. Brand artwork is a design
@@ -282,8 +356,8 @@ React view  →  CoreClient (src/lib/core-client.ts)      ← framing, id correl
 - **Wire contract is shared, not re-invented.** `src/lib/protocol.ts` mirrors
   `core/crates/sandpane-protocol` exactly: camelCase payload fields, `snake_case` statuses and
   workspace modes, `SCREAMING_SNAKE_CASE` error codes, `{v,id,…}` frames, the `AgentEvent`
-  tagged union, and the 22-name `Method` surface of Rust `Method::ALL` (A3a added six project
-  methods). `schemas/*.json` is
+  tagged union, and the 27-name `Method` surface of Rust `Method::ALL` (A3a added six project
+  methods, A3b five conversation methods). `schemas/*.json` is
   the third copy; they move together, and `tests/protocol-drift.test.ts` reads the Rust crate and
   the schemas to prove it.
 - **Feature detection, never assumption.** Every additive read is gated on

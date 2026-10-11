@@ -61,7 +61,7 @@ import kotlin.test.assertTrue
  *     core/crates/sandpane-protocol/src/lib.rs;
  *   - the protocol-v1 additive fields: an OLD frame parses, and an absent value stays absent on
  *     the way out instead of becoming `null`, `{}`, or a benign workspace mode;
- *   - the 22-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
+ *   - the 27-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
  *     compared by [ProtocolDriftGuardTest]).
  *
  * NOT covered here, on purpose: a live socket round trip. `SocketChannel` against
@@ -202,7 +202,12 @@ class CoreClientFramingTest {
             "project.update", "project.archive", "project.unarchive", "project.delete",
             "project.add_repository", "project.remove_repository",
         ).forEach { assertTrue(CoreMethods.isAllowlisted(it), it) }
-        assertEquals(22, CoreMethods.ALL.size)
+        // A3b: the five conversation-lifecycle methods are allowlisted.
+        listOf(
+            "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
+            "conversation.export",
+        ).forEach { assertTrue(CoreMethods.isAllowlisted(it), it) }
+        assertEquals(27, CoreMethods.ALL.size)
     }
 
     @Test
@@ -217,6 +222,8 @@ class CoreClientFramingTest {
                 "project.add_repository", "project.remove_repository",
                 "sandbox.list", "sandbox.create", "sandbox.stop", "sandbox.remove",
                 "conversation.create", "conversation.send", "conversation.list", "conversation.history",
+                "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
+                "conversation.export",
                 "task.cancel", "task.list", "task.subscribe", "git.review", "git.apply",
             ),
             CoreMethods.ALL,
@@ -232,9 +239,17 @@ class CoreClientFramingTest {
             CoreMethods.ADDITIVE_A3A,
         )
         assertEquals(
-            CoreMethods.ADDITIVE_IN_V1 + CoreMethods.ADDITIVE_A1 + CoreMethods.ADDITIVE_A3A,
+            setOf(
+                "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
+                "conversation.export",
+            ),
+            CoreMethods.ADDITIVE_A3B,
+        )
+        assertEquals(
+            CoreMethods.ADDITIVE_IN_V1 + CoreMethods.ADDITIVE_A1 + CoreMethods.ADDITIVE_A3A + CoreMethods.ADDITIVE_A3B,
             CoreMethods.REQUIRES_ADVERTISEMENT,
         )
+        assertEquals(16, CoreMethods.REQUIRES_ADVERTISEMENT.size, "every method beyond the 11-method baseline is gated")
     }
 
     // -----------------------------------------------------------------------

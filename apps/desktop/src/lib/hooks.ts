@@ -52,10 +52,24 @@ import {
 } from "./sandbox-lifecycle";
 import {
   addConversation,
+  forgetConversation,
   forgetProjectConversations,
   listConversations,
+  replaceConversation,
   subscribeConversations,
 } from "./conversation-store";
+import {
+  ConversationDeletionFlow,
+  ConversationExportController,
+  conversationCacheTaskIds,
+  conversationLifecycleGates,
+  conversationListParams,
+  forgetConversationLocally,
+  conversationRecheck,
+  type ConversationDeletionState,
+  type ConversationExportState,
+  type ConversationLifecycleGates,
+} from "./conversation-lifecycle";
 import {
   decodeApplyResult,
   decodeConversation,
@@ -206,21 +220,24 @@ export function useProjects(options: { includeArchived?: boolean } = {}): {
   };
 }
 
-export function useSandboxes(): {
+export function useSandboxes(wanted = true): {
   sandboxes: SandboxSummary[];
   isLoading: boolean;
+  /** True once Core actually answered `sandbox.list` (not pending, not failed). */
+  loaded: boolean;
   error: CoreRequestError | null;
 } {
   const deps = useDeps();
   const query = useQuery<SandboxSummary[]>({
     queryKey: queryKeys.sandboxes,
     queryFn: () => deps.client.listSandboxSummaries(),
-    enabled: deps.transportAvailable,
+    enabled: wanted && deps.transportAvailable,
     staleTime: 5_000,
   });
   return {
     sandboxes: query.data ?? [],
-    isLoading: query.isPending && deps.transportAvailable,
+    isLoading: query.isPending && wanted && deps.transportAvailable,
+    loaded: query.isSuccess,
     error: query.error ? asCoreRequestError(query.error) : null,
   };
 }
@@ -373,10 +390,15 @@ export function useSessionConversations(): readonly Conversation[] {
 /**
  * `conversation.list` — every non-archived conversation Core holds for a
  * project, which is what lets the cockpit show chats this window never created.
+ *
+ * `includeArchived` (A3b) adds archived rows, and is put on the wire ONLY when
+ * this Core advertises `conversation.archive`; the archived read is a child
+ * key, so invalidating `["core","conversations"]` re-reads both.
  */
 export function useCoreConversations(
   projectId: string | null,
   wanted = true,
+  includeArchived = false,
 ): {
   conversations: Conversation[];
   gate: FeatureGate;
@@ -388,10 +410,14 @@ export function useCoreConversations(
 } {
   const deps = useDeps();
   const gate = useCoreFeatureGate("conversation.list", "conversation.list");
+  const lifecycle = useConversationLifecycleGates();
+  const params = conversationListParams(projectId, includeArchived, lifecycle);
+  const withArchived = params.includeArchived === true;
   const query = useQuery<Conversation[]>({
-    queryKey: queryKeys.conversations(projectId),
-    queryFn: () =>
-      deps.client.listConversations({ ...(projectId === null ? {} : { projectId }) }),
+    queryKey: withArchived
+      ? [...queryKeys.conversations(projectId), "with-archived"]
+      : queryKeys.conversations(projectId),
+    queryFn: () => deps.client.listConversations(params),
     enabled: wanted && deps.transportAvailable && gate.state === "supported",
     staleTime: 5_000,
   });
@@ -832,4 +858,122 @@ export function useProjectDeletionFlow(): { flow: ProjectDeletionFlow; state: De
   const flow = ref.current;
   const state = useSyncExternalStore(flow.subscribe, flow.getState);
   return { flow, state };
+}
+
+// ---------------------------------------------------------------------------
+// A3b conversation lifecycle
+// ---------------------------------------------------------------------------
+
+/** Every A3b action's gate, folded from the probe (`unprobed` ≠ `unsupported`). */
+export function useConversationLifecycleGates(): ConversationLifecycleGates {
+  const link = useCoreLink();
+  return conversationLifecycleGates(capabilitiesOf(link));
+}
+
+/** One A3b conversation write (each is one RPC answering a `Conversation`). */
+export type ConversationActionInput =
+  | { kind: "rename"; conversationId: string; title: string }
+  | { kind: "archive"; conversationId: string }
+  | { kind: "unarchive"; conversationId: string };
+
+/**
+ * Conversation writes. Never retried (none is replay-safe). Core's answer
+ * replaces this window's own copy (so a merged list never re-adds a stale
+ * one), and every conversation list is re-read on SETTLED — success or
+ * failure — because a lost answer may still have been applied.
+ */
+export function useConversationAction() {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  return useMutation<Conversation, CoreRequestError, ConversationActionInput>({
+    mutationFn: (action) => {
+      switch (action.kind) {
+        case "rename":
+          return deps.client.renameConversation(action.conversationId, action.title);
+        case "archive":
+          return deps.client.archiveConversation(action.conversationId);
+        case "unarchive":
+          return deps.client.unarchiveConversation(action.conversationId);
+      }
+    },
+    retry: false,
+    onSuccess: (conversation) => replaceConversation(conversation),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ["core", "conversations"] });
+    },
+  });
+}
+
+/**
+ * The two-step `conversation.delete` flow for one view. Re-reads every
+ * conversation list after each exchange. When Core no longer has the
+ * conversation (`deleted: true`, a step-2 NOT_FOUND, or an unknown outcome a
+ * scoped re-read settled) it is forgotten locally: the route leaves it if it
+ * is open, its history pages and task projections are dropped, and this
+ * window's copy is removed. The token lives only inside the flow.
+ */
+export function useConversationDeletionFlow(selection: {
+  selectedConversationId: string | null;
+  onClearSelection: () => void;
+}): { flow: ConversationDeletionFlow; state: ConversationDeletionState } {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  const link = useCoreLink();
+  const selectionRef = useRef(selection);
+  // The probed capabilities, read when an unknown outcome is re-checked.
+  const capabilitiesRef = useRef(capabilitiesOf(link));
+  useEffect(() => {
+    selectionRef.current = selection;
+    capabilitiesRef.current = capabilitiesOf(link);
+  });
+  const ref = useRef<ConversationDeletionFlow | null>(null);
+  if (ref.current === null) {
+    const forget = (conversationId: string) =>
+      forgetConversationLocally(conversationId, {
+        selectedConversationId: () => selectionRef.current.selectedConversationId,
+        clearSelection: () => selectionRef.current.onClearSelection(),
+        forgetSessionConversation: forgetConversation,
+        dropCachedReads: (id) => {
+          const taskIds = conversationCacheTaskIds(
+            id,
+            qc.getQueriesData({ queryKey: ["core", "task-list"] }).map(([, data]) => data),
+            deps.store.getSnapshot(),
+          );
+          deps.store.forgetTasks(taskIds);
+          qc.removeQueries({ queryKey: queryKeys.history(id) });
+          // The task lists still name the deleted tasks: re-read them.
+          void qc.invalidateQueries({ queryKey: ["core", "task-list"] });
+        },
+      });
+    ref.current = new ConversationDeletionFlow(deps.client, {
+      onSettled: () => {
+        void qc.invalidateQueries({ queryKey: ["core", "conversations"] });
+      },
+      onDeleted: forget,
+      onGone: forget,
+      // `includeArchived` only when `conversation.archive` is advertised;
+      // otherwise the outcome stays unknown (a live-only list proves nothing).
+      recheckListed: conversationRecheck(deps.client, () => capabilitiesRef.current),
+    });
+  }
+  const flow = ref.current;
+  const state = useSyncExternalStore(flow.subscribe, flow.getState);
+  return { flow, state };
+}
+
+/**
+ * One export controller per view. The full export text stays inside the
+ * controller (never React Query, a store or a log); Copy uses the webview's
+ * `navigator.clipboard`.
+ */
+export function useConversationExport(): {
+  controller: ConversationExportController;
+  state: ConversationExportState;
+} {
+  const deps = useDeps();
+  const ref = useRef<ConversationExportController | null>(null);
+  if (ref.current === null) ref.current = new ConversationExportController(deps.client);
+  const controller = ref.current;
+  const state = useSyncExternalStore(controller.subscribe, controller.getState);
+  return { controller, state };
 }

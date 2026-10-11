@@ -24,6 +24,7 @@ import { decodeProjectDeleteResult, decodeProjects } from "../src/lib/decode";
 import { MalformedFrameError } from "../src/lib/framing";
 import { buildProjectRepositoryParams, buildProjectUpdateParams } from "../src/lib/guards";
 import {
+  CONVERSATION_LIFECYCLE_METHODS,
   METHODS,
   PROJECT_LIFECYCLE_METHODS,
   type ConfirmationRequest,
@@ -139,13 +140,16 @@ function scripted(answer: (method: string) => { ok?: unknown; err?: unknown }) {
 // ---------------------------------------------------------------------------
 
 describe("A3a drift against the Rust sources", () => {
-  it("the six methods sit right after project.list, in Method::ALL order (22 total)", () => {
+  it("the six methods sit right after project.list, in Method::ALL order (27 total since A3b)", () => {
     const all = rustMethodAll().names;
-    expect(all).toHaveLength(22);
+    expect(all).toHaveLength(27);
     expect(METHODS).toEqual(all);
     const at = METHODS.indexOf("project.list");
     expect(METHODS.slice(at + 1, at + 7)).toEqual([...PROJECT_LIFECYCLE_METHODS]);
-    expect(A3A_CORE_METHODS).toEqual([...METHODS]);
+    // The A3a Core's set is today's minus the five A3b conversation methods.
+    expect(A3A_CORE_METHODS).toEqual(
+      METHODS.filter((m) => !(CONVERSATION_LIFECYCLE_METHODS as readonly string[]).includes(m)),
+    );
   });
 
   it("none of the six is replay-safe on either side, and each has the default deadline", () => {
@@ -176,7 +180,7 @@ describe("A3a drift against the Rust sources", () => {
     }
     expect(deadlineBody).toContain("Method::ProjectCreate => 43_000,");
     expect(deadlineBody).toContain("Method::ProjectAddRepository => 43_000,");
-    expect(proxy).toContain("assert_eq!(Method::ALL.len(), 22);");
+    expect(proxy).toContain("assert_eq!(Method::ALL.len(), 27);");
   });
 
   it("every exact message equals the Rust const of the same name", () => {

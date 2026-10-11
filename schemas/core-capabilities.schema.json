@@ -48,12 +48,12 @@
     },
     "features": {
       "type": "array",
-      "description": "Optional protocol features this Core implements (A2, additive), derived from the single list sandpane_protocol::FEATURES. A feature names behaviour a client cannot infer from `methods` (a pre-A2 Core silently drops an unknown request field): 'idempotency-keys' (sandbox.create / conversation.send honour idempotencyKey), 'sandbox-create-agent' (sandbox.create honours agent). Deliberately NOT an enum: clients must ignore feature strings they do not know. `items.examples` lists the features this protocol revision defines and is the value set the drift gate compares. Absent from a pre-A2 Core = nothing advertised.",
+      "description": "Optional protocol features this Core implements (A2, additive), derived from the single list sandpane_protocol::FEATURES. A feature names behaviour a client cannot infer from `methods` (a pre-A2 Core silently drops an unknown request field): 'idempotency-keys' (sandbox.create / conversation.send honour idempotencyKey), 'sandbox-create-agent' (sandbox.create honours agent), 'conversation-sandbox-id' (A3b: conversation.create persists sandboxId and every Conversation carries it when one was stored; without it a client cannot tell 'no sandbox chosen' from 'an older Core discarded it'). Deliberately NOT an enum: clients must ignore feature strings they do not know. `items.examples` lists the features this protocol revision defines and is the value set the drift gate compares. Absent from a pre-A2 Core = nothing advertised.",
       "uniqueItems": true,
       "items": {
         "type": "string",
         "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
-        "examples": ["idempotency-keys", "sandbox-create-agent"]
+        "examples": ["idempotency-keys", "sandbox-create-agent", "conversation-sandbox-id"]
       }
     }
   }

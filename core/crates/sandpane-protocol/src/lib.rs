@@ -153,6 +153,16 @@ pub enum Method {
     ConversationList,
     #[serde(rename = "conversation.history")]
     ConversationHistory,
+    #[serde(rename = "conversation.rename")]
+    ConversationRename,
+    #[serde(rename = "conversation.archive")]
+    ConversationArchive,
+    #[serde(rename = "conversation.unarchive")]
+    ConversationUnarchive,
+    #[serde(rename = "conversation.delete")]
+    ConversationDelete,
+    #[serde(rename = "conversation.export")]
+    ConversationExport,
     #[serde(rename = "task.cancel")]
     TaskCancel,
     #[serde(rename = "task.list")]
@@ -171,7 +181,7 @@ impl Method {
     /// from the enum rather than hand-written, and `dispatch` must match
     /// exhaustively over the same enum, so an advertised method always really
     /// exists and a handled method is always advertised.
-    pub const ALL: [Method; 22] = [
+    pub const ALL: [Method; 27] = [
         Self::SystemProbe,
         Self::ProjectCreate,
         Self::ProjectList,
@@ -189,6 +199,11 @@ impl Method {
         Self::ConversationSend,
         Self::ConversationList,
         Self::ConversationHistory,
+        Self::ConversationRename,
+        Self::ConversationArchive,
+        Self::ConversationUnarchive,
+        Self::ConversationDelete,
+        Self::ConversationExport,
         Self::TaskCancel,
         Self::TaskList,
         Self::TaskSubscribe,
@@ -221,6 +236,11 @@ impl Method {
             "conversation.send" => Self::ConversationSend,
             "conversation.list" => Self::ConversationList,
             "conversation.history" => Self::ConversationHistory,
+            "conversation.rename" => Self::ConversationRename,
+            "conversation.archive" => Self::ConversationArchive,
+            "conversation.unarchive" => Self::ConversationUnarchive,
+            "conversation.delete" => Self::ConversationDelete,
+            "conversation.export" => Self::ConversationExport,
             "task.cancel" => Self::TaskCancel,
             "task.list" => Self::TaskList,
             "task.subscribe" => Self::TaskSubscribe,
@@ -249,6 +269,11 @@ impl Method {
             Self::ConversationSend => "conversation.send",
             Self::ConversationList => "conversation.list",
             Self::ConversationHistory => "conversation.history",
+            Self::ConversationRename => "conversation.rename",
+            Self::ConversationArchive => "conversation.archive",
+            Self::ConversationUnarchive => "conversation.unarchive",
+            Self::ConversationDelete => "conversation.delete",
+            Self::ConversationExport => "conversation.export",
             Self::TaskCancel => "task.cancel",
             Self::TaskList => "task.list",
             Self::TaskSubscribe => "task.subscribe",
@@ -268,7 +293,15 @@ impl Method {
 /// * `idempotency-keys` — `sandbox.create` / `conversation.send` honour
 ///   `idempotencyKey` (A2).
 /// * `sandbox-create-agent` — `sandbox.create` honours `agent` (A1).
-pub const FEATURES: [&str; 2] = ["idempotency-keys", "sandbox-create-agent"];
+/// * `conversation-sandbox-id` — `conversation.create` persists `sandboxId`
+///   and every `Conversation` carries it when one was stored (A3b, §3.3
+///   item 2). Without it a client cannot tell "no sandbox was chosen" from
+///   "an older Core discarded the choice".
+pub const FEATURES: [&str; 3] = [
+    "idempotency-keys",
+    "sandbox-create-agent",
+    "conversation-sandbox-id",
+];
 
 /// [`FEATURES`] as owned strings — the one derivation `system.probe` uses.
 pub fn feature_names() -> Vec<String> {
@@ -558,9 +591,11 @@ pub struct ConfirmationTarget {
 /// binding at all, a binding that predates sbx-id tracking or has no recorded
 /// id, or a binding for an earlier sandbox with a different id. Every client
 /// must show it prominently together with `impact`. For a PROJECT target
-/// (`project.delete`, A3a) `external` is always `false`: a project exists only
-/// in Core, and `target.id` is the project id (`target.name` is display only —
-/// a rename between the steps does not invalidate the token). Not a proof of human
+/// (`project.delete`, A3a) or a CONVERSATION target (`conversation.delete`,
+/// A3b) `external` is always `false`: both exist only in Core, and `target.id`
+/// is the project / conversation id (`target.name` — the project name or the
+/// stored conversation title — is display only: a rename between the steps
+/// does not invalidate the token). Not a proof of human
 /// presence: see design 2026-10-09 §2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -608,7 +643,7 @@ pub struct ConversationCreateParams {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
     pub id: String,
@@ -616,6 +651,122 @@ pub struct Conversation {
     pub title: String,
     pub agent_id: String,
     pub created_at: String,
+    /// A3b (additive): RFC 3339 UTC instant the conversation was archived;
+    /// ABSENT when it is live (and from a Core older than A3b). An archived
+    /// conversation refuses `conversation.send` and `conversation.rename`
+    /// (`VALIDATION_FAILED`); history, export and task reads keep working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    /// A3b (additive): the sandbox NAME chosen when the conversation was
+    /// created — a stored name, NOT a binding or an identity: Core does not
+    /// check that the sandbox still exists, and a same-named replacement is
+    /// indistinguishable. Absent when none was chosen, for rows created before
+    /// A3b, and from an older Core; rely on it only when `system.probe`
+    /// advertises the `conversation-sandbox-id` feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<String>,
+}
+
+/// `conversation.rename` params (A3b). `title`: 1..=200 characters, the
+/// `project.name` refusals (every control character including newline and
+/// tab, line/paragraph separators, bidi controls); empty or whitespace-only
+/// is refused. Refused on an archived conversation or project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRenameParams {
+    pub conversation_id: String,
+    pub title: String,
+}
+
+/// `conversation.archive` / `conversation.unarchive` params (A3b). Both are
+/// idempotent (an archived conversation keeps its original `archivedAt`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationIdParams {
+    pub conversation_id: String,
+}
+
+/// `conversation.delete` params (A3b, two-step confirmation, design §2).
+/// Without `confirmToken` Core deletes nothing and answers a
+/// [`ConfirmationRequest`] (action `conversation.delete`, target
+/// `{name: <stored title>, id}`, `external: false`); with it, Core re-checks
+/// the preconditions and deletes the conversation's rows. The token is bound
+/// to the conversation ID: a rename between the steps does not invalidate it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDeleteParams {
+    pub conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_token: Option<String>,
+}
+
+/// `conversation.delete` result: exactly one field — `confirmation` (step 1,
+/// nothing changed) or `deleted: true` (step 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDeleteResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ConfirmationRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+}
+
+/// `conversation.export` params (A3b) — the same paging as
+/// `conversation.history`: messages strictly after `afterSequence` (negative
+/// normalised to 0), `limit` clamped to `1..=500` (default 200), plus the
+/// history byte ceiling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationExportParams {
+    pub conversation_id: String,
+    #[serde(default)]
+    pub after_sequence: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// The `format` tag of every `conversation.export` page.
+pub const CONVERSATION_EXPORT_FORMAT: &str = "sandpane.conversation-export.v1";
+
+/// What best-effort redaction replaced in one export page (A3b §3.3 item 6).
+/// `byKind` maps a kind name (`auth-header`, `private-key`, `token`, `jwt`,
+/// `env-secret`, `url-credentials`, `url-secret-param`) to its replacement
+/// count on THIS page; a kind with zero replacements is OMITTED (never listed
+/// with 0), so `byKind` is `{}` when nothing was replaced. `replacements` is
+/// the sum of `byKind`. Every page carries the (redacted) conversation title,
+/// but the title's replacements are COUNTED only on the first page
+/// (`afterSequence` absent or 0): clients can simply sum `replacements` and
+/// `byKind` over all pages. Overlapping matches are merged into one
+/// replacement, attributed to the most specific kind (e.g. a private key in
+/// an env value counts as `private-key`). `bestEffort` is always `true`:
+/// redaction is pattern-based and can miss secrets — review the export
+/// before sharing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRedaction {
+    pub best_effort: bool,
+    pub replacements: u64,
+    pub by_kind: std::collections::BTreeMap<String, u64>,
+}
+
+/// `conversation.export` result (A3b): ONE page of a redacted export. Scope:
+/// the conversation metadata and its messages only — task events, artifacts
+/// and verification output are NOT included. `conversation.title` and every
+/// `messages[].content` are redacted; there is no unredacted mode.
+/// `truncated` / `nextSequence` follow `conversation.history`'s rules: page
+/// until `truncated` is false, requiring `nextSequence` to strictly increase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationExportResult {
+    /// Always [`CONVERSATION_EXPORT_FORMAT`].
+    pub format: String,
+    /// RFC 3339 UTC.
+    pub exported_at: String,
+    pub conversation: Conversation,
+    pub messages: Vec<MessageRecord>,
+    pub truncated: bool,
+    pub next_sequence: i64,
+    pub redaction: ExportRedaction,
 }
 
 /// `conversation.send` params. Content is data, never a command (specs/02 §2).
@@ -722,6 +873,16 @@ pub struct ConversationListParams {
     /// Rows to return; clamped to `1..=500`, default 200.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// A3b (additive): also list archived conversations. Absent/false = live
+    /// only — what an older client (which never sends it) always gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_archived: Option<bool>,
+}
+
+impl ConversationListParams {
+    pub fn include_archived(&self) -> bool {
+        self.include_archived.unwrap_or(false)
+    }
 }
 
 /// `conversation.history` params — bounded transcript read.
@@ -955,10 +1116,11 @@ mod tests {
     /// one of them exactly once — `CoreCapabilities.methods` is derived from it.
     /// A1 added `sandbox.stop` and `sandbox.remove`; there is deliberately NO
     /// `sandbox.start` (sbx v0.47 has no `start`). A3a added the six project
-    /// lifecycle methods (lowercase snake_case segments, design §3.2 item 1).
+    /// lifecycle methods (lowercase snake_case segments, design §3.2 item 1);
+    /// A3b added the five conversation lifecycle methods (§3.3 item 1).
     #[test]
-    fn all_twenty_two_methods_round_trip() {
-        const EXPECTED: [&str; 22] = [
+    fn all_twenty_seven_methods_round_trip() {
+        const EXPECTED: [&str; 27] = [
             "system.probe",
             "project.create",
             "project.list",
@@ -976,6 +1138,11 @@ mod tests {
             "conversation.send",
             "conversation.list",
             "conversation.history",
+            "conversation.rename",
+            "conversation.archive",
+            "conversation.unarchive",
+            "conversation.delete",
+            "conversation.export",
             "task.cancel",
             "task.list",
             "task.subscribe",
@@ -1081,12 +1248,20 @@ mod tests {
     /// gate. Additive only: a feature string is never renamed or reused.
     #[test]
     fn features_list_is_pinned() {
-        assert_eq!(FEATURES, ["idempotency-keys", "sandbox-create-agent"]);
+        assert_eq!(
+            FEATURES,
+            [
+                "idempotency-keys",
+                "sandbox-create-agent",
+                "conversation-sandbox-id"
+            ]
+        );
         assert_eq!(
             feature_names(),
             vec![
                 "idempotency-keys".to_string(),
-                "sandbox-create-agent".to_string()
+                "sandbox-create-agent".to_string(),
+                "conversation-sandbox-id".to_string()
             ]
         );
         // A pre-A2 Core omits `features`: still parses, as "nothing advertised".
@@ -1099,7 +1274,115 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&c).unwrap()["features"],
-            serde_json::json!(["idempotency-keys", "sandbox-create-agent"])
+            serde_json::json!([
+                "idempotency-keys",
+                "sandbox-create-agent",
+                "conversation-sandbox-id"
+            ])
+        );
+    }
+
+    /// A3b: `archivedAt` / `sandboxId` are additive — absent when unset (and
+    /// from an older Core), camelCase when present.
+    #[test]
+    fn conversation_additive_fields_are_absent_tolerant() {
+        let old: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "c", "projectId": "p", "title": "t", "agentId": "codex", "createdAt": "ts"
+        }))
+        .unwrap();
+        assert_eq!(
+            (old.archived_at.as_deref(), old.sandbox_id.as_deref()),
+            (None, None)
+        );
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(
+            v.get("archivedAt").is_none() && v.get("sandboxId").is_none(),
+            "{v}"
+        );
+        let set = Conversation {
+            archived_at: Some("2026-10-11T00:00:00Z".into()),
+            sandbox_id: Some("atlas-auth".into()),
+            ..old
+        };
+        let v = serde_json::to_value(&set).unwrap();
+        assert_eq!(v["archivedAt"], "2026-10-11T00:00:00Z");
+        assert_eq!(v["sandboxId"], "atlas-auth");
+        // conversation.list: includeArchived optional, default false.
+        let l: ConversationListParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!l.include_archived());
+        assert!(!serde_json::to_string(&l)
+            .unwrap()
+            .contains("includeArchived"));
+        let l: ConversationListParams =
+            serde_json::from_value(serde_json::json!({"includeArchived": true})).unwrap();
+        assert!(l.include_archived());
+    }
+
+    /// A3b: params and result shapes of the five conversation methods.
+    #[test]
+    fn conversation_lifecycle_wire_shapes() {
+        let r: ConversationRenameParams =
+            serde_json::from_value(serde_json::json!({"conversationId": "c", "title": "T"}))
+                .unwrap();
+        assert_eq!((r.conversation_id.as_str(), r.title.as_str()), ("c", "T"));
+        assert!(serde_json::from_value::<ConversationRenameParams>(
+            serde_json::json!({"conversationId": "c"})
+        )
+        .is_err());
+        let i: ConversationIdParams =
+            serde_json::from_value(serde_json::json!({"conversationId": "c"})).unwrap();
+        assert_eq!(i.conversation_id, "c");
+        let d: ConversationDeleteParams =
+            serde_json::from_value(serde_json::json!({"conversationId": "c"})).unwrap();
+        assert_eq!(d.confirm_token, None);
+        let step2 = ConversationDeleteResult {
+            confirmation: None,
+            deleted: Some(true),
+        };
+        assert_eq!(
+            serde_json::to_value(&step2).unwrap(),
+            serde_json::json!({"deleted": true})
+        );
+        let e: ConversationExportParams =
+            serde_json::from_value(serde_json::json!({"conversationId": "c"})).unwrap();
+        assert_eq!((e.after_sequence, e.limit), (0, None));
+        let mut by_kind = std::collections::BTreeMap::new();
+        by_kind.insert("token".to_string(), 2u64);
+        let res = ConversationExportResult {
+            format: CONVERSATION_EXPORT_FORMAT.to_string(),
+            exported_at: "ts".into(),
+            conversation: serde_json::from_value(serde_json::json!({
+                "id": "c", "projectId": "p", "title": "t", "agentId": "codex", "createdAt": "ts"
+            }))
+            .unwrap(),
+            messages: vec![],
+            truncated: false,
+            next_sequence: 0,
+            redaction: ExportRedaction {
+                best_effort: true,
+                replacements: 2,
+                by_kind,
+            },
+        };
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["format"], "sandpane.conversation-export.v1");
+        let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "conversation",
+                "exportedAt",
+                "format",
+                "messages",
+                "nextSequence",
+                "redaction",
+                "truncated"
+            ]
+        );
+        assert_eq!(
+            v["redaction"],
+            serde_json::json!({"bestEffort": true, "replacements": 2, "byKind": {"token": 2}})
         );
     }
 

@@ -10,6 +10,11 @@
 //! Unix sockets only and says so instead of pretending (see `main.rs`).
 
 pub mod confirm;
+mod conversation_lifecycle;
+pub use conversation_lifecycle::{
+    CONVERSATION_DELETE_ACTION, MSG_CONVERSATION_ARCHIVED, MSG_CONVERSATION_HAS_TASKS,
+    MSG_CONVERSATION_NOT_FOUND, MSG_TITLE_BLANK, UNTITLED_CONVERSATION,
+};
 pub mod inflight;
 mod project_lifecycle;
 pub use project_lifecycle::{
@@ -25,7 +30,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use sandpane_core::idempotency::{self, Lookup};
 use sandpane_core::process::RunLimits;
 use sandpane_core::sbx::{
@@ -39,13 +44,15 @@ use sandpane_core::workspace::{self, WorkspaceError};
 use sandpane_core::{git as scoregit, Database, EventLog};
 use sandpane_protocol::{
     AgentCapability, AgentEvent, ApplyResult, ChangeSet, ConfirmationRequest, ConfirmationTarget,
-    Conversation, ConversationCreateParams, ConversationHistoryParams, ConversationHistoryResult,
-    ConversationListParams, ConversationSendParams, CoreCapabilities, ErrorCode, FileChange,
-    FileChangeStatus, GitApplyParams, MessageRecord, Method, Project, ProjectCreateParams,
-    ProjectDeleteParams, ProjectIdParams, ProjectRepositoryParams, ProjectUpdateParams, RpcRequest,
-    RpcResponse, SandboxCreateSpec, SandboxRemoveParams, SandboxRemoveResult, SandboxStopParams,
-    SandboxStopResult, SandboxSummary, SbxStatus, TaskEvent, TaskListParams, TaskStatus,
-    TaskSubscribeParams, TaskSummary, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
+    ConversationCreateParams, ConversationDeleteParams, ConversationExportParams,
+    ConversationHistoryParams, ConversationHistoryResult, ConversationIdParams,
+    ConversationListParams, ConversationRenameParams, ConversationSendParams, CoreCapabilities,
+    ErrorCode, FileChange, FileChangeStatus, GitApplyParams, MessageRecord, Method, Project,
+    ProjectCreateParams, ProjectDeleteParams, ProjectIdParams, ProjectRepositoryParams,
+    ProjectUpdateParams, RpcRequest, RpcResponse, SandboxCreateSpec, SandboxRemoveParams,
+    SandboxRemoveResult, SandboxStopParams, SandboxStopResult, SandboxSummary, SbxStatus,
+    TaskEvent, TaskListParams, TaskStatus, TaskSubscribeParams, TaskSummary, WorkspaceMode,
+    CORE_VERSION, PROTOCOL_VERSION,
 };
 
 /// Bounded frame size: refuse oversized input instead of buffering forever
@@ -126,6 +133,18 @@ impl std::fmt::Debug for CreateClaimHook {
     }
 }
 
+/// TEST SEAM for the A3b paths (`CoreConfig::test_before_task_write`,
+/// `CoreConfig::test_before_export_redaction`). Called with NO Core lock
+/// held, so it may issue requests. Production (`main.rs`) never sets one.
+#[derive(Clone)]
+pub struct TestHook(pub Arc<dyn Fn(&ServerInner) + Send + Sync>);
+
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook(..)")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CoreConfig {
     pub sbx_limits: SbxLimits,
@@ -150,6 +169,18 @@ pub struct CoreConfig {
     /// Test seam only — see [`CreateClaimHook`]. `None` in production.
     #[doc(hidden)]
     pub test_after_create_claim: Option<CreateClaimHook>,
+    /// Test seam only (A3b): called by `conversation.send` / [`create_task`]
+    /// AFTER the early conversation check and BEFORE the task's write
+    /// transaction — the window in which a concurrent `conversation.archive`
+    /// or `conversation.delete` can land, forcing the in-transaction re-check
+    /// to refuse. `None` in production.
+    #[doc(hidden)]
+    pub test_before_task_write: Option<TestHook>,
+    /// Test seam only (A3b): called by `conversation.export` after the page
+    /// was read and the DB mutex RELEASED, immediately before redaction runs.
+    /// `None` in production.
+    #[doc(hidden)]
+    pub test_before_export_redaction: Option<TestHook>,
 }
 
 pub struct ServerInner {
@@ -171,6 +202,9 @@ pub struct ServerInner {
     pub project_creates: inflight::ProjectCreates,
     /// Test seam ([`CreateClaimHook`]); `None` in production.
     test_after_create_claim: Option<CreateClaimHook>,
+    /// Test seams ([`TestHook`]); `None` in production.
+    test_before_task_write: Option<TestHook>,
+    pub(crate) test_before_export_redaction: Option<TestHook>,
 }
 
 impl ServerInner {
@@ -241,6 +275,8 @@ impl ServerInner {
             sandbox_ops: inflight::SandboxOpLocks::new(),
             project_creates: inflight::ProjectCreates::new(),
             test_after_create_claim: config.test_after_create_claim,
+            test_before_task_write: config.test_before_task_write,
+            test_before_export_redaction: config.test_before_export_redaction,
             confirmation_ttl: config
                 .confirmation_ttl
                 .unwrap_or(confirm::CONFIRMATION_TTL)
@@ -880,6 +916,21 @@ fn dispatch(
             .map_err(Into::into),
         Method::ConversationHistory => parse_params::<ConversationHistoryParams>(params)
             .and_then(|p| conversation_history(inner, p))
+            .map_err(Into::into),
+        Method::ConversationRename => parse_params::<ConversationRenameParams>(params)
+            .and_then(|p| conversation_lifecycle::conversation_rename(inner, p))
+            .map_err(Into::into),
+        Method::ConversationArchive => parse_params::<ConversationIdParams>(params)
+            .and_then(|p| conversation_lifecycle::conversation_set_archived(inner, p, true))
+            .map_err(Into::into),
+        Method::ConversationUnarchive => parse_params::<ConversationIdParams>(params)
+            .and_then(|p| conversation_lifecycle::conversation_set_archived(inner, p, false))
+            .map_err(Into::into),
+        Method::ConversationDelete => parse_params::<ConversationDeleteParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| conversation_lifecycle::conversation_delete(inner, p)),
+        Method::ConversationExport => parse_params::<ConversationExportParams>(params)
+            .and_then(|p| conversation_lifecycle::conversation_export(inner, p))
             .map_err(Into::into),
         Method::TaskCancel => match string_param(&params, "taskId") {
             Some(t) => task_cancel(inner, t).map_err(Into::into),
@@ -2182,34 +2233,25 @@ fn conversation_create(
         Validator::sandbox_name(sb)
             .map_err(|e| (ErrorCode::ValidationFailed, format!("sandbox id: {e}")))?;
     }
-    let title = if p.title.trim().is_empty() {
-        "Untitled conversation".to_string()
-    } else {
-        Validator::display_text(&p.title, 200)
-            .map_err(|e| (ErrorCode::ValidationFailed, format!("title: {e}")))?
-            .to_string()
-    };
+    // A3b §3.3 item 7: `Validator::conversation_title`; empty or
+    // whitespace-only still becomes "Untitled conversation".
+    let title = conversation_lifecycle::title_for_create(&p.title)?;
     let id = uuid::Uuid::new_v4().to_string();
-    let now = now_rfc3339();
-    {
+    let conv = {
         let db = inner.lock_db();
         // A3a: exists AND not archived, in the same critical section as the
         // insert (cannot race project.archive / project.delete).
         project_lifecycle::require_live_project(db.conn(), &p.project_id)?;
+        // A3b §3.3 item 3: the validated sandbox NAME is persisted (it used
+        // to be discarded) — a stored name, never a binding.
         db.conn()
             .execute(
-                "INSERT INTO conversations (id, project_id, title, agent_id, created_at)
-                 VALUES (?1,?2,?3,?4,?5)",
-                params![id, p.project_id, title, p.agent_id, now],
+                "INSERT INTO conversations (id, project_id, title, agent_id, created_at, sandbox_id)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![id, p.project_id, title, p.agent_id, now_rfc3339(), p.sandbox_id],
             )
             .map_err(internal)?;
-    }
-    let conv = Conversation {
-        id,
-        project_id: p.project_id,
-        title,
-        agent_id: p.agent_id,
-        created_at: now,
+        conversation_lifecycle::load_conversation(db.conn(), &id)?
     };
     serde_json::to_value(conv).map_err(internal)
 }
@@ -2284,21 +2326,22 @@ fn create_task_keyed(
         .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, format!("content: {e}"))))?;
     let (project_id, agent_id) = {
         let db = inner.lock_db();
-        let found = db
+        // EARLY check, BEFORE any worktree is allocated: the conversation
+        // exists, its project is not archived (A3a) and it is not archived
+        // itself (A3b §3.3 item 4). `write_new_task` re-checks the same rule
+        // inside its transaction (authoritative).
+        let project_id =
+            conversation_lifecycle::require_writable_conversation(db.conn(), conversation_id)
+                .map_err(SvcFailure::from)?;
+        let agent_id: String = db
             .conn()
             .query_row(
-                "SELECT project_id, agent_id FROM conversations
-                 WHERE id = ?1 AND archived_at IS NULL",
+                "SELECT agent_id FROM conversations WHERE id = ?1",
                 params![conversation_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                |r| r.get(0),
             )
-            .map_err(|_| {
-                SvcFailure::from((ErrorCode::NotFound, "conversation not found".to_string()))
-            })?;
-        // A3a: refuse an archived project BEFORE any worktree is allocated.
-        // `write_new_task` re-checks inside its transaction (authoritative).
-        project_lifecycle::require_live_project(db.conn(), &found.0).map_err(SvcFailure::from)?;
-        found
+            .map_err(internal)?;
+        (project_id, agent_id)
     };
 
     let task_id = uuid::Uuid::new_v4().to_string();
@@ -2328,6 +2371,10 @@ fn create_task_keyed(
             result_json: serde_json::to_string(&summary).map_err(internal)?,
         }),
     };
+    // Test seam (A3b): no Core lock is held here.
+    if let Some(hook) = &inner.test_before_task_write {
+        (hook.0)(inner);
+    }
     let written = write_new_task(
         inner,
         &task_id,
@@ -2379,6 +2426,23 @@ fn create_task_keyed(
     };
     {
         let db = inner.lock_db();
+        // Review I3: the write committed and the DB mutex was released, so a
+        // racing `task.cancel` + `conversation.delete` (or `project.delete`)
+        // may have removed the task by now. Then there is nothing to attach
+        // the scaffold event to; the request itself succeeded, so answer the
+        // summary already built (like a replay, it is not current state)
+        // instead of INTERNAL. Checked under the same guard as the append.
+        let still_exists: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(internal)?;
+        if still_exists == 0 {
+            return Ok(summary);
+        }
         let log = EventLog::new(&db);
         let now2 = now_rfc3339();
         match admission {
@@ -2636,20 +2700,12 @@ fn write_new_task(
     }
     let db = inner.lock_db();
     let tx = db.conn().unchecked_transaction().map_err(internal)?;
-    // A3a (authoritative, same transaction as every write below): the
-    // conversation still exists — a project.delete that landed since the
-    // early check is NOT_FOUND, never an FK INTERNAL — and its project is not
-    // archived (cannot race project.archive). Nothing is written otherwise.
-    let project_id: String = tx
-        .query_row(
-            "SELECT project_id FROM conversations WHERE id = ?1 AND archived_at IS NULL",
-            params![conversation_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(internal)?
-        .ok_or_else(|| (ErrorCode::NotFound, "conversation not found".to_string()))?;
-    project_lifecycle::require_live_project(&tx, &project_id)?;
+    // A3a/A3b (authoritative, same transaction as every write below): the
+    // conversation still exists — a project.delete or conversation.delete
+    // that landed since the early check is NOT_FOUND, never an FK INTERNAL —
+    // its project is not archived and it is not archived itself (cannot race
+    // project.archive / conversation.archive). Nothing is written otherwise.
+    conversation_lifecycle::require_writable_conversation(&tx, conversation_id)?;
     {
         let log = EventLog::from_conn(&tx);
         tx.execute(
@@ -3221,39 +3277,28 @@ fn task_list(inner: &ServerInner, p: TaskListParams) -> Result<serde_json::Value
 }
 
 /// `conversation.list` — chat enumeration, previously impossible (v1 gap 1).
+/// A3b: archived conversations only with `includeArchived: true`.
 fn conversation_list(
     inner: &ServerInner,
     p: ConversationListParams,
 ) -> Result<serde_json::Value, SvcError> {
     let limit = clamp_limit(p.limit);
     optional_scoping_id("projectId", &p.project_id)?;
-    let limit_i64 = limit as i64;
-    let db = inner.lock_db();
-    let mut stmt = db
-        .conn()
-        .prepare(
-            "SELECT id, project_id, title, agent_id, created_at FROM conversations
-             WHERE archived_at IS NULL AND (?1 IS NULL OR project_id = ?1)
-             ORDER BY created_at ASC, id ASC LIMIT ?2",
-        )
-        .map_err(internal)?;
-    let rows = stmt
-        .query_map(params![p.project_id, limit_i64], |r| {
-            Ok(Conversation {
-                id: r.get(0)?,
-                project_id: r.get(1)?,
-                title: r.get(2)?,
-                agent_id: r.get(3)?,
-                created_at: r.get(4)?,
-            })
-        })
-        .map_err(internal)?;
-    let out = rows.collect::<Result<Vec<_>, _>>().map_err(internal)?;
+    let out = {
+        let db = inner.lock_db();
+        conversation_lifecycle::list_conversations(
+            db.conn(),
+            p.project_id.as_deref(),
+            p.include_archived(),
+            limit as i64,
+        )?
+    };
     serde_json::to_value(out).map_err(internal)
 }
 
 /// `conversation.history` — bounded transcript read with disclosure of BOTH
 /// bounds (specs/02 §2 "bounded responses … with truncation disclosure").
+/// A3b: archived conversations are served too (an unknown one is NOT_FOUND).
 fn conversation_history(
     inner: &ServerInner,
     p: ConversationHistoryParams,
@@ -3263,34 +3308,36 @@ fn conversation_history(
     // A negative cursor is meaningless (sequences start at 1); normalise it
     // rather than passing a nonsense bound to SQLite.
     let after = p.after_sequence.max(0);
-    let db = inner.lock_db();
-    // Existence first: an unknown (or archived) conversation is a structured
-    // NOT_FOUND, never an empty-but-successful answer that looks like "no
-    // messages". The id is bound, never interpolated.
-    let known: i64 = db
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE id = ?1 AND archived_at IS NULL",
-            params![p.conversation_id],
-            |r| r.get(0),
-        )
-        .map_err(internal)?;
-    if known == 0 {
-        return Err((ErrorCode::NotFound, "conversation not found".into()));
-    }
+    let result = {
+        let db = inner.lock_db();
+        // Existence first: an unknown conversation is a structured NOT_FOUND,
+        // never an empty-but-successful answer that looks like "no messages".
+        conversation_lifecycle::load_conversation(db.conn(), &p.conversation_id)?;
+        read_message_page(db.conn(), &p.conversation_id, after, limit)?
+    };
+    serde_json::to_value(result).map_err(internal)
+}
 
+/// One page of a conversation's messages — THE paging rule shared by
+/// `conversation.history` and `conversation.export` (A3b §3.3 item 6), run
+/// under the DB lock over the RAW stored rows.
+fn read_message_page(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    after: i64,
+    limit: usize,
+) -> Result<ConversationHistoryResult, SvcError> {
     // Read one row MORE than the caller asked for: that probe row proves the
     // scan was cut short without materialising the whole transcript.
     let fetch = limit as i64 + 1;
-    let mut stmt = db
-        .conn()
+    let mut stmt = conn
         .prepare(
             "SELECT id, conversation_id, role, content, sequence FROM messages
              WHERE conversation_id = ?1 AND sequence > ?2 ORDER BY sequence ASC LIMIT ?3",
         )
         .map_err(internal)?;
     let rows = stmt
-        .query_map(params![p.conversation_id, after, fetch], |r| {
+        .query_map(params![conversation_id, after, fetch], |r| {
             Ok(MessageRecord {
                 id: r.get(0)?,
                 conversation_id: r.get(1)?,
@@ -3315,6 +3362,8 @@ fn conversation_history(
         // wire rather than an undercount of hostile content. The FIRST row is
         // always allowed through — see [`MAX_HISTORY_BYTES`] for why that cannot
         // overflow the frame cap — so paging can never stall on an oversize row.
+        // Export redacts AFTER this count; redaction never lengthens a row, so
+        // the count still bounds the redacted page.
         let row_bytes = serde_json::to_string(&record)
             .map(|s| s.len())
             .map_err(internal)?;
@@ -3326,12 +3375,11 @@ fn conversation_history(
         messages.push(record);
     }
     let next_sequence = messages.last().map(|m| m.sequence).unwrap_or(after);
-    let result = ConversationHistoryResult {
+    Ok(ConversationHistoryResult {
         messages,
         truncated,
         next_sequence,
-    };
-    serde_json::to_value(result).map_err(internal)
+    })
 }
 
 fn query_task_ids(db: &Database, project_id: Option<&str>) -> Result<Vec<String>, SvcError> {
