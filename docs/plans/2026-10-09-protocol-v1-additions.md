@@ -76,7 +76,7 @@ Each row is one commit, plus its `docs(audit)` log entry. Status is tracked in t
 | A4 | `ConversationSendParams.mode?: "task" \| "discuss"` | default `"task"` | `discuss` never gets a writable workspace. With no verified adapter, both still answer `PERMISSION_DENIED` (honest). Follow-up from A1: once tasks carry sandbox names, `sandbox.stop` / `sandbox.remove` must refuse, or describe in `impact`, active tasks bound to the sandbox. |
 | A5 | `ChangeSet.repoPath?`, `ChangeSet.uninspected?: string[]`, `FileChange.oldPath?` | response fields | `oldPath` comes from `--name-status -M`. `uninspected` lets a future review return a flagged partial list for submodules instead of refusing; today it is always refused. |
 | A5 | `git.diff` | `{ taskId, path, maxBytes? }` → `{ path, oldPath?, patch, binary, truncated, baseBlob?, taskBlob? }` | Read-only. Hardened runner; the path must be in the task's change list. Patch capped (default 256 KiB). |
-| A6 | `git.apply` (existing) implemented for `selectedFiles` | unchanged shape | Uses `git apply --3way --index`, or `cherry-pick --no-commit` for a whole task. Dirty gate on the touched paths plus the submodule refusal. Conflicts are rolled back and reported as `CONFLICT` with paths. |
+| A6 | `git.apply` (existing) implemented for reviewed entries | additive: `entries`, `FileChange.taskBlob`/`taskMode`, `ApplyResult.appliedFiles` | **Superseded by §3.6** (originally `--3way` / `cherry-pick`): `host_worktree` only; content bound to the reviewed blob ids; no git process reads the task worktree; exact-set snapshot from objects; host leading-path and dirty gates; `git apply --index` with post-write verification; durable start/finish events. |
 | A7 | `verification.list`, `verification.approve` (user-entered argv + label), `verification.revoke`, `verification.run` | `VerificationCommand { id, label, argv: string[], approvedAt }`, `VerificationResult { exitCode, stdout, stderr, truncated, elapsedMs }` | Runs **only** inside the task's sandbox via `sbx exec` with an argv vector (no shell). Output is bounded and redacted. Never runs on the host. |
 | A7 | `project.context` | `{ detected: [{ manifest, suggestedCommands: string[][] }], approved: VerificationCommand[] }` | Bounded, read-only manifest parsing. Suggestions are never auto-approved. |
 | A8 | `sbx.status` (read-only diagnostics) | `{ path, version, daemon: { running }, policyInitialized?, captured: boolean }` | From `version` and `daemon status --json`. |
@@ -329,7 +329,7 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
 
 | # | Addition | Shape (additive) | Notes |
 |---|---|---|---|
-| A4b | Workspace selection on `conversation.send` + wire `worktree.discard` (token) | `workspace?: { mode, repoPath? }` | **Recorded, not scheduled.** Prerequisite for any wire-created task with Git context; designed and reviewed on its own because it writes host Git state. |
+| A4b | Workspace selection on `conversation.send` + wire `worktree.discard` (token) | `workspace?: { mode, repoPath? }` | **Recorded, not scheduled.** Prerequisite for any wire-created task with Git context; designed and reviewed on its own because it writes host Git state. **Hard precondition (A6 §3.6 item 2 / C3):** before any path makes `host_worktree` creatable or binds a sandbox to a task worktree, `git.review` and `git.diff` on `host_worktree` must stop running git in the task worktree. Git is pinned to `--git-dir=<host common dir>`, and the task side is read only by Core. A test plants a hostile `.git` file and asserts that a marker filter never runs. |
 
 ### 3.5 A5 decisions (`git.diff` + `ChangeSet` fields), fixed before implementation
 
@@ -390,6 +390,100 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
    - VS Code renders through its native diff editor where the patch allows, otherwise as a read-only text document. JetBrains uses its diff viewer or a read-only viewer. Desktop uses a read-only monospace view.
    - `binary`, `truncated` and `lossy` are disclosed, and `oldPath → path` is shown for renames.
    - Patch text is untrusted data: revealed, never rendered as HTML or Markdown, never executed.
+
+### 3.6 A6 decisions (`git.apply` for reviewed files), fixed before implementation
+
+This is the first path that writes into the user's own repository (AGENTS.md rule 7, specs/06 §6). It binds the apply to the exact content Core hashed at review, never merges into the user's edits, never writes beyond a symlink, and records itself durably. It **supersedes the A6 table row**: there is no `--3way` and no `cherry-pick`. With `HEAD == base` enforced and the touched paths clean, `--3way` could only act when the preimage does not match, and it would then leave conflict markers and unmerged entries in the user's tree. That is not a rollback. A whole-task apply is simply every entry through the same path.
+
+The design-level `security-reviewer` pass on the first draft returned **BLOCK**. C1–C3 and W1–W4 were proven by git 2.56 probes on APFS; C4 was found by analysis. Every finding is folded in below and tagged with its id. A re-review returned PASS-WITH-WARNINGS. Its R1–R8 are folded in as well.
+
+1. **Scope by workspace mode.**
+   - `host_worktree` is the only mode that applies.
+   - `direct_mount` is refused: "this task worked directly in your repository; its changes are already in your working tree, so there is nothing to apply". This resolves the old `preconditions_for_apply` scope-limit comment without weakening the gate.
+   - `sbx_clone`, a removed worktree, and no Git context are refused with the existing review messages. The submodule refusal is unchanged.
+   - Today `sandbox.create` refuses `host_worktree`, so A6 is reachable only for tasks seeded internally. It is recorded as UNVERIFIED until A4b.
+2. **No git process on the apply path reads the task worktree (C3).**
+   - The worktree's `.git` file is agent-writable, and every git process re-reads it. It can name an agent-owned gitdir whose `commondir` points back at the host, so the common-dir, toplevel and worktree-list checks all still pass. That gitdir's filter config then runs on the host.
+   - Therefore every task-side git call on the apply path passes `--git-dir=<canonical common dir of the REGISTERED host repository>`. That directory is derived from the registered repository, never read from the worktree. Pinning `<common>/worktrees/<id>` is not enough, because its `commondir` may be agent-writable.
+   - **Every** task-side call, including the runner's own filter and object-format enumeration (`repo_overrides`), runs with `--git-dir=<common>` and cwd = Core's temp dir, never the task worktree. The object format used for `taskBlob` is read once from the host common dir's config (R3).
+   - The task side is read **only by Core**, through the A5 `openat` walk (`O_DIRECTORY|O_NOFOLLOW` per component, `fstatat(AT_SYMLINK_NOFOLLOW)`, `O_NOFOLLOW|O_NONBLOCK` leaf, inode check).
+   - **A4b precondition (recorded, not part of A6):** A5 `git.review` and `git.diff` on `host_worktree` still run git in the worktree, so a raced `.git` file could run a clean filter. Before A4b makes `host_worktree` creatable, the host_worktree change list must move to the same model: git pinned to the host common dir, with the task side read by Core.
+3. **Content binding.**
+   - **`FileChange.taskBlob?` / `taskMode?` on `git.review`** (additive), produced only for `host_worktree` tasks:
+     - `taskBlob` = `H("blob <len>\0" + bytes)`, over bytes Core read itself. `H` is SHA-1 (collision-detecting, matching git's sha1dc; RustCrypto `sha1collisiondetection`, new dependency, `cargo deny`/`cargo audit` when added) or SHA-256 (`sha2`), according to the repository's object format.
+     - `taskMode` is `100644`, `100755` or `120000`, from `lstat`.
+     - Both are absent for `deleted` entries and for files over the **32 MiB** apply cap (disclosed as "too large to apply").
+   - **`git.diff` derives `taskBlob`/`taskMode` and the displayed patch from ONE read (C4).** On `host_worktree`, Core reads the task file once (full content up to the cap), hashes it, and renders the display from those same bytes. The base side comes from objects (`baseBlob`), and the diff is computed between the two Core-owned temp files with `git --git-dir=<common> diff --no-index --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ -U3 -- <tmp/base> <tmp/task>` (cwd = the Core temp dir; `--no-index` fails without a repository under `GIT_ATTR_SOURCE`, R2). `binary` is decided from the bytes read (git's NUL-in-first-8000 rule on both sides), not from a git read of the worktree. Header names are temp names; clients already take names from JSON (A5). Display truncation applies only after hashing. Untracked entries hash the full content, not the `maxBytes + 1` prefix.
+   - **`ChangeSet.reviewId?`** (additive, R4): an opaque id for each `git.review` answer on a `host_worktree` task. Core keeps the last 8 per task in memory, so a Core restart means review again. `git.review` never lists ignored files (`--exclude-standard`), and the id is what makes "reviewed" mean "Core listed it". It is not a human-presence token.
+   - **`git.apply` params gain `reviewId?` and `entries?: [{path, status, oldPath?, taskBlob?, taskMode?}]`** (additive), copied verbatim from the reviewed `git.review` answer. Every entry must be a member of that review, with identical `path`, `status`, `oldPath`, `taskBlob` and `taskMode`. Otherwise: "entries do not match a review Core produced; review again; nothing was written".
+     - A6 apply **requires** `reviewId` and `entries`. `selectedFiles` without `entries`, both together, or an empty list are refused (`VALIDATION_FAILED`, "…; nothing was written"). An empty list never means "all".
+     - Paths travel in a typed raw-path argv channel built only from a validated entry (like `LiteralPathspec`; empty and NUL refused), because `--cacheinfo`/`--force-remove` take raw paths, not pathspecs.
+   - **Entry validation from Core alone:** the base side comes from `ls-tree -z <base>` under `--git-dir=<common>`; presence, type and hash come from the `openat` walk. Required state per status:
+     - `added`/`untracked`: absent in base, a present regular file.
+     - `modified`: present in base, a present regular file.
+     - `deleted`: present in base, the leaf absent (ENOENT) with real-directory ancestors.
+     - `renamed`: `oldPath` present in base and absent in the worktree; `path` absent in base and present.
+     - Any mismatch, or a hash or mode different from `taskBlob`/`taskMode`: "<path> changed since it was reviewed; review it again; nothing was written".
+   - **Entry policy:** mode `120000` (symlinks) is refused ("symlinks are never applied"); gitlinks are refused; a path listed twice is refused. An executable-bit change is allowed and disclosed. A case-only rename on a case-insensitive filesystem fails closed in git ("already exists") and is disclosed as unsupported. A typechange (`T` in `diff-tree --raw`, symlink↔file) counts as `modified` in the exact-set check. Any target whose base mode is `120000` (deleting a tracked symlink, or a symlink→file change) is refused as unsupported and disclosed (R7).
+4. **Snapshot from objects only.**
+   - Each selected non-deleted entry's bytes (from the step-3 read) are copied into a Core-owned `0700` temp dir. `hash-object -w --no-filters -- <tempfile>` under `--git-dir=<common>` must print exactly `taskBlob`.
+   - In a temp index (`GIT_INDEX_FILE` set by Core inside its temp dir; the env scrub strips inherited `GIT_*`): `read-tree <base>`, then `update-index --add --cacheinfo <mode>,<oid>,<path>` per added or modified path and `update-index --force-remove -- <path>` per deleted path or rename `oldPath`, then `write-tree` → the snapshot tree. `update-index` runs without `--replace`, and any `update-index` failure is reported as "changed since it was reviewed" (R8).
+   - **Exact-set check (C1).** Literal pathspecs prefix-match directories (`:(literal)a` matches `a/b`), so no step may be pathspec-scoped. Core runs `diff-tree -r -z --raw --no-renames <base> <snapshot>` **without a pathspec**. The resulting set of (path, status, new mode, new oid) must equal the selected entries exactly: a rename is a delete of `oldPath` plus an add of `path`, nothing more and nothing less. Otherwise: "<path>: the snapshot differs from the reviewed entries; nothing was written". This is also what makes directory/file swaps fail closed.
+   - The patch is then generated, again **without a pathspec**: `git -c diff.suppressBlankEmpty=false diff-tree -r --binary --full-index --no-renames --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ <base> <snapshot>`, written to the Core temp dir. The `-c` is a global option before the subcommand, passed through the runner's config channel; after the subcommand it would be diff-tree's combined-diff flag (R1).
+   - It is never built with the `git.diff` builders or the display-capped runner (A5 constraint; a test pins this).
+   - Snapshot objects in the shared store stay unreferenced and are pruned by git normally.
+5. **Host gates** (host repository, hardened runner, work tree pinned, plus `confirm_work_tree` on the host root):
+   - the repo-wide submodule scan;
+   - `HEAD` == the recorded base == `expectedBase` (exact full oid);
+   - every touched path (`path`, and `oldPath`) is absent from `git status --porcelain=v1 -z --untracked-files=all --ignored=matching -- :(literal)…`;
+   - **hidden index entries (W3):** any touched path flagged assume-unchanged or skip-worktree (`index_hidden_entries`, scoped to the touched paths) is refused;
+   - **host leading-path check (C2):** with `--index`, git's "beyond a symlink" check consults only the index, so an untracked or ignored symlinked directory (e.g. a symlinked `node_modules`, `.venv` or `data`) would send the write outside the repository. For every touched path, Core walks the host work tree with `openat` (`O_DIRECTORY|O_NOFOLLOW`):
+     - every existing ancestor must be a real directory;
+     - a create target's leaf must be absent;
+     - a modify or delete target's leaf must be a regular file (`fstatat AT_SYMLINK_NOFOLLOW`);
+     - otherwise: "<path> lies under a symlink or a file in your working tree; nothing was written".
+     
+     Residual (disclosed): the window between this walk and git's write. With the writer lock (item 8), only the user's own concurrent actions can use it.
+   - **filtered paths (R5):** a touched path whose host attributes name a `filter` (e.g. LFS) is refused, because filters are blanked and it would receive raw content. This is evaluated with `git check-attr -z filter -- <raw paths>` in the host repository WITHOUT the `GIT_ATTR_SOURCE` override: the host's `.gitattributes` are the user's, and `check-attr` executes nothing. A selected entry that adds or modifies `.gitattributes` is flagged in the confirmation.
+6. **Write.**
+   - `git apply --check --index --whitespace=nowarn <patchfile>`, then `git apply --index --whitespace=nowarn <patchfile>`.
+   - **Pins (W4):** `core.autocrlf=false`, `core.safecrlf=false`, `core.symlinks=true`, `core.fileMode=true`, `core.protectHFS=true`, `core.protectNTFS=true`, `core.checkStat=default`, `core.trustctime=true`, `core.splitIndex=false`, `core.sparseCheckout=false`, `index.sparse=false`, and `apply.whitespace`/`apply.ignoreWhitespace` neutralized. A test runs each with hostile user and repo values.
+   - **Budget:** the total patch size is capped, so the whole chain (scans, gates, snapshot, check, write, verify) fits well inside the 45 s client deadline. The write runs under its own limit, not the QUERY kill. If that limit fires, Core kills git and reports the W1 outcome with `partial: true`, adding that `.git/index.lock` may remain and must be removed only after checking that no git process is running (R6).
+   - **`--check` failure:** `applied: false`, abortReason "the patch does not apply cleanly; nothing was written", and `conflictedFiles` = the paths git names (repo-relative, parsed defensively, capped).
+   - **Failure after `--check` passed (W1):** if the write itself fails or is killed, `applied: false`, abortReason "the write failed after git's checks passed; some files may have been written or staged — check `git status` in <repoPath>". It is never "nothing was written".
+   - **Post-write verification (W2):** `git apply` does not verify text postimage oids. So host `ls-files -s -z` for the touched paths must equal the snapshot entries (oid and mode; deleted paths absent), and `diff-files --quiet` on them must be clean. A mismatch is a non-success: "files were changed, but the staged content differs from the reviewed content — check `git status` in <repoPath>".
+   - The result is staged in the host index and working tree. **Nothing is committed.**
+7. **Result (additive):**
+   - `ApplyResult.appliedFiles?: string[]`;
+   - `ApplyResult.modeChanges?: [{path, from, to}]`;
+   - `ApplyResult.snapshotTree?`;
+   - `ApplyResult.partial?: boolean`, true only for the W1 and W2 outcomes.
+   - Gate failures keep the structured `applied: false` + `abortReason` shape, with stable message constants. Malformed params are `VALIDATION_FAILED`.
+8. **Durability, locking, retries.**
+   - **Locking (W6):** apply takes the scheduler writer lock for the host repository path. If any writer holds it (e.g. a `direct_mount` task), or another apply or worktree discard is running, the answer is `CONFLICT` and nothing runs.
+   - **Durability (W7):** a durable `git.apply.started {files, baseCommit, snapshotTree}` task event is appended before the first host write, and `git.applied` / `git.apply.failed` after it, before the response (rule 4). On restart, an unterminated start is reconciled against the host index and recorded as applied, partial or not applied, never assumed. These are new event types, not enum values.
+   - **Retries:** `git.apply` is not replay-safe and never in a client's read-only set. A lost answer is "may have been applied — check `git status` in the repository before retrying". A retry after success fails closed, because the touched paths are now staged and the item 5 gate refuses them.
+9. **Confirmation (rule 7; W5).** No Core token: §2's token proves nothing about human presence, and the content binding already ties the apply to the reviewed bytes. Instead:
+   - Clients MUST show a native modal **opened only from a user gesture**, never triggered by chat, agent or tool text. It names the repository (`repoPath`, revealed) and lists every file with its status.
+   - It separately flags:
+     - entries whose content was never fully shown (binary, truncated, or never opened in a diff);
+     - executable additions and exec-bit changes;
+     - paths that run automatically: under `.husky/`, `.githooks/`, `.github/workflows/`, `.envrc`, `.vscode/`, `.idea/`, `.gitattributes`, `.gitmodules`, or the host's effective `core.hooksPath` when Core reports it as repo-relative (`ChangeSet.hostHooksPath?`, additive).
+   - It says the files are written into the working tree and staged, nothing is committed, and the content is "the version Core hashed when you reviewed".
+   - If a `git.diff` the user opened returned a `taskBlob` different from the entry's, the client MUST NOT send, and asks for a re-review.
+10. **Feature and deadline.**
+    - The new feature `git-apply` (5 features) is advertised only by a Core that implements items 1–9. Clients enable Apply only when it is advertised; otherwise they keep the current "not implemented" state.
+    - The method count stays 28.
+    - `git.apply` uses the 45 s git deadline (desktop proxy 43 s). A timeout is reported as a lost answer, per item 8.
+11. **Verification.**
+    - Core integration tests seed `host_worktree` tasks through the internal API, on real temporary repositories with a real linked worktree, and send real `git.apply` frames. They cover:
+      - modified, added, deleted, renamed, exec-bit and binary entries;
+      - tab, newline and quote paths;
+      - every refusal above, including the C1 directory/file swap, C2 untracked and ignored symlinked ancestors, a C3 planted `.git` file (a marker script must never run), and the C4 single read;
+      - W1 failure after the check, W2 verification, W3 hidden entries and W4 hostile config;
+      - a lost-answer retry, a concurrent apply, writer-lock contention and restart reconciliation.
+    - Mutation runs cover the gates.
+    - Over the wire, the live checks can confirm only the advertisement and the "no Git context" refusal (UNVERIFIED until A4b).
 
 ## 4. Client obligations per addition
 
