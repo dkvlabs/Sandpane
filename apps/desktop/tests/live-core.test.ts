@@ -25,6 +25,8 @@ import { CoreClient, type CoreTransport } from "../src/lib/core-client";
 import {
   CONVERSATION_LIFECYCLE_METHODS,
   FEATURE_CONVERSATION_SANDBOX_ID,
+  FEATURE_CONVERSATION_SEND_MODE,
+  KNOWN_FEATURES,
   METHODS,
   coreAdvertisesFeature,
   coreAdvertisesMethod,
@@ -122,6 +124,10 @@ describeLive("real Core answers the way the mirror claims", () => {
     expect(outcome.capabilities.methods).toEqual([...METHODS]);
     expect(METHODS).toHaveLength(27);
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SANDBOX_ID)).toBe(true);
+    // A4: conversation-send-mode, and an A4 Core advertises exactly this
+    // client's known features (no method was added: still 27).
+    expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SEND_MODE)).toBe(true);
+    expect(outcome.capabilities.features).toEqual([...KNOWN_FEATURES]);
   });
 
   it("returns repositories on project.list and an array from conversation.list", async () => {

@@ -75,6 +75,11 @@ function optStr(rec: Rec, key: string, what: string): string | null {
   return v;
 }
 
+/** `{ [key]: value }` only when the value is present. */
+function optField<K extends string>(key: K, value: string | null): Partial<Record<K, string>> {
+  return value === null ? {} : ({ [key]: value } as Record<K, string>);
+}
+
 function num(rec: Rec, key: string, what: string): number {
   const v = rec[key];
   if (typeof v !== "number" || !Number.isFinite(v)) {
@@ -601,6 +606,10 @@ export function decodeTaskSummary(value: unknown): TaskSummary {
     sandboxName: optStr(t, "sandboxName", "TaskSummary"),
     taskBranch: optStr(t, "taskBranch", "TaskSummary"),
     baseCommit: optStr(t, "baseCommit", "TaskSummary"),
+    // A4: both optional strings; absent / null stay absent. `mode` is an OPEN
+    // string (an unknown value is kept and displayed, never refused).
+    ...optField("mode", optStr(t, "mode", "TaskSummary")),
+    ...optField("chosenSandboxName", optStr(t, "chosenSandboxName", "TaskSummary")),
     ...(replayedMarker(t) ?? {}),
   };
 }

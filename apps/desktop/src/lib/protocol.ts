@@ -237,6 +237,13 @@ export const FEATURE_SANDBOX_CREATE_AGENT = "sandbox-create-agent" as const;
  * "no sandbox was chosen" from "an older Core discarded the choice".
  */
 export const FEATURE_CONVERSATION_SANDBOX_ID = "conversation-sandbox-id" as const;
+/**
+ * `conversation.send` honours `mode` (`"task"` | `"discuss"`) and new tasks
+ * carry `TaskSummary.mode` (A4, §3.4 item 1). A pre-A4 Core silently drops
+ * `mode` and would treat a discussion as a task, so `mode` is sent ONLY when
+ * this is advertised.
+ */
+export const FEATURE_CONVERSATION_SEND_MODE = "conversation-send-mode" as const;
 
 /**
  * Every feature this desktop build knows, in Rust `FEATURES` order
@@ -247,6 +254,7 @@ export const KNOWN_FEATURES = [
   FEATURE_IDEMPOTENCY_KEYS,
   FEATURE_SANDBOX_CREATE_AGENT,
   FEATURE_CONVERSATION_SANDBOX_ID,
+  FEATURE_CONVERSATION_SEND_MODE,
 ] as const;
 export type KnownFeature = (typeof KNOWN_FEATURES)[number];
 
@@ -620,7 +628,16 @@ export interface ConversationSendParams {
   attachments: ContextRef[];
   /** Retry-safety key (A2); same rules as `SandboxCreateSpec.idempotencyKey`. */
   idempotencyKey?: string;
+  /**
+   * A4: absent means `"task"`. This build sends only `"discuss"`, and only
+   * when `conversation-send-mode` is advertised (see `send-mode.ts`).
+   */
+  mode?: SendMode;
 }
+
+/** The send modes Core accepts (A4, case-sensitive; drift-tested). */
+export const SEND_MODES = ["task", "discuss"] as const;
+export type SendMode = (typeof SEND_MODES)[number];
 
 /**
  * `task.subscribe` params. Cursor rules mirrored exactly from
@@ -766,6 +783,19 @@ export interface TaskSummary {
   sandboxName?: string | null;
   taskBranch?: string | null;
   baseCommit?: string | null;
+  /**
+   * A4: the mode the task was created with — an OPEN string (`"task"` /
+   * `"discuss"` today; anything else is displayed as-is). Absent on tasks
+   * created before A4.
+   */
+  mode?: string;
+  /**
+   * A4: the sandbox NAME the task's chat chose at creation, copied at send
+   * time. NOT a binding and NOT where the task runs: it never feeds the
+   * isolation label, the stop/remove counts or any scope logic — that is
+   * `sandboxName`'s job, which A4 does not change.
+   */
+  chosenSandboxName?: string;
   /**
    * A2: present (`true`) ONLY when this is a REPLAY of an earlier keyed
    * `conversation.send` — the task as FIRST created. Its status is NOT current

@@ -219,7 +219,14 @@ export interface CoreCapabilities {
  *    then may `Conversation.sandboxId` be read as "the sandbox NAME chosen at
  *    creation" — never as a live binding.
  */
-export const KNOWN_FEATURES = ['idempotency-keys', 'sandbox-create-agent', 'conversation-sandbox-id'] as const;
+export const KNOWN_FEATURES = [
+  'idempotency-keys',
+  'sandbox-create-agent',
+  'conversation-sandbox-id',
+  // A4 (§3.4): `conversation.send` honours `mode`. Send it ONLY when this is
+  // advertised: a pre-A4 Core drops the field and records a discussion as a task.
+  'conversation-send-mode',
+] as const;
 
 export type CoreFeature = (typeof KNOWN_FEATURES)[number];
 
@@ -533,7 +540,21 @@ export interface ConversationSendParams {
   attachments: ContextRef[];
   /** A2: see `SandboxCreateSpec.idempotencyKey`; same rule, same gating. */
   idempotencyKey?: string;
+  /**
+   * A4 (§3.4): the requested send mode; absent = "task". The wrapper sends the
+   * key ONLY for "discuss" (Task frames stay byte-identical to A2/A3b), and
+   * callers pass "discuss" only when Core advertises `conversation-send-mode`.
+   */
+  mode?: SendMode;
 }
+
+/**
+ * A4: the two values `conversation.send` accepts (case-sensitive). Core
+ * answers anything else with VALIDATION_FAILED `mode must be "task" or
+ * "discuss"`. NOT the type of `TaskSummary.mode`, which is an open string.
+ */
+export const SEND_MODES = ['task', 'discuss'] as const;
+export type SendMode = (typeof SEND_MODES)[number];
 
 /**
  * `task.subscribe` params. Cursor semantics resolved by protocol v1 — mirror
@@ -631,6 +652,18 @@ export interface TaskSummary {
   sandboxName?: string | null;
   taskBranch?: string | null;
   baseCommit?: string | null;
+  /**
+   * A4: the send mode the task was created with — an OPEN string ("task" /
+   * "discuss" today; an unknown value is displayed as-is, never a decode
+   * failure). Absent on tasks created before A4.
+   */
+  mode?: string | null;
+  /**
+   * A4: the sandbox NAME the task's chat chose, stored at send time. NOT a
+   * binding and NOT where the task runs; never feeds stop/remove counts,
+   * isolation labels or scope logic (that is `sandboxName`'s job).
+   */
+  chosenSandboxName?: string | null;
   /**
    * A2: `true` when this is the STORED first response to an earlier identical
    * keyed `conversation.send`. Its `status` is NOT current (the task may since

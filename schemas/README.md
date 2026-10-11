@@ -63,7 +63,19 @@ pending (A3a client step). The A3b conversation-lifecycle shapes —
 `Conversation.archivedAt` / `sandboxId` — are likewise defined by the Rust
 types; their five method names are in `rpc-request`'s enum and the
 `conversation-sandbox-id` feature is in `core-capabilities` (both gated by
-`schema-drift`). Client adoption pending (A3b client step). The
+`schema-drift`). Client adoption pending (A3b client step). The A4 send-mode
+shapes — `ConversationSendParams.mode` (`"task"` | `"discuss"`, a plain string
+on the wire so Core can answer any other value with the exact
+VALIDATION_FAILED message; explicit `"task"` is normalized to absent before
+the idempotency fingerprint), `TaskSummary.mode` (the send mode: an OPEN
+string, set on every task created from A4 on, absent on older tasks) and
+`TaskSummary.chosenSandboxName` (present only when the task's chat chose a
+sandbox: a stored NAME, not a binding, and it never means the task runs in
+that sandbox; `TaskSummary.sandboxName` keeps its pre-A4 binding-only
+meaning) — are likewise defined by the Rust types; no method is added and no
+enum is added to any schema. The `conversation-send-mode`
+feature is in `core-capabilities` (gated by `schema-drift`). Client adoption
+pending (A4 client step). The
 `docs/specs/02 §2` contract blocks are the
 human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7

@@ -91,6 +91,10 @@ class ScriptedCore {
   };
   /** Future-Core shape: task.list rows carry `sandboxName`. Today's Core never sets it. */
   taskSandboxNames = false;
+  /** A4 shape: task.list rows carry `mode` and `chosenSandboxName` (the chat's choice, NOT a binding). */
+  taskChosenNames = false;
+  /** A4: the `mode` value task.list rows report when `taskChosenNames` is set (any JSON value). */
+  taskMode: unknown = 'discuss';
   /** `sandbox.stop` answer. */
   stopAnswer: { ok: unknown } | { err: { code: string; message: string } } = {
     ok: { stopped: true, requeried: { name: 'atlas-box', probedState: 'stopped', boundProjectId: 'p1', workspaceMode: 'sbx_clone' } },
@@ -289,6 +293,9 @@ class ScriptedCore {
               // Real Core never fills sandboxName (tasks.sandbox_binding_id is
               // never written); `taskSandboxNames` simulates a future Core.
               ...(this.taskSandboxNames ? { sandboxName: project === 'p1' ? 'atlas-box' : 'nova-live' } : {}),
+              ...(this.taskChosenNames
+                ? { mode: this.taskMode, chosenSandboxName: project === 'p1' ? 'atlas-box' : 'nova-live' }
+                : {}),
             })),
         };
       case 'conversation.list': {
@@ -372,11 +379,20 @@ class ScriptedCore {
         if (target && target['archivedAt'] !== undefined && !this.forced.has('conversation.send')) {
           return { err: { code: 'VALIDATION_FAILED', message: 'conversation is archived; unarchive it first; nothing was changed' } };
         }
+        // A4 (mirrors Core): only "task" / "discuss"; null = absent. A pre-A4
+        // Core (feature not advertised) ignores the field entirely.
+        const honoursMode = this.features?.includes('conversation-send-mode') === true;
+        if (honoursMode && p['mode'] !== undefined && p['mode'] !== null && p['mode'] !== 'task' && p['mode'] !== 'discuss') {
+          return { err: { code: 'VALIDATION_FAILED', message: 'mode must be "task" or "discuss"' } };
+        }
         const stored = this.replayFor(frame);
         if (stored) return stored;
         const forced = this.takeForced(frame.method);
         if (forced) return forced;
-        return this.remember(frame, { id: `task-new-${this.requests.length}`, conversationId: p['conversationId'], status: 'queued' });
+        const sendMode = this.features?.includes('conversation-send-mode')
+          ? { mode: p['mode'] === 'discuss' ? 'discuss' : 'task', ...(typeof target?.['sandboxId'] === 'string' ? { chosenSandboxName: target['sandboxId'] } : {}) }
+          : {};
+        return this.remember(frame, { id: `task-new-${this.requests.length}`, conversationId: p['conversationId'], status: 'queued', ...sendMode });
       }
       case 'git.review':
         return {
@@ -2295,6 +2311,245 @@ describe('A3b conversation lifecycle', () => {
     expect(await session.exportConversation('c1')).toBe(false);
     expect(stub.errors.at(-1)).toMatch(/could not be written/);
     expect(session.snapshot().status?.text).not.toMatch(/Redacted export written to/);
+    session.dispose();
+  });
+});
+
+describe('A4 conversation.send mode', () => {
+  const MODE_FEATURES = ['idempotency-keys', 'sandbox-create-agent', 'conversation-sandbox-id', 'conversation-send-mode'];
+
+  async function online(core = new ScriptedCore()) {
+    const made = makeSession(core);
+    await made.session.attach();
+    await settle();
+    return { core, ...made };
+  }
+
+  function modeCore(): ScriptedCore {
+    const core = new ScriptedCore();
+    core.features = [...MODE_FEATURES];
+    return core;
+  }
+
+  async function sendWith(session: SandpaneSession, mode: 'task' | 'discuss', text = 'explain the auth flow') {
+    session.selectSandbox('atlas-box');
+    const plan = session.previewContext(false);
+    stub.answers.set('Send anyway', 'Send anyway');
+    await session.send(text, false, plan.planId, 'command', mode);
+  }
+
+  /** Fire the client deadline of the (held) request whose timeout is `ms`. */
+  function expire(timers: FakeTimers, ms: number): void {
+    const timer = timers.pending.find((t) => t.ms === ms);
+    if (!timer) throw new Error(`no pending ${ms} ms timer`);
+    timers.clear(timer.id);
+    timer.fn();
+  }
+
+  it('advertised: Task sends NO mode key; Discuss sends "mode":"discuss"', async () => {
+    const { core, session } = await online(modeCore());
+    expect(session.snapshot().sendModeSupported).toBe(true);
+    await sendWith(session, 'task');
+    await sendWith(session, 'discuss');
+    const frames = core.calls('conversation.send');
+    expect(frames).toHaveLength(2);
+    expect(Object.keys(frames[0]?.params ?? {})).not.toContain('mode');
+    expect(frames[1]?.params['mode']).toBe('discuss');
+    session.dispose();
+  });
+
+  it('not advertised: Task sends no mode key; Discuss is refused visibly and nothing is sent', async () => {
+    const { core, session } = await online();
+    expect(session.snapshot().sendModeSupported).toBe(false);
+    await sendWith(session, 'task');
+    expect(core.calls('conversation.send')).toHaveLength(1);
+    expect(Object.keys(core.calls('conversation.send')[0]?.params ?? {})).not.toContain('mode');
+    await sendWith(session, 'discuss');
+    expect(core.calls('conversation.send')).toHaveLength(1);
+    expect(session.snapshot().status?.tone).toBe('error');
+    expect(session.snapshot().status?.text).toMatch(/^Not sent: .*does not advertise "conversation-send-mode"/);
+    expect(session.snapshot().status?.text).toMatch(/record a discussion as a task/);
+    session.dispose();
+  });
+
+  it('Discuss re-probes before sending: a Core that dropped the feature gets no frame (no conversation is created)', async () => {
+    const core = modeCore();
+    const { session } = await online(core);
+    const probes = core.calls('system.probe').length;
+    const creates = core.calls('conversation.create').length;
+    // The cached probe still says "supported"; Core now is a pre-A4 build.
+    core.features = ['idempotency-keys', 'sandbox-create-agent'];
+    await sendWith(session, 'discuss');
+    expect(core.calls('system.probe').length).toBeGreaterThan(probes);
+    expect(core.calls('conversation.send')).toHaveLength(0);
+    expect(core.calls('conversation.create')).toHaveLength(creates);
+    expect(session.snapshot().status?.text).toMatch(/^Not sent: /);
+    expect(session.snapshot().sendModeSupported).toBe(false);
+    session.dispose();
+  });
+
+  it('Discuss with the writable intent is refused (a discussion never asks for a writable workspace)', async () => {
+    const { core, session } = await online(modeCore());
+    session.selectSandbox('atlas-box');
+    const plan = session.previewContext(true);
+    stub.answers.set('Send anyway', 'Send anyway');
+    await session.send('do it', true, plan.planId, 'command', 'discuss');
+    expect(core.calls('conversation.send')).toHaveLength(0);
+    expect(session.snapshot().status?.text).toMatch(/^Not sent: Discuss .*writable/);
+    session.dispose();
+  });
+
+  it('"Retry safely" resends the identical Discuss params, mode and key included', async () => {
+    const core = modeCore();
+    let first = true;
+    core.hold = (f) => {
+      if (f.method !== 'conversation.send' || !first) return false;
+      first = false;
+      return true;
+    };
+    const { session, timers } = await online(core);
+    stub.answers.set('Retry safely', 'Retry safely');
+    const sending = sendWith(session, 'discuss');
+    await settle();
+    expire(timers, 15_000);
+    await sending;
+    await settle(30);
+    const frames = core.calls('conversation.send');
+    expect(frames).toHaveLength(2);
+    expect(frames[1]?.params).toEqual(frames[0]?.params);
+    expect(frames[1]?.params['mode']).toBe('discuss');
+    expect(frames[1]?.params['idempotencyKey']).toMatch(/^[0-9a-f]{32}$/);
+    session.dispose();
+  });
+
+  it('"Retry safely" of a Discuss send is refused when the re-probed Core no longer advertises send mode', async () => {
+    const core = modeCore();
+    let first = true;
+    core.hold = (f) => {
+      if (f.method !== 'conversation.send' || !first) return false;
+      first = false;
+      return true;
+    };
+    stub.manual.add('Retry safely');
+    const { session, timers } = await online(core);
+    const sending = sendWith(session, 'discuss');
+    await settle();
+    expire(timers, 15_000);
+    await sending;
+    await settle();
+    // Core restarts as an A2-A3b build: keys yes, send mode no.
+    core.features = ['idempotency-keys', 'sandbox-create-agent'];
+    stub.clicks.shift()?.('Retry safely');
+    await settle(30);
+    expect(core.calls('conversation.send')).toHaveLength(1);
+    expect(stub.errors.at(-1)).toMatch(/^Not retried: the connected Core does not advertise "conversation-send-mode"/);
+    expect(stub.errors.at(-1)).toMatch(/Nothing was sent/);
+    // "Retry safely" is withdrawn: the refusal offers no button, and nothing is pending.
+    expect(stub.errorCalls.at(-1)?.items).toEqual([]);
+    expect(stub.clicks).toHaveLength(0);
+    session.dispose();
+  });
+
+  it("Core's VALIDATION_FAILED mode refusal is shown with honest copy", async () => {
+    const core = modeCore();
+    core.forced.set('conversation.send', { code: 'VALIDATION_FAILED', message: 'mode must be "task" or "discuss"' });
+    const { session } = await online(core);
+    await sendWith(session, 'discuss');
+    expect(stub.errors.at(-1)).toContain('Core refused the send mode');
+    expect(stub.errors.at(-1)).toContain('Core said: VALIDATION_FAILED: mode must be "task" or "discuss"');
+    session.dispose();
+  });
+
+  it('task rows carry the send mode (open string) and the chat-chosen name, revealed and capped', async () => {
+    const core = modeCore();
+    core.taskChosenNames = true;
+    core.taskMode = `plan\u202E${'x'.repeat(300)}`;
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const { session } = makeSession(core, state);
+    await session.attach();
+    await settle();
+    const row = session.snapshot().tasks.find((t) => t.taskId === 'task-a');
+    expect(row?.mode).toMatch(/^plan/);
+    expect(row?.mode).not.toContain('\u202E');
+    expect(row?.mode).toMatch(/\u2026 \(truncated\)$/);
+    expect((row?.mode ?? '').length).toBeLessThanOrEqual(64 + '\u2026 (truncated)'.length);
+    expect(row?.chosenSandboxName).toBe('atlas-box');
+    session.dispose();
+  });
+
+  it('a task with ONLY chosenSandboxName leaves the stop copy at "cannot be checked" (never a count)', async () => {
+    const core = modeCore();
+    core.taskChosenNames = true;
+    const { session } = await online(core);
+    await session.stopSandbox('atlas-box');
+    expect(core.calls('task.list').length).toBeGreaterThan(0);
+    const call = stub.warningCalls.find((c) => c.items.includes('Stop sandbox'));
+    expect(call?.message).toBe('Stop sandbox "atlas-box"?');
+    expect(call?.options?.detail).toContain(
+      'Active tasks in this sandbox cannot be checked: Core does not yet record which sandbox a task uses.',
+    );
+    expect(call?.options?.detail).not.toMatch(/active task\(s\) (use it|recorded by Core run)/);
+    session.dispose();
+  });
+
+  it('I1: a reconnect to a pre-A4 Core between the re-probe and the send refuses the Discuss send (never downgraded)', async () => {
+    const core = modeCore();
+    const { session } = await online(core);
+    core.hold = (f) => f.method === 'conversation.create';
+    const sending = sendWith(session, 'discuss');
+    await settle();
+    expect(core.calls('conversation.create')).toHaveLength(1);
+    // While the create is in flight, the client re-probes a Core without the feature.
+    core.features = ['idempotency-keys', 'sandbox-create-agent'];
+    core.hold = null;
+    await session.refresh();
+    expect(session.snapshot().sendModeSupported).toBe(false);
+    core.release();
+    await sending;
+    await settle();
+    expect(core.calls('conversation.send')).toHaveLength(0);
+    expect(session.snapshot().status?.tone).toBe('error');
+    expect(session.snapshot().status?.text).toMatch(/^Not sent: .*does not advertise "conversation-send-mode"/);
+    session.dispose();
+  });
+
+  it('I4: a non-string TaskSummary.mode is shown as unreadable, never echoed', async () => {
+    const core = modeCore();
+    core.taskChosenNames = true;
+    core.taskMode = 7;
+    const state = new MemoryState();
+    state.values.set('sandpane.ui.selectedProject', 'p1');
+    const { session } = makeSession(core, state);
+    await session.attach();
+    await settle();
+    const row = session.snapshot().tasks.find((t) => t.taskId === 'task-a');
+    expect(row?.mode).toBe('(unreadable value from Core \u2014 not shown)');
+    expect(row?.mode).not.toContain('7');
+    session.dispose();
+  });
+
+  it("sandbox.remove step 1 shows Core's 'could not be read' A4 impact variant", async () => {
+    const core = modeCore();
+    const line =
+      'the number of unfinished tasks sent from chats that chose this sandbox name could not be read; removing it does not cancel them';
+    core.confirmation = { ...core.confirmation, impact: ['removes sandbox atlas-box', line] };
+    const { session } = await online(core);
+    expect(await session.removeSandbox('atlas-box')).toBe(false);
+    const call = stub.warningCalls.find((c) => c.items.includes('Remove sandbox'));
+    expect(call?.options?.detail).toContain(`\u2022 ${line}`);
+    session.dispose();
+  });
+
+  it("sandbox.remove step 1 shows Core's A4 impact line about chat-chosen names", async () => {
+    const core = modeCore();
+    const line =
+      '2 unfinished task(s) were sent from chats that chose this sandbox name; removing it does not cancel them';
+    core.confirmation = { ...core.confirmation, impact: ['removes sandbox atlas-box', line] };
+    const { session } = await online(core);
+    expect(await session.removeSandbox('atlas-box')).toBe(false);
+    const call = stub.warningCalls.find((c) => c.items.includes('Remove sandbox'));
+    expect(call?.options?.detail).toContain(`• ${line}`);
     session.dispose();
   });
 });

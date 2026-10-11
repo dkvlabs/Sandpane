@@ -12,6 +12,7 @@
 // call from the EDT.
 package labs.dkv.sandpane.core
 
+import kotlinx.serialization.SerializationException
 import labs.dkv.sandpane.text.VisibleText
 import java.util.concurrent.CompletionException
 import java.util.concurrent.ExecutionException
@@ -79,6 +80,14 @@ object ErrorAttribution {
         is TimeoutException ->
             "Core did not answer before the deadline; the request may still be running there, " +
                 "so no result is assumed"
+
+        // ---- a reply that did not decode: never echoed (review I3) --------------------------
+        // kotlinx puts a snippet of the JSON input in these messages, so the message is never shown.
+        is SerializationException ->
+            "Core sent a reply this plugin could not decode; its content is not shown"
+
+        is IllegalArgumentException ->
+            "this plugin could not process Core's reply (${t.javaClass.simpleName}); its content is not shown"
 
         else ->
             "${t.javaClass.simpleName}: ${t.message ?: "no message"}"

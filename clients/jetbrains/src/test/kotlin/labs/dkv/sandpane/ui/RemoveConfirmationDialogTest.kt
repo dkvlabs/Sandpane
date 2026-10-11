@@ -51,6 +51,25 @@ class RemoveConfirmationDialogTest {
         assertFalse(html.contains(token), "the confirmation token is never displayed")
     }
 
+    /**
+     * A4 (\u00A73.4 item 3): Core may add a descriptive line about tasks sent from chats that chose this
+     * sandbox NAME. The fixture text mirrors Core's `format!` in `issue_remove_confirmation` (illustrative,
+     * not a captured answer; ProtocolDriftGuardTest pins the wording). It is shown through the same
+     * revealed, escaped, capped path as every other impact line.
+     */
+    @Test
+    fun theChosenSandboxNameImpactLineIsShown() {
+        val counted = "3 unfinished task(s) were sent from chats that chose this sandbox name; removing it does not cancel them"
+        val unreadable = "the number of unfinished tasks sent from chats that chose this sandbox name could not be read; " +
+            "removing it does not cancel them"
+        for (line in listOf(counted, unreadable)) {
+            val html = RemoveConfirmation.message(issued(listOf("removes sandbox atlas-demo-1", line), external = false)).build()
+            assertTrue(html.contains(line), html)
+            assertTrue(html.contains("Impact, as reported by Core (2 line(s))"), html)
+            assertFalse(html.contains(token))
+        }
+    }
+
     @Test
     fun externalHeaderComesFirst() {
         val html = RemoveConfirmation.message(issued(listOf("removes sandbox atlas-demo-1"), external = true)).build()

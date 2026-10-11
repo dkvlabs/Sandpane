@@ -487,6 +487,13 @@ export interface TaskIndexEntry {
   sandboxName: string | null;
   taskBranch: string | null;
   baseCommit: string | null;
+  /** A4: `TaskSummary.mode` (open string), from the task.list row; else null. */
+  mode: string | null;
+  /**
+   * A4: `TaskSummary.chosenSandboxName` — the name the task's chat chose.
+   * Display only: NEVER read by `taskIsolationView` or any count or scope.
+   */
+  chosenSandboxName: string | null;
   /**
    * Core's raw status when this build does not recognise it (`status` is then
    * `"unknown"`): from the `task.list` row, or from the event log for an
@@ -524,6 +531,8 @@ export function foldTaskIndex(
       sandboxName: task.sandboxName ?? null,
       taskBranch: task.taskBranch ?? null,
       baseCommit: task.baseCommit ?? null,
+      mode: task.mode ?? null,
+      chosenSandboxName: task.chosenSandboxName ?? null,
       unrecognizedStatus: task.status === "unknown" ? task.unrecognizedStatus ?? null : null,
       disagreement: null,
     });
@@ -543,6 +552,8 @@ export function foldTaskIndex(
         sandboxName: null,
         taskBranch: null,
         baseCommit: null,
+        mode: null,
+        chosenSandboxName: null,
         unrecognizedStatus: projection.unrecognizedStatus,
         disagreement: null,
       });

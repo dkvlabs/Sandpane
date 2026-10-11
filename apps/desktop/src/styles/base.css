@@ -1378,3 +1378,40 @@ button.chip {
   white-space: pre;
   user-select: text;
 }
+
+/* A4: the composer's Task / Discuss choice and a task's recorded send facts. */
+.send-mode {
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  border: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.send-mode legend {
+  padding: 0;
+  margin-right: var(--space-2);
+  float: left;
+}
+
+.send-mode .muted {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.task-facts {
+  margin: 0;
+  display: grid;
+  gap: var(--space-1);
+}
+
+.task-facts__row dt {
+  font-weight: 600;
+}
+
+.task-facts__row dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

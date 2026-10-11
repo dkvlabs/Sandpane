@@ -82,6 +82,10 @@ class TaskMonitorService(private val project: Project) : Disposable {
          * for the task is stopped and the transcript may be incomplete; null when not refused.
          */
         val replayRefusal: String? = null,
+        /** A4: Core's [TaskSummary.mode] (an open string), shown read-only; null when Core did not report it. */
+        val mode: String? = null,
+        /** A4: Core's [TaskSummary.chosenSandboxName] — display only, never [sandboxName]. */
+        val chosenSandboxName: String? = null,
     ) {
         /** Only a KNOWN awaiting_review enables review/apply; an unknown status never does. */
         val awaitingReview: Boolean get() = status == Reported.Known(TaskStatus.AWAITING_REVIEW)
@@ -306,7 +310,7 @@ class TaskMonitorService(private val project: Project) : Disposable {
             is KeyedRequests.Prepared.Refused -> return KeyedCall(
                 original,
                 null,
-                CompletableFuture.failedFuture(CoreValidationException("idempotencyKey", prepared.reason)),
+                CompletableFuture.failedFuture(CoreValidationException(prepared.field, prepared.reason)),
             )
             is KeyedRequests.Prepared.Ready -> prepared.params
         }
@@ -398,8 +402,15 @@ class TaskMonitorService(private val project: Project) : Disposable {
     }
 
     private fun applySummary(summary: TaskSummary) {
-        val prior = views[summary.id]
-        views[summary.id] = TaskView(
+        views[summary.id] = fromSummary(summary, views[summary.id])
+    }
+
+
+    companion object {
+        private const val MAX_NOTES = 12
+
+        /** Pure: the row for a Core [TaskSummary], keeping what [prior] knew that the summary omits. */
+        fun fromSummary(summary: TaskSummary, prior: TaskView?): TaskView = TaskView(
             taskId = summary.id,
             conversationId = summary.conversationId,
             status = summary.status,
@@ -410,12 +421,10 @@ class TaskMonitorService(private val project: Project) : Disposable {
             lastEventAt = prior?.lastEventAt,
             notes = prior?.notes ?: emptyList(),
             replayRefusal = prior?.replayRefusal,
+            // A4: display only. Never folded into sandboxName (the binding), scope or impact logic.
+            mode = summary.mode ?: prior?.mode,
+            chosenSandboxName = summary.chosenSandboxName ?: prior?.chosenSandboxName,
         )
-    }
-
-
-    companion object {
-        private const val MAX_NOTES = 12
 
         /** Pure form of [unknownStatusNote] (instance method), over the given rows. */
         internal fun unknownStatusNote(rows: Collection<TaskView>): String {

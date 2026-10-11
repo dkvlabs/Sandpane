@@ -376,6 +376,8 @@ object ConversationOutcomes {
         return when (e.message) {
             MSG_CONVERSATION_ARCHIVED -> "This conversation is archived — unarchive it first. Core did not accept the message."
             MSG_PROJECT_ARCHIVED -> "This conversation's project is archived — unarchive the project first. Core did not accept the message."
+            SendModes.MSG_SEND_MODE_INVALID ->
+                "Core refused the send mode (Core: ${SendModes.MSG_SEND_MODE_INVALID}). Core did not accept the message."
             else -> null
         }
     }

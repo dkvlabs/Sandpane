@@ -39,6 +39,10 @@ export interface TaskView {
   statusSequence: number;
   conversationId?: string;
   sandboxName?: string | null;
+  /** A4: Core's recorded send mode — an OPEN string, display only. */
+  mode?: string | null;
+  /** A4: the name the task's chat chose — NOT a binding; display only, never counted. */
+  chosenSandboxName?: string | null;
   taskBranch?: string | null;
   baseCommit?: string | null;
   lines: TranscriptLine[];
@@ -317,6 +321,10 @@ function applySummary(state: TaskViewState, summary: TaskSummary): TaskViewState
     status: named ? summary.status : previous.status,
     conversationId: summary.conversationId,
     ...(summary.sandboxName !== undefined ? { sandboxName: summary.sandboxName } : {}),
+    // A4: copied verbatim for display; a value this client does not know is
+    // shown as-is, never mapped onto "task"/"discuss" and never an unknown kind.
+    ...(summary.mode !== undefined ? { mode: summary.mode } : {}),
+    ...(summary.chosenSandboxName !== undefined ? { chosenSandboxName: summary.chosenSandboxName } : {}),
     ...(summary.taskBranch !== undefined ? { taskBranch: summary.taskBranch } : {}),
     ...(summary.baseCommit !== undefined ? { baseCommit: summary.baseCommit } : {}),
     ...(named

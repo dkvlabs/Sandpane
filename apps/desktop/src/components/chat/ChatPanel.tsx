@@ -31,6 +31,15 @@ import {
 import { clearSentDraft, foldAgentView, taskStatusView, withDraft } from "../../lib/reducers";
 import type { Conversation } from "../../lib/protocol";
 import { ConversationTranscript } from "./ConversationTranscript";
+import { SendModeChoice, TaskSendFacts } from "./SendMode";
+import {
+  buildSendVariables,
+  discussModeNotRecorded,
+  sendModeGate,
+  submitWithDiscussPrecheck,
+  type SendChoice,
+} from "../../lib/send-mode";
+import { useDeps } from "../../app/context";
 import { FeatureChip } from "../ui/feature-gate";
 import {
   Badge,
@@ -105,6 +114,18 @@ export function ChatPanel({
   const createConversation = useCreateConversation();
   const { write: sendWrite, state: send } = useKeyedSend();
   const keysAdvertised = idempotencyKeysAdvertised(capabilities);
+  // A4: Task / Discuss is offered only when Core advertises it; `mode` is
+  // never put on the wire otherwise (a pre-A4 Core would drop it silently).
+  const sendMode = sendModeGate(capabilities);
+  const modeAdvertised = capabilities === null ? null : sendMode.state === "supported";
+  // The choice is UI-only and per conversation, for this window only (never
+  // persisted): every chat starts at Task.
+  const [sendChoices, setSendChoices] = useState<Readonly<Record<string, SendChoice>>>({});
+  // A NEW Discuss send re-probes Core first (the cached probe may be stale);
+  // while that runs Send is disabled, and a refusal is shown under its chat.
+  const deps = useDeps();
+  const [prechecking, setPrechecking] = useState(false);
+  const [notSent, setNotSent] = useState<{ conversationId: string; note: string } | null>(null);
 
   const agents = capabilities?.agents ?? [];
   const [agentId, setAgentId] = useState<string>("");
@@ -149,6 +170,7 @@ export function ChatPanel({
   const selected: Conversation | null =
     conversations.find((c) => c.id === selectedConversationId) ?? null;
   const draft = selected === null ? "" : (drafts[selected.id] ?? "");
+  const sendChoice: SendChoice = selected === null ? "task" : (sendChoices[selected.id] ?? "task");
   // The single send mutation outlives tab switches; its result is shown only
   // under the conversation it was actually sent from.
   const sendIsForSelected =
@@ -336,12 +358,31 @@ export function ChatPanel({
           className="composer"
           onSubmit={(event) => {
             event.preventDefault();
-            if (draft.trim().length === 0 || sending || sendBlocked !== null) return;
+            if (draft.trim().length === 0 || sending || prechecking || sendBlocked !== null) return;
             const conversationId = selected.id;
             const content = draft;
             // One Send = one user action = one fresh key (A2), and no key at all
-            // when this Core does not advertise the feature.
-            void sendWrite.submit(forNewAction({ conversationId, content }, keysAdvertised));
+            // when this Core does not advertise the feature. `mode` only for
+            // Discuss, and only when advertised (A4).
+            const variables = buildSendVariables(
+              forNewAction({ conversationId, content }, keysAdvertised),
+              sendChoice,
+              modeAdvertised,
+            );
+            setNotSent(null);
+            setPrechecking(true);
+            void submitWithDiscussPrecheck(variables, {
+              probe: () => deps.client.probe(),
+              submit: (v) => {
+                // The probe answered: the exchange itself is the keyed write's.
+                setPrechecking(false);
+                return sendWrite.submit(v);
+              },
+            })
+              .then((outcome) => {
+                if (outcome.kind === "not-sent") setNotSent({ conversationId, note: outcome.note });
+              })
+              .finally(() => setPrechecking(false));
           }}
         >
           <label className="field">
@@ -358,11 +399,19 @@ export function ChatPanel({
               }}
             />
           </label>
+          <SendModeChoice
+            gate={sendMode}
+            value={sendChoice}
+            onChange={(next) => {
+              const conversationId = selected.id;
+              setSendChoices((current) => ({ ...current, [conversationId]: next }));
+            }}
+          />
           <div className="row-actions">
             <Button
               variant="primary"
               type="submit"
-              disabled={sendBlocked !== null || draft.trim().length === 0 || sending}
+              disabled={sendBlocked !== null || draft.trim().length === 0 || sending || prechecking}
               title={sendBlocked ?? undefined}
             >
               Send
@@ -372,10 +421,20 @@ export function ChatPanel({
             </span>
           </div>
           {sendBlocked !== null && archivedReason === null && <p className="muted">{sendBlocked}</p>}
+          {prechecking && (
+            <p className="muted" role="status">
+              Re-checking that Core still advertises send modes before sending the discussion…
+            </p>
+          )}
+          {notSent !== null && notSent.conversationId === selected.id && (
+            <Warning tone="attention" title="Not sent">
+              {notSent.note}
+            </Warning>
+          )}
           {sendIsForSelected && send.kind === "sending" && send.retry && (
             <p className="muted" role="status">
               Retrying safely — re-checking Core, then resending the identical message with the same
-              key…
+              key and send mode…
             </p>
           )}
           {sendIsForSelected && send.kind === "failed" && (
@@ -404,6 +463,14 @@ export function ChatPanel({
                   {taskStatusView(send.result.status, send.result.unrecognizedStatus).label}
                 </Mono>
                 . The timeline below is the only place progress is reported, from durable events.
+                <TaskSendFacts task={send.result} />
+              </Warning>
+            )}
+          {sendIsForSelected &&
+            send.kind === "succeeded" &&
+            discussModeNotRecorded(send.params, send.result) !== null && (
+              <Warning tone="attention" title="Send mode not recorded">
+                {discussModeNotRecorded(send.params, send.result)}
               </Warning>
             )}
         </form>

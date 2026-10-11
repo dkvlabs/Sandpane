@@ -59,6 +59,14 @@ client) implementing the JB0/JB1 surface of
 > internal usage files). A3b is UNVERIFIED end to end: the chat-panel controls, the rename/delete/export
 > dialogs and the native save dialog were never shown in an IDE and no A3b request reached a running Core.
 >
+> Re-run on 11.10.2026 after the A4 client work (`conversation.send` mode: feature
+> `conversation-send-mode`, composer Task / Discuss choice, `TaskSummary.mode` / `chosenSandboxName`;
+> method pin unchanged at 27): `rm -rf build/test-results && ./gradlew test --rerun buildPlugin
+> verifyPluginStructure --offline --no-build-cache` passes with **389 tests, 0 failures, 0 errors,
+> 0 skipped** across 35 test classes (JUnit XML), and `./gradlew verifyPlugin --offline --rerun-tasks`
+> reports **`Compatible`** against IU-262.10968.63. A4 is UNVERIFIED end to end: the Task / Discuss
+> combo was never shown in an IDE and no A4 request reached a running Core.
+>
 > **Proven on this host** (exact commands and outputs in "Checks actually run" below):
 > `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
 > (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
@@ -263,6 +271,8 @@ clients/jetbrains/
     │   │   ├── core/ConversationExport.kt    # A3b: export pager (cursor/page-cap rules), file assembler, save flow
     │   │   ├── ui/ConversationControls.kt    # A3b: chat-panel buttons (rename/(un)archive/delete/export, show archived)
     │   │   ├── ui/ConversationDialogs.kt     # A3b: delete confirmation, export copy, rename dialog
+    │   │   ├── core/SendMode.kt              # A4: Task / Discuss choice, send params, mode gate, display lines
+    │   │   ├── ui/TaskRowText.kt             # A4: task row meta (status + Send mode + chosen sandbox name)
     │   │   ├── services/{SandpaneContextProvider,EditorDiffProvider,SbxService,TaskMonitorService}.kt
     │   │   ├── services/FolderMatching.kt    # folder → Core project, pure and canonicalized on both sides
     │   │   └── settings/{SandpaneSettings,SandpaneConfigurable}.kt
@@ -272,6 +282,7 @@ clients/jetbrains/
         ├── core/ProjectLifecycleTest.kt      # A3a frames, gating, delete flow, copy, validators (39 tests)
         ├── core/ConversationLifecycleTest.kt # A3b frames, gating, delete flow, copy, validator, UI state, single-flight (46 tests)
         ├── core/ConversationExportTest.kt    # A3b export paging, partial/failed, file shape, save/cancel (15 tests)
+        ├── core/SendModeTest.kt              # A4 send frames, mode gate, keyed retry, open-string mode, copy, no echo (11 tests)
         ├── core/CoreCommandsTest.kt          # guards, gates, the three cursor shapes  (30 tests)
         ├── core/SandboxLifecycleTest.kt      # A1 frames, token flow, stop report       (27 tests)
         ├── core/IdempotencyTest.kt           # A2 keys, features, CONFLICT copy, replay (19 tests)
@@ -340,7 +351,7 @@ not advertised ⇒ the action is visibly disabled and nothing is sent. There is 
 `Project.repositories`, `SandboxSummary.workspaceMode` and the optional
 `TaskSubscribeParams.afterSequences`.
 
-This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (23 tests), which
+This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (24 tests), which
 reads the Rust sources and the schemas out of the working tree and compares them against the
 Kotlin mirror: method names **and their order**, the `Method::parse` arms, the
 `rpc-request.schema.json` `method` enum, every `pub const` numeric bound (evaluated, not copied), the
@@ -602,6 +613,31 @@ discovery revision this client is now synced to**):
   count, the replacement count by kind, PARTIAL when so, and the best-effort copy. Export content is
   never logged; a page that does not decode becomes fixed text (`ConversationExportResult.toString`
   prints counts only). Export is a read, so its failures say "No file was written", never "unknown".
+- **Send mode (A4).** A **Task / Discuss** combo beside the Send button (`ChatPanel`, native Swing).
+  It defaults to Task and is NOT remembered: it resets to Task whenever the selected conversation
+  changes. It is enabled only when Core advertises `conversation-send-mode`; otherwise it is shown
+  disabled at Task with "not supported by this Core". Task omits `mode` (the frame is byte-identical
+  to an A2/A3b frame); Discuss sends `"mode":"discuss"`. `KeyedRequests.newSend` and `retrySend`
+  refuse a `mode` for a Core that does not advertise the feature (nothing is sent, no key is minted):
+  a pre-A4 Core silently drops it and would record a discussion as a task. The composer passes the
+  user's SELECTED choice as-is (review W3): a Discuss that meets a Core without the feature (a reconnect
+  raced the combo reset) is refused visibly with nothing sent and the text kept in the composer — it is
+  never silently sent as a Task. "Retry safely" resends the
+  prepared params unchanged, `mode` included. The tooltip says only what Core does: it records the
+  requested mode, and **neither Task nor Discuss runs an agent in this build** (both stay queued). Core's
+  `mode must be "task" or "discuss"` refusal is worded as Core's ("Core did not accept the message").
+  Task rows and the "Core accepted task" line show Core's `TaskSummary.mode` as "Send mode: …" (an open
+  string: an unknown value is shown as-is) and `chosenSandboxName` as "sandbox chosen by its chat — not
+  where it runs: …", both revealed and capped, never from the local combo. `chosenSandboxName` is
+  display-only: it never fills `TaskView.sandboxName` (the binding), and this plugin has no isolation
+  label, stop/remove task count or scope logic for it to feed (a source-scan test fails if any other
+  file starts reading it). `sandbox.remove`'s new A4 impact line ("N unfinished task(s) were sent from
+  chats that chose this sandbox name; removing it does not cancel them") goes through the existing
+  revealed, escaped, capped impact rendering.
+- **Undecodable replies are never echoed** (A4 review I3). kotlinx puts a snippet of the JSON input in
+  its decode messages, so `ErrorAttribution` maps `SerializationException` (and any other
+  `IllegalArgumentException`) to fixed text ("…its content is not shown"), and `task.list` rows decode
+  through the fixed-text `decodeOrFixed` path. A row with a non-string `mode` is never quoted back.
 - **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **27** protocol
   method names before writing a byte; there is no free-form RPC. The refusal is a
   `CoreValidationException` — this client's own word — and not a `CoreRpcException`, because Core
@@ -681,6 +717,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Gate after the A3a client work (project lifecycle, 11.10.2026) | `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache` (after deleting `build/test-results` and `build/distributions`); `./gradlew verifyPlugin --offline --rerun` | `BUILD SUCCESSFUL`; **303 tests, 0 failures, 0 errors, 0 skipped**, 32 result files; verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 69 source files (40 main, 29 test) |
 | Gate after the A3a combined-review fixes (11.10.2026) | same two commands (`verifyPlugin --offline --rerun`) | `BUILD SUCCESSFUL in 15s`; **311 tests, 0 failures, 0 errors, 0 skipped**, 32 result files (two fresh gate runs and three further `test --rerun` runs all green); verifier `Compatible` (no deprecated/experimental/internal usage files); 70 source files (41 main, 29 test) |
 | Gate after the A3b client work (conversation lifecycle, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 18s`; **376 tests, 0 failures, 0 errors, 0 skipped**, 34 result files (ConversationLifecycleTest 46, ConversationExportTest 15, ConversationSelectionTest 4, ConversationReconcileTest 4, ProtocolDriftGuardTest 23, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 76 source files (45 main, 31 test); zip 1 628 803 bytes; 7 Kotlin `w:` on the full recompile (`verifyPlugin --rerun-tasks`), all in pre-existing code (none in A3b files) |
+| Gate after the A4 client work (send mode, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 15s`; **389 tests, 0 failures, 0 errors, 0 skipped**, 35 result files (SendModeTest 11, ProtocolDriftGuardTest 24, RemoveConfirmationDialogTest 7, IdempotencyTest 19, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 79 source files (47 main, 32 test); zip 1 644 556 bytes; the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A4 files) |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |
@@ -738,6 +775,9 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
   `VirtualFileWrapper.getFile()` and the `BoxLayout` header row are written against the documentation and
   the 262 bytecode only. The export holds every page in memory (worst case 200 pages × Core's 2 MiB page
   ceiling) before the file is written.
+- **A4 send mode** (11.10.2026): the Task / Discuss combo, its disabled state and the task-row meta were
+  never shown in an IDE; no A4 request reached a running Core. Gating is tested against fabricated
+  capability lists only.
 - **Older/newer Core compatibility** (testing this client against an older and a newer Core within
   the compatibility policy) has not been done; advertisement gating is tested against fabricated
   capability lists only.

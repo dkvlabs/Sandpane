@@ -558,7 +558,13 @@ object CoreFeatures {
      */
     const val CONVERSATION_SANDBOX_ID: String = "conversation-sandbox-id"
 
-    val KNOWN: List<String> = listOf(IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT, CONVERSATION_SANDBOX_ID)
+    /**
+     * A4: `conversation.send` honours `mode` (`"task"` | `"discuss"`) and new tasks carry
+     * [TaskSummary.mode]. Only when this is advertised may `mode` be sent.
+     */
+    const val CONVERSATION_SEND_MODE: String = "conversation-send-mode"
+
+    val KNOWN: List<String> = listOf(IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT, CONVERSATION_SANDBOX_ID, CONVERSATION_SEND_MODE)
 }
 
 /**
@@ -849,6 +855,13 @@ data class ConversationSendParams(
     val attachments: List<ContextRef> = emptyList(),
     /** A2, additive: see [SandboxCreateSpec.idempotencyKey]; the same rules apply. */
     @SerialName("idempotencyKey") val idempotencyKey: String? = null,
+    /**
+     * A4, additive (design 2026-10-09 \u00A73.4): `"discuss"` for a Discuss send; NULL (the key is omitted,
+     * so the frame is byte-identical to an A2/A3b frame) for Task. Sent only when Core advertises
+     * [CoreFeatures.CONVERSATION_SEND_MODE] ([labs.dkv.sandpane.core.KeyedRequests.newSend] refuses
+     * otherwise): a pre-A4 Core silently drops it and would record a discussion as a task.
+     */
+    val mode: String? = null,
 )
 
 @Serializable
@@ -972,6 +985,17 @@ data class TaskSummary(
      * reconciled to `interrupted`), so it is never shown as current; the UI re-reads `task.list`.
      */
     val replayed: Boolean? = null,
+    /**
+     * A4, additive: the send mode the task was created with (`"task"` / `"discuss"` today), ABSENT on
+     * older tasks. An OPEN string: an unknown value is shown as-is (revealed, capped), never refused.
+     */
+    val mode: String? = null,
+    /**
+     * A4, additive: the sandbox NAME the task's chat chose, copied at send time. NOT a binding and NOT
+     * where the task runs (no task runs in a sandbox in this build). Display only — it never feeds
+     * [sandboxName], scope or impact logic.
+     */
+    @SerialName("chosenSandboxName") val chosenSandboxName: String? = null,
 )
 
 // ---------------------------------------------------------------------------

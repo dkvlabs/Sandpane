@@ -40,7 +40,9 @@ import {
   KeyedWrite,
   keyRecheckFromProbe,
   type KeyedWriteState,
+  type KeyRecheck,
 } from "./idempotency";
+import { sendKeyRecheckFromProbe, sendParamsFor, type SendVariables } from "./send-mode";
 import {
   SandboxRemovalFlow,
   SandboxStopConfirm,
@@ -559,6 +561,8 @@ export interface KeyedWriteHandle<P extends { idempotencyKey?: string }, R> {
 function useKeyedWrite<P extends { idempotencyKey?: string }, R>(
   run: (params: P) => Promise<R>,
   settled: (params: P) => void,
+  /** Pre-retry check; default: `idempotency-keys` still advertised. */
+  recheck?: (params: P) => Promise<KeyRecheck>,
 ): KeyedWriteHandle<P, R> {
   const deps = useDeps();
   const runRef = useRef(run);
@@ -571,7 +575,7 @@ function useKeyedWrite<P extends { idempotencyKey?: string }, R>(
   if (ref.current === null) {
     ref.current = new KeyedWrite<P, R>((params) => runRef.current(params), {
       // W1: the CURRENT Core must still advertise keys right before a retry.
-      recheckKeys: async () => keyRecheckFromProbe(await deps.client.probe()),
+      recheckKeys: recheck ?? (async () => keyRecheckFromProbe(await deps.client.probe())),
       onSettled: (params) => settledRef.current(params),
     });
   }
@@ -688,11 +692,7 @@ export function useCreateConversation() {
 }
 
 /** Variables of one chat send (the key travels only when minted for this action). */
-export interface SendVariables {
-  conversationId: string;
-  content: string;
-  idempotencyKey?: string;
-}
+export type { SendVariables };
 
 /**
  * `conversation.send` as a keyed write (A2). The conversation id travels WITH
@@ -705,17 +705,15 @@ export function useKeyedSend(): KeyedWriteHandle<SendVariables, TaskSummary> {
   const deps = useDeps();
   const qc = useQueryClient();
   return useKeyedWrite<SendVariables, TaskSummary>(
-    ({ conversationId, content, idempotencyKey }) =>
-      deps.client.sendConversationMessage({
-        conversationId,
-        content,
-        attachments: [],
-        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-      }),
+    // A4: the variables already hold `mode` only when it may be sent; a
+    // "Retry safely" passes the SAME variables, so the same key and mode.
+    (variables) => deps.client.sendConversationMessage(sendParamsFor(variables)),
     (variables) => {
       void qc.invalidateQueries({ queryKey: queryKeys.history(variables.conversationId) });
       void qc.invalidateQueries({ queryKey: ["core", "task-list"] });
     },
+    // A Discuss retry also needs conversation-send-mode advertised NOW.
+    async (variables) => sendKeyRecheckFromProbe(await deps.client.probe(), variables),
   );
 }
 

@@ -418,3 +418,96 @@ describe('A3b conversation list and archived state', () => {
     expect(h.byId('sp-conversations').textContent).toContain('does not advertise conversation.list');
   });
 });
+
+describe('A4 composer: Task / Discuss send mode', () => {
+  const supported = { sendModeSupported: true };
+
+  it('is built once with Task as the default; the node survives state pushes', () => {
+    const h = boot();
+    h.push(state(supported));
+    h.flushFrame();
+    const mode = h.byId('sp-send-mode');
+    expect(mode.tagName).toBe('SELECT');
+    expect(mode.value).toBe('task');
+    expect(mode.children.map((o) => o.value)).toEqual(['task', 'discuss']);
+    mode.value = 'discuss';
+    h.push(state({ ...supported, status: { tone: 'info', text: 'x' } }));
+    h.flushFrame();
+    expect(h.byId('sp-send-mode')).toBe(mode);
+    expect(mode.value).toBe('discuss');
+  });
+
+  it('advertised: the note says neither mode runs an agent and Discuss is not safe execution', () => {
+    const h = boot();
+    h.push(state(supported));
+    h.flushFrame();
+    expect(h.byId('sp-send-mode').disabled).toBe(false);
+    const note = h.byId('sp-send-mode-note').textContent;
+    expect(note).toMatch(/Neither .*runs an agent/);
+    expect(note).toMatch(/not safe execution/);
+  });
+
+  it('not advertised: disabled at Task with "not supported by this Core"', () => {
+    const h = boot();
+    h.push(state(supported));
+    h.flushFrame();
+    h.byId('sp-send-mode').value = 'discuss';
+    h.push(state({ sendModeSupported: false }));
+    h.flushFrame();
+    expect(h.byId('sp-send-mode').disabled).toBe(true);
+    expect(h.byId('sp-send-mode').value).toBe('task');
+    expect(h.byId('sp-send-mode-note').textContent).toContain('not supported by this Core');
+    // An older extension state without the flag is treated as unsupported.
+    const old = boot();
+    expect(old.byId('sp-send-mode').disabled).toBe(true);
+  });
+
+  it('Task posts no mode key; Discuss posts mode "discuss"', () => {
+    const h = boot();
+    h.push(state({ ...supported, contextPlan: plan({ planId: 7, mode: 'read_only' }) }));
+    h.flushFrame();
+    h.byId('sp-input').value = 'explain';
+    h.posted.length = 0;
+    h.byId('sp-send').click();
+    expect(h.posted).toEqual([{ type: 'send', text: 'explain', writable: false, planId: 7 }]);
+    h.byId('sp-send-mode').value = 'discuss';
+    h.byId('sp-send-mode').dispatch('change');
+    h.posted.length = 0;
+    h.byId('sp-send').click();
+    expect(h.posted).toEqual([{ type: 'send', text: 'explain', writable: false, planId: 7, mode: 'discuss' }]);
+  });
+
+  it('Discuss clears and disables the writable intent; Task enables it again', () => {
+    const h = boot();
+    h.push(state(supported));
+    h.flushFrame();
+    const writable = h.byId('sp-writable');
+    writable.checked = true;
+    h.byId('sp-send-mode').value = 'discuss';
+    h.byId('sp-send-mode').dispatch('change');
+    expect(writable.checked).toBe(false);
+    expect(writable.disabled).toBe(true);
+    h.byId('sp-send-mode').value = 'task';
+    h.byId('sp-send-mode').dispatch('change');
+    expect(writable.disabled).toBe(false);
+  });
+
+  it('task chips show the send mode as-is and the chat-chosen sandbox, labelled "not where it runs"', () => {
+    const h = boot();
+    h.push(
+      state({
+        ...supported,
+        tasks: [
+          { taskId: 't-1', status: 'queued', branch: null, baseCommit: null, unknownKinds: [], mode: 'plan', chosenSandboxName: 'atlas-box' },
+          { taskId: 't-2', status: 'queued', branch: null, baseCommit: null, unknownKinds: [] },
+        ],
+      }),
+    );
+    h.flushFrame();
+    const text = h.byId('sp-tasks').textContent;
+    expect(text).toContain('Send mode: plan');
+    expect(text).toContain('sandbox chosen by its chat — not where it runs: atlas-box');
+    // A row without the fields invents nothing.
+    expect(text.match(/Send mode/g)).toHaveLength(1);
+  });
+});

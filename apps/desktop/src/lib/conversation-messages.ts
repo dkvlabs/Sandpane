@@ -23,6 +23,13 @@ export const MSG_CONVERSATION_NOT_FOUND = "conversation not found";
 export const MSG_TITLE_BLANK =
   "conversation title must not be empty or whitespace-only; nothing was changed";
 
+/**
+ * A4 (`sandpane-service/src/lib.rs`, drift-tested in `tests/send-mode.test.ts`):
+ * the frame WAS sent; Core refused the send's `mode` before a key row, a
+ * message or a task was created.
+ */
+export const MSG_SEND_MODE_INVALID = 'mode must be "task" or "discuss"';
+
 /** The Rust const name each message is drift-tested against. */
 export const CONVERSATION_MESSAGE_CONSTS: Readonly<Record<string, string>> = {
   MSG_CONVERSATION_ARCHIVED,
@@ -63,6 +70,12 @@ export function conversationMessageCopy(code: string, message: string): Conversa
       return {
         title: "Nothing was changed — the title is empty or whitespace-only",
         action: "Type a title with at least one visible character.",
+      };
+    case `VALIDATION_FAILED\u0000${MSG_SEND_MODE_INVALID}`:
+      return {
+        title: "Core did not accept the message — it refused the send mode",
+        action:
+          "Core accepts only \"task\" or \"discuss\". This build sends \"discuss\" only when Core advertises conversation-send-mode; re-check Core and send again.",
       };
     default:
       return null;

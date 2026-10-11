@@ -333,6 +333,9 @@ class ProtocolDriftGuardTest {
             "pub best_effort: bool" to "@SerialName(\"bestEffort\")",
             "pub by_kind: std::collections::BTreeMap<String, u64>" to "@SerialName(\"byKind\")",
             "pub exported_at: String" to "@SerialName(\"exportedAt\")",
+            // A4
+            "pub mode: Option<String>" to "val mode: String? = null",
+            "pub chosen_sandbox_name: Option<String>" to "@SerialName(\"chosenSandboxName\") val chosenSandboxName: String? = null",
             // A1
             "pub agent: Option<String>" to "val agent: String? = null",
             "pub confirm_token: Option<String>" to "confirmToken",
@@ -829,6 +832,27 @@ class ProtocolDriftGuardTest {
         assertFalse(requiredOf(capabilitiesSchema, root).contains("features"), "features became required — not additive")
         assertTrue(rust.contains("pub features: Vec<String>"))
         assertTrue(kotlinMirror.contains("val features: List<String> = emptyList()"))
+    }
+
+    /** A4 (\u00A73.4): the mode values, the normalisation and the exact refusal are Core's. */
+    @Test
+    fun sendModeValuesAndMessageMatchCore() {
+        val msg = Regex("""pub const MSG_SEND_MODE_INVALID: &str = r#"(.*?)"#;""").find(service)?.groupValues?.get(1)
+            ?: fail("MSG_SEND_MODE_INVALID not found")
+        assertEquals(msg, SendModes.MSG_SEND_MODE_INVALID)
+        assertTrue(service.contains("SendMode::Task => \"task\""), "Core's task spelling changed")
+        assertTrue(service.contains("SendMode::Discuss => \"discuss\""), "Core's discuss spelling changed")
+        assertTrue(service.contains("None | Some(\"task\") => SendMode::Task"), "Core no longer treats absent and \"task\" alike")
+        assertTrue(service.contains("Some(\"discuss\") => SendMode::Discuss"))
+        assertEquals(listOf("task", "discuss"), SendModes.WIRE_VALUES)
+        assertTrue(Regex("""pub struct ConversationSendParams \{[\s\S]*?skip_serializing_if = "Option::is_none"\)\]\s*pub mode: Option<String>,""").containsMatchIn(rust))
+        val summary = Regex("""pub struct TaskSummary \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1) ?: fail("TaskSummary not found")
+        assertTrue(Regex("""#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\s*pub mode: Option<String>""").containsMatchIn(summary))
+        assertTrue(Regex("""#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\s*pub chosen_sandbox_name: Option<String>""").containsMatchIn(summary))
+        assertTrue(summary.contains("pub sandbox_name: Option<String>"), "sandboxName (the binding) must stay a separate field")
+        // The sandbox.remove impact line the dialog test renders (illustrative fixture) is still Core's wording.
+        assertTrue(service.contains("unfinished task(s) were sent from chats that chose this sandbox name; \\"))
+        assertTrue(service.contains("removing it does not cancel them"))
     }
 
     /** Joins a Rust string literal that uses `\`-newline continuations, as rustc does. */

@@ -40,6 +40,7 @@ import { ErrorPanel } from "../projects/ProjectsView";
 import { FeatureGateNotice } from "../../components/ui/feature-gate";
 import { navigate, type Route } from "../../app/router";
 import { useProbeRefetch } from "../../components/ui/refresh";
+import { TaskSendFacts } from "../../components/chat/SendMode";
 import type { TaskStatus } from "../../lib/protocol";
 
 type Filter = "all" | TaskBucket;
@@ -165,6 +166,7 @@ export function TasksView({ route }: { route: Route }) {
                 <th>Conversation</th>
                 <th>Seq</th>
                 <th>Source</th>
+                <th>Send</th>
                 <th>Actions</th>
               </tr>
             </thead>
@@ -207,6 +209,9 @@ export function TasksView({ route }: { route: Route }) {
                           reads differ
                         </Badge>
                       )}
+                    </td>
+                    <td>
+                      <TaskSendFacts task={task} />
                     </td>
                     <td>
                       <Button
@@ -259,6 +264,11 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
     <div className="grid grid--workspace">
       <div>
         <TaskHeader projection={projection} />
+        {row !== null && (row.mode !== null || row.chosenSandboxName !== null) && (
+          <Panel title="Recorded with this send">
+            <TaskSendFacts task={row} />
+          </Panel>
+        )}
         <ActivityTimeline projection={projection} maxVisible={200} />
         <Panel title="Cancel this task">
           <div className="row-actions">

@@ -8,6 +8,7 @@
 import * as vscode from 'vscode';
 import type { SandpaneSession } from '../session';
 import type { SidebarState, TaskRow } from '../webview/bridge';
+import { CHOSEN_SANDBOX_LABEL, SEND_MODE_LABEL, codeSpanText, taskModeParts } from './sendMode';
 
 export class SandpaneTaskTreeProvider implements vscode.TreeDataProvider<TaskRow> {
   static readonly viewId = 'sandpane.tasks';
@@ -40,6 +41,9 @@ export class SandpaneTaskTreeProvider implements vscode.TreeDataProvider<TaskRow
     const detailParts = [
       `branch: ${element.branch ?? 'unknown'}`,
       `base: ${element.baseCommit?.slice(0, 8) ?? 'unknown'}`,
+      // A4: send mode and the chat's chosen name — read-only, labelled, and
+      // already revealed and capped in the snapshot.
+      ...taskModeParts(element),
       element.unknownKinds.length > 0
         ? `${element.unknownKinds.length} unrecognized event kind(s)`
         : null,
@@ -58,6 +62,10 @@ export class SandpaneTaskTreeProvider implements vscode.TreeDataProvider<TaskRow
         `- status: \`${element.status ?? 'not emitted by Core'}\` (Core is the only authority)`,
         `- branch: \`${element.branch ?? 'unknown'}\``,
         `- base commit: \`${element.baseCommit ?? 'unknown'}\``,
+        element.mode !== undefined ? `- ${SEND_MODE_LABEL}: \`${codeSpanText(element.mode)}\`` : '',
+        element.chosenSandboxName !== undefined
+          ? `- ${CHOSEN_SANDBOX_LABEL}: \`${codeSpanText(element.chosenSandboxName)}\``
+          : '',
         element.unknownKinds.length > 0 ? `- unrecognized event kinds: ${element.unknownKinds.join(', ')}` : '',
         '',
         'Opens `git.review` against the recorded base revision.',

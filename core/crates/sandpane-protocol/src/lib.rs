@@ -297,10 +297,15 @@ impl Method {
 ///   and every `Conversation` carries it when one was stored (A3b, §3.3
 ///   item 2). Without it a client cannot tell "no sandbox was chosen" from
 ///   "an older Core discarded the choice".
-pub const FEATURES: [&str; 3] = [
+/// * `conversation-send-mode` — `conversation.send` honours `mode`
+///   (`"task"` | `"discuss"`) and new tasks carry `TaskSummary.mode` (A4,
+///   §3.4 item 1). A pre-A4 Core silently drops `mode` and would treat a
+///   discussion as a task, so clients send it only when advertised.
+pub const FEATURES: [&str; 4] = [
     "idempotency-keys",
     "sandbox-create-agent",
     "conversation-sandbox-id",
+    "conversation-send-mode",
 ];
 
 /// [`FEATURES`] as owned strings — the one derivation `system.probe` uses.
@@ -783,6 +788,19 @@ pub struct ConversationSendParams {
     /// `replayed: true`; it is not current state — re-read with `task.list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// A4 (additive, §3.4 item 1): `"task"` (the default when absent; `null`
+    /// reads as absent) or `"discuss"`. A `discuss` task never gets a
+    /// writable workspace. Any other STRING value is refused by Core with
+    /// `VALIDATION_FAILED` and the exact message `mode must be "task" or
+    /// "discuss"` — it is a plain string on the wire so that this refusal is
+    /// Core's message, not a decode error. A NON-string `mode` (number,
+    /// object, …) fails params decoding instead: still `VALIDATION_FAILED`,
+    /// but with the generic serde decode message, not the exact one. Core normalizes
+    /// an explicit `"task"` to absent BEFORE the idempotency fingerprint, so
+    /// every A2 hash is unchanged and "task" vs absent replays. Send it only
+    /// when `system.probe` advertises `conversation-send-mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1005,6 +1023,21 @@ pub struct TaskSummary {
     pub task_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// A4 (additive, §3.4 item 1): the mode the task was created with —
+    /// `"task"` or `"discuss"` today — present on every task created from A4
+    /// on, ABSENT on older rows. An OPEN string: clients display an unknown
+    /// value as-is and never fail to decode it (§1 rule 2: no strict enum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// A4 (additive, §3.4 item 3): the sandbox NAME the task's chat chose
+    /// (`Conversation.sandboxId`), copied when the task was sent. Present
+    /// only when the chat chose one; absent on tasks created before A4.
+    /// A stored name — NOT a binding, NOT an identity, and it NEVER means the
+    /// task runs (or ran) in that sandbox: no task can run in a sandbox in
+    /// this build. Never feed it into isolation labels, stop/remove impact
+    /// counts or scope logic; that is `sandbox_name`'s job (review C1/C2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_sandbox_name: Option<String>,
     /// A2 (additive): `true` ONLY when this response is a REPLAY of an
     /// earlier keyed request. A replay returns the FIRST response unchanged
     /// plus `replayed: true`; it is not current state — re-read with
@@ -1253,7 +1286,8 @@ mod tests {
             [
                 "idempotency-keys",
                 "sandbox-create-agent",
-                "conversation-sandbox-id"
+                "conversation-sandbox-id",
+                "conversation-send-mode"
             ]
         );
         assert_eq!(
@@ -1261,7 +1295,8 @@ mod tests {
             vec![
                 "idempotency-keys".to_string(),
                 "sandbox-create-agent".to_string(),
-                "conversation-sandbox-id".to_string()
+                "conversation-sandbox-id".to_string(),
+                "conversation-send-mode".to_string()
             ]
         );
         // A pre-A2 Core omits `features`: still parses, as "nothing advertised".
@@ -1277,7 +1312,8 @@ mod tests {
             serde_json::json!([
                 "idempotency-keys",
                 "sandbox-create-agent",
-                "conversation-sandbox-id"
+                "conversation-sandbox-id",
+                "conversation-send-mode"
             ])
         );
     }
@@ -1384,6 +1420,64 @@ mod tests {
             v["redaction"],
             serde_json::json!({"bestEffort": true, "replacements": 2, "byKind": {"token": 2}})
         );
+    }
+
+    /// A4 §3.4 item 1: `mode` is optional on send (absent = "task", never
+    /// serialized when absent, so A2 fingerprints are unchanged) and an OPEN
+    /// string on `TaskSummary` (an unknown value decodes, never fails).
+    #[test]
+    fn send_mode_and_task_mode_are_optional_open_strings() {
+        let old: ConversationSendParams =
+            serde_json::from_value(serde_json::json!({"conversationId": "c", "content": "hi"}))
+                .unwrap();
+        assert_eq!(old.mode, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("mode"));
+        let discuss: ConversationSendParams = serde_json::from_value(
+            serde_json::json!({"conversationId": "c", "content": "hi", "mode": "discuss"}),
+        )
+        .unwrap();
+        assert_eq!(discuss.mode.as_deref(), Some("discuss"));
+        assert_eq!(serde_json::to_value(&discuss).unwrap()["mode"], "discuss");
+        // Any string parses: Core (not serde) refuses unknown values, with
+        // the exact §3.4 message.
+        let odd: ConversationSendParams = serde_json::from_value(
+            serde_json::json!({"conversationId": "c", "content": "hi", "mode": "Task"}),
+        )
+        .unwrap();
+        assert_eq!(odd.mode.as_deref(), Some("Task"));
+
+        let t: TaskSummary =
+            serde_json::from_str(r#"{"id":"t1","conversationId":"c1","status":"queued"}"#).unwrap();
+        assert_eq!(t.mode, None);
+        assert!(!serde_json::to_string(&t).unwrap().contains("mode"));
+        let future: TaskSummary = serde_json::from_str(
+            r#"{"id":"t1","conversationId":"c1","status":"queued","mode":"plan-later"}"#,
+        )
+        .unwrap();
+        assert_eq!(future.mode.as_deref(), Some("plan-later"));
+        assert_eq!(serde_json::to_value(&future).unwrap()["mode"], "plan-later");
+    }
+
+    /// A4 review C1/C2: the chat's chosen sandbox name is its OWN field
+    /// (`chosenSandboxName`), never folded into `sandboxName` (the binding a
+    /// task runs in, which shipped clients turn into isolation labels and
+    /// stop/remove impact counts).
+    #[test]
+    fn chosen_sandbox_name_is_separate_from_sandbox_name_and_optional() {
+        let t: TaskSummary =
+            serde_json::from_str(r#"{"id":"t1","conversationId":"c1","status":"queued"}"#).unwrap();
+        assert_eq!(t.chosen_sandbox_name, None);
+        assert!(!serde_json::to_string(&t).unwrap().contains("hosenSandbox"));
+        let chosen = TaskSummary {
+            chosen_sandbox_name: Some("atlas-auth".into()),
+            ..t
+        };
+        let v = serde_json::to_value(&chosen).unwrap();
+        assert_eq!(v["chosenSandboxName"], "atlas-auth");
+        assert!(v.get("sandboxName").is_none(), "{v}");
+        let back: TaskSummary = serde_json::from_value(v).unwrap();
+        assert_eq!(back.chosen_sandbox_name.as_deref(), Some("atlas-auth"));
+        assert_eq!(back.sandbox_name, None);
     }
 
     /// A2 review W1: a replay is marked, the first response never is.

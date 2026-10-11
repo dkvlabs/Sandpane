@@ -28,7 +28,7 @@ pub struct Database {
 }
 
 /// Newest schema version this build understands.
-pub const LATEST_SCHEMA_VERSION: i64 = 6;
+pub const LATEST_SCHEMA_VERSION: i64 = 7;
 
 /// Schema v1: the entity set from specs/02 §3.
 const MIGRATION_V1: &str = r#"
@@ -236,6 +236,19 @@ const MIGRATION_V6: &str = r#"
 ALTER TABLE conversations ADD COLUMN sandbox_id TEXT;
 "#;
 
+/// Schema v7 (A4, design 2026-10-09 §3.4): per task, the send `mode`
+/// (`"task"` | `"discuss"`) and `chosen_sandbox_name` — the sandbox NAME
+/// copied from the conversation's `sandbox_id` when the task was sent. Both
+/// are stored facts about the request. `chosen_sandbox_name` is NOT a
+/// binding and never means "runs in" (that is `sandbox_binding_id`; review
+/// C1/C2). Indexed for the `sandbox.remove` impact count (review I2). Rows
+/// created before v7 stay NULL — never back-filled or guessed.
+const MIGRATION_V7: &str = r#"
+ALTER TABLE tasks ADD COLUMN mode TEXT;
+ALTER TABLE tasks ADD COLUMN chosen_sandbox_name TEXT;
+CREATE INDEX idx_tasks_chosen_sandbox_name ON tasks(chosen_sandbox_name);
+"#;
+
 impl Database {
     /// Open (or create) the database at `path` and migrate to the latest
     /// schema. Refuses databases from a newer schema version.
@@ -309,6 +322,9 @@ impl Database {
         }
         if current < 6 {
             self.apply_migration(6, MIGRATION_V6)?;
+        }
+        if current < 7 {
+            self.apply_migration(7, MIGRATION_V7)?;
         }
         Ok(())
     }
@@ -763,8 +779,7 @@ mod tests {
             .unwrap();
         }
         let db = Database::open(&path).unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 6);
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let row: (String, Option<String>, Option<String>) = db
             .conn()
             .query_row(
@@ -802,27 +817,121 @@ mod tests {
             .unwrap();
         drop(db);
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         assert!(!dir.path().join("core.sqlite3.pre-v6.bak.1").exists());
     }
 
-    /// A3b: a database written by a NEWER Core (v7) is refused untouched —
-    /// no pragma, no backup, no migration (no silent downgrade).
+    /// A4 migration: a REAL v6 file (v1..v6 SQL, a task row written the
+    /// pre-A4 way) upgrades forward to v7: the row intact with `mode` and
+    /// `chosen_sandbox_name` NULL (never back-filled), a consistent
+    /// `.pre-v7.bak` of the v6 file taken, both new columns writable, the
+    /// count index present, and no `sandbox_name` column overloading the
+    /// binding's meaning.
     #[test]
-    fn v7_database_is_refused_by_a_v6_core() {
+    fn v6_database_migrates_forward_to_v7_with_task_mode_and_chosen_sandbox_name_and_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("core.sqlite3");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 7).unwrap();
+            for sql in [
+                MIGRATION_V1,
+                MIGRATION_V2,
+                MIGRATION_V3,
+                MIGRATION_V4,
+                MIGRATION_V5,
+                MIGRATION_V6,
+            ] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 6).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO conversations (id,project_id,title,agent_id,created_at,sandbox_id)
+                     VALUES ('c1','p1','Chat','codex','t','atlas-auth');
+                 INSERT INTO tasks (id,conversation_id,status,created_at,updated_at)
+                     VALUES ('t1','c1','queued','t','t');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(LATEST_SCHEMA_VERSION, 7);
+        assert_eq!(db.schema_version().unwrap(), 7);
+        let row: (String, Option<String>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT status, mode, chosen_sandbox_name FROM tasks WHERE id='t1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("queued".into(), None, None), "never back-filled");
+        let backup = dir.path().join("core.sqlite3.pre-v7.bak");
+        assert!(backup.exists());
+        let b = Connection::open(&backup).unwrap();
+        let v: i64 = b
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 6);
+        let cols: i64 = b
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks')
+                 WHERE name IN ('mode','chosen_sandbox_name','sandbox_name')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 0, "the backup is the untouched v6 schema");
+        db.conn()
+            .execute(
+                "UPDATE tasks SET mode='discuss', chosen_sandbox_name='atlas-auth' WHERE id='t1'",
+                [],
+            )
+            .unwrap();
+        // Review I2: the remove-impact count is indexed.
+        let idx: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('tasks') l
+                 JOIN pragma_index_info(l.name) i
+                 WHERE i.name = 'chosen_sandbox_name'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "an index on tasks(chosen_sandbox_name)");
+        // v7 never added a column that overloads the binding's name.
+        let overloaded: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'sandbox_name'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(overloaded, 0);
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 7);
+        assert!(!dir.path().join("core.sqlite3.pre-v7.bak.1").exists());
+    }
+
+    /// A database written by a NEWER Core (v8) is refused untouched — no
+    /// pragma, no backup, no migration (no silent downgrade).
+    #[test]
+    fn v8_database_is_refused_by_a_v7_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 8).unwrap();
         }
         let err = Database::open(&path).unwrap_err();
         assert!(
             matches!(
                 err,
                 DbError::TooNew {
-                    found: 7,
-                    supported: 6
+                    found: 8,
+                    supported: 7
                 }
             ),
             "{err}"
@@ -839,7 +948,7 @@ mod tests {
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 7, "left untouched");
+        assert_eq!(v, 8, "left untouched");
     }
 
     #[test]

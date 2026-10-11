@@ -21,6 +21,7 @@ import {
   MSG_CONVERSATION_ARCHIVED,
   MSG_CONVERSATION_HAS_TASKS,
   MSG_CONVERSATION_NOT_FOUND,
+  MSG_SEND_MODE_INVALID,
   MSG_TITLE_BLANK,
 } from "../../src/lib/conversation-messages";
 import { isRustWhitespace, validateConversationTitle } from "../../src/lib/wizard";
@@ -90,6 +91,18 @@ export interface FakeCoreOptions {
 export const A2_CORE_FEATURES: readonly string[] = [
   "idempotency-keys",
   "sandbox-create-agent",
+  "some-future-feature",
+];
+
+/**
+ * What the A4 Core advertises (Rust `FEATURES`, drift-tested in
+ * `tests/send-mode.test.ts`), plus a future unknown one clients must ignore.
+ */
+export const A4_CORE_FEATURES: readonly string[] = [
+  "idempotency-keys",
+  "sandbox-create-agent",
+  "conversation-sandbox-id",
+  "conversation-send-mode",
   "some-future-feature",
 ];
 
@@ -214,6 +227,14 @@ export interface FakeConversation extends Conversation {
 }
 
 export class FakeCore {
+  /**
+   * MODELED A4 `sandbox.remove` step-1 impact line (Core's `format!`, drift-
+   * tested): unfinished tasks sent from chats that chose this sandbox NAME.
+   */
+  static chosenNameImpactLine(n: number): string {
+    return `${n} unfinished task(s) were sent from chats that chose this sandbox name; removing it does not cancel them`;
+  }
+
   private readonly listeners: ((line: string) => void)[] = [];
   readonly events: TaskEvent[] = [];
   readonly tasks: TaskSummary[] = [];
@@ -748,8 +769,26 @@ export class FakeCore {
             workspaceMode: params.workspaceMode ?? null,
           };
         });
-      case "conversation.send":
-        return this.keyed(request.method, params, ok, err, () => {
+      case "conversation.send": {
+        // A4 (MODELED on `normalize_send_params`): only a Core advertising
+        // conversation-send-mode reads `mode`. A pre-A4 Core ignores the
+        // unknown field (serde), so a discussion is silently a task there.
+        const honoursMode = this.advertises("conversation-send-mode");
+        const { mode: rawMode, ...withoutMode } = params;
+        let sendParams: Record<string, unknown> = withoutMode;
+        let mode: "task" | "discuss" = "task";
+        if (honoursMode && rawMode !== undefined && rawMode !== null) {
+          // Checked BEFORE the key lookup: nothing is stored or run.
+          if (rawMode !== "task" && rawMode !== "discuss") {
+            return err("VALIDATION_FAILED", MSG_SEND_MODE_INVALID);
+          }
+          // An explicit "task" is normalized to absent before the fingerprint.
+          if (rawMode === "discuss") {
+            mode = "discuss";
+            sendParams = { ...withoutMode, mode: "discuss" };
+          }
+        }
+        return this.keyed(request.method, sendParams, ok, err, () => {
           // A3b (MODELED): checked AFTER the key lookup, so a keyed replay to
           // a since-archived conversation still returns the stored answer.
           // An unknown conversation stays lenient here (pre-A3b double).
@@ -763,10 +802,17 @@ export class FakeCore {
             id,
             conversationId: String(params.conversationId ?? ""),
             status: "queued",
+            // A4: the requested mode, and the chat's chosen sandbox NAME
+            // (never `sandboxName`, which stays the unfilled binding).
+            ...(honoursMode ? { mode } : {}),
+            ...(honoursMode && conversation?.sandboxId !== undefined
+              ? { chosenSandboxName: conversation.sandboxId }
+              : {}),
           };
           this.tasks.push(task);
           return { ...task };
         });
+      }
 
       // -- A1 lifecycle (modeled on the service source, see header) -----------
 
@@ -813,6 +859,8 @@ export class FakeCore {
                   : [
                       "not created by Sandpane: Core has no binding for this sandbox and cannot describe what it holds",
                     ]),
+                // A4 (MODELED): describe, never refuse.
+                ...this.chosenNameImpact(name),
                 ...this.extraImpact,
               ],
               external: !box.bound,
@@ -1012,6 +1060,21 @@ export class FakeCore {
    * `require_writable_conversation` (MODELED): the PROJECT refusal first (an
    * unknown project stays lenient), then the archived conversation.
    */
+  /** Does this double's `system.probe` advertise `feature`? */
+  private advertises(feature: string): boolean {
+    const features = this.options.features === undefined ? A2_CORE_FEATURES : this.options.features;
+    return features !== null && !this.options.legacyCore && features.includes(feature);
+  }
+
+  /** A4 `sandbox.remove` impact: unfinished tasks whose chat chose `name`. */
+  private chosenNameImpact(name: string): string[] {
+    if (!this.advertises("conversation-send-mode")) return [];
+    const n = this.tasks.filter(
+      (t) => t.chosenSandboxName === name && !TERMINAL_TASK_STATUSES.has(String(t.status)),
+    ).length;
+    return n === 0 ? [] : [FakeCore.chosenNameImpactLine(n)];
+  }
+
   private writableRefusal(conversation: FakeConversation): [string, string] | null {
     const project = this.projects.find((p) => p.id === conversation.projectId);
     if (project?.archivedAt !== undefined) return ["VALIDATION_FAILED", MSG_PROJECT_ARCHIVED];

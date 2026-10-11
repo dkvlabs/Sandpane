@@ -130,7 +130,10 @@ class CoreCommands(
             return CompletableFuture.failedFuture(e)
         }
         return rpc.request(CoreMethods.TASK_LIST, payload)
-            .thenApply { CoreJson.decodeFromJsonElement(ListSerializer(TaskSummary.serializer()), it) }
+            .thenApply { ok ->
+                // Review I3: a row that does not decode is never echoed (kotlinx quotes the input).
+                decodeOrFixed(CoreMethods.TASK_LIST) { CoreJson.decodeFromJsonElement(ListSerializer(TaskSummary.serializer()), ok) }
+            }
     }
 
     // -----------------------------------------------------------------------

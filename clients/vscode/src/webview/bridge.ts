@@ -54,6 +54,10 @@ export interface TaskRow {
   branch: string | null;
   baseCommit: string | null;
   unknownKinds: string[];
+  /** A4: Core's send mode, revealed and capped (open string); absent on older tasks. */
+  mode?: string;
+  /** A4: the name the task's chat chose — NOT where it runs; revealed and capped. */
+  chosenSandboxName?: string;
 }
 
 export interface CapabilitySummary {
@@ -125,6 +129,11 @@ export interface SidebarState {
    * Core's own reason); null = sending is allowed. Send is disabled while set.
    */
   composerBlocked: string | null;
+  /**
+   * A4: Core advertises `conversation-send-mode`. When false the composer's
+   * Task / Discuss choice is disabled at Task and nothing sends `mode`.
+   */
+  sendModeSupported: boolean;
   lines: ChatLine[];
   /** What the stream shows: one conversation, or every task of the project. */
   transcript: { scope: 'conversation' | 'project'; label: string };
@@ -154,7 +163,14 @@ export type WebviewToExtension =
    * extension checks it (and its mode) to reject a stale or wrong-intent
    * plan. Not a forgery defence: the id is visible to the webview.
    */
-  | { type: 'send'; text: string; writable: boolean; planId: number | null }
+  | {
+      type: 'send';
+      text: string;
+      writable: boolean;
+      planId: number | null;
+      /** A4: present ONLY when the user chose Discuss; absent = Task. */
+      mode?: 'discuss';
+    }
   | { type: 'cancelTask'; taskId: string }
   | { type: 'reviewTask'; taskId: string }
   /** A3b: select a Core-listed conversation; `''` = start a new one on the next send. */
@@ -215,13 +231,15 @@ export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefine
       return typeof name === 'string' ? { type: 'selectSandbox', name } : undefined;
     }
     case 'send': {
-      const r = raw as { text?: unknown; writable?: unknown; planId?: unknown };
+      const r = raw as { text?: unknown; writable?: unknown; planId?: unknown; mode?: unknown };
       if (typeof r.text !== 'string') return undefined;
       return {
         type: 'send',
         text: r.text,
         writable: r.writable === true,
         planId: typeof r.planId === 'number' && Number.isSafeInteger(r.planId) && r.planId >= 0 ? r.planId : null,
+        // A4: only the exact "discuss" selects Discuss; anything else is Task.
+        ...(r.mode === 'discuss' ? { mode: 'discuss' as const } : {}),
       };
     }
     case 'cancelTask':
@@ -254,6 +272,7 @@ export function emptySidebarState(connection: ConnectionTone): SidebarState {
     conversation: null,
     conversations: { supported: false, note: null, showArchived: false, showArchivedSupported: false, rows: [] },
     composerBlocked: null,
+    sendModeSupported: false,
     lines: [],
     transcript: { scope: 'project', label: 'Transcript of all tasks in this project (no conversation selected)' },
     tasks: [],

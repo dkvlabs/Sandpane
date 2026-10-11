@@ -50,8 +50,8 @@ object KeyedRequests {
     sealed class Prepared<P> {
         data class Ready<P>(val params: P) : Prepared<P>()
 
-        /** Nothing is sent; [reason] is this plugin's word. */
-        data class Refused<P>(val reason: String) : Prepared<P>()
+        /** Nothing is sent; [reason] is this plugin's word; [field] names the request field it is about. */
+        data class Refused<P>(val reason: String, val field: String = "idempotencyKey") : Prepared<P>()
     }
 
     private fun keysAdvertised(caps: CoreCapabilities?): Boolean = caps?.hasFeature(CoreFeatures.IDEMPOTENCY_KEYS) == true
@@ -84,6 +84,7 @@ object KeyedRequests {
         mint: () -> String = IdempotencyKeys::fresh,
     ): Prepared<ConversationSendParams> {
         if (params.idempotencyKey != null) return Prepared.Refused(NEW_ACTION_HAS_KEY)
+        SendModes.refusal(params, caps)?.let { return Prepared.Refused(it, field = "mode") }
         return Prepared.Ready(if (keysAdvertised(caps)) params.copy(idempotencyKey = mint()) else params)
     }
 
@@ -93,7 +94,10 @@ object KeyedRequests {
 
     /** "Retry safely" of a send: the identical params, same key. */
     fun retrySend(previous: ConversationSendParams, caps: CoreCapabilities?): Prepared<ConversationSendParams> =
-        retryGate(previous.idempotencyKey, caps)?.let { Prepared.Refused(it) } ?: Prepared.Ready(previous)
+        retryGate(previous.idempotencyKey, caps)?.let { Prepared.Refused(it) }
+            // A4: a reconnect to a pre-A4 Core would drop `mode` and record a task.
+            ?: SendModes.refusal(previous, caps)?.let { Prepared.Refused(it, field = "mode") }
+            ?: Prepared.Ready(previous)
 
     /**
      * Why a resend would NOT be safe, or null when it is. Without a key a resend could run twice;

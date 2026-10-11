@@ -74,6 +74,10 @@ interface TaskRow {
   branch: string | null;
   baseCommit: string | null;
   unknownKinds: string[];
+  /** A4: Core's send mode (open string), already revealed and capped. */
+  mode?: string;
+  /** A4: the name the task's chat chose — NOT where it runs. */
+  chosenSandboxName?: string;
 }
 
 interface ContextPlanView {
@@ -120,6 +124,8 @@ interface SidebarState {
   conversations: ConversationListView;
   /** Why Send is disabled (Core's own reason), or null. */
   composerBlocked: string | null;
+  /** A4: Core advertises `conversation-send-mode` (absent from an older host = no). */
+  sendModeSupported?: boolean;
   lines: ChatLine[];
   transcript: { scope: 'conversation' | 'project'; label: string };
   tasks: TaskRow[];
@@ -153,6 +159,8 @@ interface SidebarRefs {
   plan: HTMLElement;
   input: HTMLTextAreaElement;
   writable: HTMLInputElement;
+  sendMode: HTMLSelectElement;
+  sendModeNote: HTMLElement;
   preview: HTMLElement;
   send: HTMLButtonElement;
   composerNote: HTMLElement;
@@ -166,6 +174,7 @@ interface PaintMemo {
   notices: string;
   conversations: string;
   composerNote: string;
+  sendModeNote: string;
   lineKeys: string[];
   transcriptLabel: string;
   tasks: string;
@@ -177,6 +186,13 @@ interface PaintMemo {
 }
 
 const LIVE_WRITABLE_LABEL = 'LIVE-WRITABLE';
+
+// A4 copy — mirrors src/vscode/sendMode.ts (this script is import-free; a
+// test pins the two copies together).
+const SEND_MODE_LABEL = 'Send mode';
+const CHOSEN_SANDBOX_LABEL = 'sandbox chosen by its chat \u2014 not where it runs';
+const SEND_MODE_NOTE = 'Send mode: Core records whether you asked for a Task or a Discuss. Neither mode runs an agent in this build: every send stays queued. Discuss is not a sandbox, not a dry run and not safe execution.';
+const SEND_MODE_UNSUPPORTED = 'Task / Discuss: not supported by this Core (it does not advertise "conversation-send-mode"); every send is a Task.';
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -308,6 +324,21 @@ function buildSkeleton(
   writableLabel.setAttribute('for', writable.id);
   const send = el('button', undefined, 'Send');
   send.id = 'sp-send';
+  // A4: Task / Discuss. Built once, Task by default, disabled until Core
+  // advertises `conversation-send-mode`; not remembered (UI-only DOM state).
+  const sendMode = el('select', 'sp-sandbox-select');
+  sendMode.id = 'sp-send-mode';
+  sendMode.setAttribute('aria-label', SEND_MODE_LABEL);
+  for (const [value, label] of [
+    ['task', 'Task'],
+    ['discuss', 'Discuss'],
+  ] as const) {
+    const option = el('option', undefined, label);
+    option.value = value;
+    sendMode.appendChild(option);
+  }
+  sendMode.value = 'task';
+  sendMode.disabled = true;
 
   const requestPreview = (): void => {
     api.postMessage({ type: 'previewContext', writable: writable.checked });
@@ -315,9 +346,20 @@ function buildSkeleton(
   preview.addEventListener('click', requestPreview);
   // A shown list is tied to the intent it was built for: switching intent
   // replaces it with the list for the new intent (or keeps none).
-  writable.addEventListener('change', () => {
+  const intentChanged = (): void => {
     if (current()?.contextPlan) requestPreview();
     paintSendLabel(send, current(), writable.checked);
+  };
+  writable.addEventListener('change', intentChanged);
+  // Discuss never asks for a writable workspace: it clears and locks the
+  // writable intent (the extension refuses the combination as well).
+  sendMode.addEventListener('change', () => {
+    const discuss = sendMode.value === 'discuss';
+    writable.disabled = discuss;
+    if (discuss && writable.checked) {
+      writable.checked = false;
+      intentChanged();
+    }
   });
   send.addEventListener('click', () => {
     // The extension refuses a second in-flight send anyway (review W3), and an
@@ -334,7 +376,15 @@ function buildSkeleton(
       return;
     }
     memo.sentText = text;
-    api.postMessage({ type: 'send', text, writable: writable.checked, planId: plan.planId });
+    // A4: `mode` only for Discuss — and only while the choice is enabled.
+    const discuss = !sendMode.disabled && sendMode.value === 'discuss';
+    api.postMessage({
+      type: 'send',
+      text,
+      writable: writable.checked,
+      planId: plan.planId,
+      ...(discuss ? { mode: 'discuss' } : {}),
+    });
   });
   input.addEventListener('keydown', (event: KeyboardEvent) => {
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
@@ -343,10 +393,17 @@ function buildSkeleton(
     }
   });
   actions.appendChild(preview);
+  actions.appendChild(sendMode);
   actions.appendChild(writable);
   actions.appendChild(writableLabel);
   actions.appendChild(send);
   root.appendChild(actions);
+
+  // --- A4: what the send mode is (and is not) ---
+  const sendModeNote = el('div', 'sp-status');
+  sendModeNote.id = 'sp-send-mode-note';
+  sendModeNote.setAttribute('role', 'note');
+  root.appendChild(sendModeNote);
 
   // --- why Send is disabled (Core's own reason), when it is ---
   const composerNote = el('div', 'sp-status');
@@ -373,6 +430,8 @@ function buildSkeleton(
     plan,
     input,
     writable,
+    sendMode,
+    sendModeNote,
     preview,
     send,
     composerNote,
@@ -612,6 +671,13 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
       );
       chip.setAttribute('title', `branch: ${valueOrDash(row.branch)} · base: ${valueOrDash(row.baseCommit)}`);
       children.push(chip);
+      // A4: read-only, as Core reported them (already revealed and capped).
+      if (typeof row.mode === 'string' && row.mode.length > 0) {
+        children.push(el('span', 'sp-chip', `${SEND_MODE_LABEL}: ${row.mode}`));
+      }
+      if (typeof row.chosenSandboxName === 'string' && row.chosenSandboxName.length > 0) {
+        children.push(el('span', 'sp-chip', `${CHOSEN_SANDBOX_LABEL}: ${row.chosenSandboxName}`));
+      }
 
       const review = el('button', 'secondary', 'Review');
       review.id = `sp-review-${token}`;
@@ -671,6 +737,18 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
     memo.composerNote = noteText;
     refs.composerNote.textContent = noteText;
   }
+  // A4: an unadvertised send mode is locked at Task (never sent).
+  const modeSupported = state.sendModeSupported === true;
+  if (!modeSupported && refs.sendMode.value !== 'task') {
+    refs.sendMode.value = 'task';
+    refs.writable.disabled = false;
+  }
+  if (refs.sendMode.disabled === modeSupported) refs.sendMode.disabled = !modeSupported;
+  const modeNote = modeSupported ? SEND_MODE_NOTE : SEND_MODE_UNSUPPORTED;
+  if (modeNote !== memo.sendModeNote) {
+    memo.sendModeNote = modeNote;
+    refs.sendModeNote.textContent = modeNote;
+  }
   memo.sendLabel = paintSendLabel(refs.send, state, refs.writable.checked);
 
   // --- status line ---
@@ -696,6 +774,7 @@ function bootSandpaneSidebar(): void {
     notices: '',
     conversations: '',
     composerNote: '',
+    sendModeNote: '',
     lineKeys: [],
     transcriptLabel: '',
     tasks: '',

@@ -20,23 +20,24 @@ an earlier revision of this README claimed that while the crate did not compile 
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A3b conversation-lifecycle pass, 2026-10-11
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A4 send-mode pass, 2026-10-11
 
-Run fresh after the A3b conversation-lifecycle client work (protocol design 2026-10-09 §3.3), against
-the A3b Core + schema in the working tree, on top of the A3a project-lifecycle work (§3.2), the A2 idempotency work and its review fixes
+Run fresh after the A4 `conversation.send` mode client work (protocol design 2026-10-09 §3.4), against
+the A4 Core + schema in the working tree, on top of the A3b conversation-lifecycle work (§3.3) and
+the A3a project-lifecycle work (§3.2), the A2 idempotency work and its review fixes
 (W1–W4, I4, I5) and the A1 sandbox-lifecycle work and its review fixes. Every row below is a command that was actually run, with its actual
 result, except where a row says it was not re-run:
 
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **18 files, 557 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm test` (`vitest run`) | OK — **19 files, 583 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
 | `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
 | `cd src-tauri && cargo fmt --check` | OK — no diff |
-| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b pass (`clippy --all-targets` below compiles the crate) |
+| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b / A4 passes (`clippy --all-targets` below compiles the crate) |
 | `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
 | `cd src-tauri && cargo test --offline` | OK — **32 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 27; the six A3a project methods and the five A3b conversation methods are allowlisted and never replay-safe; all five A3b methods and the A3a methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s) |
-| `make desktop-check` (repo root) | NOT re-run in the A3b pass (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
+| `make desktop-check` (repo root) | NOT re-run in the A3b / A4 passes (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
 | `npm run lint --if-present` | No `lint` script in this package — nothing ran |
 
 **Correction of an earlier claim.** A previous revision of this table reported `cargo check` OK
@@ -224,6 +225,52 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 | Clipboard write inside the Tauri webview | **UNVERIFIED** — the Copy path is tested with an injected clipboard; WebKit permission behaviour in the native window was never exercised |
 | `ChatPanel` wiring (settings section, disabled Send on an archived chat) | Not SSR-renderable in this suite (external-store hooks); the pieces it composes are tested, the panel itself is **UNVERIFIED** |
 | `tests/live-core.test.ts` A3b pins (27 methods, `conversation-sandbox-id` advertised) | Updated, **not run** (skips without `SANDPANE_SOCKET`) |
+
+### A4 send mode — what the desktop does, and status
+
+- **No new method** (still 27). `KNOWN_FEATURES` gains `conversation-send-mode` (drift-tested
+  against Rust `FEATURES`). The proxy (`ipc_client.rs`) pins no features and is unchanged.
+- **Composer (Chat panel).** A "Send as: Task / Discuss" choice, default Task. It is enabled only
+  when Core advertises `conversation-send-mode`; otherwise it is shown disabled with "not supported
+  by this Core" (or "not probed yet"), and `mode` is never sent — a pre-A4 Core would drop it and
+  record a discussion as a task. Task omits `mode` (the frame stays byte-identical to an A2/A3b
+  send); Discuss sends `"mode":"discuss"`. The choice is UI-only, per conversation, for this window
+  only (never persisted; every chat starts at Task). Copy: neither Task nor Discuss runs an agent
+  in this build — Core records the requested mode and the task stays queued; Discuss is not a
+  sandbox or a restricted run.
+- **Retry safely** resends the identical variables (same key, same mode). A Discuss retry is not
+  sent when the re-probed Core no longer advertises `conversation-send-mode` ("Not retried: … it
+  would drop "discuss" …"; Retry safely is withdrawn). This needed a params-aware pre-retry check
+  in `KeyedWrite` (`recheckKeys(params)`, new `not-retried` outcome); `sandbox.create` keeps the
+  keys-only check.
+- **Task rows and detail** show "Send mode" (`TaskSummary.mode`, an OPEN string: an unknown value
+  such as `plan` is shown as-is) and "Sandbox chosen by its chat — not where it runs"
+  (`TaskSummary.chosenSandboxName`), read-only, revealed and capped at 120 characters. Older tasks
+  carry neither, and nothing is shown.
+- **`chosenSandboxName` is never a binding.** It is kept in its own `TaskIndexEntry` field and is
+  never read by `taskIsolationView` (a task carrying only it stays UNVERIFIED) or by
+  `countActiveTasksOn` (its stop count stays "cannot be checked"). Both are tested.
+- **`sandbox.remove` step 1** may carry Core's new impact line ("N unfinished task(s) were sent from
+  chats that chose this sandbox name; removing it does not cancel them"); the existing revealed,
+  capped impact rendering shows it (tested). `sandbox.stop` is unchanged.
+- **Honest copy.** Core's exact `VALIDATION_FAILED` `mode must be "task" or "discuss"` maps to
+  "Core did not accept the message — it refused the send mode" (the frame was sent; Core refuses
+  before any key row, message or task).
+- **A new Discuss send re-probes Core first.** The cached probe can be up to 30 s old, so just
+  before a NEW Discuss send `system.probe` is re-read. If `conversation-send-mode` is no longer
+  advertised the send is refused visibly ("Not sent: this Core does not advertise send modes, so
+  it would record the discussion as a task. Nothing was sent."), no frame is written, and it is
+  never downgraded to Task; a failed re-probe also sends nothing. Send is disabled while the
+  re-probe runs. A Task send is not re-probed.
+- **Answer check.** If a Discuss send's task does not report `mode: "discuss"`, a "Send mode not
+  recorded" warning says Core did not record the requested mode (the reported value revealed).
+
+| Item | Status |
+| --- | --- |
+| Frames, gating, retry, decode, facts, isolation/stop exclusions, impact line, copy | Functional headless: `tests/send-mode.test.ts` (26 tests, incl. SSR of the choice and the facts) against an in-memory FakeCore. **UNVERIFIED live** — never run against a real A4 Core, never in the running desktop app |
+| FakeCore `mode` validation / normalization, `TaskSummary.mode` / `chosenSandboxName`, the `features` entry, the remove impact line, a pre-A4 Core dropping `mode` | **Modeled** on `sandpane-service/src/lib.rs` (working tree, §3.4), **not captured** from a live run |
+| The choice inside `ChatPanel` (wiring, per-conversation memory) | `ChatPanel` cannot be SSR-rendered in this suite; the component and the pure helpers are tested, the wiring is **UNVERIFIED** |
+| `tests/live-core.test.ts` A4 pins (`conversation-send-mode` advertised, features equal `KNOWN_FEATURES`) | Updated, **not run** |
 
 ### Live Core run (earlier evidence — NOT re-run in the review-fix pass)
 

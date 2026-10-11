@@ -188,7 +188,7 @@ async function main() {
   // A2: advertisement only. This harness never sends a keyed sandbox.create
   // (it would drive the real sbx); keyed sends are not exercised here either.
   check(
-    'A2/A3b: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent, conversation-sandbox-id)',
+    'A2/A3b/A4: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent, conversation-sandbox-id, conversation-send-mode)',
     Array.isArray(caps.features) &&
       KNOWN_FEATURES.every((f) => caps.features.includes(f)) &&
       KNOWN_FEATURES.every((f) => coreAdvertisesFeature(caps, f)),

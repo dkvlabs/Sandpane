@@ -22,6 +22,7 @@ import labs.dkv.sandpane.core.RenderedEvent
 import labs.dkv.sandpane.model.AgentEvent
 import labs.dkv.sandpane.model.Conversation
 import labs.dkv.sandpane.model.ConversationSendParams
+import labs.dkv.sandpane.core.SendModes
 import labs.dkv.sandpane.model.CoreEventKinds
 import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.PROTOCOL_VERSION
@@ -175,6 +176,17 @@ class ChatPanel(
     }
 
     private val sendButton = JButton("Send")
+
+    /**
+     * A4 Task / Discuss choice. Defaults to Task, is not remembered (reset whenever the selected
+     * conversation changes) and is enabled only when Core advertises `conversation-send-mode`.
+     */
+    private val sendModeCombo = JComboBox(SendModes.Choice.entries.toTypedArray()).apply {
+        selectedItem = SendModes.Choice.TASK
+        toolTipText = PlainText.tooltip(SendModes.COMPOSER_COPY)
+        alignmentX = java.awt.Component.LEFT_ALIGNMENT
+    }
+    private var sendModeConversationId: String? = null
 
     private val connectionLabel = PlainText.label("  not connected")
     private val contextLabel = PlainText.label("  no editor context")
@@ -408,6 +420,7 @@ class ChatPanel(
      * the Send-target line in line with it; a no-op when they already agree.
      */
     private fun onConversationSelectionChanged() {
+        resetSendModeOnConversationChange()
         val selected = conversationModel.selectedItem as? Conversation
         targetLabel.text = ConversationSelection.targetLine(selected)
         targetLabel.toolTipText = PlainText.tooltip(
@@ -596,6 +609,7 @@ class ChatPanel(
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             add(Box.createVerticalGlue())
             add(targetLabel)
+            add(sendModeCombo)
             add(sendButton)
         }
 
@@ -709,6 +723,31 @@ class ChatPanel(
         }
     }
 
+    /** A4: the Task / Discuss choice follows Core's advertisement only. EDT-only; makes no Core call. */
+    private fun refreshSendMode(blocked: Boolean) {
+        resetSendModeOnConversationChange()
+        when (val state = SendModes.choiceState(connection.capabilities)) {
+            is SendModes.ChoiceState.Enabled -> {
+                sendModeCombo.isEnabled = !blocked
+                sendModeCombo.toolTipText = PlainText.tooltip(SendModes.COMPOSER_COPY)
+            }
+            is SendModes.ChoiceState.Disabled -> {
+                sendModeCombo.selectedItem = SendModes.Choice.TASK
+                sendModeCombo.isEnabled = false
+                sendModeCombo.toolTipText = PlainText.tooltip(state.reason)
+            }
+        }
+    }
+
+    /** The choice is not remembered: another conversation always starts at Task. EDT-only. */
+    private fun resetSendModeOnConversationChange() {
+        val selectedId = (conversationModel.selectedItem as? Conversation)?.id
+        if (selectedId != sendModeConversationId) {
+            sendModeConversationId = selectedId
+            sendModeCombo.selectedItem = SendModes.Choice.TASK
+        }
+    }
+
     /** The single place that decides whether an action is allowed, from Core state. */
     private fun refreshGateUI() {
         val problem = connection.connectionProblem()
@@ -723,6 +762,7 @@ class ChatPanel(
             ?: selectionBlocker()
 
         val blocked = blocker != null
+        refreshSendMode(blocked)
         composer.isEnabled = !blocked
         sendButton.isEnabled = !blocked && composer.text.isNotBlank()
         sendButton.toolTipText = PlainText.tooltip(blocker ?: "Send this text plus the editor context to Core")
@@ -830,7 +870,7 @@ class ChatPanel(
     private fun updateRowStatus(taskId: String, view: TaskMonitorService.TaskView) {
         val rowId = "agent-$taskId"
         val row = rowsById[rowId] ?: return
-        val updated = row.copy(meta = "task ${taskId.take(8)} · ${view.statusLabel} (reported by Core)")
+        val updated = row.copy(meta = TaskRowText.meta(taskId, view))
         val index = rowsModel.indexOf(row)
         if (index >= 0) rowsModel.setElementAt(updated, index)
         rowsById[rowId] = updated
@@ -858,11 +898,24 @@ class ChatPanel(
         }
         val snapshot = contextProvider.collect()
         contextLabel.text = "  " + snapshot.describeForStatusBar()
-        val params = ConversationSendParams(
-            conversationId = conversationId,
-            content = contextProvider.buildContent(content, snapshot),
-            attachments = snapshot.attachments,
-        )
+        // A4: the SELECTED choice as-is (review W3). Task omits `mode`; a Discuss that meets a Core without
+        // the feature (a reconnect raced the combo reset) is refused here, visibly, and nothing is sent.
+        val params = when (
+            val composed = SendModes.composerSend(
+                conversationId = conversationId,
+                content = contextProvider.buildContent(content, snapshot),
+                attachments = snapshot.attachments,
+                selected = sendModeCombo.selectedItem as? SendModes.Choice,
+                caps = connection.capabilities,
+            )
+        ) {
+            is SendModes.ComposerSend.Refused -> {
+                addSystemRow("Nothing was sent (your text is still in the composer): ${composed.reason}.")
+                refreshGateUI()
+                return
+            }
+            is SendModes.ComposerSend.Ready -> composed.params
+        }
         composer.text = ""
         addAttachmentChips(snapshot)
         addUserRow(content)
@@ -916,7 +969,8 @@ class ChatPanel(
                                 is TaskMonitorService.SendResult.FromSummary ->
                                     // An unknown status is still an ACCEPTED task: Core queued it.
                                     "Core accepted task ${result.taskId.take(8)} · status reported by Core: " +
-                                        result.summary.status.describe()
+                                        result.summary.status.describe() +
+                                        SendModes.detailsOf(result.summary).joinToString("") { " · $it" }
 
                                 is TaskMonitorService.SendResult.TaskIdOnly ->
                                     "Core accepted task ${result.taskId.take(8)} (id-only response; see protocol gap 2)"

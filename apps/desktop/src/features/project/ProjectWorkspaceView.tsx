@@ -40,6 +40,7 @@ import {
 import { IconRefresh } from "../../components/layout/icons";
 import { href, navigate, type Route } from "../../app/router";
 import { useProbeRefetch } from "../../components/ui/refresh";
+import { TaskSendFacts } from "../../components/chat/SendMode";
 import { useUiPreferences } from "../../app/context";
 
 export function ProjectWorkspaceView({ route }: { route: Route }) {
@@ -255,6 +256,7 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
                         {task.conversationId === null
                           ? " · conversation unknown"
                           : ` · chat ${task.conversationId.slice(0, 8)}`}
+                        <TaskSendFacts task={task} inline />
                       </span>
                     </button>
                   </li>

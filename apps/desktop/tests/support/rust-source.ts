@@ -240,6 +240,9 @@ export const REDACT_RUST = "core/crates/sandpane-core/src/redact.rs";
  */
 export function rustStrConst(relative: string, name: string): string {
   const source = read(relative);
+  // A raw string literal (`r#"…"#`) has no escapes: its body is the value.
+  const raw = new RegExp(`pub const ${name}: &str =\\s*r#"([\\s\\S]*?)"#;`).exec(source);
+  if (raw !== null) return raw[1];
   const head = new RegExp(`pub const ${name}: &str =\\s*"`).exec(source);
   if (head === null) throw new Error(`${relative} has no "pub const ${name}: &str = \\"…\\";"`);
   let i = head.index + head[0].length;

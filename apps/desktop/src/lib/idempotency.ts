@@ -175,6 +175,13 @@ export const NOT_RETRIED_UNCHECKED =
 export type KeyRecheck =
   | { kind: "advertised" }
   | { kind: "not-advertised" }
+  /**
+   * Keys are advertised, but something else the IDENTICAL params rely on is
+   * not (A4: a `"discuss"` send to a Core that no longer advertises
+   * `conversation-send-mode` would have `mode` silently dropped). Nothing is
+   * sent; `note` says why, and Retry safely is withdrawn.
+   */
+  | { kind: "not-retried"; note: string }
   | { kind: "unreachable"; error: CoreRequestError };
 
 export type KeyedWriteState<P, R> =
@@ -193,8 +200,11 @@ export type KeyedWriteState<P, R> =
     };
 
 export interface KeyedWriteOptions<P, R> {
-  /** Re-read `system.probe` and say whether `idempotency-keys` is advertised NOW. */
-  recheckKeys: () => Promise<KeyRecheck>;
+  /**
+   * Re-read `system.probe` and say whether `idempotency-keys` (and whatever
+   * else these exact params rely on) is advertised NOW.
+   */
+  recheckKeys: (params: P) => Promise<KeyRecheck>;
   onSuccess?: (params: P, result: R) => void;
   /** After every exchange that may have reached Core (re-read state). */
   onSettled?: (params: P) => void;
@@ -264,12 +274,16 @@ export class KeyedWrite<P extends { idempotencyKey?: string }, R> {
       this.set({ kind: "sending", params: previous.params, retry: true });
       let check: KeyRecheck;
       try {
-        check = await this.options.recheckKeys();
+        check = await this.options.recheckKeys(previous.params);
       } catch (err) {
         check = { kind: "unreachable", error: asCoreError(err) };
       }
       if (check.kind === "not-advertised") {
         this.set({ ...previous, retryOffered: false, note: NOT_RETRIED_NO_KEYS, noteError: null });
+        return false;
+      }
+      if (check.kind === "not-retried") {
+        this.set({ ...previous, retryOffered: false, note: check.note, noteError: null });
         return false;
       }
       if (check.kind === "unreachable") {

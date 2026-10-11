@@ -49,6 +49,7 @@ import type {
   SandboxStopResult,
   SandboxSummary,
   SbxAgent,
+  SendMode,
 } from './core-client/protocol';
 import { coreAdvertisesFeature, coreAdvertisesMethod, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT } from './core-client/protocol';
 import {
@@ -84,6 +85,15 @@ import {
   stopOutcomeView,
 } from './vscode/sandboxActions';
 import { plainText } from './text/visibleText';
+import {
+  DISCUSS_NOT_ADVERTISED,
+  DISCUSS_NOT_WRITABLE,
+  RETRY_MODE_NOT_ADVERTISED,
+  SEND_MODE_FEATURE,
+  chosenSandboxText,
+  sendModeErrorCopy,
+  taskModeText,
+} from './vscode/sendMode';
 import {
   ARCHIVED_LABEL,
   DELETE_PROJECT_BUTTON,
@@ -1758,7 +1768,9 @@ export class SandpaneSession {
       // Today's Core never records which sandbox a task uses
       // (`tasks.sandbox_binding_id` is never written, `sandboxName` is always
       // absent), so a zero count would be a false "no active task". Only when
-      // Core starts filling `sandboxName` is the count meaningful.
+      // Core starts filling `sandboxName` is the count meaningful. A4's
+      // `chosenSandboxName` is deliberately NOT read: it is the name a chat
+      // chose, not where a task runs (design §3.4 item 3).
       if (!tasks.some((task) => typeof task.sandboxName === 'string' && task.sandboxName.length > 0)) {
         return null;
       }
@@ -1788,6 +1800,7 @@ export class SandpaneSession {
     writable: boolean,
     planId: number | null,
     origin: 'sidebar' | 'command' = 'sidebar',
+    mode: SendMode = 'task',
   ): Promise<void> {
     if (!this.host.supported) {
       void vscode.window.showWarningMessage(this.host.explanation);
@@ -1807,7 +1820,7 @@ export class SandpaneSession {
     }
     this.sending = true;
     this.emit();
-    const run = this.sendGuarded(text, writable, planId, origin).finally(() => {
+    const run = this.sendGuarded(text, writable, planId, origin, mode).finally(() => {
       this.sending = false;
       if (this.sendInFlight === run) this.sendInFlight = null;
       this.emit();
@@ -1824,6 +1837,7 @@ export class SandpaneSession {
     writable: boolean,
     planId: number | null,
     origin: 'sidebar' | 'command',
+    mode: SendMode,
   ): Promise<void> {
     // A3b: an archived project / conversation — Core would refuse the send;
     // say so with Core's own reason and send nothing.
@@ -1832,6 +1846,19 @@ export class SandpaneSession {
       this.setStatus('error', `Not sent: ${blocked}`);
       this.emit();
       return;
+    }
+    // A4: Discuss is never silently downgraded to Task — refused instead.
+    if (mode === 'discuss') {
+      const refusal = writable
+        ? DISCUSS_NOT_WRITABLE
+        : this.coreHasFeature(SEND_MODE_FEATURE)
+          ? null
+          : DISCUSS_NOT_ADVERTISED;
+      if (refusal !== null) {
+        this.setStatus('error', `Not sent: ${refusal}`);
+        this.emit();
+        return;
+      }
     }
     const authorization = authorizeSend(
       this.contextPlan ? { id: this.contextPlanId, mode: this.contextPlan.mode } : null,
@@ -1862,6 +1889,7 @@ export class SandpaneSession {
         return;
       }
     }
+    if (mode === 'discuss' && !(await this.sendModeStillAdvertised())) return;
     let conversationId: string;
     try {
       if (this.connection.connectionState !== 'online') await this.attach();
@@ -1902,6 +1930,14 @@ export class SandpaneSession {
       this.reportError(error, 'conversation.create');
       return;
     }
+    // A4 (review I1): a reconnect may have landed between the re-probe and
+    // here (the cache is refreshed on every load). A Discuss send goes only to
+    // a Core that still advertises send mode — refused, never downgraded.
+    if (mode === 'discuss' && !this.coreHasFeature(SEND_MODE_FEATURE)) {
+      this.setStatus('error', `Not sent: ${DISCUSS_NOT_ADVERTISED}`);
+      this.emit();
+      return;
+    }
     // A2: one fresh key for THIS send, only when Core honours keys.
     const key = this.coreHasFeature('idempotency-keys') ? newIdempotencyKey() : undefined;
     await this.deliverSend(
@@ -1910,9 +1946,31 @@ export class SandpaneSession {
         content: text,
         attachments: plan?.refs ?? [],
         ...(key !== undefined ? { idempotencyKey: key } : {}),
+        // A4: Task travels as no key (identical to A2/A3b frames).
+        ...(mode === 'discuss' ? { mode: 'discuss' as const } : {}),
       },
       { scopeProjectId, sentPlanId, origin },
     );
+  }
+
+  /**
+   * A4 send-time gate for Discuss: attach if needed and re-probe THIS Core —
+   * the cached probe may predate a reconnect to a pre-A4 build, which would
+   * drop `mode` and record the discussion as a task. Runs before any
+   * conversation is created, so a refusal leaves nothing behind.
+   */
+  private async sendModeStillAdvertised(): Promise<boolean> {
+    try {
+      if (this.connection.connectionState !== 'online') await this.connection.connect();
+      this.capabilities = await this.commands.systemProbe();
+    } catch (error) {
+      this.reportError(error, 'system.probe', 'Not sent: the send mode could not be checked with Core.');
+      return false;
+    }
+    if (this.coreHasFeature(SEND_MODE_FEATURE)) return true;
+    this.setStatus('error', `Not sent: ${DISCUSS_NOT_ADVERTISED}`);
+    this.emit();
+    return false;
   }
 
   /**
@@ -1968,6 +2026,15 @@ export class SandpaneSession {
     params: ConversationSendParams,
     ctx: { scopeProjectId: string | null; sentPlanId: number; origin: 'sidebar' | 'command' },
   ): Promise<void> {
+    // A4: `retryKeyed` re-probed THIS Core just now. A send that carries
+    // `mode` is resent only to a Core that honours it — never stripped of it
+    // (that would change the request under the same key).
+    if (params.mode !== undefined && !this.coreHasFeature(SEND_MODE_FEATURE)) {
+      void vscode.window.showErrorMessage(RETRY_MODE_NOT_ADVERTISED);
+      this.setStatus('error', RETRY_MODE_NOT_ADVERTISED);
+      this.emit();
+      return;
+    }
     // The failed send's own guard is released a few microtasks after its
     // notification appears; a click that lands first waits for that release.
     if (this.sendInFlight) await this.sendInFlight.catch(() => undefined);
@@ -2176,7 +2243,7 @@ export class SandpaneSession {
         this.previewContext(message.writable);
         break;
       case 'send':
-        void this.send(message.text, message.writable, message.planId, 'sidebar');
+        void this.send(message.text, message.writable, message.planId, 'sidebar', message.mode ?? 'task');
         break;
       case 'cancelTask':
         void this.cancelTask(message.taskId);
@@ -2279,6 +2346,7 @@ export class SandpaneSession {
         : null,
       conversations: this.conversationListView(),
       composerBlocked: this.composerBlockedReason(),
+      sendModeSupported: this.coreHasFeature(SEND_MODE_FEATURE),
       lines: transcript.lines.map((line) => ({
         role: line.role,
         text: line.text,
@@ -2293,6 +2361,8 @@ export class SandpaneSession {
         branch: task.taskBranch ?? null,
         baseCommit: task.baseCommit ?? null,
         unknownKinds: task.unknownKinds,
+        ...optionalText('mode', taskModeText(task.mode)),
+        ...optionalText('chosenSandboxName', chosenSandboxText(task.chosenSandboxName)),
       })),
       acceptedSends: this.acceptedSends,
       sending: this.sending,
@@ -2518,7 +2588,8 @@ export class SandpaneSession {
   reportError(error: unknown, operation: string, contextArg?: string): void {
     // Core's exact A3a refusals (archived project, unregistered repository …)
     // get their honest copy wherever they surface.
-    const context = contextArg ?? projectErrorCopy(error) ?? conversationErrorCopy(error) ?? undefined;
+    const context =
+      contextArg ?? projectErrorCopy(error) ?? conversationErrorCopy(error) ?? sendModeErrorCopy(error) ?? undefined;
     const failure = toFailure(error);
     const guidance = explainFailure(error);
     const coreMessage =
@@ -2557,6 +2628,11 @@ export class SandpaneSession {
     const state = this.snapshot();
     for (const listener of this.listeners) listener(state);
   }
+}
+
+/** `{ [key]: value }` when there is a value to show, else nothing (no invented field). */
+function optionalText<K extends string>(key: K, value: string | null): Partial<Record<K, string>> {
+  return value === null ? {} : ({ [key]: value } as Partial<Record<K, string>>);
 }
 
 function describe(error: unknown): string {

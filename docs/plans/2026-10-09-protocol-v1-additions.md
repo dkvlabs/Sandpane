@@ -301,17 +301,19 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
    - `ConversationSendParams.mode?: "task" | "discuss"` (`Option`, `skip_serializing_if`). Absent means `"task"`.
    - **Hash stability:** Core normalizes an explicit `"task"` to absent *before* the idempotency fingerprint is computed. Every A2 hash stays stable, and two clients that differ only in sending `"task"` explicitly get a replay, not a `CONFLICT`. Any other value is `VALIDATION_FAILED` (`mode must be "task" or "discuss"`).
    - `TaskSummary.mode?: string` is present on every task created from A4 on (`"task"` or `"discuss"`) and absent on older rows. Clients decode it as an **open string**, never a strict enum (§1 table): an unknown value is displayed as-is, never a decode failure.
-   - Migration v7 adds `tasks.mode TEXT` and `tasks.sandbox_name TEXT` (item 3), with the same backup and downgrade-refusal rules.
+   - Migration v7 adds `tasks.mode TEXT` and `tasks.chosen_sandbox_name TEXT` (item 3), plus an index on the latter, with the same backup and downgrade-refusal rules.
    - `features` gains `"conversation-send-mode"`. Clients send `mode` only when it is advertised, because a pre-A4 Core silently drops the field and would treat a discussion as a task.
 2. **What `discuss` means.**
    - A `discuss` task never gets a writable workspace. The internal `create_task` API refuses `discuss` with any workspace request other than none or `mountless` (`VALIDATION_FAILED`, "a discuss task never gets a writable workspace; nothing was run").
    - The wire path has no workspace selection at all (item 4), so over the wire this cannot occur today. It is enforced and tested at the internal API.
    - The task's scaffold event says which mode was requested. With no verified adapter, both modes still record `PERMISSION_DENIED` and stay `queued` (honest, unchanged).
 3. **Sandbox-name follow-up from A1 (describe, never refuse).**
-   - From A4 on, a new task stores `tasks.sandbox_name` from its conversation's `sandbox_id` (A3b) at send time. `TaskSummary.sandboxName` is then filled.
+   - From A4 on, a new task stores `tasks.chosen_sandbox_name` from its conversation's `sandbox_id` (A3b) at send time, and reports it as the new additive `TaskSummary.chosenSandboxName?`.
+   - **`TaskSummary.sandboxName` keeps its pre-A4 meaning:** the sandbox a task is bound to, from `sandbox_bindings` only. A4 never fills it from the chat's choice. Shipped clients read `sandboxName` as "the sandbox this task runs in": the desktop derives a verified isolation label from it, and the VS Code and desktop stop dialogs count tasks by it. Overloading it would make them claim isolation and impact that do not exist (A4 Core review C1/C2).
    - It is a stored **name**, not an identity, and no task can run in a sandbox today. So `sandbox.stop` and `sandbox.remove` **never refuse** because of it.
    - `sandbox.remove` step 1 adds one impact line when unfinished tasks were sent from chats that chose this sandbox name: "N unfinished task(s) were sent from chats that chose this sandbox name; removing it does not cancel them".
    - `sandbox.stop` is unchanged.
+   - The count reads only `tasks.chosen_sandbox_name` (no back-fill). Tasks created before v7 in a chat that chose the name are not counted. No shipped database has such rows, because v6 and v7 land in consecutive commits; the line is descriptive and never refuses.
 4. **Not in A4: workspace selection on the wire** (new row A4b below). A `conversation.send` that creates a `host_worktree` task writes a task branch and a worktree into the user's repository, and every such task stays `queued` with no wire-level discard. That needs its own decisions:
    - which modes are allowed over the wire (never `direct_mount` without the live-writable label);
    - which repositories qualify;
@@ -323,7 +325,7 @@ A3 is landed in two commits: **A3a** (projects, below) and **A3b** (conversation
    - Every pinned method list is unchanged (no new method).
    - Known-features lists gain `conversation-send-mode`.
    - The composer gets a Task / Discuss choice, shown only when the feature is advertised, with copy that says neither runs an agent in this build.
-   - `TaskSummary.mode` and `sandboxName` are shown read-only, revealed and capped.
+   - `TaskSummary.mode` (labelled "Send mode") and `chosenSandboxName` (labelled "sandbox chosen by its chat — not where it runs") are shown read-only, revealed and capped. `chosenSandboxName` never feeds isolation labels, stop or remove impact counts, or scope logic.
 
 | # | Addition | Shape (additive) | Notes |
 |---|---|---|---|

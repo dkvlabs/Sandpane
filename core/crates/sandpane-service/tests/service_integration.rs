@@ -2508,6 +2508,227 @@ fn sandbox_remove_two_step_flow_removes_and_marks_the_binding() {
     assert_eq!(again["confirmation"]["target"]["id"], ATLAS_REPLACEMENT_ID);
 }
 
+/// A4 §3.4 item 3 (describe, never refuse): step 1 names the unfinished
+/// tasks sent from chats that chose this sandbox NAME. Other names, chats
+/// with no name and finished tasks are not counted; the line disappears when
+/// none is left; step 2 still removes while tasks are unfinished; and
+/// `sandbox.stop` is unchanged.
+#[test]
+fn sandbox_remove_step_one_counts_unfinished_tasks_sent_from_chats_that_chose_the_name() {
+    const LINE: &str = "unfinished task(s) were sent from chats that chose this sandbox name; \
+                        removing it does not cancel them";
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = bind_atlas(&mut s, &fake);
+    let impact = |s: &mut TestServer, id: &str| -> (Vec<String>, String) {
+        let step1 = s.ok(
+            id,
+            "sandbox.remove",
+            serde_json::json!({"name": "atlas-auth"}),
+        );
+        let c = &step1["confirmation"];
+        (
+            c["impact"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l.as_str().unwrap().to_string())
+                .collect(),
+            c["token"].as_str().unwrap().to_string(),
+        )
+    };
+    let (baseline, _) = impact(&mut s, "b0");
+    assert!(
+        !baseline.iter().any(|l| l.contains("unfinished")),
+        "{baseline:?}"
+    );
+
+    let chat = |s: &mut TestServer, id: &str, sandbox: Option<&str>| -> String {
+        let mut p =
+            serde_json::json!({"projectId": project["id"], "agentId": "codex", "title": id});
+        if let Some(name) = sandbox {
+            p["sandboxId"] = serde_json::json!(name);
+        }
+        s.ok(id, "conversation.create", p)["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let send = |s: &mut TestServer, id: &str, conv: &str, mode: &str| -> String {
+        s.ok(
+            id,
+            "conversation.send",
+            serde_json::json!({"conversationId": conv, "content": "x", "mode": mode}),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let atlas_chat = chat(&mut s, "c1", Some("atlas-auth"));
+    let nova_chat = chat(&mut s, "c2", Some("nova-search"));
+    let plain_chat = chat(&mut s, "c3", None);
+    let t1 = send(&mut s, "s1", &atlas_chat, "task");
+    let t2 = send(&mut s, "s2", &atlas_chat, "discuss");
+    send(&mut s, "s3", &nova_chat, "task");
+    send(&mut s, "s4", &plain_chat, "task");
+
+    let (two, _) = impact(&mut s, "i2");
+    let expected2 = format!("2 {LINE}");
+    assert_eq!(
+        two.iter()
+            .filter(|l| l.contains("unfinished"))
+            .collect::<Vec<_>>(),
+        vec![&expected2],
+        "{two:?}"
+    );
+    // Additive: every other line is exactly the baseline.
+    let others: Vec<String> = two.iter().filter(|l| **l != expected2).cloned().collect();
+    assert_eq!(others, baseline);
+
+    s.ok("x1", "task.cancel", serde_json::json!({"taskId": &t1}));
+    let (one, _) = impact(&mut s, "i1");
+    assert!(one.contains(&format!("1 {LINE}")), "{one:?}");
+    s.ok("x2", "task.cancel", serde_json::json!({"taskId": &t2}));
+    let (zero, _) = impact(&mut s, "i0");
+    assert_eq!(zero, baseline, "no line once nothing is unfinished");
+
+    // Never refuses: stop and remove both proceed with an unfinished task.
+    send(&mut s, "s5", &atlas_chat, "task");
+    fake.ls_after("stop", &ls_with_atlas(ATLAS_ID, "stopped"));
+    let stopped = s.ok(
+        "st",
+        "sandbox.stop",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    assert_eq!(stopped["stopped"], true, "{stopped}");
+    let (again, token) = impact(&mut s, "i3");
+    assert!(again.contains(&format!("1 {LINE}")), "{again:?}");
+    fake.ls_after("rm", EMPTY_LS);
+    let removed = s.ok(
+        "rm",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(removed, serde_json::json!({"removed": true}));
+}
+
+/// Step-1 impact lines of `sandbox.remove` for `atlas-auth` (+ the token).
+fn atlas_remove_impact(s: &mut TestServer, id: &str) -> (Vec<String>, String) {
+    let step1 = s.ok(
+        id,
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth"}),
+    );
+    let c = &step1["confirmation"];
+    (
+        c["impact"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect(),
+        c["token"].as_str().unwrap().to_string(),
+    )
+}
+
+const UNFINISHED_LINE: &str = "unfinished task(s) were sent from chats that chose this sandbox \
+                               name; removing it does not cancel them";
+
+/// Review I7 (fail-closed): a task whose stored status Core cannot read is
+/// counted as unfinished — the line over-reports, never hides.
+#[test]
+fn sandbox_remove_counts_an_unreadable_task_status_as_unfinished() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let project = bind_atlas(&mut s, &fake);
+    let conv = s.ok(
+        "c",
+        "conversation.create",
+        serde_json::json!({"projectId": project["id"], "agentId": "codex", "title": "c",
+                           "sandboxId": "atlas-auth"}),
+    );
+    s.inner
+        .lock_db()
+        .conn()
+        .execute(
+            "INSERT INTO tasks (id, conversation_id, chosen_sandbox_name, status, created_at,
+                                updated_at)
+             VALUES ('t-garbled', ?1, 'atlas-auth', 'not-a-status', 't', 't')",
+            [conv["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let (impact, _) = atlas_remove_impact(&mut s, "i");
+    assert!(
+        impact.contains(&format!("1 {UNFINISHED_LINE}")),
+        "{impact:?}"
+    );
+}
+
+/// Review I7 (cross-project): chats in TWO projects that chose the same
+/// sandbox name are both counted (a name is not scoped to a project).
+#[test]
+fn sandbox_remove_counts_unfinished_tasks_across_projects() {
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    let atlas = bind_atlas(&mut s, &fake);
+    let nova = s.ok(
+        "p2",
+        "project.create",
+        serde_json::json!({"name": "Nova Demo", "repositories": []}),
+    );
+    for (i, project) in [&atlas, &nova].into_iter().enumerate() {
+        let conv = s.ok(
+            &format!("c{i}"),
+            "conversation.create",
+            serde_json::json!({"projectId": project["id"], "agentId": "codex", "title": "c",
+                               "sandboxId": "atlas-auth"}),
+        );
+        s.ok(
+            &format!("s{i}"),
+            "conversation.send",
+            serde_json::json!({"conversationId": conv["id"], "content": "x"}),
+        );
+    }
+    let (impact, _) = atlas_remove_impact(&mut s, "i");
+    assert!(
+        impact.contains(&format!("2 {UNFINISHED_LINE}")),
+        "{impact:?}"
+    );
+}
+
+/// Review I1: if the count cannot be read, step 1 still answers (never
+/// INTERNAL, never a refusal) and says so honestly; step 2 still removes.
+/// The read failure is injected for real: the column the count reads is
+/// dropped from the live database, so the query fails inside Core.
+#[test]
+fn sandbox_remove_step_one_survives_an_unreadable_unfinished_count() {
+    const UNREADABLE: &str = "the number of unfinished tasks sent from chats that chose this \
+                              sandbox name could not be read; removing it does not cancel them";
+    let fake = fake_sbx(&ls_with_atlas(ATLAS_ID, "running"), None, None);
+    let mut s = start_server(fake.locator());
+    bind_atlas(&mut s, &fake);
+    let (baseline, _) = atlas_remove_impact(&mut s, "b");
+    s.inner
+        .lock_db()
+        .conn()
+        .execute_batch(
+            "DROP INDEX idx_tasks_chosen_sandbox_name;
+             ALTER TABLE tasks DROP COLUMN chosen_sandbox_name;",
+        )
+        .unwrap();
+    let (impact, token) = atlas_remove_impact(&mut s, "i");
+    let mut expected = baseline.clone();
+    expected.push(UNREADABLE.to_string());
+    assert_eq!(impact, expected);
+    fake.ls_after("rm", EMPTY_LS);
+    let removed = s.ok(
+        "rm",
+        "sandbox.remove",
+        serde_json::json!({"name": "atlas-auth", "confirmToken": token}),
+    );
+    assert_eq!(removed, serde_json::json!({"removed": true}));
+}
+
 #[test]
 fn sandbox_remove_flags_a_sandbox_not_created_by_sandpane() {
     let fake = fake_sbx(ROWS_RUNNING_STOPPED, None, None);
@@ -3243,7 +3464,8 @@ fn features_are_advertised_from_the_single_const_list() {
         serde_json::json!([
             "idempotency-keys",
             "sandbox-create-agent",
-            "conversation-sandbox-id"
+            "conversation-sandbox-id",
+            "conversation-send-mode"
         ])
     );
 }

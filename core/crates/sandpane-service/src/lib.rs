@@ -1970,16 +1970,40 @@ fn issue_remove_confirmation(
                 ),
             ))
         })?;
-    let rows = {
+    let (rows, unfinished_named) = {
         let db = inner.lock_db();
-        live_bindings(&db)?.remove(name).unwrap_or_default()
+        let rows = live_bindings(&db)?.remove(name).unwrap_or_default();
+        // Review I1: a descriptive line must never turn step 1 into
+        // INTERNAL; an unreadable count is said, not hidden (see below).
+        let unfinished = unfinished_tasks_for_chosen_sandbox_name(db.conn(), name);
+        (rows, unfinished)
     };
     // `external` is decided by IDENTITY (review W1): Sandpane vouches only for
     // a live binding recorded for exactly this sbx id.
     let matched = rows
         .iter()
         .find(|b| b.sbx_id.as_deref() == Some(id.as_str()));
-    let impact = removal_impact(name, &id, &entry.status, matched, &rows);
+    let mut impact = removal_impact(name, &id, &entry.status, matched, &rows);
+    // A4 §3.4 item 3 — describe, never refuse: a chosen name is not an
+    // identity and no task can run in a sandbox in this build.
+    match unfinished_named {
+        Ok(0) => {}
+        Ok(n) => impact.push(format!(
+            "{n} unfinished task(s) were sent from chats that chose this sandbox name; \
+             removing it does not cancel them"
+        )),
+        Err((_, detail)) => {
+            eprintln!(
+                "sandpane-service: sandbox.remove {name}: unfinished-task count unreadable: \
+                 {detail}"
+            );
+            impact.push(
+                "the number of unfinished tasks sent from chats that chose this sandbox name \
+                 could not be read; removing it does not cancel them"
+                    .to_string(),
+            );
+        }
+    }
     let ttl = inner.confirmation_ttl;
     let token = inner
         .lock_confirmations()
@@ -2015,6 +2039,34 @@ fn issue_remove_confirmation(
         impact,
         external: matched.is_none(),
     })
+}
+
+/// Tasks (any project) whose stored `chosen_sandbox_name` (the name their
+/// chat chose — never a binding) equals `name` and that are not finished.
+/// Fail-closed like `has_unfinished_tasks`: a status Core cannot read counts
+/// as unfinished (the line over-reports, never hides).
+fn unfinished_tasks_for_chosen_sandbox_name(
+    conn: &rusqlite::Connection,
+    name: &str,
+) -> Result<i64, SvcError> {
+    let mut stmt = conn
+        .prepare("SELECT id, status FROM tasks WHERE chosen_sandbox_name = ?1")
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map(params![name], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    Ok(rows
+        .iter()
+        .filter(|(task_id, stored)| {
+            task_status_from_stored(stored, task_id)
+                .map(|s| !TaskStateMachine::from_status(s).is_terminal())
+                .unwrap_or(true)
+        })
+        .count() as i64)
 }
 
 /// Short, human impact lines for the confirmation dialog. Only what Core
@@ -2305,7 +2357,80 @@ pub fn create_task(
     content: &str,
     workspace: Option<TaskWorkspaceRequest>,
 ) -> Result<TaskSummary, SvcFailure> {
-    create_task_keyed(inner, conversation_id, content, workspace, None).map_err(|e| match e {
+    create_task_with_mode(inner, conversation_id, content, workspace, SendMode::Task)
+}
+
+/// What a send asks for (A4, design 2026-10-09 §3.4 item 2). Stored per task
+/// as `tasks.mode` and shown as `TaskSummary.mode`. In this build NEITHER mode
+/// runs an agent (no verified adapter): both stay `queued` with the same
+/// PERMISSION_DENIED scaffold event, which names the mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendMode {
+    /// The default (absent on the wire): work on the project.
+    Task,
+    /// Talk only. Never gets a writable workspace.
+    Discuss,
+}
+
+impl SendMode {
+    /// The wire / stored spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SendMode::Task => "task",
+            SendMode::Discuss => "discuss",
+        }
+    }
+}
+
+/// §3.4 item 1 — clients match on this exact string.
+pub const MSG_SEND_MODE_INVALID: &str = r#"mode must be "task" or "discuss""#;
+/// §3.4 item 2 — clients match on this exact string.
+pub const MSG_DISCUSS_WORKSPACE: &str =
+    "a discuss task never gets a writable workspace; nothing was run";
+
+/// The ONE place wire `conversation.send` params become the params the A2
+/// fingerprint is computed over (§3.4 item 1, hash stability): the key is
+/// cleared, an explicit `"task"` (and `null`, which serde already reads as
+/// absent) becomes absent, `"discuss"` is kept, anything else is
+/// VALIDATION_FAILED before a key row or anything else is touched. Because
+/// `mode` is `skip_serializing_if = "Option::is_none"`, a normalized task
+/// send serializes exactly like a pre-A4 send, so every stored A2 hash keeps
+/// matching (pinned in `send_mode_normalization_keeps_pre_a4_fingerprints`).
+fn normalize_send_params(
+    p: &ConversationSendParams,
+) -> Result<(ConversationSendParams, SendMode), SvcFailure> {
+    let mode = match p.mode.as_deref() {
+        None | Some("task") => SendMode::Task,
+        Some("discuss") => SendMode::Discuss,
+        Some(_) => {
+            return Err(SvcFailure::from((
+                ErrorCode::ValidationFailed,
+                MSG_SEND_MODE_INVALID.to_string(),
+            )))
+        }
+    };
+    let mut fp = p.clone();
+    fp.idempotency_key = None;
+    fp.mode = match mode {
+        SendMode::Task => None,
+        SendMode::Discuss => Some(SendMode::Discuss.as_str().to_string()),
+    };
+    Ok((fp, mode))
+}
+
+/// [`create_task`] with an explicit [`SendMode`]. A `discuss` task never gets
+/// a writable workspace: any request other than none or `mountless` is
+/// VALIDATION_FAILED ([`MSG_DISCUSS_WORKSPACE`]) before anything is read,
+/// allocated or written (§3.4 item 2). The wire path has no workspace
+/// selection, so this is reachable only through this internal API.
+pub fn create_task_with_mode(
+    inner: &ServerInner,
+    conversation_id: &str,
+    content: &str,
+    workspace: Option<TaskWorkspaceRequest>,
+    mode: SendMode,
+) -> Result<TaskSummary, SvcFailure> {
+    create_task_keyed(inner, conversation_id, content, workspace, mode, None).map_err(|e| match e {
         TaskWriteError::Failed(f) => f,
         // Unkeyed writes insert no key row, so they cannot lose a key race.
         TaskWriteError::KeyRace => internal("unkeyed task write reported a key race").into(),
@@ -2320,11 +2445,24 @@ fn create_task_keyed(
     conversation_id: &str,
     content: &str,
     workspace: Option<TaskWorkspaceRequest>,
+    send_mode: SendMode,
     keyed: Option<&KeyedCall>,
 ) -> Result<TaskSummary, TaskWriteError> {
     Validator::display_text(content, 64 * 1024)
         .map_err(|e| SvcFailure::from((ErrorCode::ValidationFailed, format!("content: {e}"))))?;
-    let (project_id, agent_id) = {
+    // §3.4 item 2: pure check, BEFORE any DB read or Git/worktree work.
+    if send_mode == SendMode::Discuss
+        && workspace
+            .as_ref()
+            .is_some_and(|w| w.mode != WorkspaceMode::Mountless)
+    {
+        return Err(SvcFailure::from((
+            ErrorCode::ValidationFailed,
+            MSG_DISCUSS_WORKSPACE.to_string(),
+        ))
+        .into());
+    }
+    let (project_id, agent_id, chosen_sandbox_name) = {
         let db = inner.lock_db();
         // EARLY check, BEFORE any worktree is allocated: the conversation
         // exists, its project is not archived (A3a) and it is not archived
@@ -2333,15 +2471,19 @@ fn create_task_keyed(
         let project_id =
             conversation_lifecycle::require_writable_conversation(db.conn(), conversation_id)
                 .map_err(SvcFailure::from)?;
-        let agent_id: String = db
+        // §3.4 item 3: the sandbox NAME the conversation chose (A3b,
+        // write-once at `conversation.create`), copied onto the task as
+        // `chosen_sandbox_name`. A stored name, never an identity or binding,
+        // and never `sandbox_name` (review C1/C2).
+        let (agent_id, chosen_sandbox_name): (String, Option<String>) = db
             .conn()
             .query_row(
-                "SELECT agent_id FROM conversations WHERE id = ?1",
+                "SELECT agent_id, sandbox_id FROM conversations WHERE id = ?1",
                 params![conversation_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(internal)?;
-        (project_id, agent_id)
+        (project_id, agent_id, chosen_sandbox_name)
     };
 
     let task_id = uuid::Uuid::new_v4().to_string();
@@ -2356,7 +2498,11 @@ fn create_task_keyed(
         id: task_id.clone(),
         conversation_id: conversation_id.to_string(),
         status: TaskStatus::Queued,
+        // Pre-A4 meaning and value (review C1/C2): the sandbox a task is
+        // BOUND to. A new task has no binding, so this stays absent.
         sandbox_name: None,
+        mode: Some(send_mode.as_str().to_string()),
+        chosen_sandbox_name: chosen_sandbox_name.clone(),
         task_branch: prepared.as_ref().and_then(|p| p.task_branch.clone()),
         base_commit: prepared.as_ref().and_then(|p| p.base_commit.clone()),
         // The FIRST response: stored without the replay marker (W1).
@@ -2377,9 +2523,13 @@ fn create_task_keyed(
     }
     let written = write_new_task(
         inner,
-        &task_id,
-        conversation_id,
-        content,
+        &NewTask {
+            task_id: &task_id,
+            conversation_id,
+            content,
+            send_mode,
+            chosen_sandbox_name: chosen_sandbox_name.as_deref(),
+        },
         prepared.as_ref(),
         keyed_write.as_ref(),
     );
@@ -2454,12 +2604,15 @@ fn create_task_keyed(
                 // claim PROVIDER_AUTH_REQUIRED, which falsely tells the user
                 // that signing in would help. VALIDATION_FAILED was rejected
                 // because nothing in the request is malformed.
+                // A4 §3.4 item 2: the message names the requested mode;
+                // both modes get this same event and stay queued.
                 let ev = AgentEvent::Error {
                     code: ErrorCode::PermissionDenied,
                     message: format!(
                         "no verified agent adapter for '{agent_id}' in this build: \
                          the in-SBX feasibility gate (P0) has not passed, so Core will not run it \
-                         — task stays queued"
+                         — task stays queued (requested mode: {})",
+                        send_mode.as_str()
                     ),
                 };
                 log.append(
@@ -2474,7 +2627,10 @@ fn create_task_keyed(
                 log.append(
                     &task_id,
                     "scheduler.deferred",
-                    &serde_json::json!({ "reason": format!("{other:?}") }),
+                    &serde_json::json!({
+                        "reason": format!("{other:?}"),
+                        "mode": send_mode.as_str(),
+                    }),
                     &now2,
                 )
                 .map_err(internal)?;
@@ -2647,17 +2803,33 @@ fn workspace_failure(e: WorkspaceError) -> SvcFailure {
     SvcFailure::from((code, e.to_string()))
 }
 
+/// The request-side facts of one new task, as [`write_new_task`] stores them.
+struct NewTask<'a> {
+    task_id: &'a str,
+    conversation_id: &'a str,
+    content: &'a str,
+    send_mode: SendMode,
+    /// The conversation's chosen sandbox NAME (§3.4 item 3), if any. Stored
+    /// as `tasks.chosen_sandbox_name`; never a binding.
+    chosen_sandbox_name: Option<&'a str>,
+}
+
 /// The durable unit for a new task: message, task row (with its Git context)
 /// and the created/message/queued events, in ONE transaction, so the
 /// append-only log never disagrees with `tasks` (specs/02 §4).
 fn write_new_task(
     inner: &ServerInner,
-    task_id: &str,
-    conversation_id: &str,
-    content: &str,
+    new: &NewTask<'_>,
     prepared: Option<&PreparedWorkspace>,
     keyed: Option<&KeyedWrite<'_>>,
 ) -> Result<(), TaskWriteError> {
+    let NewTask {
+        task_id,
+        conversation_id,
+        content,
+        send_mode,
+        chosen_sandbox_name,
+    } = *new;
     let now = now_rfc3339();
     let mut machine = TaskStateMachine::new();
     // created -> queued is decided up front (pure logic) so the whole write
@@ -2665,7 +2837,11 @@ fn write_new_task(
     let to = machine
         .transition(TaskStatus::Queued)
         .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
-    let mut created = serde_json::json!({ "conversationId": conversation_id });
+    // A4: the requested mode is part of the durable creation record (it is
+    // written in the same transaction, so it exists even when the post-commit
+    // scaffold event is skipped because the task was already deleted).
+    let mut created =
+        serde_json::json!({ "conversationId": conversation_id, "mode": send_mode.as_str() });
     let mut mode_str: Option<&'static str> = None;
     let mut worktree_str: Option<String> = None;
     if let Some(p) = prepared {
@@ -2717,8 +2893,9 @@ fn write_new_task(
         .map_err(internal)?;
         tx.execute(
             "INSERT INTO tasks (id, conversation_id, repo_id, base_commit, task_branch,
-                                workspace_mode, worktree_path, status, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'created',?8,?8)",
+                                workspace_mode, worktree_path, status, created_at, updated_at,
+                                mode, chosen_sandbox_name)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'created',?8,?8,?9,?10)",
             params![
                 task_id,
                 conversation_id,
@@ -2727,7 +2904,9 @@ fn write_new_task(
                 prepared.and_then(|p| p.task_branch.clone()),
                 mode_str,
                 worktree_str,
-                now
+                now,
+                send_mode.as_str(),
+                chosen_sandbox_name
             ],
         )
         .map_err(internal)?;
@@ -3035,15 +3214,14 @@ fn conversation_send(
     inner: &ServerInner,
     p: ConversationSendParams,
 ) -> Result<serde_json::Value, SvcFailure> {
-    let keyed = {
-        let mut without_key = p.clone();
-        without_key.idempotency_key = None;
-        keyed_call(
-            Method::ConversationSend,
-            p.idempotency_key.as_deref(),
-            &without_key,
-        )?
-    };
+    // A4 §3.4 item 1: validate + normalize `mode` BEFORE the fingerprint
+    // (and before any key row exists).
+    let (fingerprinted, send_mode) = normalize_send_params(&p)?;
+    let keyed = keyed_call(
+        Method::ConversationSend,
+        p.idempotency_key.as_deref(),
+        &fingerprinted,
+    )?;
     // A replay is answered from the key row alone: nothing is written.
     //
     // DOCUMENTED ASYMMETRY (A3a review I3, design §3.2): this lookup runs
@@ -3060,7 +3238,14 @@ fn conversation_send(
     }
     // Protocol v1 carries no workspace selection, so the wire path creates a
     // task WITHOUT Git context — never an implied worktree or live mount.
-    match create_task_keyed(inner, &p.conversation_id, &p.content, None, keyed.as_ref()) {
+    match create_task_keyed(
+        inner,
+        &p.conversation_id,
+        &p.content,
+        None,
+        send_mode,
+        keyed.as_ref(),
+    ) {
         Ok(summary) => serde_json::to_value(summary).map_err(|e| internal(e).into()),
         // Lost the key insert race: the whole write rolled back; answer from
         // the winner's row (a replay, or CONFLICT if it is not `done`).
@@ -3216,8 +3401,12 @@ fn task_list(inner: &ServerInner, p: TaskListParams) -> Result<serde_json::Value
     // placeholders (same reviewed pattern as `reconcile_after_restart`) — no
     // caller value is ever formatted into the statement.
     let mut sql = String::from(
+        // `sandboxName` is the BINDING's name only, exactly as before A4
+        // (review C1/C2, I3); the chat's choice is the separate
+        // `chosenSandboxName`. Both A4 columns are NULL (absent) on pre-v7
+        // rows.
         "SELECT t.id, t.conversation_id, t.status, t.created_at, t.task_branch,
-                t.base_commit, sb.sandbox_name
+                t.base_commit, sb.sandbox_name, t.mode, t.chosen_sandbox_name
          FROM tasks t
          JOIN conversations c ON c.id = t.conversation_id
          LEFT JOIN sandbox_bindings sb ON sb.id = t.sandbox_binding_id
@@ -3255,14 +3444,27 @@ fn task_list(inner: &ServerInner, p: TaskListParams) -> Result<serde_json::Value
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })
         .map_err(internal)?;
     let mut out: Vec<TaskSummary> = Vec::new();
     for row in rows {
-        let (id, conversation_id, stored_status, task_branch, base_commit, sandbox_name) =
-            row.map_err(internal)?;
+        let (
+            id,
+            conversation_id,
+            stored_status,
+            task_branch,
+            base_commit,
+            sandbox_name,
+            mode,
+            chosen_sandbox_name,
+        ) = row.map_err(internal)?;
         out.push(TaskSummary {
+            // Open string (§3.4 item 1): passed through as stored.
+            mode,
+            chosen_sandbox_name,
             sandbox_name,
             task_branch,
             base_commit,
@@ -3827,6 +4029,64 @@ mod tests {
         })
         .unwrap();
         serde_json::from_str(&handle_line(i, &line)).unwrap()
+    }
+
+    /// A4 §3.4 item 1 — hash stability. These fingerprints were computed at
+    /// f44ab4c (pre-A4, before `mode` existed) with `idempotency::fingerprint`
+    /// over the parsed params with the key removed. Absent, explicit "task"
+    /// and `null` must still produce them byte-for-byte, so every key stored
+    /// by an A2-era Core keeps replaying; "discuss" must differ.
+    #[test]
+    fn send_mode_normalization_keeps_pre_a4_fingerprints() {
+        const PRE_A4: [(&str, &str); 2] = [
+            (
+                r#"{"conversationId":"conv-pinned","content":"hello","attachments":[]}"#,
+                "fcb9565997fbd5e6ec9cd4970cfa44829ca4fc6aae358f02c3ba69a422212efe",
+            ),
+            (
+                r#"{"conversationId":"conv-pinned","content":"hello","attachments":[{"kind":"file","target":"src/main.rs"}]}"#,
+                "39f8cc5fc31c43d4be6d39a05d12b73ac998e4dd6f590a4c58128755542f2113",
+            ),
+        ];
+        for (base, pinned) in PRE_A4 {
+            for extra in [
+                serde_json::json!({}),
+                serde_json::json!({"mode": "task"}),
+                serde_json::json!({"mode": null}),
+                serde_json::json!({"mode": "task", "idempotencyKey": "k-1"}),
+                serde_json::json!({"idempotencyKey": "another-key"}),
+            ] {
+                let mut v: serde_json::Value = serde_json::from_str(base).unwrap();
+                for (k, x) in extra.as_object().unwrap() {
+                    v[k] = x.clone();
+                }
+                let wire: ConversationSendParams = serde_json::from_value(v).unwrap();
+                let (fp, mode) = normalize_send_params(&wire).unwrap();
+                assert_eq!(mode, SendMode::Task, "{extra}");
+                assert!(fp.idempotency_key.is_none() && fp.mode.is_none(), "{extra}");
+                assert_eq!(
+                    idempotency::fingerprint(&fp).unwrap(),
+                    pinned,
+                    "{base} + {extra}"
+                );
+            }
+            let mut v: serde_json::Value = serde_json::from_str(base).unwrap();
+            v["mode"] = serde_json::json!("discuss");
+            let wire: ConversationSendParams = serde_json::from_value(v).unwrap();
+            let (fp, mode) = normalize_send_params(&wire).unwrap();
+            assert_eq!(mode, SendMode::Discuss);
+            assert_eq!(fp.mode.as_deref(), Some("discuss"));
+            assert_ne!(idempotency::fingerprint(&fp).unwrap(), pinned);
+        }
+        for bad in ["Task", "", "chat", " discuss"] {
+            let wire: ConversationSendParams = serde_json::from_value(serde_json::json!({
+                "conversationId": "c", "content": "x", "mode": bad
+            }))
+            .unwrap();
+            let e = normalize_send_params(&wire).unwrap_err();
+            assert_eq!(e.code, ErrorCode::ValidationFailed);
+            assert_eq!(e.message, r#"mode must be "task" or "discuss""#);
+        }
     }
 
     /// Review S-f: a handler that panics still releases its connection slot.

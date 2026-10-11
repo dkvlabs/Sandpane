@@ -51,6 +51,7 @@ import type {
   ProjectRepositoryParams,
   ProjectUpdateParams,
   SandboxCreateSpec,
+  SendMode,
   SandboxRemoveResult,
   SandboxStopResult,
   SandboxSummary,
@@ -61,6 +62,7 @@ import type {
 } from './protocol';
 import {
   SBX_AGENTS,
+  SEND_MODES,
   isSbxAgent,
   MAX_CURSOR_KEY_LEN,
   MAX_LIST_LIMIT,
@@ -69,6 +71,20 @@ import {
 } from './protocol';
 import type { ErrorCode, TaskEvent, TaskStatus } from './events';
 import { isTaskStatus } from './events';
+
+/** A4: Core's exact refusal for any other `mode` (sandpane-service `MSG_SEND_MODE_INVALID`). */
+export const MSG_SEND_MODE_INVALID = 'mode must be "task" or "discuss"';
+
+/**
+ * A4: exactly Core's rule — "task" or "discuss", case-sensitive, nothing
+ * trimmed; `null` (like absent) means no mode. Never stricter than Core: every
+ * value Core accepts passes.
+ */
+export function validateSendMode(mode: unknown): SendMode | undefined {
+  if (mode === undefined || mode === null) return undefined;
+  if (typeof mode === 'string' && (SEND_MODES as readonly string[]).includes(mode)) return mode as SendMode;
+  throw new CoreValidationError('mode', MSG_SEND_MODE_INVALID);
+}
 
 /** Thrown before a request leaves the client. Never a Core verdict. */
 export class CoreValidationError extends Error {
@@ -799,6 +815,8 @@ export class CoreCommands {
       if (params.idempotencyKey !== undefined) {
         payload['idempotencyKey'] = validateIdempotencyKey(params.idempotencyKey);
       }
+      // A4: Task is the default and travels as NO key; only Discuss is sent.
+      if (validateSendMode(params.mode) === 'discuss') payload['mode'] = 'discuss';
       return this.connection.request<TaskSummary>('conversation.send', payload);
     });
   }
