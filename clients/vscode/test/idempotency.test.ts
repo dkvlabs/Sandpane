@@ -24,6 +24,9 @@ import {
   isUnknownOutcome,
   keyedConflictCopy,
   newIdempotencyKey,
+  IDEMPOTENCY_RETENTION_MS,
+  SAFE_RETRY_WINDOW_MS,
+  safeRetryWindowOpen,
 } from '../src/core-client/idempotency';
 import { KNOWN_FEATURES, PROTOCOL_VERSION, coreAdvertisesFeature } from '../src/core-client/protocol';
 import { makeHarness } from './helpers/fakeCore';
@@ -111,6 +114,7 @@ describe('features', () => {
       'conversation-sandbox-id',
       'conversation-send-mode',
       'git-apply',
+      'verification',
     ]);
     expect(coreAdvertisesFeature({}, 'idempotency-keys')).toBe(false);
     expect(coreAdvertisesFeature(null, 'idempotency-keys')).toBe(false);
@@ -176,5 +180,27 @@ describe('unknown outcome detection', () => {
     expect(REPLAY_NOTICE).toBe(
       'Core returned the result of your earlier identical request (replayed). It may be out of date; refreshing from Core.',
     );
+  });
+});
+
+describe('"Retry safely" window (Core keeps keys for RETENTION_SECS)', () => {
+  it('drift: the retention is Core\'s RETENTION_SECS and the window is one hour shorter', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const rust = readFileSync(resolve(__dirname, '..', '..', '..', 'core', 'crates', 'sandpane-core', 'src', 'idempotency.rs'), 'utf8');
+    const m = /pub const RETENTION_SECS: u64 = 24 \* 60 \* 60;/.exec(rust);
+    expect(m).not.toBeNull();
+    expect(IDEMPOTENCY_RETENTION_MS).toBe(24 * 60 * 60 * 1000);
+    expect(SAFE_RETRY_WINDOW_MS).toBe(23 * 60 * 60 * 1000);
+  });
+
+  it('open only from the first send until 23 h after it; unknown first-send time is closed', () => {
+    const t = Date.parse('2026-10-12T12:00:00Z');
+    expect(safeRetryWindowOpen(t, t)).toBe(true);
+    expect(safeRetryWindowOpen(t, t + SAFE_RETRY_WINDOW_MS - 1)).toBe(true);
+    expect(safeRetryWindowOpen(t, t + SAFE_RETRY_WINDOW_MS)).toBe(false);
+    expect(safeRetryWindowOpen(undefined, t)).toBe(false);
+    // A clock that jumped far backwards cannot prove the age: closed.
+    expect(safeRetryWindowOpen(t, t - 2 * 60 * 60 * 1000)).toBe(false);
   });
 });

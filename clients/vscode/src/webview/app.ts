@@ -78,6 +78,20 @@ interface TaskRow {
   mode?: string;
   /** A4: the name the task's chat chose — NOT where it runs. */
   chosenSandboxName?: string;
+  /** A7: Verify… / Results… (absent from an older host = unsupported). */
+  verification?: { runEnabled: boolean; runReason: string | null; runs: string[] };
+}
+
+/** A7: the per-project Verification section (every string already plain text). */
+interface VerificationPanelView {
+  supported: boolean;
+  note: string | null;
+  commands: { label: string; argv: string[] }[];
+  repositories: {
+    repoPath: string;
+    manifests: { manifest: string; suggestions: string[]; notes: string[] }[];
+    unreadable: string[];
+  }[];
 }
 
 interface ContextPlanView {
@@ -132,6 +146,8 @@ interface SidebarState {
   gitApplySupported?: boolean;
   /** A6: an apply flow is running in the extension host. */
   applyInFlight?: boolean;
+  /** A7: absent from an older host = unsupported. */
+  verification?: VerificationPanelView;
   lines: ChatLine[];
   transcript: { scope: 'conversation' | 'project'; label: string };
   tasks: TaskRow[];
@@ -160,6 +176,7 @@ interface SidebarRefs {
   select: HTMLSelectElement;
   notices: HTMLElement;
   conversations: HTMLElement;
+  verification: HTMLElement;
   stream: HTMLElement;
   tasks: HTMLElement;
   plan: HTMLElement;
@@ -179,6 +196,7 @@ interface PaintMemo {
   sandboxes: string;
   notices: string;
   conversations: string;
+  verification: string;
   composerNote: string;
   sendModeNote: string;
   lineKeys: string[];
@@ -201,6 +219,11 @@ const SEND_MODE_NOTE = 'Send mode: Core records whether you asked for a Task or 
 const APPLY_UNSUPPORTED =
   'Apply: not implemented by this Core (it does not advertise "git.apply" with the feature "git-apply")';
 const APPLY_IN_FLIGHT_TITLE = 'Apply: another apply is in progress \u2014 wait for it to finish';
+const VERIFICATION_UNSUPPORTED_NOTE =
+  'Verification: not supported by the attached Sandpane Core (it does not advertise "verification").';
+const VERIFICATION_DISCLOSURE =
+  'Approved commands are exact argument lists, never run here: Verify\u2026 on a task opens a dialog in VS Code, and Core runs ' +
+  'one only after you confirm it there. Suggestions are what Core detected in root manifests; approving one opens the same dialogs.';
 const SEND_MODE_UNSUPPORTED = 'Task / Discuss: not supported by this Core (it does not advertise "conversation-send-mode"); every send is a Task.';
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -294,6 +317,12 @@ function buildSkeleton(
   conversations.id = 'sp-conversations';
   conversations.setAttribute('aria-label', 'Conversations Core lists for this project');
   root.appendChild(conversations);
+
+  // --- A7: the project's verification commands and Core's suggestions ---
+  const verification = el('div', 'sp-conversations');
+  verification.id = 'sp-verification';
+  verification.setAttribute('aria-label', 'Verification commands Core lists for this project');
+  root.appendChild(verification);
 
   // --- message stream ---
   const stream = el('div', 'sp-stream');
@@ -434,6 +463,7 @@ function buildSkeleton(
     select,
     notices,
     conversations,
+    verification,
     stream,
     tasks,
     plan,
@@ -547,6 +577,63 @@ function conversationChildren(view: ConversationListView, api: VsCodeApi): HTMLE
   return children;
 }
 
+const VERIFICATION_BUTTONS: ReadonlyArray<[id: string, action: string, label: string, title: string]> = [
+  ['sp-verify-add', 'add', 'Add\u2026', 'Add a verification command: label and exact arguments, then confirm in a dialog'],
+  ['sp-verify-suggest', 'approveSuggestion', 'Approve suggestion\u2026', "Pick one of Core's detected suggestions, then confirm in a dialog"],
+  ['sp-verify-revoke', 'revoke', 'Revoke\u2026', 'Pick an approved command and confirm; future runs only'],
+  ['sp-verify-refresh', 'refresh', 'Refresh', 'Re-read the list and the suggestions from Core (read-only)'],
+];
+
+/**
+ * The Verification section (A7). Buttons post ONLY `{type, action}`: the
+ * extension opens a native dialog filled from a fresh Core read. Labels,
+ * arguments, suggestions and notes are text (textContent), never run here.
+ */
+function verificationChildren(view: VerificationPanelView, api: VsCodeApi): HTMLElement[] {
+  const children: HTMLElement[] = [];
+  const head = el('div', 'sp-picker');
+  head.appendChild(el('strong', undefined, 'Verification'));
+  for (const [id, action, label, title] of VERIFICATION_BUTTONS) {
+    const button = el('button', 'secondary', label);
+    button.id = id;
+    if (view.supported) {
+      button.setAttribute('title', title);
+    } else {
+      button.disabled = true;
+      button.setAttribute('title', VERIFICATION_UNSUPPORTED_NOTE);
+    }
+    button.addEventListener('click', () => api.postMessage({ type: 'verificationAction', action }));
+    head.appendChild(button);
+  }
+  children.push(head);
+  if (!view.supported) {
+    children.push(el('div', 'sp-empty', view.note ?? VERIFICATION_UNSUPPORTED_NOTE));
+    return children;
+  }
+  if (view.note !== null) children.push(el('div', 'sp-empty', view.note));
+  children.push(el('div', 'sp-empty', VERIFICATION_DISCLOSURE));
+  if (view.commands.length === 0) children.push(el('div', 'sp-empty', 'No approved verification command for this project.'));
+  for (const command of view.commands) {
+    const box = el('div', 'sp-conv-row');
+    box.appendChild(el('div', 'sp-conv-title', command.label));
+    box.appendChild(el('pre', 'sp-msg-body', command.argv.join('\n')));
+    children.push(box);
+  }
+  for (const repo of view.repositories) {
+    const box = el('div', 'sp-conv-row');
+    box.appendChild(el('div', 'sp-empty', `Suggestions Core detected in ${repo.repoPath}:`));
+    if (repo.manifests.length === 0) box.appendChild(el('div', 'sp-empty', 'none'));
+    for (const manifest of repo.manifests) {
+      box.appendChild(el('div', 'sp-chip', manifest.manifest));
+      if (manifest.suggestions.length > 0) box.appendChild(el('pre', 'sp-msg-body', manifest.suggestions.join('\n')));
+      for (const note of manifest.notes) box.appendChild(el('div', 'sp-empty', `note from Core: ${note}`));
+    }
+    if (repo.unreadable.length > 0) box.appendChild(el('div', 'sp-empty', `not read: ${repo.unreadable.join(', ')}`));
+    children.push(box);
+  }
+  return children;
+}
+
 function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsCodeApi): void {
   // --- header ---
   const headerKey = JSON.stringify([state.connection, state.capabilities?.coreVersion ?? '', state.header]);
@@ -635,6 +722,19 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
     rebuildRegion(refs.conversations, conversationChildren(conversationView, api));
   }
 
+  // --- A7 verification section: rebuilt only when it changed ---
+  const verificationView: VerificationPanelView = state.verification ?? {
+    supported: false,
+    note: null,
+    commands: [],
+    repositories: [],
+  };
+  const verificationKey = JSON.stringify(verificationView);
+  if (verificationKey !== memo.verification) {
+    memo.verification = verificationKey;
+    rebuildRegion(refs.verification, verificationChildren(verificationView, api));
+  }
+
   // --- message stream: append when the transcript only grew ---
   if (state.transcript.label !== memo.transcriptLabel) {
     memo.transcriptLabel = state.transcript.label;
@@ -671,6 +771,7 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
     state.gitDiffSupported === true,
     state.gitApplySupported === true,
     state.applyInFlight === true,
+    state.verification?.supported === true,
   ]);
   if (tasksKey !== memo.tasks) {
     memo.tasks = tasksKey;
@@ -730,6 +831,40 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
       }
       apply.addEventListener('click', () => api.postMessage({ type: 'applyTask', taskId: row.taskId }));
       children.push(apply);
+
+      // A7: Verify… (opens the Run dialog in the extension host) and
+      // Results… (pick a run Core's events name). Only the task id is posted.
+      const verify = row.verification;
+      const verificationOn = state.verification?.supported === true && verify !== undefined;
+      const run = el('button', 'secondary', 'Verify\u2026');
+      run.id = `sp-verify-run-${token}`;
+      run.setAttribute('aria-label', `Run an approved verification command on task ${row.taskId} (asks for confirmation)`);
+      const runReason = !verificationOn
+        ? VERIFICATION_UNSUPPORTED_NOTE
+        : verify.runEnabled
+          ? null
+          : (verify.runReason ?? 'unavailable');
+      if (runReason === null) {
+        run.setAttribute('title', "Pick an approved command and confirm in a dialog; Core runs it in the task's sandbox");
+      } else {
+        run.disabled = true;
+        run.setAttribute('title', runReason);
+      }
+      run.addEventListener('click', () => api.postMessage({ type: 'runVerification', taskId: row.taskId }));
+      children.push(run);
+      const results = el('button', 'secondary', 'Results\u2026');
+      results.id = `sp-verify-results-${token}`;
+      results.setAttribute('aria-label', `Show a verification result of task ${row.taskId} (read-only)`);
+      if (verificationOn) {
+        results.setAttribute('title', "Pick a run Core's events name and open its output, read-only");
+      } else {
+        results.disabled = true;
+        results.setAttribute('title', VERIFICATION_UNSUPPORTED_NOTE);
+      }
+      results.addEventListener('click', () => api.postMessage({ type: 'showVerificationResults', taskId: row.taskId }));
+      children.push(results);
+      if (verificationOn && runReason !== null) children.push(el('div', 'sp-empty', `Verify: ${runReason}`));
+      for (const line of verificationOn ? verify.runs : []) children.push(el('div', 'sp-empty', `verification: ${line}`));
 
       // Cancel is an explicit request; Core decides whether the state allows it.
       const cancel = el('button', 'secondary', 'Cancel');
@@ -819,6 +954,7 @@ function bootSandpaneSidebar(): void {
     sandboxes: '',
     notices: '',
     conversations: '',
+    verification: '',
     composerNote: '',
     sendModeNote: '',
     lineKeys: [],

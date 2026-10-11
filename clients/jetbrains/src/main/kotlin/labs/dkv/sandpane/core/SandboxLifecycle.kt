@@ -216,7 +216,14 @@ sealed class RemoveOutcome {
     fun describe(): OutcomeText {
         val shown = VisibleText.reveal(name)
         return when (this) {
-            is Step1Failed -> OutcomeText(
+            is Step1Failed -> if (isVerificationRunning(error)) {
+                OutcomeText(
+                    "Sandpane: sandbox not removed \u2014 a verification is running in it",
+                    "A verification is running in '$shown'; wait for it to finish. Nothing was deleted. Core said: " +
+                        VisibleText.reveal((ErrorAttribution.unwrap(error) as CoreRpcException).message),
+                    OutcomeSeverity.WARNING,
+                )
+            } else OutcomeText(
                 ErrorAttribution.headline(CoreMethods.SANDBOX_REMOVE, error),
                 "No confirmation was issued for '$shown', so nothing can be removed (step 1 never changes " +
                     "anything): ${ErrorAttribution.describe(error)}",
@@ -291,7 +298,14 @@ sealed class RemoveOutcome {
                         )
                     }
 
-                    CoreErrorCodes.CONFLICT -> OutcomeText(
+                    CoreErrorCodes.CONFLICT -> if (t.message == Verifications.MSG_SANDBOX_VERIFICATION_RUNNING) {
+                        OutcomeText(
+                            "Sandpane: sandbox not removed \u2014 a verification is running in it",
+                            "$coreSaid. A verification is running in '$shown'; wait for it to finish. Nothing was " +
+                                "deleted; nothing is retried.",
+                            OutcomeSeverity.WARNING,
+                        )
+                    } else OutcomeText(
                         "Sandpane: removal refused with a conflict",
                         "$coreSaid. Either a different sandbox now has this name (its sbx id changed since " +
                             "you confirmed), or another operation on this sandbox is in progress — Core's own " +
@@ -324,6 +338,12 @@ sealed class RemoveOutcome {
             )
         }
     }
+}
+
+/** A7: Core's exact "a verification is running in this sandbox; …; nothing was deleted" CONFLICT. */
+private fun isVerificationRunning(error: Throwable?): Boolean {
+    val t = ErrorAttribution.unwrap(error) as? CoreRpcException ?: return false
+    return t.raisedByCore && t.code == CoreErrorCodes.CONFLICT && t.message == Verifications.MSG_SANDBOX_VERIFICATION_RUNNING
 }
 
 /** A failure whose request may have reached Core, worded without claiming either way. */

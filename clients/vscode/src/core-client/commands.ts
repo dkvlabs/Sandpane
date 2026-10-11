@@ -1,5 +1,5 @@
 /**
- * Typed wrappers for **exactly** the 28 Core methods (`sandpane_protocol::Method`
+ * Typed wrappers for **exactly** the 34 Core methods (`sandpane_protocol::Method`
  * / `Method::ALL`). Every wrapper maps to one Core method; `sandbox.remove` has
  * two wrappers because its two confirmation steps are deliberately separate
  * calls (`sandboxRemoveRequest` never carries a token, `sandboxRemoveConfirm`
@@ -59,9 +59,12 @@ import type {
   TaskListParams,
   TaskSubscribeParams,
   TaskSummary,
+  VerificationApproveParams,
+  VerificationRunParams,
 } from './protocol';
 import {
   FILE_CHANGE_STATUSES,
+  isWorkspaceMode,
   MAX_DIFF_BYTES,
   SBX_AGENTS,
   SEND_MODES,
@@ -477,6 +480,95 @@ export function validateStatusFilter(
   return out.length > 0 ? out : undefined;
 }
 
+// --- A7 (§3.7 item 2): verification label / argv, mirrored from Core -------
+
+/** `MAX_VERIFICATION_LABEL_CHARS` in sandpane-core validation.rs. */
+export const MAX_VERIFICATION_LABEL_CHARS = 80;
+/** `MAX_VERIFICATION_ARGS` — elements of an approved argv. */
+export const MAX_VERIFICATION_ARGS = 64;
+/** `MAX_VERIFICATION_ARG_BYTES` — UTF-8 bytes of ONE element. */
+export const MAX_VERIFICATION_ARG_BYTES = 4096;
+/** `MAX_VERIFICATION_ARGV_BYTES` — UTF-8 bytes of all elements together. */
+export const MAX_VERIFICATION_ARGV_BYTES = 16 * 1024;
+
+/** Rust `str::trim` (Unicode White_Space at both ends) — never JS `trim()`. */
+export function rustTrim(value: string): string {
+  const points = Array.from(value);
+  let start = 0;
+  let end = points.length;
+  while (start < end && isRustWhitespace(points[start]?.codePointAt(0) ?? 0)) start += 1;
+  while (end > start && isRustWhitespace(points[end - 1]?.codePointAt(0) ?? 0)) end -= 1;
+  return points.slice(start, end).join('');
+}
+
+/**
+ * `Validator::verification_label`, early feedback only (Core is the
+ * authority): Rust-trimmed, 1..=80 chars, no Cc and no spoofing format
+ * character. Core ALSO refuses invisible format characters (zero-width,
+ * BOM, tags …); that list is left to Core so this check can never be
+ * stricter. Returns the trimmed label (what Core stores). A refusal names
+ * the code point, never the label.
+ */
+export function validateVerificationLabel(value: string, field = 'label'): string {
+  if (typeof value !== 'string') throw new CoreValidationError(field, 'value must be a string');
+  const label = rustTrim(value);
+  if (label.length === 0) throw new CoreValidationError(field, 'value is empty');
+  const points = Array.from(label);
+  if (points.length > MAX_VERIFICATION_LABEL_CHARS) {
+    throw new CoreValidationError(field, `value exceeds max length ${MAX_VERIFICATION_LABEL_CHARS}`);
+  }
+  for (const ch of points) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (isRustControl(cp) || isSpoofingFormatChar(cp) || isLoneSurrogate(cp)) {
+      throw new CoreValidationError(field, `contains a disallowed character ${hex(cp)}`);
+    }
+  }
+  return label;
+}
+
+/**
+ * `Validator::verification_argv` exactly, early feedback only (Core is the
+ * authority and re-checks): 1..=64 elements; each at most 4096 UTF-8 bytes,
+ * all together at most 16 KiB; no NUL and no control character other than
+ * TAB and LF (C0, DEL and C1 are refused); `argv[0]` non-empty and not
+ * starting with `-`. Nothing is interpreted: no shell, no split, no glob.
+ * There is deliberately NO secret check here — Core's redactor decides.
+ * Messages are Core's own wording and name the argument NUMBER only, never
+ * its value. Returns the SAME elements (never trimmed or normalized).
+ */
+export function validateVerificationArgv(argv: readonly string[], field = 'argv'): string[] {
+  const shape = (reason: string): never => {
+    throw new CoreValidationError(field, `value has an invalid shape: ${reason}`);
+  };
+  if (!Array.isArray(argv) || argv.length === 0 || argv.length > MAX_VERIFICATION_ARGS) {
+    shape(`argv must have 1 to ${MAX_VERIFICATION_ARGS} elements (it has ${Array.isArray(argv) ? argv.length : 0})`);
+  }
+  const bytes = new TextEncoder();
+  let total = 0;
+  argv.forEach((element: unknown, i) => {
+    const n = i + 1;
+    if (typeof element !== 'string') shape(`argument ${n} is not a string`);
+    const text = element as string;
+    for (const ch of text) {
+      const cp = ch.codePointAt(0) ?? 0;
+      // A lone surrogate is not valid UTF-8: Core cannot decode the frame.
+      if (isLoneSurrogate(cp)) shape(`argument ${n} is not valid UTF-8 (a lone surrogate)`);
+    }
+    const size = bytes.encode(text).length;
+    if (size > MAX_VERIFICATION_ARG_BYTES) shape(`argument ${n} is longer than ${MAX_VERIFICATION_ARG_BYTES} bytes`);
+    if (text.includes('\0')) shape(`argument ${n} contains a NUL character`);
+    for (const ch of text) {
+      const cp = ch.codePointAt(0) ?? 0;
+      if (isRustControl(cp) && cp !== 0x09 && cp !== 0x0a) shape(`argument ${n} contains a control character`);
+    }
+    total += size;
+  });
+  if (total > MAX_VERIFICATION_ARGV_BYTES) shape(`argv is longer than ${MAX_VERIFICATION_ARGV_BYTES} bytes in total`);
+  if (argv[0] === '') shape('argument 1 (the program) is empty');
+  if ((argv[0] ?? '').startsWith('-')) shape("argument 1 (the program) must not start with '-'");
+  return [...argv];
+}
+
 export interface CancelResult {
   requested: boolean;
 }
@@ -532,6 +624,24 @@ export const GIT_QUERY_TIMEOUT_MS = PROJECT_GIT_TIMEOUT_MS;
  * never retried automatically.
  */
 export const GIT_APPLY_TIMEOUT_MS = GIT_QUERY_TIMEOUT_MS;
+
+/**
+ * A7: `project.context` reads the project's registered repositories (bounded,
+ * race-safe file reads, no tool runs) — the same 45 s deadline as the git
+ * reads. Read-only, so a timeout changed nothing.
+ */
+export const PROJECT_CONTEXT_TIMEOUT_MS = GIT_QUERY_TIMEOUT_MS;
+
+/**
+ * A7: `verification.run` answers right after the durable start, but BEFORE it
+ * Core runs `sbx version` (RunLimits::PROBE, 3 s) and `sbx ls --json`
+ * (RunLimits::QUERY, 30 s) for its version and identity gates. 45 s keeps
+ * Core's own verdict ahead of the client deadline (drift-tested). NOT
+ * read-only: a timeout means the run MAY have started; only "Retry safely"
+ * (same idempotency key) resends it. `verification.list` / `approve` /
+ * `revoke` / `result` keep the connection's default deadline.
+ */
+export const VERIFICATION_RUN_TIMEOUT_MS = 45_000;
 
 /** A6: Core's `MAX_APPLY_ENTRIES` — at most this many entries per call. */
 export const MAX_APPLY_ENTRIES = 1000;
@@ -1103,6 +1213,83 @@ export class CoreCommands {
       };
       return this.connection.request<unknown>('git.apply', payload, { timeoutMs: GIT_APPLY_TIMEOUT_MS });
     });
+  }
+
+  // --- A7 (§3.7): verification commands + project.context -----------------
+  // Every answer is UNTRUSTED and returned as `unknown`: callers shape-check
+  // it (src/vscode/verification.ts) and never echo it. None of these takes a
+  // command string; `verificationRun` names an approved command by id.
+
+  /** A7: `{projectId}` → `{commands}`. Read-only; default deadline. */
+  verificationList(projectId: string): Promise<unknown> {
+    return guarded(() =>
+      this.connection.request<unknown>('verification.list', { projectId: validateScopingId(projectId, 'projectId') }),
+    );
+  }
+
+  /**
+   * A7: `{projectId, label, argv}` → `{command}`. The argv goes out exactly
+   * as given (element by element, never split, trimmed or normalized); the
+   * label Rust-trimmed (what Core stores). Only these three keys are sent.
+   * Core refuses a secret-shaped label or argument; this client does not
+   * pre-judge that. Default deadline; never retried.
+   */
+  verificationApprove(params: VerificationApproveParams): Promise<unknown> {
+    return guarded(() =>
+      this.connection.request<unknown>('verification.approve', {
+        projectId: validateScopingId(params.projectId, 'projectId'),
+        label: validateVerificationLabel(params.label),
+        argv: validateVerificationArgv(params.argv),
+      }),
+    );
+  }
+
+  /** A7: `{commandId}` → `{revoked: true}`. Idempotent; default deadline. */
+  verificationRevoke(commandId: string): Promise<unknown> {
+    return guarded(() =>
+      this.connection.request<unknown>('verification.revoke', { commandId: validateScopingId(commandId, 'commandId') }),
+    );
+  }
+
+  /**
+   * A7: `{taskId, commandId, expectedSandboxName, expectedWorkspaceMode,
+   * idempotencyKey?}` → `{runId, startedSequence, replayed?}`. The payload is
+   * built from these keys only, in the A2 fingerprint order. 45 s deadline
+   * (`VERIFICATION_RUN_TIMEOUT_MS`); never retried automatically.
+   */
+  verificationRun(params: VerificationRunParams): Promise<unknown> {
+    return guarded(() => {
+      const mode: unknown = params.expectedWorkspaceMode;
+      if (!isWorkspaceMode(mode)) {
+        throw new CoreValidationError('expectedWorkspaceMode', 'is not a workspace mode Core knows');
+      }
+      const payload: Record<string, unknown> = {
+        taskId: validateScopingId(params.taskId, 'taskId'),
+        commandId: validateScopingId(params.commandId, 'commandId'),
+        expectedSandboxName: validateAddressableSandboxName(params.expectedSandboxName, 'expectedSandboxName'),
+        expectedWorkspaceMode: mode,
+      };
+      if (params.idempotencyKey !== undefined) payload['idempotencyKey'] = validateIdempotencyKey(params.idempotencyKey);
+      return this.connection.request<unknown>('verification.run', payload, { timeoutMs: VERIFICATION_RUN_TIMEOUT_MS });
+    });
+  }
+
+  /** A7: `{runId}` → `VerificationResult` (untrusted output). Read-only; default deadline. */
+  verificationResult(runId: string): Promise<unknown> {
+    return guarded(() =>
+      this.connection.request<unknown>('verification.result', { runId: validateScopingId(runId, 'runId') }),
+    );
+  }
+
+  /** A7: `{projectId}` → `ProjectContextResult`. Read-only; 45 s deadline (it reads files). */
+  projectContext(projectId: string): Promise<unknown> {
+    return guarded(() =>
+      this.connection.request<unknown>(
+        'project.context',
+        { projectId: validateScopingId(projectId, 'projectId') },
+        { timeoutMs: PROJECT_CONTEXT_TIMEOUT_MS },
+      ),
+    );
   }
 }
 

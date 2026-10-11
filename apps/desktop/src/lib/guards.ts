@@ -31,6 +31,9 @@ import {
   type TaskListParams,
   type TaskStatus,
   type TaskSubscribeParams,
+  type VerificationApproveParams,
+  type VerificationRunParams,
+  WORKSPACE_MODES,
 } from "./protocol";
 import {
   validateConversationTitle,
@@ -663,5 +666,68 @@ export function buildGitApplyParams(params: GitApplyParams): GitApplyParams {
     expectedBase: params.expectedBase,
     reviewId: params.reviewId,
     entries: params.entries.map(applyEntryOf),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// A7 verification + project.context (design 2026-10-09 §3.7)
+//
+// Ids are checked with Core's `validate_scoping_id` rule. Labels and argv are
+// NOT checked here: Core is the authority for them (its shape and secret
+// checks), and the confirmation dialog shows a no-stricter-than-Core early
+// warning only. Every value travels exactly as given — argv is never split,
+// trimmed or joined.
+// ---------------------------------------------------------------------------
+
+/** `verification.list` / `project.context` params: exactly `{projectId}`. */
+export function buildVerificationProjectParams(projectId: string): { projectId: string } {
+  return { projectId: validateScopingId(projectId, "projectId") };
+}
+
+/** `verification.approve` params: `{projectId, label, argv}`, argv copied element by element. */
+export function buildVerificationApproveParams(params: VerificationApproveParams): VerificationApproveParams {
+  if (!Array.isArray(params.argv) || params.argv.some((a) => typeof a !== "string")) {
+    throw new CoreValidationError("argv", "must be a list of strings");
+  }
+  if (typeof params.label !== "string") {
+    throw new CoreValidationError("label", "must be a string");
+  }
+  return {
+    projectId: validateScopingId(params.projectId, "projectId"),
+    label: params.label,
+    argv: [...params.argv],
+  };
+}
+
+/** `verification.revoke` params: exactly `{commandId}`. */
+export function buildVerificationRevokeParams(commandId: string): { commandId: string } {
+  return { commandId: validateScopingId(commandId, "commandId") };
+}
+
+/** `verification.result` params: exactly `{runId}`. */
+export function buildVerificationResultParams(runId: string): { runId: string } {
+  return { runId: validateScopingId(runId, "runId") };
+}
+
+/**
+ * `verification.run` params, in Core's fingerprint order:
+ * `{taskId, commandId, expectedSandboxName, expectedWorkspaceMode,
+ * idempotencyKey?}`. Never argv, never a path. The key, when present, is
+ * checked with Core's rule and never rewritten; absent stays absent.
+ */
+export function buildVerificationRunParams(params: VerificationRunParams): VerificationRunParams {
+  const checked = checkIdempotencyKey(params);
+  if (typeof checked.expectedSandboxName !== "string" || checked.expectedSandboxName.length === 0) {
+    throw new CoreValidationError("expectedSandboxName", "this task is not bound to a sandbox");
+  }
+  if (!(WORKSPACE_MODES as readonly string[]).includes(checked.expectedWorkspaceMode)) {
+    throw new CoreValidationError("expectedWorkspaceMode", "must be a workspace mode Core recorded");
+  }
+  return {
+    taskId: validateScopingId(checked.taskId, "taskId"),
+    commandId: validateScopingId(checked.commandId, "commandId"),
+    expectedSandboxName: checked.expectedSandboxName,
+    expectedWorkspaceMode: checked.expectedWorkspaceMode,
+    ...(checked.idempotencyKey === undefined ? {} : { idempotencyKey: checked.idempotencyKey }),
   };
 }

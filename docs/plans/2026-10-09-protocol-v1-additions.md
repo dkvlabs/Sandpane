@@ -545,9 +545,9 @@ The design-level `security-reviewer` pass on the first draft returned **BLOCK**.
    - `argv`:
      - 1–64 elements;
      - each element at most 4096 bytes, all of them together at most 16 KiB;
-     - valid UTF-8 with no NUL;
+     - valid UTF-8 with no NUL, and no other control character: C0 except TAB and LF, DEL, and C1 U+0080–U+009F are refused (code review W1: each one serializes as a 6-byte escape and could push a listing past the frame limit);
      - `argv[0]` is non-empty and does not start with `-` (hygiene only, I1: after `--` no element can become an `sbx` flag).
-   - **No secrets (C1).** Each argv element and the label go through `redact::redact`.
+   - **No secrets (C1).** Each argv element, the label, the space-joined argv and its JSON form go through `redact::redact`. The joined and JSON forms catch a secret split across elements (code review W3). The same check runs again at run start, so a command stored under an older, weaker redactor is refused there.
      - Any replacement → `VALIDATION_FAILED` "argument N looks like a secret (<kind>); approved commands cannot hold secrets; nothing was approved", or "the label looks like a secret …".
      - `RedactorUnavailable` → the approve is refused: "the secret check is unavailable, so nothing was approved".
      - Only proven-clean argv is ever stored, put in events or returned. The approve dialog says "Do not put tokens or passwords in arguments".
@@ -620,7 +620,7 @@ The design-level `security-reviewer` pass on the first draft returned **BLOCK**.
      - **Disclosed:** after a crash, the orphaned `sbx exec` client and its in-sandbox process may keep running.
      - Copy: "Core restarted while this verification ran; its result is unknown, and the command may still be running inside the sandbox".
    - **Lifecycle (W7):**
-     - `project.delete`, `conversation.delete` and `sandbox.remove` refuse while a run is in flight for any of their tasks or sandboxes ("a verification is running …; wait for it to finish; nothing was deleted"). `sandbox.stop` describes in-flight runs in its impact.
+     - `project.delete`, `conversation.delete` and `sandbox.remove` refuse while a run is in flight for any of their tasks or sandboxes ("a verification is running …; wait for it to finish; nothing was deleted"). `sandbox.stop` is unchanged and allows a stop during a run (item 14).
      - **Task status is never changed by a verification** (rule 3). A7 deliberately does not use the specs/02 §4 `verifying` state, and clients never show a verification as task status (I6).
 6. **Exit status and output (honest, bounded, redacted).**
    - `exitCode` is **the exit status of `sbx exec`**. Whether sbx passes a command's non-zero exit through unchanged is UNVERIFIED (C-2). The only capture is `echo`, which exited 0, and sbx's own failures also exit 1.
@@ -710,6 +710,57 @@ The design-level `security-reviewer` pass on the first draft returned **BLOCK**.
       - output never in events;
       - delete refusals while a run is in flight;
       - `project.context` on real temporary repositories (a symlinked root and manifest, oversized, BOM, deeply nested and duplicate-key JSON, pre/post scripts, `.npmrc`, the make file order, hostile script text).
+
+14. **Implementation decisions (recorded at the A7 Core implementation).**
+    - **`sandbox.stop` is unchanged.** It has no `impact` field and no token flow, so describing in-flight runs would need a wire change. Stopping a sandbox during a run is allowed; there is no cancel in A7, and stop is the user's way out of a runaway command. The run then ends with whatever outcome `sbx exec` reports (typically `signaled` or `exited`). Clients that know a run is in flight say so in their own stop dialog. The deletes still refuse (item 5).
+    - **Wire details:**
+      - `VerificationResult.elapsedMs` is optional, absent while the run is in flight.
+      - `redactions` is `{bestEffort, replacements, byKind, outputWithheld?}`; `outputWithheld: true` means the redactor was unavailable and no output was stored.
+      - `verification.run` answers `{runId, startedSequence, replayed?}`.
+      - `stdoutBytes` / `stderrBytes` count the raw captured bytes, before redaction.
+      - A restart reconciliation adds `reconciledAfterRestart: true` to the `interrupted` outcome event.
+    - **Secret-refusal advice** is in `details.hint`, so the message keeps the item 2 template.
+    - **Small choices:**
+      - Argument numbers in messages are 1-based.
+      - A worker panic records `read_failed`; a worker that never started records `spawn_failed`.
+      - The start transaction also re-checks that the binding is live and unchanged, that the project and conversation are not archived, the sandbox-name operation claim, and the shutdown flag.
+      - The verification check comes first in the project and conversation delete checks.
+    - **Residuals:**
+      - `read_failed` is proven by unit tests only, not by an integration test.
+      - Graceful shutdown (item 5) is implemented and tested, but `main.rs` has no shutdown path yet, so a real Core relies on restart reconciliation.
+      - `project.context` notes are not redacted. They are returned for display only, from the user's own registered repository, and never stored.
+      - When a `direct_mount` run holds the writer lock, the pinned `git.apply` / `sandbox.create` "busy" texts name the holder with an older parenthetical.
+    - **Code review outcome (A7 Core review, PASS-WITH-WARNINGS; re-verified PASS-WITH-WARNINGS).**
+      - **W1, fixed:** argv refuses control characters (item 2). `verification.list`, `project.context` and `verification.result` also measure their response against `MAX_FRAME_BYTES − 64 KiB` and return a bounded `VALIDATION_FAILED` "the response would exceed the frame limit …; nothing was returned". The details are `commandIds`, `repositories` / `repositoryCount` / `approvedBytes`, and `runId`.
+      - **W2, fixed:** `run_partial` detects the leader's exit without reaping it (`waitid … WNOWAIT`). It signals the group only while the leader is unreaped, reads for at most the grace period after a natural exit, and keeps `Exited` together with the new `outputIncomplete` flag (result and finished event). It leaves no reader threads behind.
+      - **W3, fixed:** the joined-argv and JSON-argv secret checks, plus a re-check at run start (item 2).
+      - **S1, S2, I2, fixed:** close-on-exec on the duplicated fd; `project.context` notes are redacted, or withheld when the redactor is unavailable; a note text fix.
+      - **Follow-up, fixed before commit:**
+        - **N1:** the `process::` timing tests warm each script before the clock starts and wait for readiness markers. 4 concurrent copies × 10 rounds had 0/40 failures, against 36/40 before; 16 runs under a CPU hog on every core had 0 failures.
+        - **I-b (pre-existing):** `run_bounded` (git and sbx) now uses the same unreaped-leader pattern. It reads both pipes non-blocking on the calling thread, with no reader threads, sends group signals only through the slot while the leader is unreaped, and has no post-reap group kill. Its external behaviour and types are unchanged, and every git and sbx test passes.
+        - **I-a:** a failed `waitid` makes the reap kill the child first; it never counts as "exited".
+        - Three mutants survived because a pipe read error or a `waitid` error on Core's own child cannot be triggered from a test; `drain`'s error recording is unit-tested.
+        - The `cfg(not(unix))` path is the unchanged old code, not built on this host.
+      - **Accepted:**
+        - I-c: an oversized request `id` echoes into its own response (pre-existing, self-inflicted).
+        - I-e: redactor pattern gaps (`--api-key=…`, `--password …`) are best-effort and out of A7 scope.
+        - I-d: `output_incomplete` was added to migration v8 in place before any commit, so a development database created by an earlier uncommitted A7 build must be recreated.
+    - **Client review outcome (two read-only security reviews: desktop + JetBrains, then VS Code; both PASS-WITH-WARNINGS, no Critical).**
+      - **Deadline correction (cross-client, brief error):** `verification.run` answers only after the version gate (`RunLimits::PROBE`, 3 s) and the identity gate (`RunLimits::QUERY`, 30 s), both before the durable start. So every client now gives it the git deadline: desktop proxy 43 s / webview 45 s, JetBrains 45 s, VS Code 45 s. Each is drift-pinned against `process.rs`, so a client never shows "may have started" while Core is still gating.
+      - **JetBrains J-W1, fixed:** a started run follows the task without a (possibly stale) `TaskSummary`, on the EDT, so a verification never changes a displayed task status (rule 3).
+      - **JetBrains J-W2, fixed:** the approve, run and revoke confirmations are plain non-editable text (`JTextArea`, `html.disable`). No A7 dialog uses HTML (item 6).
+      - **VS Code W1, fixed:** archived-project and archived-conversation refusals get their own copy for approve, run and revoke.
+      - **VS Code W2, fixed:** only `revoked: true` counts as revoked. Anything else is shown as "may not have been revoked", and the list is re-read.
+      - **VS Code W3, fixed:** the output document opens directly in its own language (dedicated `.sandpane-verification` extension). The header claims "not linked" only while the language-scoped `editor.links` is exactly `false`, and otherwise says that links are enabled by a setting and are untrusted.
+      - **Info, fixed (all clients where it applied):**
+        - "Retry safely" is offered only within 23 h of the key's first send, inside Core's 24 h retention (drift-pinned to `RETENTION_SECS`), and re-checked at click time.
+        - Suggestion notes are dropped once the argv is edited.
+        - JetBrains reads `project.context` only on "Detect suggestions"; VS Code never reads it from the timer refresh.
+        - Every remaining Core string is revealed (timestamps, run ids, picker titles), and Zs spaces and delimiters are escaped in JetBrains list rows.
+        - JetBrains `toString`s show sizes only.
+        - Desktop Revoke… requires a trusted event.
+        - An INTERNAL "…; nothing was run" refusal reads as definite.
+        - Re-approving an existing argv says so.
 
 ## 4. Client obligations per addition
 

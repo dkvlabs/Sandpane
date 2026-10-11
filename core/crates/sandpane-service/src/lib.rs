@@ -30,11 +30,23 @@ pub use project_lifecycle::{
     MSG_REPOSITORY_UNREGISTERED_DURING_CREATE, MSG_UPDATE_NEEDS_A_FIELD, PROJECT_DELETE_ACTION,
 };
 pub mod runtime;
+mod verification;
+pub use verification::{
+    msg_exec_unverified, msg_sandbox_not_running, msg_verification_repo_busy,
+    reconcile_verifications_after_restart, verification_lock_holder, VerificationRegistry,
+    EVENT_VERIFICATION_FINISHED, EVENT_VERIFICATION_STARTED, MAX_COMMANDS_PER_PROJECT,
+    MAX_CONCURRENT_VERIFICATIONS, MSG_COMMAND_NOT_FOUND, MSG_COMMAND_OTHER_PROJECT,
+    MSG_COMMAND_REVOKED, MSG_CONVERSATION_VERIFICATION_RUNNING, MSG_PROJECT_VERIFICATION_RUNNING,
+    MSG_RUN_NOT_FOUND, MSG_SANDBOX_VERIFICATION_RUNNING, MSG_TASK_NOT_FOUND, MSG_TOO_MANY_COMMANDS,
+    MSG_VERIFICATION_CORE_BUSY, MSG_VERIFICATION_IDENTITY, MSG_VERIFICATION_NOT_BOUND,
+    MSG_VERIFICATION_SANDBOX_BUSY, MSG_VERIFICATION_SANDBOX_CHANGED,
+    MSG_VERIFICATION_SHUTTING_DOWN, MSG_VERIFICATION_TASK_BUSY, MSG_VERSION_UNREADABLE,
+};
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use rusqlite::params;
 use sandpane_core::idempotency::{self, Lookup};
@@ -48,6 +60,7 @@ use sandpane_core::task::{TaskStateMachine, ALL_STATUSES};
 use sandpane_core::validation::Validator;
 use sandpane_core::workspace::{self, WorkspaceError};
 use sandpane_core::{git as scoregit, Database, EventLog};
+use sandpane_protocol::ProjectContextParams;
 use sandpane_protocol::{
     AgentCapability, AgentEvent, ChangeSet, ConfirmationRequest, ConfirmationTarget,
     ConversationCreateParams, ConversationDeleteParams, ConversationExportParams,
@@ -58,7 +71,8 @@ use sandpane_protocol::{
     ProjectRepositoryParams, ProjectUpdateParams, RpcRequest, RpcResponse, SandboxCreateSpec,
     SandboxRemoveParams, SandboxRemoveResult, SandboxStopParams, SandboxStopResult, SandboxSummary,
     SbxStatus, TaskEvent, TaskListParams, TaskStatus, TaskSubscribeParams, TaskSummary,
-    WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
+    VerificationApproveParams, VerificationListParams, VerificationResultParams,
+    VerificationRevokeParams, VerificationRunParams, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
 };
 
 /// Bounded frame size: refuse oversized input instead of buffering forever
@@ -212,6 +226,27 @@ pub struct CoreConfig {
     /// `sandpane_core::apply::ApplyLimits::default()`. `None` in production.
     #[doc(hidden)]
     pub test_apply_limits: Option<sandpane_core::apply::ApplyLimits>,
+    /// Test seam only (A7, §3.7 item 3): extra sbx versions for which
+    /// `verification.run` may spawn `sbx exec`, ON TOP of
+    /// `sandpane_core::sbx::VERIFIED_EXEC_VERSIONS` (empty in A7). `None` in
+    /// production — `main.rs` never sets it, so production never runs
+    /// `sbx exec`.
+    #[doc(hidden)]
+    pub test_verified_exec_versions: Option<Vec<SbxVersion>>,
+    /// Test seam only (A7): a verification run's limits and kill grace
+    /// instead of `RunLimits::VERIFICATION` / 5 s. `None` in production.
+    #[doc(hidden)]
+    pub test_verification_limits: Option<(RunLimits, std::time::Duration)>,
+    /// Test seam only (A7 W4): the environment the verification path's
+    /// allowlist is applied TO, instead of Core's own. The allowlist and
+    /// `env_clear` still run on it. `None` in production.
+    #[doc(hidden)]
+    pub test_verification_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    /// Test seam only (A7): called by `verification.run` after every gate
+    /// (and the `direct_mount` writer lock) and BEFORE the start transaction,
+    /// with no DB or scheduler lock held. `None` in production.
+    #[doc(hidden)]
+    pub test_verification_before_start: Option<TestHook>,
 }
 
 pub struct ServerInner {
@@ -243,6 +278,14 @@ pub struct ServerInner {
     pub(crate) test_apply_before_write: Option<TestHook>,
     pub(crate) test_apply_after_write: Option<TestHook>,
     pub(crate) test_apply_limits: Option<sandpane_core::apply::ApplyLimits>,
+    /// A7: verification runs in flight (W7). Memory only.
+    pub verifications: verification::VerificationRegistry,
+    /// A7: a handle to this server for the verification worker threads.
+    pub(crate) self_weak: Weak<ServerInner>,
+    pub(crate) test_verified_exec_versions: Vec<SbxVersion>,
+    pub(crate) test_verification_limits: Option<(RunLimits, std::time::Duration)>,
+    pub(crate) test_verification_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    pub(crate) test_verification_before_start: Option<TestHook>,
 }
 
 impl ServerInner {
@@ -306,7 +349,10 @@ impl ServerInner {
         // outcome event belongs to a dead Core. The host index decides what
         // happened — recorded durably before any client connects.
         git_apply::reconcile_applies_after_restart(&db, &git)?;
-        let inner = Arc::new(Self {
+        // A7 (§3.7 item 5, W3): a verification start with no outcome belongs
+        // to a dead Core: `interrupted`, durably, before any client connects.
+        verification::reconcile_verifications_after_restart(&db)?;
+        let inner = Arc::new_cyclic(|self_weak| Self {
             db: Mutex::new(db),
             scheduler: Mutex::new(Scheduler::reconciliation_baseline()),
             sbx_locator,
@@ -326,6 +372,12 @@ impl ServerInner {
             test_apply_before_write: config.test_apply_before_write,
             test_apply_after_write: config.test_apply_after_write,
             test_apply_limits: config.test_apply_limits,
+            verifications: verification::VerificationRegistry::default(),
+            self_weak: self_weak.clone(),
+            test_verified_exec_versions: config.test_verified_exec_versions.unwrap_or_default(),
+            test_verification_limits: config.test_verification_limits,
+            test_verification_env: config.test_verification_env,
+            test_verification_before_start: config.test_verification_before_start,
             confirmation_ttl: config
                 .confirmation_ttl
                 .unwrap_or(confirm::CONFIRMATION_TTL)
@@ -1005,6 +1057,24 @@ fn dispatch(
         Method::GitApply => parse_params::<GitApplyParams>(params)
             .map_err(SvcFailure::from)
             .and_then(|p| git_apply::git_apply(inner, p)),
+        Method::VerificationList => parse_params::<VerificationListParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| verification::verification_list(inner, p)),
+        Method::VerificationApprove => parse_params::<VerificationApproveParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| verification::verification_approve(inner, p)),
+        Method::VerificationRevoke => parse_params::<VerificationRevokeParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| verification::verification_revoke(inner, p)),
+        Method::VerificationRun => parse_params::<VerificationRunParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| verification::verification_run(inner, p)),
+        Method::VerificationResult => parse_params::<VerificationResultParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| verification::verification_result(inner, p)),
+        Method::ProjectContext => parse_params::<ProjectContextParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| verification::project_context(inner, p)),
     };
     match result {
         Ok(value) => RpcResponse::ok(id, value),
@@ -2013,12 +2083,27 @@ fn sandbox_remove(
     serde_json::to_value(result).map_err(|e| internal(e).into())
 }
 
+/// A7: `CONFLICT` while a verification runs in sandbox `name` (read under
+/// the DB mutex; the registry is a leaf lock).
+fn refuse_running_verification_in(inner: &ServerInner, name: &str) -> Result<(), SvcFailure> {
+    let _db = inner.lock_db();
+    if inner.verifications.running_in_sandbox(name) {
+        return Err(SvcFailure::from((
+            ErrorCode::Conflict,
+            MSG_SANDBOX_VERIFICATION_RUNNING.to_string(),
+        )));
+    }
+    Ok(())
+}
+
 /// Step 1: look the sandbox up in SBX (the source of truth), describe the
 /// impact, issue a token bound to (action, name, sbx id). Changes nothing.
 fn issue_remove_confirmation(
     inner: &ServerInner,
     name: &str,
 ) -> Result<ConfirmationRequest, SvcFailure> {
+    // A7 (§3.7 item 5, W7): never while a verification runs in it.
+    refuse_running_verification_in(inner, name)?;
     let program = locate_sbx(inner)?;
     let entry = sbx_list(&program, &inner.sbx_limits.query)?
         .into_iter()
@@ -2250,6 +2335,10 @@ fn remove_confirmed(inner: &ServerInner, name: &str, token: &str) -> Result<(), 
             ))
         })?;
     let _name_claim = claim_sandbox_name(inner, name)?;
+    // A7: AFTER the name claim and under the DB mutex — a run checks the
+    // claim and registers in ONE DB critical section, so either it saw this
+    // claim (and refused) or this sees its registry entry.
+    refuse_running_verification_in(inner, name)?;
     let program = locate_sbx(inner)?;
     let entry = sbx_list(&program, &inner.sbx_limits.query)?
         .into_iter()

@@ -14,6 +14,12 @@
 import * as vscode from 'vscode';
 import { PATCH_SCHEME } from './vscode/gitDiff';
 import { APPLY_LIST_SCHEME } from './vscode/gitApply';
+import { VERIFICATION_SCHEME } from './vscode/verification';
+import {
+  verificationCommandHandlers,
+  type VerificationCommandId,
+  type VerificationHandler,
+} from './vscode/verificationCommands';
 import * as fs from 'node:fs';
 import { SandpaneSession } from './session';
 import { SandpaneChatProvider } from './webview/sidebar';
@@ -106,6 +112,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, session.patchDocuments),
     // A6 V-W1: the read-only full list of a large apply (in memory, never on disk).
     vscode.workspace.registerTextDocumentContentProvider(APPLY_LIST_SCHEME, session.applyListDocuments),
+    // A7: read-only verification output and argument lists (in memory, plain text, never a terminal).
+    vscode.workspace.registerTextDocumentContentProvider(VERIFICATION_SCHEME, session.verificationDocuments),
     ...registrations(session, output, log),
   );
 
@@ -121,7 +129,7 @@ export function activate(context: vscode.ExtensionContext): void {
     host.supported
   ) {
     const timer = setInterval(() => {
-      void session.refresh().catch(() => undefined);
+      void session.refresh({ background: true }).catch(() => undefined);
     }, 30_000);
     context.subscriptions.push(new vscode.Disposable(() => clearInterval(timer)));
   }
@@ -176,7 +184,23 @@ function registrations(
     return run(title, work);
   };
 
+  // A7: each handler IGNORES its arguments (a command: URI or another
+  // extension can pass anything); the dialogs read everything from Core.
+  const verificationHandlers = Object.fromEntries(
+    Object.entries(verificationCommandHandlers(session)).map(([id, handler]) => [
+      id,
+      (..._ignored: unknown[]) => guard(`Sandpane: ${id.replace(/^sandpane\./, '')}`, () => handler()).then(() => undefined),
+    ]),
+  ) as Record<VerificationCommandId, VerificationHandler>;
+
   return [
+    vscode.commands.registerCommand('sandpane.approveVerification', verificationHandlers['sandpane.approveVerification']),
+    // prettier-ignore
+    vscode.commands.registerCommand('sandpane.approveVerificationSuggestion', verificationHandlers['sandpane.approveVerificationSuggestion']),
+    vscode.commands.registerCommand('sandpane.revokeVerification', verificationHandlers['sandpane.revokeVerification']),
+    vscode.commands.registerCommand('sandpane.runVerification', verificationHandlers['sandpane.runVerification']),
+    vscode.commands.registerCommand('sandpane.showVerificationResult', verificationHandlers['sandpane.showVerificationResult']),
+
     vscode.commands.registerCommand('sandpane.newProject', () =>
       guard('Sandpane: new project', async () => {
         const name = await vscode.window.showInputBox({

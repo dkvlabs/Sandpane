@@ -13,7 +13,7 @@
 import { CoreRpcError, CoreTransportError } from '../core-client/connection';
 import { FILE_CHANGE_STATUSES } from '../core-client/protocol';
 import type { ChangeSet, FileChange, GitDiffResult } from '../core-client/protocol';
-import { inspectHidden, plainText } from '../text/visibleText';
+import { inspectHidden, plainText, revealKeepingTabs } from '../text/visibleText';
 
 /** Scheme of the read-only virtual patch documents. */
 export const PATCH_SCHEME = 'sandpane-diff';
@@ -210,19 +210,10 @@ export function symlinkTarget(
  * patch content. `altered` marks the line for the disclosure count.
  */
 function revealPatchLine(line: string): { text: string; altered: boolean; crlf: boolean } {
-  let altered = false;
   // A CRLF line ending is common, not suspicious: shown as a visible `\r`
   // but counted separately from hidden / bidi characters.
   const crlf = line.endsWith('\r');
-  const content = crlf ? line.slice(0, -1) : line;
-  const text = content
-    .split('\t')
-    .map((segment) => {
-      const revealed = inspectHidden(segment);
-      altered = altered || revealed.altered;
-      return revealed.text;
-    })
-    .join('\t');
+  const { text, altered } = revealKeepingTabs(crlf ? line.slice(0, -1) : line);
   return { text: crlf ? `${text}\\r` : text, altered, crlf };
 }
 

@@ -264,6 +264,18 @@ fn has_unfinished_tasks(conn: &Connection, id: &str) -> Result<bool, SvcError> {
     }))
 }
 
+/// A7 (§3.7 item 5, W7): refuse while a verification runs for any task of
+/// the conversation. Called under the DB mutex (the registry is a leaf).
+fn refuse_running_verification(inner: &ServerInner, id: &str) -> Result<(), SvcFailure> {
+    if inner.verifications.running_for_conversation(id) {
+        return Err(SvcFailure::from((
+            ErrorCode::Conflict,
+            crate::MSG_CONVERSATION_VERIFICATION_RUNNING.to_string(),
+        )));
+    }
+    Ok(())
+}
+
 fn conflict_has_tasks() -> SvcFailure {
     SvcFailure::from((ErrorCode::Conflict, MSG_CONVERSATION_HAS_TASKS.to_string()))
 }
@@ -378,6 +390,7 @@ fn issue_delete_confirmation(
     let impact = {
         let db = inner.lock_db();
         let conv = load_conversation(db.conn(), id)?;
+        refuse_running_verification(inner, id)?;
         if has_unfinished_tasks(db.conn(), id)? {
             return Err(conflict_has_tasks());
         }
@@ -451,12 +464,15 @@ fn delete_confirmed(inner: &ServerInner, id: &str, token: &str) -> Result<(), Sv
     if find_conversation(&tx, id)?.is_none() {
         return Err(not_found().into());
     }
+    refuse_running_verification(inner, id)?;
     if has_unfinished_tasks(&tx, id)? {
         return Err(conflict_has_tasks());
     }
     const TASKS: &str = "(SELECT id FROM tasks WHERE conversation_id = ?1)";
     for sql in [
-        // 1. what hangs off the conversation's tasks
+        // 1. what hangs off the conversation's tasks (A7: verification
+        //    runs before tasks)
+        format!("DELETE FROM verification_runs WHERE task_id IN {TASKS}"),
         format!("DELETE FROM verifications WHERE task_id IN {TASKS}"),
         format!("DELETE FROM task_artifacts WHERE task_id IN {TASKS}"),
         format!("DELETE FROM task_events WHERE task_id IN {TASKS}"),

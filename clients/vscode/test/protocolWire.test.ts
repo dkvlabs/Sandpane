@@ -144,13 +144,13 @@ describe('wire names match the Rust protocol crate', () => {
     expect(serviceLib).toContain('pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;');
   });
 
-  it('declares exactly the 28 method names Core parses, in Method::ALL order', () => {
+  it('declares exactly the 34 method names Core parses, in Method::ALL order', () => {
     // (1) every `"dotted.name" =>` arm of Rust's `Method::parse` (segments are
     // lowercase snake_case since A3a: `project.add_repository`).
     const fromRust = [...rustProtocol.matchAll(/"([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)" =>/g)].map((m) => m[1]);
     expect(fromRust.sort()).toEqual([...CORE_METHODS].sort());
-    expect(new Set(fromRust).size).toBe(28);
-    expect(CORE_METHODS).toHaveLength(28);
+    expect(new Set(fromRust).size).toBe(34);
+    expect(CORE_METHODS).toHaveLength(34);
     // (2) the advertisement list itself, including ORDER — `CoreCapabilities.methods`
     // is derived from it, and a name that renames in Rust must break here.
     expect(methodAllWireNames()).toEqual([...CORE_METHODS]);
@@ -195,7 +195,16 @@ describe('wire names match the Rust protocol crate', () => {
       'conversation.export',
     ]);
     // A5: git.diff sits right after git.review, before git.apply.
-    expect(CORE_METHODS.slice(22)).toEqual(['task.cancel', 'task.list', 'task.subscribe', 'git.review', 'git.diff', 'git.apply']);
+    expect(CORE_METHODS.slice(22, 28)).toEqual(['task.cancel', 'task.list', 'task.subscribe', 'git.review', 'git.diff', 'git.apply']);
+    // A7: the six verification methods sit right after git.apply, at the end.
+    expect(CORE_METHODS.slice(28)).toEqual([
+      'verification.list',
+      'verification.approve',
+      'verification.revoke',
+      'verification.run',
+      'verification.result',
+      'project.context',
+    ]);
     expect(CORE_METHODS).not.toContain('sandbox.start');
     expect(rustProtocol).not.toContain('"sandbox.start" =>');
   });
@@ -378,7 +387,7 @@ describe('wire names match the Rust protocol crate', () => {
   });
 
   it('pins the method advertisement (`Method::ALL` → `CoreCapabilities.methods`)', () => {
-    expect(rustProtocol).toContain('pub const ALL: [Method; 28]');
+    expect(rustProtocol).toContain('pub const ALL: [Method; 34]');
     // Derived, never hand-written: `wire_names()` maps over ALL…
     expect(rustProtocol).toMatch(/pub fn wire_names\(\) -> Vec<&'static str> \{[\s\S]*Self::ALL\.iter\(\)/);
     // …and the probe answers with it.

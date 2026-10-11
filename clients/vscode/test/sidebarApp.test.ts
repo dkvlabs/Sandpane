@@ -581,3 +581,111 @@ describe('A6: per-task Apply button', () => {
     expect(busy.byId('sp-apply-t-1').getAttribute('title')).toContain('another apply is in progress');
   });
 });
+
+describe('A7: Verification section and per-task Verify… / Results…', () => {
+  const panel = {
+    supported: true,
+    note: null,
+    commands: [{ label: 'unit tests', argv: ['[1] "cargo"', '[2] "test"'] }],
+    repositories: [
+      {
+        repoPath: '/repo/atlas',
+        manifests: [{ manifest: 'package.json', suggestions: ['["npm", "run", "test"]'], notes: ['npm run test runs: vitest'] }],
+        unreadable: ['Cargo.toml'],
+      },
+    ],
+  };
+  const row = (verification: Record<string, unknown> | undefined) => ({
+    taskId: 't-1',
+    status: 'awaiting_review',
+    branch: null,
+    baseCommit: null,
+    unknownKinds: [],
+    ...(verification ? { verification } : {}),
+  });
+
+  it('lists approved commands (label + every argv line) and Core suggestions with notes, as text', () => {
+    const h = boot();
+    h.push(state({ verification: panel }));
+    h.flushFrame();
+    const section = h.byId('sp-verification');
+    for (const text of ['unit tests', '[1] "cargo"', '[2] "test"', '["npm", "run", "test"]', 'npm run test runs: vitest', '/repo/atlas', 'Cargo.toml']) {
+      expect(section.textContent).toContain(text);
+    }
+    expect(section.textContent).toContain('never run here');
+  });
+
+  it('section buttons post verificationAction with NO id, label or argv (the dialog reads Core)', () => {
+    const h = boot();
+    h.push(state({ verification: panel }));
+    h.flushFrame();
+    h.posted.length = 0;
+    for (const id of ['sp-verify-add', 'sp-verify-suggest', 'sp-verify-revoke', 'sp-verify-refresh']) h.byId(id).click();
+    expect(h.posted).toEqual([
+      { type: 'verificationAction', action: 'add' },
+      { type: 'verificationAction', action: 'approveSuggestion' },
+      { type: 'verificationAction', action: 'revoke' },
+      { type: 'verificationAction', action: 'refresh' },
+    ]);
+  });
+
+  it('unsupported (or an older host without the field): buttons disabled with the note; nothing posts', () => {
+    for (const verification of [
+      { supported: false, note: 'Verification is not supported by the attached Sandpane Core (it does not advertise "verification").', commands: [], repositories: [] },
+      undefined,
+    ]) {
+      const h = boot();
+      h.push(state({ ...(verification ? { verification } : {}), tasks: [row(undefined)] }));
+      h.flushFrame();
+      h.posted.length = 0;
+      for (const id of ['sp-verify-add', 'sp-verify-suggest', 'sp-verify-revoke', 'sp-verify-refresh', 'sp-verify-run-t-1', 'sp-verify-results-t-1']) {
+        expect(h.byId(id).disabled).toBe(true);
+        h.byId(id).click();
+      }
+      expect(h.posted).toEqual([]);
+      expect(h.byId('sp-verification').textContent).toContain('not supported');
+    }
+  });
+
+  it('a hostile label is text, never markup', () => {
+    const h = boot();
+    const hostile = '<img src=x onerror=alert(1)>';
+    h.push(state({ verification: { ...panel, commands: [{ label: hostile, argv: ['[1] "x"'] }] } }));
+    h.flushFrame();
+    const label = h.byId('sp-verification').find((el) => el.textContent === hostile);
+    expect(label).toBeDefined();
+    expect(label?.children).toHaveLength(0);
+  });
+
+  it('per task: Verify… posts runVerification and Results… posts showVerificationResults (task id only); runs are listed', () => {
+    const h = boot();
+    h.push(state({
+      verification: panel,
+      tasks: [row({ runEnabled: true, runReason: null, runs: ['unit tests — exit status 0 (as reported by sbx exec)'] })],
+    }));
+    h.flushFrame();
+    expect(h.byId('sp-tasks').textContent).toContain('unit tests — exit status 0 (as reported by sbx exec)');
+    h.posted.length = 0;
+    h.byId('sp-verify-run-t-1').click();
+    h.byId('sp-verify-results-t-1').click();
+    expect(h.posted).toEqual([
+      { type: 'runVerification', taskId: 't-1' },
+      { type: 'showVerificationResults', taskId: 't-1' },
+    ]);
+  });
+
+  it('an unbound task: Verify… is disabled and says why (title and visible text)', () => {
+    const h = boot();
+    h.push(state({ verification: panel, tasks: [row({ runEnabled: false, runReason: 'this task is not bound to a sandbox', runs: [] })] }));
+    h.flushFrame();
+    const run = h.byId('sp-verify-run-t-1');
+    expect(run.disabled).toBe(true);
+    expect(run.getAttribute('title')).toContain('this task is not bound to a sandbox');
+    expect(h.byId('sp-tasks').textContent).toContain('Verify: this task is not bound to a sandbox');
+    h.posted.length = 0;
+    run.click();
+    expect(h.posted).toEqual([]);
+    // Results stays available: Core's events may name runs this view has not caught up on.
+    expect(h.byId('sp-verify-results-t-1').disabled).toBe(false);
+  });
+});

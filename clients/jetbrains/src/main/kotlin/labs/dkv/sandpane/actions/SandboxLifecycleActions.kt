@@ -14,6 +14,9 @@ import labs.dkv.sandpane.core.OutcomeSeverity
 import labs.dkv.sandpane.core.OutcomeText
 import labs.dkv.sandpane.core.SandboxRemoveFlow
 import labs.dkv.sandpane.core.StopReport
+import labs.dkv.sandpane.core.VerificationActivity
+import labs.dkv.sandpane.core.Verifications
+import labs.dkv.sandpane.text.VisibleText
 import labs.dkv.sandpane.model.CoreMethods
 import labs.dkv.sandpane.model.SandboxSummary
 import labs.dkv.sandpane.services.SbxService
@@ -141,6 +144,19 @@ class StopSandboxAction : SandboxLifecycleAction(
         val project = event.project ?: return
         val picked = pickSandbox(project, "Sandpane: Stop Sandbox", "Stop Sandbox") ?: return
         val name = picked.name
+        // A7 (\u00A73.7 item 14): stop stays allowed during a run (it is the way out of a runaway
+        // command). When this IDE knows of one in this sandbox (Core's started event without a
+        // finished one), the user confirms that stopping ends it; Cancel is the default.
+        if (VerificationActivity.runningIn(name) &&
+            !confirm(
+                project,
+                "Sandpane: Stop Sandbox",
+                "Sandbox '" + VisibleText.reveal(name) + "': " + Verifications.STOP_DURING_RUN + ".",
+                "Stop Sandbox",
+            )
+        ) {
+            return
+        }
         // stopSandbox issues the RPC through ConnectionManager's io pool; nothing blocks the EDT.
         SbxService.instance(project).stopSandbox(name).whenComplete { result, error ->
             notifyOutcome(project, StopReport.describe(name, result, error))

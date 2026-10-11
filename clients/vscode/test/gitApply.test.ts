@@ -235,7 +235,7 @@ describe('A6 drift: Rust sources', () => {
   it('git-apply is a known feature and equals Rust FEATURES', () => {
     expect(GIT_APPLY_FEATURE).toBe('git-apply');
     expect(KNOWN_FEATURES).toContain(GIT_APPLY_FEATURE);
-    expect(rustProtocol).toMatch(/pub const FEATURES: \[&str; 5\] = \[[\s\S]*"git-apply",\s*\];/);
+    expect(rustProtocol).toMatch(/pub const FEATURES: \[&str; 6\] = \[[\s\S]*"git-apply",\s*"verification",\s*\];/);
   });
 
   it("the 45 s deadline stays above Core's total apply budget (prepare + write + verify)", () => {

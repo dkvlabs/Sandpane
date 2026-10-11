@@ -75,6 +75,7 @@ import {
   MAX_LIST_LIMIT,
   PROJECT_LIFECYCLE_METHODS,
   TASK_STATUSES,
+  VERIFICATION_METHODS,
 } from "../src/lib/protocol";
 import { MAX_REASON_CHARS, TERMINAL_STATUSES, describeCoreError } from "../src/lib/reducers";
 import { A1_CORE_METHODS, FakeCore, TOKEN_REJECTED_MESSAGE } from "./support/fake-core";
@@ -165,14 +166,15 @@ describe("A1 pinned lists", () => {
     ]);
     expect(rustMethodAll().names).toEqual([...METHODS]);
     expect(schemaMethodEnum()).toEqual([...METHODS]);
-    expect(METHODS).toHaveLength(28);
+    expect(METHODS).toHaveLength(34);
     // The A1 Core's set is today's minus the six A3a project methods, the
-    // five A3b conversation methods and A5's git.diff.
+    // five A3b conversation methods, A5's git.diff and the six A7 methods.
     expect(A1_CORE_METHODS).toEqual(
       METHODS.filter(
         (m) =>
           !(PROJECT_LIFECYCLE_METHODS as readonly string[]).includes(m) &&
           !(CONVERSATION_LIFECYCLE_METHODS as readonly string[]).includes(m) &&
+          !(VERIFICATION_METHODS as readonly string[]).includes(m) &&
           m !== "git.diff",
       ),
     );

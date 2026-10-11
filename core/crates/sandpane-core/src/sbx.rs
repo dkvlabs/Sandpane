@@ -10,6 +10,7 @@
 //! state/error/CRUD outputs. The older top-level `tests/fixtures/sbx/list.json`
 //! stays labeled illustrative and no longer drives any parser expectation.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -180,6 +181,54 @@ impl std::fmt::Display for SbxVersion {
     }
 }
 
+/// sbx versions for which `sbx exec` argument passing is PROVEN (A7, design
+/// 2026-10-09 §3.7 items 3 and 11): a version is added only after captures
+/// C-1 (argument passing), C-2 (exit status), C-5 (working directory) and
+/// C-7 (user) exist for it. EMPTY in A7 — no version is proven yet, so Core
+/// never spawns `sbx exec` in production; `verification.run` answers
+/// `UNSUPPORTED_SBX_VERSION`. Integration tests add their fake's version
+/// through a `CoreConfig` test seam only.
+pub const VERIFIED_EXEC_VERSIONS: &[SbxVersion] = &[];
+
+/// Whether `version` may run `sbx exec`: listed in
+/// [`VERIFIED_EXEC_VERSIONS`] or in `extra` (the test seam; empty in
+/// production).
+pub fn exec_verified(version: &SbxVersion, extra: &[SbxVersion]) -> bool {
+    VERIFIED_EXEC_VERSIONS
+        .iter()
+        .chain(extra.iter())
+        .any(|v| v == version)
+}
+
+/// Environment variables passed to sbx on the A7 verification path (W4):
+/// the environment is CLEARED, then only these (plus every `LC_*`) are
+/// copied from Core's own environment, so host tokens never reach sbx.
+pub const EXEC_ENV_ALLOWLIST: [&str; 6] = ["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG"];
+
+/// The allowlisted subset of `vars` (W4), in input order.
+pub fn exec_env<I>(vars: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    vars.into_iter()
+        .filter(|(k, _)| {
+            let k = k.as_encoded_bytes();
+            EXEC_ENV_ALLOWLIST.iter().any(|a| a.as_bytes() == k) || k.starts_with(b"LC_")
+        })
+        .collect()
+}
+
+/// ONE execution context for every sbx invocation on the verification path
+/// (R2): the exec itself, the identity gate's `ls --json` and the version
+/// probe all run with exactly this environment (cleared, then
+/// [`exec_env`]) and this Core-owned empty `0700` working directory, so the
+/// gates cannot consult a different daemon or context than the exec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SbxExecContext {
+    pub cwd: PathBuf,
+    pub env: Vec<(OsString, OsString)>,
+}
+
 /// A fully-built, injection-safe SBX invocation: fixed program + argument
 /// vector, ready for `std::process::Command`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +244,27 @@ impl SbxCommand {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         run_bounded(cmd, limits)
+    }
+
+    /// The `Command` for this invocation inside `ctx` (R2): environment
+    /// CLEARED then set to `ctx.env`, working directory `ctx.cwd`. Never a
+    /// shell.
+    pub fn command_in(&self, ctx: &SbxExecContext) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args)
+            .env_clear()
+            .envs(ctx.env.iter().map(|(k, v)| (k, v)))
+            .current_dir(&ctx.cwd);
+        cmd
+    }
+
+    /// [`Self::run`] inside `ctx` (A7 gates: version probe, `ls --json`).
+    pub fn run_in(
+        &self,
+        ctx: &SbxExecContext,
+        limits: &RunLimits,
+    ) -> Result<BoundedOutput, ProcessError> {
+        run_bounded(self.command_in(ctx), limits)
     }
 }
 
@@ -345,6 +415,33 @@ impl SbxCommandBuilder {
             args: vec!["rm".into(), "--force".into(), name.into()],
         })
     }
+
+    /// `sbx exec -- NAME ARGV…` (A7, design 2026-10-09 §3.7 item 3). EXACTLY
+    /// that: no `-i`/`-t`/`-u`/`-e`/`-w`/`--privileged`/`--cloud`. The `--`
+    /// comes BEFORE the sandbox name: the cobra v1.10.2 / pflag v1.0.10
+    /// probe showed that with it there, no later element is ever read as an
+    /// sbx flag under interspersed or non-interspersed parsing (without it,
+    /// interspersed parsing would take `-u root --privileged --cloud` from
+    /// the user's argv; with `NAME --`, non-interspersed parsing passes the
+    /// `--` into the command). UNVERIFIED against the real sbx until C-1.
+    ///
+    /// `argv` is the user-approved vector, passed through byte for byte: it
+    /// is validated for SHAPE only ([`Validator::verification_argv`]) and is
+    /// deliberately NOT run through the metacharacter tripwire — no shell is
+    /// involved, and the user approved those exact bytes.
+    pub fn exec(program: &Path, name: &str, argv: &[String]) -> Result<SbxCommand, SbxError> {
+        Validator::sandbox_name(name)?;
+        Validator::verification_argv(argv)?;
+        let mut args: Vec<String> = Vec::with_capacity(argv.len() + 3);
+        args.push("exec".into());
+        args.push("--".into());
+        args.push(name.into());
+        args.extend(argv.iter().cloned());
+        Ok(SbxCommand {
+            program: program.to_path_buf(),
+            args,
+        })
+    }
 }
 
 /// Probed sandbox status from an `ls --json` row. Only the two values seen in
@@ -381,6 +478,10 @@ pub struct SbxListEntry {
     pub id: Option<String>,
     pub status: SbxSandboxStatus,
     pub agent: Option<String>,
+    /// The `workspaces` array (A7 W5 identity gate): `None` when absent or
+    /// not an array of strings (unknown — the gate fails closed). Only the
+    /// `direct_mount` shape (one host path) is captured.
+    pub workspaces: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -392,6 +493,21 @@ struct RawListRow {
     status: Option<String>,
     #[serde(default)]
     agent: Option<String>,
+    #[serde(default)]
+    workspaces: Option<serde_json::Value>,
+}
+
+fn string_array(v: Option<serde_json::Value>) -> Option<Vec<String>> {
+    match v? {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|i| match i {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -427,6 +543,7 @@ pub fn parse_list_json(output: &str) -> Result<Vec<SbxListEntry>, SbxError> {
                 _ => SbxSandboxStatus::Unknown,
             },
             agent: r.agent.filter(|a| Validator::sbx_reported_agent(a).is_ok()),
+            workspaces: string_array(r.workspaces),
         })
         .collect())
 }
@@ -859,6 +976,7 @@ mod tests {
                 id: Some("b5ebec73-e2ae-471a-811a-e011cfb1948e".into()),
                 status: SbxSandboxStatus::Running,
                 agent: Some("shell".into()),
+                workspaces: Some(vec!["$SCRATCH/empty-ws".into()]),
             }]
         );
         let stopped = parse_list_json(&body(&fixture("crud/07_ls_json_stopped.txt"))).unwrap();
@@ -999,5 +1117,192 @@ mod tests {
         let f = classify_failure("1", &long);
         assert!(f.message.chars().count() < 700);
         assert!(!f.message.contains('\u{7}'));
+    }
+
+    // ---- A7 (design 2026-10-09 §3.7 item 3) ----
+
+    fn sv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The exact argv shape: `exec`, `--`, NAME, argv… — nothing else (no
+    /// -i/-t/-u/-e/-w/--privileged/--cloud), `--` BEFORE the name.
+    #[test]
+    fn exec_builder_emits_exactly_exec_dashdash_name_argv() {
+        let c = SbxCommandBuilder::exec(
+            &prog(),
+            "atlas-auth",
+            &sv(&[
+                "printf",
+                "[%s]\n",
+                "-u",
+                "--privileged",
+                "-e",
+                "X=y",
+                "a b",
+                "$(id)",
+                "*",
+                "--",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            c.args,
+            sv(&[
+                "exec",
+                "--",
+                "atlas-auth",
+                "printf",
+                "[%s]\n",
+                "-u",
+                "--privileged",
+                "-e",
+                "X=y",
+                "a b",
+                "$(id)",
+                "*",
+                "--"
+            ])
+        );
+        assert_eq!(c.program, prog());
+        // Every element after `--` is passed through byte for byte.
+        let only = SbxCommandBuilder::exec(&prog(), "nova.v2", &sv(&["make"])).unwrap();
+        assert_eq!(only.args, sv(&["exec", "--", "nova.v2", "make"]));
+    }
+
+    #[test]
+    fn exec_builder_validates_name_and_argv_first() {
+        for bad_name in ["-u", "--privileged", "a", "default", "a b", "x;y"] {
+            assert!(
+                SbxCommandBuilder::exec(&prog(), bad_name, &sv(&["make"])).is_err(),
+                "{bad_name:?}"
+            );
+        }
+        assert!(SbxCommandBuilder::exec(&prog(), "atlas-auth", &[]).is_err());
+        assert!(SbxCommandBuilder::exec(&prog(), "atlas-auth", &sv(&["-rf"])).is_err());
+        assert!(SbxCommandBuilder::exec(&prog(), "atlas-auth", &sv(&[""])).is_err());
+    }
+
+    /// `exec` and the usage words come from the captured help; the ONLY
+    /// option-shaped token Core itself emits is `--`, before the name
+    /// (`--` is the end-of-options marker, not a Flags-section entry).
+    #[test]
+    fn exec_shape_matches_captured_help() {
+        let help = fixture("help/exec.txt");
+        assert!(help
+            .lines()
+            .any(|l| l.trim() == "sbx exec [flags] SANDBOX COMMAND [ARG...]"));
+        let c =
+            SbxCommandBuilder::exec(&prog(), "atlas-auth", &sv(&["tool", "-x", "--y"])).unwrap();
+        assert_eq!(c.args[0], "exec");
+        assert_eq!(c.args[1], "--");
+        assert_eq!(c.args[2], "atlas-auth");
+        // The captured help really does offer the flags Core never passes.
+        for f in [
+            "--interactive",
+            "--tty",
+            "--user",
+            "--env",
+            "--workdir",
+            "--privileged",
+            "--cloud",
+        ] {
+            assert!(help.contains(f), "{f} not in captured help");
+        }
+    }
+
+    #[test]
+    fn verified_exec_versions_is_empty_in_production() {
+        assert!(VERIFIED_EXEC_VERSIONS.is_empty());
+        let v047 = SbxVersion::parse(&fixture("state/version.txt")).unwrap();
+        assert!(!exec_verified(&v047, &[]));
+        assert!(exec_verified(&v047, std::slice::from_ref(&v047)));
+        let other = SbxVersion {
+            major: 0,
+            minor: 47,
+            patch: 1,
+        };
+        assert!(!exec_verified(&other, std::slice::from_ref(&v047)));
+    }
+
+    /// W4: cleared environment + allowlist (PATH, HOME, USER, LOGNAME,
+    /// TMPDIR, LANG, LC_*). Host tokens never reach sbx.
+    #[test]
+    fn exec_env_keeps_only_the_allowlist() {
+        use std::ffi::OsString;
+        let vars: Vec<(OsString, OsString)> = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/Users/demo"),
+            ("USER", "demo"),
+            ("LOGNAME", "demo"),
+            ("TMPDIR", "/tmp/x"),
+            ("LANG", "en_US.UTF-8"),
+            ("LC_ALL", "C"),
+            ("LC_CTYPE", "UTF-8"),
+            ("GITHUB_TOKEN", "ghp_canary"),
+            ("AWS_SECRET_ACCESS_KEY", "canary"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+            ("DOCKER_HOST", "tcp://x"),
+            ("SANDPANE_SBX_PATH", "/x/sbx"),
+            ("PATHX", "no"),
+            ("LCX", "no"),
+            ("lang", "no"),
+        ]
+        .iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect();
+        let kept: Vec<String> = exec_env(vars)
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            kept,
+            sv(&["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"])
+        );
+    }
+
+    /// R2: one context drives every invocation — cleared env, the allowlist,
+    /// the Core-owned cwd.
+    #[test]
+    fn command_in_context_clears_env_and_sets_cwd() {
+        use std::ffi::OsString;
+        let ctx = SbxExecContext {
+            cwd: PathBuf::from("/core/tmp/run"),
+            env: vec![(OsString::from("PATH"), OsString::from("/bin"))],
+        };
+        let cmd = SbxCommandBuilder::version(&prog()).command_in(&ctx);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/core/tmp/run")));
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(envs, vec![("PATH".to_string(), Some("/bin".to_string()))]);
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), vec!["version"]);
+    }
+
+    /// `workspaces` is parsed now (W5 identity gate). Absent or not an array
+    /// of strings → `None` (unknown: the gate fails closed).
+    #[test]
+    fn list_rows_carry_workspaces_when_present() {
+        let running = parse_list_json(&body(&fixture("crud/02_ls_json_after_create.txt"))).unwrap();
+        assert_eq!(running[0].workspaces, Some(sv(&["$SCRATCH/empty-ws"])));
+        let rows = parse_list_json(
+            r#"{"sandboxes":[
+                {"name":"a1","workspaces":[]},
+                {"name":"b2"},
+                {"name":"c3","workspaces":"/x"},
+                {"name":"d4","workspaces":["/x", 1]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(rows[0].workspaces, Some(vec![]));
+        assert_eq!(rows[1].workspaces, None);
+        assert_eq!(rows[2].workspaces, None);
+        assert_eq!(rows[3].workspaces, None);
     }
 }

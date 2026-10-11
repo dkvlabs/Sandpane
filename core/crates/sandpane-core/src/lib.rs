@@ -5,6 +5,7 @@
 //! with fixed executables + argument arrays only — never through a shell.
 
 pub mod apply;
+pub mod context;
 pub mod db;
 pub mod diff;
 pub mod events;
@@ -17,6 +18,7 @@ pub mod sbx;
 pub mod scheduler;
 pub mod task;
 pub mod validation;
+pub mod verification;
 pub mod workspace;
 
 pub use db::{Database, DbError};

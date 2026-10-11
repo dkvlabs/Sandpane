@@ -515,6 +515,8 @@ class ProjectLifecycleTest {
             Triple(CoreMethods.PROJECT_ARCHIVE, CoreErrorCodes.NOT_FOUND, ProjectOutcomes.MSG_PROJECT_NOT_FOUND) to "nothing was changed",
             Triple(CoreMethods.PROJECT_REMOVE_REPOSITORY, CoreErrorCodes.NOT_FOUND, ProjectOutcomes.MSG_REPOSITORY_NOT_REGISTERED) to "nothing was removed",
             Triple(CoreMethods.PROJECT_UPDATE, CoreErrorCodes.VALIDATION_FAILED, ProjectOutcomes.MSG_UPDATE_NEEDS_A_FIELD) to "nothing was changed",
+            // A7: Core refuses a delete while a verification runs for one of the project's tasks.
+            Triple(CoreMethods.PROJECT_DELETE, CoreErrorCodes.CONFLICT, Verifications.MSG_PROJECT_VERIFICATION_RUNNING) to "nothing was deleted",
         )
         assertEquals(ProjectOutcomes.KNOWN_MESSAGES, cases.map { it.first.third }.toSet(), "every known message has a case")
         for ((case, expected) in cases) {

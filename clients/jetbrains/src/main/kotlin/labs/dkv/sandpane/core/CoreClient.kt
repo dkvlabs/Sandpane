@@ -182,7 +182,7 @@ class CoreClient(
         assertNotEdt("CoreClient.requestBlocking($method)")
         val frame = request(method, params).get(deadlineMs(method), TimeUnit.MILLISECONDS)
         val error = frame.err
-        if (error != null) throw CoreRpcException(error.code, error.message)
+        if (error != null) throw CoreRpcException.fromCore(error)
         val ok = frame.ok
             ?: throw CoreRpcException("INTERNAL", "empty ok payload for $method", raisedByCore = false)
         return CoreJson.decodeFromJsonElement(deserializer, ok)
@@ -193,7 +193,7 @@ class CoreClient(
         assertNotEdt("CoreClient.requestBlocking($method)")
         val frame = request(method, params).get(deadlineMs(method), TimeUnit.MILLISECONDS)
         val error = frame.err
-        if (error != null) throw CoreRpcException(error.code, error.message)
+        if (error != null) throw CoreRpcException.fromCore(error)
         return frame.ok
             ?: throw CoreRpcException("INTERNAL", "empty ok payload for $method", raisedByCore = false)
     }
@@ -428,8 +428,20 @@ class CoreRpcException(
     val code: String,
     override val message: String,
     val raisedByCore: Boolean = true,
+    /**
+     * A7: Core's structured `details` (e.g. a secret refusal's `hint`, a frame refusal's
+     * `commandIds` / `repositories`), kept so the UI can show them. Never part of [getLocalizedMessage]
+     * or any log line: it is display data, read only by the copy that knows its shape.
+     */
+    val details: kotlinx.serialization.json.JsonElement? = null,
 ) : Exception(message) {
     override fun getLocalizedMessage(): String = "$code: $message"
+
+    companion object {
+        /** The exception for Core's `err` payload, with its `details` carried through. */
+        fun fromCore(error: labs.dkv.sandpane.model.RpcErrorPayload): CoreRpcException =
+            CoreRpcException(error.code, error.message, raisedByCore = true, details = error.details)
+    }
 }
 
 /** Raised when a single NDJSON frame would exceed [MAX_FRAME_BYTES]; the stream is dropped. */

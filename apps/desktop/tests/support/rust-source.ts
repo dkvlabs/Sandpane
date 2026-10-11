@@ -305,3 +305,28 @@ export function rustUsizeConst(relative: string, name: string): number {
   if (found?.[1] === undefined) throw new Error(`${relative} has no "pub const ${name}: usize = N;"`);
   return Number(found[1]);
 }
+
+/**
+ * EVERY `format!("…")` template inside `fn NAME(` (any visibility, including
+ * a private fn or an `impl` method), in source order, decoded like
+ * `rustStrConst`. Bounded by the next top-level `fn` / `pub fn` / `impl`.
+ */
+export function rustFnFormatTemplates(relative: string, fnName: string): string[] {
+  const source = read(relative);
+  const fn = new RegExp(`\\bfn ${fnName}\\(`).exec(source);
+  if (fn === null) throw new Error(`${relative} has no "fn ${fnName}("`);
+  const after = fn.index + 1;
+  const ends = ["\nfn ", "\npub fn ", "\npub(crate) fn ", "\nimpl ", "\n    pub fn ", "\n    fn "]
+    .map((marker) => source.indexOf(marker, after))
+    .filter((n) => n > 0);
+  const bound = Math.min(...ends, source.length);
+  const templates: string[] = [];
+  let at = source.indexOf("format!(", after);
+  while (at >= 0 && at < bound) {
+    const quote = source.indexOf('"', at);
+    templates.push(scanRustString(source, quote + 1, fnName));
+    at = source.indexOf("format!(", quote + 1);
+  }
+  if (templates.length === 0) throw new Error(`fn ${fnName} has no format!( template`);
+  return templates;
+}

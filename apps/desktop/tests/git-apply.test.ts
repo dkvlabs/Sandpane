@@ -194,19 +194,20 @@ const trusted = { nativeEvent: { isTrusted: true } };
 // ---------------------------------------------------------------------------
 
 describe("A6 drift against the Rust sources", () => {
-  it("git-apply is the 5th known feature, in Rust FEATURES order; methods stay 28", () => {
+  it("git-apply is the 5th known feature, in Rust FEATURES order (6 since A7); methods are 34 since A7", () => {
     const rust = /pub const FEATURES: \[&str; (\d+)\] = \[([^\]]*)\];/.exec(protocolRustSource());
     const names = [...((rust?.[2] ?? "").matchAll(/"([^"]+)"/g))].map((m) => m[1]);
-    expect(Number(rust?.[1])).toBe(5);
+    expect(Number(rust?.[1])).toBe(6);
     expect([...KNOWN_FEATURES]).toEqual(names);
-    expect(KNOWN_FEATURES).toHaveLength(5);
+    expect(KNOWN_FEATURES).toHaveLength(6);
     expect(KNOWN_FEATURES[4]).toBe(FEATURE_GIT_APPLY);
     expect(FEATURE_GIT_APPLY).toBe("git-apply");
-    expect(A6_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names);
+    // The A6 double advertises the A6 prefix (A7 appended verification).
+    expect(A6_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names.slice(0, 5));
     const all = rustMethodAll();
-    expect(all.declaredLength).toBe(28);
+    expect(all.declaredLength).toBe(34);
     expect([...METHODS]).toEqual(all.names);
-    expect(METHODS).toHaveLength(28);
+    expect(METHODS).toHaveLength(34);
   });
 
   it("git.apply gets the git deadline: webview 45 000 (Core's CLIENT_APPLY_DEADLINE), proxy 43 000", () => {

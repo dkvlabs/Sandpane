@@ -23,6 +23,7 @@ import {
   errorCodeOf,
   validateAddressableSandboxName,
   validateConversationRenameTitle,
+  validateVerificationLabel,
 } from './core-client/commands';
 import {
   CoreConnection,
@@ -51,6 +52,10 @@ import type {
   SandboxSummary,
   SbxAgent,
   SendMode,
+  ProjectContextResult,
+  TaskSummary,
+  VerificationCommand,
+  VerificationRunParams,
 } from './core-client/protocol';
 import {
   coreAdvertisesFeature,
@@ -67,10 +72,12 @@ import {
   isUnknownOutcome,
   keyedConflictCopy,
   newIdempotencyKey,
+  IDEMPOTENCY_RETENTION_MS,
+  safeRetryWindowOpen,
 } from './core-client/idempotency';
-import { TASK_STATUSES, isTerminalStatus } from './core-client/events';
+import { TASK_STATUSES, VERIFICATION_EVENT_KINDS, isTerminalStatus } from './core-client/events';
 import { EXPORT_BEST_EFFORT_COPY, collectConversationExport } from './core-client/conversationExport';
-import { EMPTY_STATE, reduceTaskView, selectTasks, type TaskViewState } from './state/reducer';
+import { EMPTY_STATE, reduceTaskView, selectTasks, type TaskView, type TaskViewState } from './state/reducer';
 import {
   authorizeSend,
   conversationInScope,
@@ -121,7 +128,48 @@ import {
   plainChangeLabel,
   parseApplyResult,
   type ApplyOutcomeView,
+  noIcons,
 } from './vscode/gitApply';
+import {
+  MALFORMED_VERIFICATION,
+  NOT_CONFIRMED,
+  SHOW_RESULT_BUTTON,
+  VERIFICATION_FEATURE,
+  VERIFICATION_GONE_TEXT,
+  VERIFICATION_IN_FLIGHT,
+  VERIFICATION_LANGUAGE,
+  VERIFICATION_METHODS,
+  VERIFICATION_SCHEME,
+  VERIFICATION_EXTENSION,
+  VERIFICATION_TOO_LATE,
+  VERIFICATION_UNSUPPORTED,
+  VERIFICATION_UNSUPPORTED_NOTE,
+  approveConfirmationView,
+  approvedCopy,
+  argvInputValue,
+  confirmStepItems,
+  finishedEventSummary,
+  outcomeCopy,
+  panelArgvLines,
+  parseArgvInput,
+  parseProjectContext,
+  parseRunStarted,
+  parseVerificationCommand,
+  parseVerificationList,
+  parseVerificationResult,
+  renderArgvDocument,
+  renderResultDocument,
+  revokeConfirmationView,
+  runBinding,
+  runConfirmationView,
+  runRowText,
+  runStartedCopy,
+  sandboxVerificationRunningCopy,
+  verificationErrorView,
+  type ConfirmationView,
+  type VerificationErrorView,
+  type VerificationOperation,
+} from './vscode/verification';
 import {
   MALFORMED_DIFF_COPY,
   PATCH_SCHEME,
@@ -180,6 +228,9 @@ import {
   type ConversationActionState,
   type ConversationListView,
   type SidebarState,
+  type TaskVerificationRow,
+  type VerificationAction,
+  type VerificationPanelView,
   type WebviewToExtension,
 } from './webview/bridge';
 
@@ -223,6 +274,9 @@ export interface SessionDeps {
   /** Wall clock for confirmation expiry display (tests pin it). */
   now?: () => number;
 }
+
+/** Marks a hydration that did not read `project.context` (background refresh). */
+const CONTEXT_NOT_READ = Symbol('project.context not read');
 
 const VSCODE_URI: UriFactory<vscode.Uri> = { file: (fsPath: string) => vscode.Uri.file(fsPath) };
 
@@ -302,7 +356,11 @@ export class SandpaneSession {
       // EVERY successful (re)connect — including a background reconnect after a
       // failed first attach — loads Core state. Previously a late reconnect left
       // the sidebar "online" with no data (review bug 9).
-      onReconnect: () => this.load(),
+      onReconnect: () => {
+        // A (re)connect is a project load: Core may be another instance.
+        this.verificationContextDue = true;
+        return this.load();
+      },
     });
     this.commands = new CoreCommands(this.connection);
   }
@@ -1240,8 +1298,14 @@ export class SandpaneSession {
   // Core operations (each is a typed RPC)
   // -----------------------------------------------------------------------
 
-  /** Reload from Core; (re)connects first when not online (the hook then loads). */
-  async refresh(): Promise<void> {
+  /**
+   * Reload from Core; (re)connects first when not online (the hook then loads).
+   * `background` (the auto-refresh timer) re-reads everything EXCEPT
+   * `project.context`, which is read on a project load, a reconnect, an
+   * explicit refresh or the Approve-suggestion action only (review I4).
+   */
+  async refresh(options: { background?: boolean } = {}): Promise<void> {
+    if (options.background !== true) this.verificationContextDue = true;
     if (!this.host.supported) {
       void vscode.window.showWarningMessage(this.host.explanation);
       return;
@@ -1319,6 +1383,11 @@ export class SandpaneSession {
     this.stopFeed();
     this.view = EMPTY_STATE;
     this.conversations = [];
+    // A7: another project's commands and suggestions are never shown here.
+    this.verificationContextDue = true;
+    this.verificationCommands = [];
+    this.verificationContext = null;
+    this.verificationNote = null;
     this.dropConversationOutOfScope();
     return true;
   }
@@ -1376,6 +1445,10 @@ export class SandpaneSession {
         'conversation.list not advertised by this Core — chat history cannot be enumerated (no fake list)',
       );
     }
+
+    // A7: not awaited — `project.context` may take up to its 45 s deadline,
+    // and the tasks and events must not wait for it. It repaints when it lands.
+    void this.hydrateVerification(projectId).then(() => this.emit());
   }
 
   async createProject(name: string, repositories: string[]): Promise<Project | undefined> {
@@ -1430,6 +1503,7 @@ export class SandpaneSession {
    * again with the IDENTICAL spec (same key); nothing calls it automatically.
    */
   private async runCreate(spec: SandboxCreateSpec, priorUnknown = false): Promise<SandboxSummary | undefined> {
+    this.noteKeySent(spec.idempotencyKey);
     try {
       const summary = await this.commands.sandboxCreate(spec);
       if (summary.replayed === true) {
@@ -1476,7 +1550,7 @@ export class SandpaneSession {
       this.reportKeyedFailure(
         error,
         'sandbox.create',
-        spec.idempotencyKey !== undefined,
+        spec.idempotencyKey,
         priorUnknown,
         () => this.runCreate(spec, true),
         () => this.refreshSandboxList(),
@@ -1504,11 +1578,12 @@ export class SandpaneSession {
   private reportKeyedFailure(
     error: unknown,
     operation: string,
-    keyed: boolean,
+    key: string | undefined,
     priorUnknown: boolean,
     attempt: () => Promise<unknown>,
     reread: () => Promise<unknown>,
   ): void {
+    const keyed = key !== undefined;
     const conflict = classifyKeyedConflict(error);
     if (conflict !== null) {
       this.reportError(error, operation, keyedConflictCopy(conflict));
@@ -1531,7 +1606,38 @@ export class SandpaneSession {
       );
       return;
     }
-    this.offerSafeRetry(operation, error, unsentRetry, attempt);
+    this.offerSafeRetry(operation, error, unsentRetry, attempt, key);
+  }
+
+  /** When each idempotency key was FIRST sent (memory only; pruned after Core's retention). */
+  private readonly keyFirstSentAt = new Map<string, number>();
+
+  private noteKeySent(key: string | undefined): void {
+    if (key === undefined || this.keyFirstSentAt.has(key)) return;
+    const now = this.now();
+    for (const [stored, at] of this.keyFirstSentAt) {
+      if (now - at > IDEMPOTENCY_RETENTION_MS) this.keyFirstSentAt.delete(stored);
+    }
+    if (this.keyFirstSentAt.size >= 1024) {
+      const oldest = this.keyFirstSentAt.keys().next().value;
+      if (oldest !== undefined) this.keyFirstSentAt.delete(oldest);
+    }
+    this.keyFirstSentAt.set(key, now);
+  }
+
+  /** "Retry safely" only within 23 h of the key's first send (Core keeps keys 24 h). */
+  private retryWindowOpen(key: string | undefined): boolean {
+    return safeRetryWindowOpen(key === undefined ? undefined : this.keyFirstSentAt.get(key), this.now());
+  }
+
+  private tooLateToRetry(operation: string): void {
+    const text =
+      `${operation} — Too late to retry safely: this request was first sent more than 23 hours ago and Core keeps ` +
+      'idempotency keys for 24 hours, so a retry could run it twice. The earlier request may have run; check state ' +
+      'before trying again. Nothing was sent.';
+    void vscode.window.showErrorMessage(text);
+    this.setStatus('error', text);
+    this.emit();
   }
 
   /**
@@ -1543,7 +1649,12 @@ export class SandpaneSession {
     error: unknown,
     retryUnsent: boolean,
     attempt: () => Promise<unknown>,
+    key: string | undefined,
   ): void {
+    if (!this.retryWindowOpen(key)) {
+      this.tooLateToRetry(operation);
+      return;
+    }
     const coreSaid = error instanceof Error ? plainText(error.message, 2_000) : '';
     const text =
       `${operation} — outcome UNKNOWN: Core did not confirm whether this request ran.\n\n` +
@@ -1558,7 +1669,7 @@ export class SandpaneSession {
     this.setStatus('error', `${operation}: outcome unknown — use "${RETRY_SAFELY}" or refresh to check.`);
     this.emit();
     void vscode.window.showErrorMessage(text, RETRY_SAFELY).then((choice) => {
-      if (choice === RETRY_SAFELY) void this.retryKeyed(operation, attempt);
+      if (choice === RETRY_SAFELY) void this.retryKeyed(operation, attempt, key);
     });
   }
 
@@ -1570,12 +1681,17 @@ export class SandpaneSession {
    * does not know yet. If Core cannot be reached, nothing was sent and the
    * original unknown outcome (with the same key) is offered again.
    */
-  private async retryKeyed(operation: string, attempt: () => Promise<unknown>): Promise<void> {
+  private async retryKeyed(operation: string, attempt: () => Promise<unknown>, key: string | undefined): Promise<void> {
+    // The window is re-checked at click time: the notification may have sat for hours.
+    if (!this.retryWindowOpen(key)) {
+      this.tooLateToRetry(operation);
+      return;
+    }
     try {
       if (this.connection.connectionState !== 'online') await this.connection.connect();
       this.capabilities = await this.commands.systemProbe();
     } catch (error) {
-      this.offerSafeRetry(operation, error, true, attempt);
+      this.offerSafeRetry(operation, error, true, attempt, key);
       return;
     }
     if (!this.coreHasFeature('idempotency-keys')) {
@@ -1696,7 +1812,9 @@ export class SandpaneSession {
       return undefined;
     }
     if (!(await this.ensureAdvertised('sandbox.stop', 'Stop sandbox'))) return undefined;
-    const confirm = stopConfirmation(validName, await this.activeTasksIn(validName));
+    // A7: catch up Core's events first, so a run started elsewhere is named.
+    if (this.verificationSupported()) await this.catchUpNow();
+    const confirm = stopConfirmation(validName, await this.activeTasksIn(validName), this.verificationRunningIn(validName));
     const answer = await vscode.window.showWarningMessage(
       confirm.message,
       { modal: true, detail: confirm.detail },
@@ -1756,7 +1874,11 @@ export class SandpaneSession {
       confirmation = await this.commands.sandboxRemoveRequest(validName);
     } catch (error) {
       // Step 1 changes nothing in Core, so even a timeout leaves nothing to undo.
-      this.reportError(error, 'sandbox.remove (confirmation request)', 'Nothing was removed.');
+      this.reportError(
+        error,
+        'sandbox.remove (confirmation request)',
+        sandboxVerificationRunningCopy(error) ?? 'Nothing was removed.',
+      );
       return false;
     }
     const view = removeConfirmationView(confirmation, this.now());
@@ -1788,7 +1910,7 @@ export class SandpaneSession {
       removed = result.removed === true;
     } catch (error) {
       const code = errorCodeOf(error);
-      const context =
+      const context = sandboxVerificationRunningCopy(error) ?? (
         code === 'VALIDATION_FAILED'
           ? 'Core refused the confirmation (wrong, expired or already used). Nothing was removed — run Remove again for a fresh confirmation.'
           : code === 'CONFLICT'
@@ -1797,7 +1919,7 @@ export class SandpaneSession {
               'removed; run Remove again for a fresh confirmation.'
             : code === 'NOT_FOUND'
               ? 'The sandbox disappeared between the confirmation and the removal.'
-              : null;
+              : null);
       this.reportLifecycleError(error, 'sandbox.remove', context);
       await this.refreshSandboxList();
       return false;
@@ -2042,6 +2164,7 @@ export class SandpaneSession {
     ctx: { scopeProjectId: string | null; sentPlanId: number; origin: 'sidebar' | 'command' },
     priorUnknown = false,
   ): Promise<void> {
+    this.noteKeySent(params.idempotencyKey);
     try {
       const summary = await this.commands.conversationSend(params);
       // Discard the plan only if it is still the one that was sent: a list the
@@ -2070,7 +2193,7 @@ export class SandpaneSession {
       this.reportKeyedFailure(
         error,
         'conversation.send',
-        params.idempotencyKey !== undefined,
+        params.idempotencyKey,
         priorUnknown,
         () => this.retrySend(params, ctx),
         () => this.reloadScope(),
@@ -2524,6 +2647,874 @@ export class SandpaneSession {
     });
   }
 
+  // -----------------------------------------------------------------------
+  // A7 — verification commands + project.context (design 2026-10-09 §3.7)
+  //
+  // Every write (approve, revoke, run) is reached ONLY from a user gesture:
+  // a contributed command (whose handler ignores its arguments) or a sidebar
+  // button (whose message carries no argv, command id or run id). Each opens
+  // a dialog filled from a FRESH Core read, then a native modal and a
+  // Cancel-first second step. Output is shown in a read-only
+  // `sandpane-verification:` document — never a terminal, never Markdown.
+  // Verification events are display-only: no task status is derived here.
+  // -----------------------------------------------------------------------
+
+  /** A7: in-memory backing store of the read-only `sandpane-verification:` documents. */
+  readonly verificationDocuments = new PatchDocumentStore(VERIFICATION_GONE_TEXT, VERIFICATION_EXTENSION);
+  /** Core's approved commands of the selected project (display cache, re-read on every load). */
+  private verificationCommands: VerificationCommand[] = [];
+  private verificationContext: ProjectContextResult | null = null;
+  /** Why the section is incomplete (a failed or malformed read), when it is. */
+  private verificationNote: string | null = null;
+  /** Tasks whose Run flow (dialogs or Core's answer) is open: one per task. */
+  private readonly verificationRunsOpening = new Set<string>();
+  /** Runs started from this window (runId → revealed label): their finish is announced. */
+  private readonly verificationRunsStartedHere = new Map<string, string>();
+  /** One approve / revoke dialog at a time. */
+  private verificationEditOpen = false;
+  /** Only the newest hydration may write the section (loads can overlap). */
+  private verificationGeneration = 0;
+  /** `project.context` is due: a project load, an explicit refresh or a reconnect (never the timer). */
+  private verificationContextDue = true;
+  /** The one `project.context` read in flight (two never overlap). */
+  private contextRead: { projectId: string; answer: Promise<unknown> } | null = null;
+
+  /** Single-flight `project.context`: a second caller joins the read in flight for that project. */
+  private readProjectContext(projectId: string): Promise<unknown> {
+    if (this.contextRead !== null && this.contextRead.projectId === projectId) return this.contextRead.answer;
+    const answer = this.commands.projectContext(projectId);
+    const entry = { projectId, answer };
+    this.contextRead = entry;
+    const clear = (): void => {
+      if (this.contextRead === entry) this.contextRead = null;
+    };
+    answer.then(clear, clear);
+    return answer;
+  }
+
+  /** Core advertises every A7 method AND the feature `verification` (last probe). */
+  private verificationSupported(): boolean {
+    return VERIFICATION_METHODS.every((method) => this.coreAdvertises(method)) && this.coreHasFeature(VERIFICATION_FEATURE);
+  }
+
+  /** Click-time gate: fresh probe; the method, the other A7 methods and the feature. */
+  private async ensureVerification(method: CoreMethodName, action: string): Promise<boolean> {
+    if (!(await this.ensureAdvertised(method, action))) return false;
+    if (!this.verificationSupported()) {
+      void vscode.window.showWarningMessage(VERIFICATION_UNSUPPORTED);
+      this.setStatus('error', VERIFICATION_UNSUPPORTED);
+      this.emit();
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Read-only hydration of the selected project's Verification section. A
+   * failure becomes a visible note; only the error CODE is logged (never a
+   * label, an argv or a note).
+   */
+  private async hydrateVerification(projectId: string): Promise<void> {
+    const generation = ++this.verificationGeneration;
+    if (!this.verificationSupported()) {
+      this.verificationCommands = [];
+      this.verificationContext = null;
+      this.verificationNote = null;
+      return;
+    }
+    const wantContext = this.verificationContextDue;
+    this.verificationContextDue = false;
+    const [list, context] = await Promise.allSettled([
+      this.commands.verificationList(projectId),
+      wantContext ? this.readProjectContext(projectId) : Promise.resolve(CONTEXT_NOT_READ),
+    ]);
+    // A stale answer (another project, or a newer load) never paints (W1).
+    if (this.selectedProjectId !== projectId || generation !== this.verificationGeneration) {
+      if (wantContext) this.verificationContextDue = true;
+      return;
+    }
+    const notes: string[] = [];
+    if (list.status === 'fulfilled') {
+      const commands = parseVerificationList(list.value);
+      this.verificationCommands = commands ?? [];
+      if (commands === null) notes.push(this.malformedVerificationNote('verification.list'));
+    } else {
+      this.verificationCommands = [];
+      notes.push(this.verificationReadNote(list.reason, 'verification.list'));
+    }
+    if (context.status === 'fulfilled' && context.value === CONTEXT_NOT_READ) {
+      // Background refresh: the last suggestions stay (same project).
+    } else if (context.status === 'fulfilled') {
+      const parsed = parseProjectContext(context.value);
+      this.verificationContext = parsed;
+      if (parsed === null) notes.push(this.malformedVerificationNote('project.context'));
+    } else {
+      this.verificationContext = null;
+      notes.push(this.verificationReadNote(context.reason, 'project.context'));
+    }
+    this.verificationNote = notes.length > 0 ? notes.join('\n') : null;
+  }
+
+  private verificationReadNote(error: unknown, operation: VerificationOperation): string {
+    this.log(`${operation} failed: ${errorCodeOf(error) ?? 'no Core error code'}`);
+    const view = verificationErrorView(error, operation);
+    return view === null ? `${operation}: Sandpane Core is not attached; nothing was read.` : noIcons(view.text);
+  }
+
+  private malformedVerificationNote(operation: VerificationOperation): string {
+    this.log(`${operation} answer failed the shape check (payload not logged)`);
+    return `${operation}: ${MALFORMED_VERIFICATION}`;
+  }
+
+  private async reloadVerification(projectId: string): Promise<void> {
+    await this.hydrateVerification(projectId);
+    this.emit();
+  }
+
+  private notConfirmed(): void {
+    this.setStatus('info', NOT_CONFIRMED);
+    this.emit();
+  }
+
+  private verificationWarning(text: string, tone: 'info' | 'error' = 'error'): void {
+    const shown = noIcons(text);
+    void vscode.window.showWarningMessage(shown);
+    this.setStatus(tone, shown);
+    this.emit();
+  }
+
+  /** A failed A7 call: honest copy (lost answer / Core refusal); the code only is logged. */
+  private reportVerificationFailure(error: unknown, operation: VerificationOperation): void {
+    const view = verificationErrorView(error, operation);
+    if (view === null) {
+      this.reportError(error, operation, 'Nothing was sent to Core.');
+      return;
+    }
+    this.log(`${operation} failed: ${errorCodeOf(error) ?? 'no answer from Core'}`);
+    this.showVerificationView(view);
+  }
+
+  private showVerificationView(view: VerificationErrorView): void {
+    const text = noIcons(view.text);
+    if (view.tone === 'warning') void vscode.window.showWarningMessage(text);
+    else void vscode.window.showErrorMessage(text);
+    // The status line carries the client's own sentence, never Core's text.
+    this.setStatus('error', text.split('\n\n')[0] ?? text);
+    this.emit();
+  }
+
+  private verificationProject(action: string): Project | null {
+    const project = this.projects.find((p) => p.id === this.selectedProjectId) ?? null;
+    if (!project) {
+      this.verificationWarning(`${action}: no project is selected. Nothing was sent.`);
+      return null;
+    }
+    return project;
+  }
+
+  /** One approve / revoke dialog at a time (two dialogs could confirm stale lists). */
+  private async verificationEdit(work: () => Promise<void>): Promise<void> {
+    if (this.verificationEditOpen) {
+      this.verificationWarning('Another verification dialog is open; finish it first. Nothing was sent.', 'info');
+      return;
+    }
+    this.verificationEditOpen = true;
+    try {
+      await work();
+    } finally {
+      this.verificationEditOpen = false;
+    }
+  }
+
+  /** Opens `text` as a read-only, plain-text `sandpane-verification:` document. */
+  private async openVerificationDocument(name: string, text: string): Promise<boolean> {
+    const { path } = this.verificationDocuments.put(name, text);
+    try {
+      let document = await vscode.workspace.openTextDocument(vscode.Uri.from({ scheme: VERIFICATION_SCHEME, path }));
+      if (document.languageId !== VERIFICATION_LANGUAGE) {
+        document = await vscode.languages.setTextDocumentLanguage(document, VERIFICATION_LANGUAGE);
+      }
+      await vscode.window.showTextDocument(document, { preview: true });
+      return true;
+    } catch (error) {
+      this.reportError(error, 'open verification view', 'The read-only view could not be opened, so nothing was sent.');
+      return false;
+    }
+  }
+
+  /**
+   * Native modal (every element, warnings), then the A6-style second step
+   * with Cancel as the first (active) item. A list the modal cuts is opened
+   * in full first. True only for the explicit choice in both.
+   */
+  private async confirmVerification(view: ConfirmationView, step: string, fullList: () => string): Promise<boolean> {
+    if (view.fullList && !(await this.openVerificationDocument('arguments', fullList()))) return false;
+    const answer = await vscode.window.showWarningMessage(view.message, { modal: true, detail: view.detail }, view.button);
+    if (answer !== view.button) return false;
+    const picked = await vscode.window.showQuickPick(confirmStepItems(step), {
+      title: view.message,
+      placeHolder: 'Cancel is selected; choose the second item to send it to Core.',
+      ignoreFocusOut: true,
+    });
+    return picked?.confirm === true;
+  }
+
+  private async askVerificationLabel(projectName: string): Promise<string | undefined> {
+    const problem = (value: string): string | null => {
+      try {
+        validateVerificationLabel(value);
+        return null;
+      } catch (error) {
+        return error instanceof Error ? error.message : 'invalid label';
+      }
+    };
+    const typed = await vscode.window.showInputBox({
+      title: noIcons(`Verification command for "${plainText(projectName, 120)}" (1/2: label)`),
+      prompt: 'A short name for this command (1 to 80 characters). Do not put tokens or passwords in it.',
+      ignoreFocusOut: true,
+      validateInput: problem,
+    });
+    if (typed === undefined) return undefined;
+    try {
+      return validateVerificationLabel(typed);
+    } catch (error) {
+      this.verificationWarning(`Add verification command: ${error instanceof Error ? error.message : 'invalid label'}. Nothing was sent.`);
+      return undefined;
+    }
+  }
+
+  /** The argv as ONE JSON array of strings: no shell split, glob, quoting or trimming. */
+  private async askVerificationArgv(projectName: string, prefill: readonly string[] | null): Promise<string[] | undefined> {
+    const typed = await vscode.window.showInputBox({
+      title: noIcons(`Verification command for "${plainText(projectName, 120)}" (2/2: arguments)`),
+      prompt:
+        'The exact argument list as a JSON array of strings, e.g. ["npm", "run", "test"]. No shell: nothing is ' +
+        'split, expanded or quoted for you. Do not put tokens or passwords in arguments.',
+      ...(prefill !== null ? { value: argvInputValue(prefill) } : {}),
+      ignoreFocusOut: true,
+      validateInput: (value: string) => {
+        const parsed = parseArgvInput(value);
+        return parsed.ok ? null : parsed.problem;
+      },
+    });
+    if (typed === undefined) return undefined;
+    const parsed = parseArgvInput(typed);
+    if (!parsed.ok) {
+      this.verificationWarning(`Add verification command: ${parsed.problem} Nothing was sent.`);
+      return undefined;
+    }
+    return parsed.argv;
+  }
+
+  private async confirmAndApprove(project: Project, label: string, argv: string[], notes: readonly string[]): Promise<void> {
+    const view = approveConfirmationView({ projectName: project.name, label, argv, notes });
+    const step = `Approve exactly ${argv.length === 1 ? 'this 1 argument' : `these ${argv.length} arguments`}`;
+    const confirmed = await this.confirmVerification(view, step, () =>
+      renderArgvDocument('arguments to approve', label, argv, notes),
+    );
+    if (!confirmed) {
+      this.notConfirmed();
+      return;
+    }
+    // I7: which commands existed BEFORE, so a byte-equal re-approval is told
+    // as such (Core returns the existing command). Read-only; best effort.
+    const knownIds = new Set(this.verificationCommands.map((c) => c.id));
+    try {
+      for (const c of parseVerificationList(await this.commands.verificationList(project.id)) ?? []) knownIds.add(c.id);
+    } catch (error) {
+      this.log(`verification.list before approve failed: ${errorCodeOf(error) ?? 'no Core error code'}`);
+    }
+    let raw: unknown;
+    try {
+      raw = await this.commands.verificationApprove({ projectId: project.id, label, argv });
+    } catch (error) {
+      this.reportVerificationFailure(error, 'verification.approve');
+      await this.reloadVerification(project.id);
+      return;
+    }
+    const command =
+      typeof raw === 'object' && raw !== null ? parseVerificationCommand((raw as { command?: unknown }).command) : null;
+    if (command === null) {
+      this.log('verification.approve answer failed the shape check (payload not logged)');
+      this.verificationWarning(
+        `verification.approve: ${MALFORMED_VERIFICATION} The command may have been approved; the Verification list is re-read.`,
+      );
+    } else {
+      const existing = knownIds.has(command.id) || command.label !== label;
+      const text = approvedCopy({ label: command.label, argvCount: command.argv.length, projectName: project.name, existing });
+      this.setStatus(existing ? 'info' : 'ok', text);
+      if (existing) void vscode.window.showInformationMessage(text);
+    }
+    await this.reloadVerification(project.id);
+  }
+
+  /** "Add verification command…": label + JSON argv → modal → second step → `verification.approve`. */
+  async approveVerificationCommand(): Promise<void> {
+    await this.verificationEdit(async () => {
+      if (!(await this.ensureVerification('verification.approve', 'Add verification command'))) return;
+      const project = this.verificationProject('Add verification command');
+      if (!project) return;
+      const label = await this.askVerificationLabel(project.name);
+      if (label === undefined) return this.notConfirmed();
+      const argv = await this.askVerificationArgv(project.name, null);
+      if (argv === undefined) return this.notConfirmed();
+      await this.confirmAndApprove(project, label, argv, []);
+    });
+  }
+
+  /**
+   * Approve one of Core's detected suggestions: a FRESH `project.context` →
+   * pick → the suggestion's argv prefilled exactly (still editable) → the
+   * same modal + step, with Core's notes about the suggestion in the modal.
+   */
+  async approveVerificationSuggestion(): Promise<void> {
+    await this.verificationEdit(async () => {
+      if (!(await this.ensureVerification('project.context', 'Approve a suggested verification command'))) return;
+      const project = this.verificationProject('Approve a suggested verification command');
+      if (!project) return;
+      let raw: unknown;
+      try {
+        raw = await this.readProjectContext(project.id);
+      } catch (error) {
+        this.reportVerificationFailure(error, 'project.context');
+        return;
+      }
+      const context = parseProjectContext(raw);
+      if (context === null) {
+        this.verificationWarning(this.malformedVerificationNote('project.context'));
+        return;
+      }
+      if (this.selectedProjectId === project.id) {
+        this.verificationContext = context;
+        this.verificationCommands = context.approved;
+        this.emit();
+      }
+      const approved = new Set(context.approved.map((c) => JSON.stringify(c.argv)));
+      const suggestions = context.repositories.flatMap((repo) =>
+        repo.detected.flatMap((manifest) =>
+          manifest.suggestedCommands.map((argv) => ({ repoPath: repo.repoPath, manifest: manifest.manifest, argv, notes: manifest.notes })),
+        ),
+      );
+      if (suggestions.length === 0) {
+        const unreadable = context.repositories.flatMap((r) => r.unreadable);
+        this.setStatus(
+          'info',
+          `Core detected no suggested command in this project's repositories` +
+            (unreadable.length > 0 ? ` (not read: ${unreadable.slice(0, 10).map((u) => plainText(u, 120)).join(', ')})` : '') +
+            '. Nothing was sent.',
+        );
+        this.emit();
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        suggestions.map((s) => ({
+          label: labelText(argvInputValue(s.argv)),
+          description: labelText(
+            `${plainText(s.manifest, 120)} in ${plainText(s.repoPath, 300)}${approved.has(JSON.stringify(s.argv)) ? ' (already approved)' : ''}`,
+          ),
+          ...(s.notes.length > 0 ? { detail: labelText(plainText(s.notes.join(' · '), 300)) } : {}),
+          suggestion: s,
+        })),
+        {
+          title: labelText(`Approve which suggested command for "${project.name}"? (detected by Core from root manifests; nothing runs now)`),
+          matchOnDescription: true,
+          ignoreFocusOut: true,
+        },
+      );
+      if (!picked) return this.notConfirmed();
+      const label = await this.askVerificationLabel(project.name);
+      if (label === undefined) return this.notConfirmed();
+      const argv = await this.askVerificationArgv(project.name, picked.suggestion.argv);
+      if (argv === undefined) return this.notConfirmed();
+      await this.confirmAndApprove(project, label, argv, picked.suggestion.notes);
+    });
+  }
+
+  /** A fresh `verification.list` for a dialog (never the cached rows). */
+  private async freshVerificationCommands(projectId: string): Promise<VerificationCommand[] | null> {
+    let raw: unknown;
+    try {
+      raw = await this.commands.verificationList(projectId);
+    } catch (error) {
+      this.reportVerificationFailure(error, 'verification.list');
+      return null;
+    }
+    const commands = parseVerificationList(raw);
+    if (commands === null) {
+      this.verificationWarning(this.malformedVerificationNote('verification.list'));
+      return null;
+    }
+    if (this.selectedProjectId === projectId) {
+      this.verificationCommands = commands;
+      this.emit();
+    }
+    return commands;
+  }
+
+  private async pickVerificationCommand(commands: VerificationCommand[], title: string): Promise<VerificationCommand | undefined> {
+    const picked = await vscode.window.showQuickPick(
+      commands.map((command) => ({
+        label: labelText(plainText(command.label, 120)),
+        description: labelText(argvInputValue(command.argv)),
+        command,
+      })),
+      { title: labelText(title), matchOnDescription: true, ignoreFocusOut: true },
+    );
+    return picked?.command;
+  }
+
+  /** "Revoke…": fresh list → pick → modal + second step → `verification.revoke`. */
+  async revokeVerificationCommand(): Promise<void> {
+    await this.verificationEdit(async () => {
+      if (!(await this.ensureVerification('verification.revoke', 'Revoke verification command'))) return;
+      const project = this.verificationProject('Revoke verification command');
+      if (!project) return;
+      const commands = await this.freshVerificationCommands(project.id);
+      if (commands === null) return;
+      if (commands.length === 0) {
+        this.setStatus('info', 'This project has no approved verification command. Nothing was sent.');
+        this.emit();
+        return;
+      }
+      const command = await this.pickVerificationCommand(commands, `Revoke which verification command of "${project.name}"?`);
+      if (!command) return this.notConfirmed();
+      const view = revokeConfirmationView(command);
+      const confirmed = await this.confirmVerification(view, 'Revoke it (future runs only)', () =>
+        renderArgvDocument('command to revoke', command.label, command.argv),
+      );
+      if (!confirmed) return this.notConfirmed();
+      let raw: unknown;
+      try {
+        raw = await this.commands.verificationRevoke(command.id);
+      } catch (error) {
+        this.reportVerificationFailure(error, 'verification.revoke');
+        await this.reloadVerification(project.id);
+        return;
+      }
+      const revoked = typeof raw === 'object' && raw !== null ? (raw as { revoked?: unknown }).revoked : undefined;
+      if (revoked === true) {
+        this.setStatus('ok', noIcons(`Revoked "${plainText(command.label, 120)}": it can no longer run; past results stay readable.`));
+      } else {
+        // W2: anything but `revoked: true` is NOT a confirmation.
+        this.log('verification.revoke answered without revoked:true (payload not logged)');
+        const text = noIcons(
+          `verification.revoke — Core did not confirm that "${plainText(command.label, 120)}" was revoked: it may not ` +
+            'have been revoked. The Verification list is re-read; check it before relying on the revocation.',
+        );
+        void vscode.window.showErrorMessage(text);
+        this.setStatus('error', text);
+      }
+      await this.reloadVerification(project.id);
+    });
+  }
+
+  /** The sidebar's Verification buttons (clicks). */
+  private async runVerificationAction(action: VerificationAction): Promise<void> {
+    switch (action) {
+      case 'add':
+        await this.approveVerificationCommand();
+        return;
+      case 'approveSuggestion':
+        await this.approveVerificationSuggestion();
+        return;
+      case 'revoke':
+        await this.revokeVerificationCommand();
+        return;
+      case 'refresh':
+        if (!(await this.ensureVerification('verification.list', 'Refresh verification'))) return;
+        if (this.selectedProjectId) await this.reloadVerification(this.selectedProjectId);
+        return;
+      default: {
+        const _exhaustive: never = action;
+        void _exhaustive;
+      }
+    }
+  }
+
+  /** "Run Verification…" from the palette: pick a task Core lists, then the Run flow. */
+  async runVerificationFromPicker(): Promise<void> {
+    if (!(await this.ensureVerification('verification.run', 'Run verification'))) return;
+    const project = this.verificationProject('Run verification');
+    if (!project) return;
+    let tasks: TaskSummary[];
+    try {
+      tasks = await this.commands.taskList({ projectId: project.id });
+    } catch (error) {
+      this.reportError(error, 'task.list (for Run verification)', 'Nothing was sent.');
+      return;
+    }
+    if (tasks.length === 0) {
+      this.setStatus('info', 'Core lists no task in this project, so there is nothing to verify. Nothing was sent.');
+      this.emit();
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      tasks.map((task) => {
+        const binding = runBinding(task, this.sandboxes);
+        return {
+          label: labelText(`task ${plainText(task.id, 200).slice(0, 8)}`),
+          description: labelText(
+            `${plainText(String(task.status), 40)} · ${binding.ok ? `sandbox ${binding.sandboxName} (${binding.workspaceMode})` : binding.reason}`,
+          ),
+          taskId: task.id,
+        };
+      }),
+      { title: 'Run a verification on which task?', ignoreFocusOut: true },
+    );
+    if (!picked) return this.notConfirmed();
+    await this.runVerificationOnTask(picked.taskId);
+  }
+
+  /**
+   * Verify… on one task. Single-flight per task (dialogs AND Core's answer).
+   * The binding is read FRESH at click time: `expectedSandboxName` is
+   * `TaskSummary.sandboxName` (never `chosenSandboxName`) and
+   * `expectedWorkspaceMode` that sandbox's `sandbox.list` mode — exactly what
+   * the modal shows. A fresh idempotency key per gesture; only "Retry
+   * safely" reuses it.
+   */
+  async runVerificationOnTask(taskId: string): Promise<void> {
+    if (this.verificationRunsOpening.has(taskId)) {
+      this.verificationWarning(VERIFICATION_IN_FLIGHT, 'info');
+      return;
+    }
+    this.verificationRunsOpening.add(taskId);
+    this.emit();
+    try {
+      await this.runVerificationFlow(taskId);
+    } finally {
+      this.verificationRunsOpening.delete(taskId);
+      this.emit();
+    }
+  }
+
+  private async runVerificationFlow(taskId: string): Promise<void> {
+    if (!(await this.ensureVerification('verification.run', 'Run verification'))) return;
+    const project = this.verificationProject('Run verification');
+    if (!project) return;
+    let tasks: TaskSummary[];
+    let sandboxes: SandboxSummary[];
+    try {
+      [tasks, sandboxes] = await Promise.all([this.commands.taskList({ projectId: project.id }), this.commands.sandboxList()]);
+    } catch (error) {
+      this.reportError(error, 'task.list / sandbox.list (for Run verification)', 'Nothing was sent.');
+      return;
+    }
+    this.sandboxes = sandboxes;
+    this.sandboxListRead = true;
+    if (this.selectedProjectId === project.id) this.view = reduceTaskView(this.view, { kind: 'taskList', tasks });
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task) {
+      this.verificationWarning('Run verification: Core no longer lists this task in the selected project. Nothing was sent.');
+      return;
+    }
+    const binding = runBinding(task, sandboxes);
+    if (!binding.ok) {
+      this.verificationWarning(`Run verification: ${binding.reason}. Nothing was sent.`);
+      return;
+    }
+    const commands = await this.freshVerificationCommands(project.id);
+    if (commands === null) return;
+    if (commands.length === 0) {
+      this.setStatus('info', 'This project has no approved verification command; add one first. Nothing was sent.');
+      this.emit();
+      return;
+    }
+    const command = await this.pickVerificationCommand(
+      commands,
+      `Run which verification command on task ${taskId.slice(0, 8)} (sandbox ${binding.sandboxName}, ${binding.workspaceMode})?`,
+    );
+    if (!command) return this.notConfirmed();
+    const view = runConfirmationView({
+      taskId,
+      label: command.label,
+      argv: command.argv,
+      sandboxName: binding.sandboxName,
+      workspaceMode: binding.workspaceMode,
+    });
+    const confirmed = await this.confirmVerification(view, `Run "${plainText(command.label, 120)}" now`, () =>
+      renderArgvDocument('command to run', command.label, command.argv),
+    );
+    if (!confirmed) return this.notConfirmed();
+    const params: VerificationRunParams = {
+      taskId,
+      commandId: command.id,
+      expectedSandboxName: binding.sandboxName,
+      expectedWorkspaceMode: binding.workspaceMode,
+      idempotencyKey: newIdempotencyKey(),
+    };
+    await this.attemptVerificationRun(params, plainText(command.label, 120), false);
+  }
+
+  /** One `verification.run` attempt with fixed params (a retry resends them unchanged). */
+  private async attemptVerificationRun(params: VerificationRunParams, label: string, priorUnknown: boolean): Promise<void> {
+    this.noteKeySent(params.idempotencyKey);
+    let raw: unknown;
+    try {
+      raw = await this.commands.verificationRun(params);
+    } catch (error) {
+      const view = verificationErrorView(error, 'verification.run');
+      if (view === null) {
+        if (priorUnknown) {
+          // The retry never left: the FIRST attempt's outcome is still unknown.
+          this.offerVerificationRetry(
+            'verification.run — the retry could not reach Core, so nothing new was sent; the earlier attempt\'s ' +
+              'outcome is still unknown (the verification may have started).',
+            params,
+            label,
+          );
+          return;
+        }
+        this.reportError(error, 'verification.run', 'Nothing was sent to Core, so nothing was run.');
+        return;
+      }
+      this.log(`verification.run failed: ${errorCodeOf(error) ?? 'no answer from Core'}`);
+      if (view.retrySafely) {
+        this.offerVerificationRetry(view.text, params, label);
+        return;
+      }
+      this.showVerificationView(view);
+      return;
+    }
+    const started = parseRunStarted(raw);
+    if (started === null) {
+      this.log('verification.run answer failed the shape check (payload not logged)');
+      this.verificationWarning(
+        `verification.run: ${MALFORMED_VERIFICATION} The verification may have started; use Results… on the task to check.`,
+      );
+      return;
+    }
+    this.verificationRunsStartedHere.set(started.runId, label);
+    const text = runStartedCopy(label, started);
+    void vscode.window.showInformationMessage(text);
+    this.setStatus('ok', text);
+    this.emit();
+    // Read Core's durable `verification.started` (and a replay's finish) now:
+    // the feed does not poll a terminal task, and the stop warning needs it.
+    await this.catchUpNow();
+  }
+
+  /** The lost-answer notification; only the "Retry safely" click resends (same key, same params). */
+  private offerVerificationRetry(text: string, params: VerificationRunParams, label: string): void {
+    if (!this.retryWindowOpen(params.idempotencyKey)) {
+      // #9: Core may have forgotten the key: a resend could start it twice.
+      const late = noIcons(`${text}\n\n${VERIFICATION_TOO_LATE}`);
+      void vscode.window.showErrorMessage(late);
+      this.setStatus('error', `verification.run: ${VERIFICATION_TOO_LATE}`);
+      this.emit();
+      return;
+    }
+    const shown = noIcons(text);
+    this.setStatus('error', `verification.run: outcome unknown — use "${RETRY_SAFELY}" or open Results… to check.`);
+    this.emit();
+    void vscode.window.showErrorMessage(shown, RETRY_SAFELY).then((choice) => {
+      if (choice === RETRY_SAFELY) void this.retryVerificationRun(params, label);
+    });
+  }
+
+  /**
+   * Click-time gate for "Retry safely" (as `retryKeyed`): attach if needed,
+   * re-probe THIS Core, and resend only if it still advertises
+   * `idempotency-keys`, `verification` and `verification.run`.
+   */
+  private async retryVerificationRun(params: VerificationRunParams, label: string): Promise<void> {
+    // #9: re-checked at click time — the notification may have sat for hours.
+    if (!this.retryWindowOpen(params.idempotencyKey)) {
+      void vscode.window.showErrorMessage(VERIFICATION_TOO_LATE);
+      this.setStatus('error', `verification.run: ${VERIFICATION_TOO_LATE}`);
+      this.emit();
+      return;
+    }
+    if (this.verificationRunsOpening.has(params.taskId)) {
+      this.verificationWarning(VERIFICATION_IN_FLIGHT, 'info');
+      return;
+    }
+    this.verificationRunsOpening.add(params.taskId);
+    this.emit();
+    try {
+      try {
+        if (this.connection.connectionState !== 'online') await this.connection.connect();
+        this.capabilities = await this.commands.systemProbe();
+      } catch {
+        this.offerVerificationRetry(
+          'verification.run — the retry could not reach Core, so nothing new was sent; the earlier attempt\'s ' +
+            'outcome is still unknown (the verification may have started).',
+          params,
+          label,
+        );
+        return;
+      }
+      if (!this.coreHasFeature('idempotency-keys') || !this.verificationSupported()) {
+        this.verificationWarning(
+          'Not retried: the connected Core no longer advertises idempotency keys and verification, so a retry could ' +
+            'start it twice. Nothing was sent; open Results… on the task to check.',
+        );
+        return;
+      }
+      await this.attemptVerificationRun(params, label, true);
+    } finally {
+      this.verificationRunsOpening.delete(params.taskId);
+      this.emit();
+    }
+  }
+
+  /** "Results…" on one task: pick a run named by Core's events, open its result. */
+  async showVerificationResults(taskId: string): Promise<void> {
+    if (!(await this.ensureVerification('verification.result', 'Show verification result'))) return;
+    await this.catchUpNow();
+    await this.pickAndOpenRun(taskId);
+  }
+
+  /** "Show Verification Result…" from the palette: pick a task with runs, then a run. */
+  async showVerificationResultFromPicker(): Promise<void> {
+    if (!(await this.ensureVerification('verification.result', 'Show verification result'))) return;
+    await this.catchUpNow();
+    const tasks = selectTasks(this.view).filter((task) => (task.verifications ?? []).length > 0);
+    if (tasks.length === 0) {
+      this.setStatus('info', "Core's events name no verification run for the tasks of this project. Nothing was requested.");
+      this.emit();
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      tasks.map((task) => ({
+        label: labelText(`task ${plainText(task.taskId, 200).slice(0, 8)}`),
+        description: `${(task.verifications ?? []).length} verification run(s)`,
+        taskId: task.taskId,
+      })),
+      { title: 'Show the verification result of which task?', ignoreFocusOut: true },
+    );
+    if (!picked) return;
+    await this.pickAndOpenRun(picked.taskId);
+  }
+
+  private async pickAndOpenRun(taskId: string): Promise<void> {
+    const runs = [...(this.view.tasks[taskId]?.verifications ?? [])].reverse();
+    if (runs.length === 0) {
+      this.setStatus('info', "Core's events name no verification run for this task yet. Nothing was requested.");
+      this.emit();
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      runs.map((run) => ({
+        label: labelText(run.label),
+        description: labelText(run.finished ?? outcomeCopy('running')),
+        runId: run.runId,
+      })),
+      { title: labelText(`Show which verification result of task ${taskId.slice(0, 8)}? (read-only)`), ignoreFocusOut: true },
+    );
+    if (!picked) return;
+    await this.openVerificationResult(picked.runId);
+  }
+
+  /** `verification.result` → the read-only, revealed plain-text document. */
+  private async openVerificationResult(runId: string): Promise<boolean> {
+    let raw: unknown;
+    try {
+      raw = await this.commands.verificationResult(runId);
+    } catch (error) {
+      this.reportVerificationFailure(error, 'verification.result');
+      return false;
+    }
+    const result = parseVerificationResult(raw);
+    if (result === null) {
+      this.verificationWarning(this.malformedVerificationNote('verification.result'));
+      return false;
+    }
+    // W3a: "not linked" only when link detection is off for this language
+    // (a workspace or user override can turn it back on).
+    const links = vscode.workspace.getConfiguration('editor', { languageId: VERIFICATION_LANGUAGE }).get<unknown>('links');
+    const document = renderResultDocument(result, { linksDisabled: links === false });
+    if (!(await this.openVerificationDocument(`verification-${runId.slice(0, 8)}`, document))) return false;
+    this.setStatus(
+      'info',
+      noIcons(`Result of "${plainText(result.label, 120)}" opened read-only: ${outcomeCopy(result.outcome, result.exitCode)}.`),
+    );
+    this.emit();
+    return true;
+  }
+
+  /** A run started in this window finished (Core's event): say so; "Show result" is a click. */
+  private notifyFinishedRuns(events: readonly { kind: string; payload: unknown }[]): void {
+    for (const event of events) {
+      if (event.kind !== VERIFICATION_EVENT_KINDS.finished) continue;
+      const summary = finishedEventSummary(event.payload);
+      if (summary === null) continue;
+      const label = this.verificationRunsStartedHere.get(summary.runId);
+      if (label === undefined) continue;
+      this.verificationRunsStartedHere.delete(summary.runId);
+      void Promise.resolve(
+        vscode.window.showInformationMessage(
+          noIcons(`Verification "${label}" finished: ${summary.text}. The task status is not changed.`),
+          SHOW_RESULT_BUTTON,
+        ),
+      ).then(async (choice) => {
+        if (choice !== SHOW_RESULT_BUTTON) return;
+        if (await this.ensureVerification('verification.result', 'Show verification result')) {
+          await this.openVerificationResult(summary.runId);
+        }
+      });
+    }
+  }
+
+  /** A run this client saw start (and not finish) in `sandbox` — for the stop warning. */
+  private verificationRunningIn(sandbox: string): boolean {
+    return selectTasks(this.view).some((task) =>
+      (task.verifications ?? []).some((run) => run.sandbox === sandbox && run.finished === null),
+    );
+  }
+
+  private taskVerificationRow(task: TaskView): TaskVerificationRow {
+    const supported = this.verificationSupported();
+    const binding = runBinding(task, this.sandboxes);
+    const opening = this.verificationRunsOpening.has(task.taskId);
+    return {
+      runEnabled: supported && binding.ok && !opening,
+      runReason: !supported
+        ? 'not supported by the attached Sandpane Core'
+        : !binding.ok
+          ? binding.reason
+          : opening
+            ? 'a verification is being started for this task'
+            : null,
+      runs: [...(task.verifications ?? [])].reverse().slice(0, 10).map(runRowText),
+    };
+  }
+
+  private verificationPanel(): VerificationPanelView {
+    if (!this.verificationSupported()) {
+      return {
+        supported: false,
+        note: this.capabilities ? VERIFICATION_UNSUPPORTED_NOTE : 'Sandpane Core is not attached.',
+        commands: [],
+        repositories: [],
+      };
+    }
+    if (!this.selectedProjectId) {
+      return { supported: true, note: 'Select a project to see its verification commands.', commands: [], repositories: [] };
+    }
+    const cap = (text: string): string => {
+      const points = Array.from(text);
+      return points.length > 300 ? `${points.slice(0, 300).join('')}… (cut here)` : text;
+    };
+    return {
+      supported: true,
+      note: this.verificationNote,
+      commands: this.verificationCommands.map((command) => ({
+        label: plainText(command.label, 120),
+        argv: panelArgvLines(command.argv),
+      })),
+      repositories: (this.verificationContext?.repositories ?? []).map((repo) => ({
+        repoPath: plainText(repo.repoPath, 300),
+        unreadable: repo.unreadable.map((name) => plainText(name, 200)),
+        manifests: repo.detected.map((manifest) => ({
+          manifest: plainText(manifest.manifest, 120),
+          suggestions: manifest.suggestedCommands.slice(0, 20).map((argv) => cap(argvInputValue(argv))),
+          notes: manifest.notes.slice(0, 20).map((note) => plainText(note, 700)),
+        })),
+      })),
+    };
+  }
+
   /**
    * Build the attachment list for the composer preview. The plan is held until
    * the user sends, and only its references go on the wire.
@@ -2626,6 +3617,16 @@ export class SandpaneSession {
       case 'conversationAction':
         void this.runConversationAction(message.action, message.conversationId);
         break;
+      case 'verificationAction':
+        // A7: a click opens a native dialog filled from Core; nothing else is sent.
+        void this.runVerificationAction(message.action);
+        break;
+      case 'runVerification':
+        void this.runVerificationOnTask(message.taskId);
+        break;
+      case 'showVerificationResults':
+        void this.showVerificationResults(message.taskId);
+        break;
       default: {
         const _exhaustive: never = message;
         void _exhaustive;
@@ -2716,6 +3717,7 @@ export class SandpaneSession {
       gitDiffSupported: this.coreAdvertises('git.diff'),
       gitApplySupported: this.coreAdvertises('git.apply') && this.coreHasFeature(GIT_APPLY_FEATURE),
       applyInFlight: this.applyInFlight,
+      verification: this.verificationPanel(),
       lines: transcript.lines.map((line) => ({
         role: line.role,
         text: line.text,
@@ -2732,6 +3734,7 @@ export class SandpaneSession {
         unknownKinds: task.unknownKinds,
         ...optionalText('mode', taskModeText(task.mode)),
         ...optionalText('chosenSandboxName', chosenSandboxText(task.chosenSandboxName)),
+        verification: this.taskVerificationRow(task),
       })),
       acceptedSends: this.acceptedSends,
       sending: this.sending,
@@ -2835,6 +3838,7 @@ export class SandpaneSession {
         onApplied: (events) => {
           if (!isCurrent()) return;
           this.view = reduceTaskView(this.view, { kind: 'taskEvents', events });
+          this.notifyFinishedRuns(events);
           this.emit();
         },
         onError: (error) => {

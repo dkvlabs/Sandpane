@@ -311,6 +311,7 @@ function describeEntry(entry: TimelineEntry): string {
     case "unmodelled":
       return entry.detail;
     case "git-apply":
+    case "verification":
       return entry.text;
     case "user-message":
       return `You: ${entry.text}`;

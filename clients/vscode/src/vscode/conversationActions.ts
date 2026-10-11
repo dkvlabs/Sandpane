@@ -24,6 +24,7 @@ import {
   MAX_IMPACT_LINE_CHARS,
   describeExpiry,
 } from './sandboxActions';
+import { CONVERSATION_VERIFICATION_RUNNING_COPY, MSG_CONVERSATION_VERIFICATION_RUNNING } from './verification';
 
 // --- Core's exact messages (sandpane-service conversation_lifecycle.rs) ---
 export const MSG_CONVERSATION_ARCHIVED = 'conversation is archived; unarchive it first; nothing was changed';
@@ -40,6 +41,8 @@ const COPY: ReadonlyArray<[code: string, message: string, copy: string]> = [
     MSG_CONVERSATION_HAS_TASKS,
     'The conversation has unfinished tasks. Cancel or finish them first; nothing was deleted.',
   ],
+  // A7: Core refuses a delete while a verification runs for one of the conversation's tasks.
+  ['CONFLICT', MSG_CONVERSATION_VERIFICATION_RUNNING, CONVERSATION_VERIFICATION_RUNNING_COPY],
   ['NOT_FOUND', MSG_CONVERSATION_NOT_FOUND, 'Core has no such conversation (it may have been deleted); nothing was changed.'],
   ['VALIDATION_FAILED', MSG_TITLE_BLANK, 'The title must not be empty or whitespace-only; nothing was changed.'],
 ];

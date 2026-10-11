@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/project-context.schema.json",
+  "title": "SandpaneProjectContext",
+  "description": "A7 project.context (design 2026-10-09 §3.7 item 9): params and result. Hand-synced with sandpane_protocol::{ProjectContextParams, ProjectContextResult, RepositoryContext, DetectedManifest}. Only syntax-checked by `make schema-lint`; not read by the value-set drift gate. Read-only and bounded: only ROOT manifests of registered repositories are read (O_DIRECTORY|O_NOFOLLOW root + identity check, race-safe O_NOFOLLOW leaf reads, 256 KiB per file); Core runs no tool. Suggestions and notes are UNTRUSTED display strings: never auto-approved, never run.",
+  "$defs": {
+    "ProjectContextParams": {
+      "type": "object",
+      "required": [
+        "projectId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "projectId": {
+          "type": "string"
+        }
+      }
+    },
+    "DetectedManifest": {
+      "type": "object",
+      "required": [
+        "manifest",
+        "suggestedCommands",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "manifest": {
+          "type": "string",
+          "description": "Root file name: package.json, Cargo.toml, go.mod, GNUmakefile/makefile/Makefile, build.gradle.kts/build.gradle (with a gradlew file), pyproject.toml."
+        },
+        "suggestedCommands": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": "Argv vectors; approving one goes through verification.approve with argv shown exactly."
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          },
+          "description": "Each at most 512 bytes (a cut note ends with an ellipsis). May quote script text from the repository verbatim (untrusted)."
+        }
+      }
+    },
+    "RepositoryContext": {
+      "type": "object",
+      "required": [
+        "repoPath",
+        "detected",
+        "unreadable"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "repoPath": {
+          "type": "string"
+        },
+        "detected": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DetectedManifest"
+          }
+        },
+        "unreadable": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Root file names nothing was taken from (over 256 KiB, a symlink, a UTF-8 BOM, invalid JSON, not a regular file, unreadable). \".\" = the repository root itself could not be opened or failed the identity check."
+        }
+      }
+    },
+    "ProjectContextResult": {
+      "type": "object",
+      "required": [
+        "repositories",
+        "approved"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "repositories": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RepositoryContext"
+          }
+        },
+        "approved": {
+          "type": "array",
+          "items": {
+            "$ref": "verification.schema.json#/$defs/VerificationCommand"
+          },
+          "description": "Repeats verification.list."
+        }
+      }
+    }
+  }
+}

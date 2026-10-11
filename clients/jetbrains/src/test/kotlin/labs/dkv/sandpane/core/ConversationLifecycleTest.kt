@@ -514,6 +514,8 @@ class ConversationLifecycleTest {
             Triple(CoreMethods.CONVERSATION_UNARCHIVE, CoreErrorCodes.VALIDATION_FAILED, ConversationOutcomes.MSG_PROJECT_ARCHIVED) to "nothing was changed",
             Triple(CoreMethods.CONVERSATION_DELETE, CoreErrorCodes.CONFLICT, ConversationOutcomes.MSG_CONVERSATION_HAS_TASKS) to "nothing was deleted",
             Triple(CoreMethods.CONVERSATION_ARCHIVE, CoreErrorCodes.NOT_FOUND, ConversationOutcomes.MSG_CONVERSATION_NOT_FOUND) to "nothing was changed",
+            // A7: Core refuses a delete while a verification runs for one of the conversation's tasks.
+            Triple(CoreMethods.CONVERSATION_DELETE, CoreErrorCodes.CONFLICT, Verifications.MSG_CONVERSATION_VERIFICATION_RUNNING) to "nothing was deleted",
         )
         assertEquals(ConversationOutcomes.KNOWN_MESSAGES, cases.map { it.first.third }.toSet(), "every known message has a case")
         for ((case, expected) in cases) {

@@ -407,3 +407,49 @@ describe('A6 apply events are shown honestly and never move the status', () => {
     }
   });
 });
+
+describe('A7 verification events are display-only and never move the status', () => {
+  const started = { runId: 'run-1', commandId: 'cmd-1', label: 'unit \u202etests', argv: ['cargo', 'test'], sandbox: 'atlas-box', workspaceMode: 'sbx_clone' };
+  const finished = {
+    runId: 'run-1', startedSequence: 2, outcome: 'exited', exitCode: 1, stdoutBytes: 10, stderrBytes: 0,
+    stdoutTruncated: true, stderrTruncated: false, redactions: { bestEffort: true, replacements: 2, byKind: {} }, elapsedMs: 5,
+    outputIncomplete: true,
+  };
+  const run = (...events: [string, unknown][]) => {
+    let state = reduceTaskView(EMPTY_STATE, { kind: 'taskEvent', event: ev('t1', 1, 'status.changed', { to: 'awaiting_review' }) });
+    events.forEach(([kind, payload], i) => {
+      state = reduceTaskView(state, { kind: 'taskEvent', event: ev('t1', i + 2, kind, payload) });
+    });
+    const task = selectTask(state, 't1');
+    expect(task?.status).toBe('awaiting_review');
+    expect(task?.unknownKinds).toEqual([]);
+    return task;
+  };
+
+  it('started → a revealed line and an open run (sandbox kept raw for comparison)', () => {
+    const task = run(['verification.started', started]);
+    expect(task?.lines.at(-1)?.text).toContain('verification started: unit \\u202Etests');
+    expect(task?.lines.at(-1)?.text).toContain('the task status is not changed');
+    expect(task?.verifications).toEqual([
+      { runId: 'run-1', label: 'unit \\u202Etests', sandbox: 'atlas-box', startedSequence: 2, finished: null, outcome: null },
+    ]);
+  });
+
+  it('finished → honest outcome copy with every disclosure; never "passed" / "failed"', () => {
+    const task = run(['verification.started', started], ['verification.finished', finished]);
+    const text = task?.verifications?.[0]?.finished ?? '';
+    expect(text).toContain('exit status 1 (as reported by sbx exec)');
+    expect(text).toContain('stdout was truncated at 64 KiB');
+    expect(text).toContain('output may be incomplete: a process kept the output open after the command exited');
+    expect(text).toContain('2 values were redacted (best effort)');
+    expect(text).not.toMatch(/passed|failed/i);
+    expect(task?.lines.at(-1)?.text).toMatch(/^verification finished: /);
+  });
+
+  it('a finished event without its started event, a malformed payload, or a replayed start do not crash or duplicate', () => {
+    const task = run(['verification.finished', finished], ['verification.finished', { nope: true }], ['verification.started', 'not an object']);
+    expect(task?.verifications).toHaveLength(1);
+    expect(task?.verifications?.[0]?.label).toBe('(its started event is not in this view)');
+    expect(task?.lines.map((l) => l.text)).toContain('verification finished (Core recorded an outcome this client cannot read)');
+  });
+});

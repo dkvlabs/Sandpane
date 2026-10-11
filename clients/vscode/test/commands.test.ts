@@ -213,9 +213,9 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
     );
   });
 
-  it('exposes exactly the 28 allowlisted methods and nothing else', () => {
-    expect(CORE_METHODS).toHaveLength(28);
-    expect(new Set(CORE_METHODS).size).toBe(28);
+  it('exposes exactly the 34 allowlisted methods and nothing else', () => {
+    expect(CORE_METHODS).toHaveLength(34);
+    expect(new Set(CORE_METHODS).size).toBe(34);
     expect(CORE_METHODS).not.toContain('shell.exec');
     expect(CORE_METHODS).not.toContain('sbx.raw');
     expect(CORE_METHODS).not.toContain('sandbox.start');
@@ -257,6 +257,13 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
       gitReview: 'git.review',
       gitDiff: 'git.diff',
       gitApply: 'git.apply',
+      // A7 (§3.7): one wrapper per method; none takes a command string.
+      verificationList: 'verification.list',
+      verificationApprove: 'verification.approve',
+      verificationRevoke: 'verification.revoke',
+      verificationRun: 'verification.run',
+      verificationResult: 'verification.result',
+      projectContext: 'project.context',
     };
     // No extra callable method on the prototype (AGENTS.md: no free-form RPC).
     expect(names.sort()).toEqual(Object.keys(wrapperToMethod).sort());

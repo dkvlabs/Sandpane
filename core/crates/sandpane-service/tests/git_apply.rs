@@ -2564,13 +2564,15 @@ fn review_reports_the_hooks_path_only_when_repo_relative() {
 }
 
 #[test]
-fn the_probe_advertises_git_apply_with_28_methods() {
+fn the_probe_advertises_git_apply_with_34_methods() {
     let mut env = Env::new();
     let caps = env.ok("system.probe", serde_json::json!({}));
     assert!(caps["features"]
         .as_array()
         .unwrap()
         .contains(&serde_json::json!("git-apply")));
-    assert_eq!(caps["features"].as_array().unwrap().len(), 5);
-    assert_eq!(caps["methods"].as_array().unwrap().len(), 28);
+    // 5 features / 28 methods after A6; A7 added "verification" and six
+    // methods.
+    assert_eq!(caps["features"].as_array().unwrap().len(), 6);
+    assert_eq!(caps["methods"].as_array().unwrap().len(), 34);
 }

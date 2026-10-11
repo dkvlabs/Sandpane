@@ -17,6 +17,7 @@ import {
   describeExpiry,
   pickText,
 } from './sandboxActions';
+import { MSG_PROJECT_VERIFICATION_RUNNING, PROJECT_VERIFICATION_RUNNING_COPY } from './verification';
 
 // --- Core's exact messages (sandpane-service project_lifecycle.rs / confirm.rs) ---
 export const MSG_PROJECT_ARCHIVED = 'project is archived; unarchive it first; nothing was changed';
@@ -43,6 +44,8 @@ const COPY: ReadonlyArray<[code: string, message: string, copy: string]> = [
   ['VALIDATION_FAILED', MSG_PROJECT_ARCHIVED, 'This project is archived. Unarchive it first; nothing was changed.'],
   ['CONFLICT', MSG_PROJECT_HAS_TASKS, 'The project has unfinished tasks. Cancel or finish them first; nothing was deleted.'],
   ['CONFLICT', MSG_PROJECT_HAS_SANDBOXES, 'The project still has sandboxes. Remove them first; nothing was deleted.'],
+  // A7: Core refuses a delete while a verification runs for one of the project's tasks.
+  ['CONFLICT', MSG_PROJECT_VERIFICATION_RUNNING, PROJECT_VERIFICATION_RUNNING_COPY],
   ['CONFLICT', MSG_PROJECT_CREATE_IN_FLIGHT, 'A sandbox is being created for this project. Try again when it finishes; nothing was deleted.'],
   ['CONFLICT', MSG_REPOSITORY_IN_USE, 'A task or sandbox of this project uses that repository; nothing was removed.'],
   ['CONFLICT', MSG_REPOSITORY_REMOVE_WHILE_CREATING, 'A sandbox is being created for this project. Try again when it finishes; nothing was removed.'],

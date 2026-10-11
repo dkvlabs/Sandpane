@@ -207,10 +207,18 @@ class ProtocolDriftGuardTest {
     fun kotlinMethodsMatchRustMethodAllExactlyIncludingOrder() {
         val fromAll = methodAllWireNames()
         assertEquals(CoreMethods.ALL, fromAll, "CoreMethods.ALL drifted from Method::ALL (order included)")
-        assertEquals(28, fromAll.size, "addition A5 advertises 28 methods")
+        assertEquals(34, fromAll.size, "addition A7 advertises 34 methods")
         // A5: git.diff sits immediately after git.review and before git.apply.
         assertEquals(fromAll.indexOf("git.review") + 1, fromAll.indexOf("git.diff"))
         assertEquals(fromAll.indexOf("git.diff") + 1, fromAll.indexOf("git.apply"))
+        // A7: the six verification methods follow git.apply, in this exact order, at the end.
+        assertEquals(
+            listOf(
+                "verification.list", "verification.approve", "verification.revoke", "verification.run",
+                "verification.result", "project.context",
+            ),
+            fromAll.subList(fromAll.indexOf("git.apply") + 1, fromAll.size),
+        )
 
         // parse() must accept every advertised name, and the schema enum must carry the same set.
         val parsed = parseArms().toSet()
@@ -230,6 +238,8 @@ class ProtocolDriftGuardTest {
             "project.add_repository", "project.remove_repository",
             "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
             "conversation.export", "git.diff",
+            "verification.list", "verification.approve", "verification.revoke", "verification.run",
+            "verification.result", "project.context",
         ).forEach { added ->
             assertTrue(fromAll.contains(added), "Rust no longer advertises $added")
             assertTrue(CoreMethods.ALL.contains(added), "the Kotlin mirror dropped $added")
@@ -246,7 +256,7 @@ class ProtocolDriftGuardTest {
     @Test
     fun methodAdvertisementIsDerivedNotHandWritten() {
         assertTrue(
-            rust.contains("pub const ALL: [Method; 28]"),
+            rust.contains("pub const ALL: [Method; 34]"),
             "Method::ALL's declared length changed — update CoreMethods.ALL and this gate",
         )
         assertTrue(
@@ -620,7 +630,13 @@ class ProtocolDriftGuardTest {
         for ((name, kotlin) in pairs) {
             assertEquals(rustStringConst(projectLifecycle, name), kotlin, "$name drifted from project_lifecycle.rs")
         }
-        assertEquals(pairs.map { it.second }.toSet(), ProjectOutcomes.KNOWN_MESSAGES, "a worded message is not drift-checked")
+        // A7 adds one message raised by the project delete checks; it lives in verification.rs (pinned in
+        // verificationMessagesMatchCore) and is CONFLICT there.
+        assertEquals(
+            pairs.map { it.second }.toSet() + Verifications.MSG_PROJECT_VERIFICATION_RUNNING,
+            ProjectOutcomes.KNOWN_MESSAGES,
+            "a worded message is not drift-checked",
+        )
         // Every `pub const MSG_*` Core declares there is mirrored (a new refusal must not ship unworded).
         val rustNames = Regex("""pub const (MSG_[A-Z_]+): &str""").findAll(projectLifecycle).map { it.groupValues[1] }.toSet()
         assertEquals(pairs.map { it.first }.toSet(), rustNames, "project_lifecycle.rs gained or lost a message const")
@@ -683,7 +699,11 @@ class ProtocolDriftGuardTest {
         val rustNames = Regex("""pub const (MSG_[A-Z_]+): &str""").findAll(conversationLifecycle).map { it.groupValues[1] }.toSet()
         assertEquals(pairs.map { it.first }.toSet(), rustNames, "conversation_lifecycle.rs gained or lost a message const")
         // The worded set = these four + A3a's project message, which Core raises FIRST in an archived project.
-        assertEquals(pairs.map { it.second }.toSet() + ProjectOutcomes.MSG_PROJECT_ARCHIVED, ConversationOutcomes.KNOWN_MESSAGES)
+        // A7 adds the verification-running delete refusal (verification.rs, pinned in verificationMessagesMatchCore).
+        assertEquals(
+            pairs.map { it.second }.toSet() + ProjectOutcomes.MSG_PROJECT_ARCHIVED + Verifications.MSG_CONVERSATION_VERIFICATION_RUNNING,
+            ConversationOutcomes.KNOWN_MESSAGES,
+        )
         assertEquals(rustStringConst(projectLifecycle, "MSG_PROJECT_ARCHIVED"), ConversationOutcomes.MSG_PROJECT_ARCHIVED)
         assertEquals(rustStringConst(conversationLifecycle, "CONVERSATION_DELETE_ACTION"), CoreMethods.CONVERSATION_DELETE)
         assertEquals(rustStringConst(rust, "CONVERSATION_EXPORT_FORMAT"), labs.dkv.sandpane.model.CONVERSATION_EXPORT_FORMAT)
@@ -972,7 +992,7 @@ class ProtocolDriftGuardTest {
     fun gitApplyShapesLimitsDeadlineAndEventsMatchCore() {
         assertTrue(labs.dkv.sandpane.model.CoreFeatures.KNOWN.contains("git-apply"))
         assertEquals(labs.dkv.sandpane.model.CoreFeatures.GIT_APPLY, "git-apply")
-        assertEquals(28, CoreMethods.ALL.size, "A6 adds no method")
+        assertEquals(34, CoreMethods.ALL.size, "A6 added no method (A7 added six)")
         val max = Regex("""pub const MAX_APPLY_ENTRIES: usize = (\d+);""").find(applyRs)?.groupValues?.get(1)?.toInt()
             ?: fail("apply.rs has no MAX_APPLY_ENTRIES")
         assertEquals(max, GitApplies.MAX_ENTRIES)
@@ -1012,6 +1032,199 @@ class ProtocolDriftGuardTest {
         }
         // git.apply is never replay-safe: Core's replay-safe set does not name it.
         assertFalse(Regex("""replay_safe[\s\S]{0,400}GitApply""").containsMatchIn(rust + service), "git.apply became replay-safe")
+    }
+
+    // ------------------------------------------------------------------
+    // A7: verification commands + project.context (design 2026-10-09 \u00A73.7)
+    // ------------------------------------------------------------------
+
+    private val verificationSvc by lazy { read("core/crates/sandpane-service/src/verification.rs") }
+    private val verificationCore by lazy { read("core/crates/sandpane-core/src/verification.rs") }
+    private val contextCore by lazy { read("core/crates/sandpane-core/src/context.rs") }
+    private val verificationSchema by lazy { read("schemas/verification.schema.json") }
+    private val contextSchema by lazy { read("schemas/project-context.schema.json") }
+    private val taskEventSchema by lazy { read("schemas/task-event.schema.json") }
+
+    /** Every Core message the A7 copy keys on is Core's constant, byte for byte. */
+    @Test
+    fun verificationMessagesMatchCore() {
+        val svc = listOf(
+            "MSG_VERIFICATION_NOT_BOUND" to Verifications.MSG_NOT_BOUND,
+            "MSG_VERIFICATION_SANDBOX_CHANGED" to Verifications.MSG_SANDBOX_CHANGED,
+            "MSG_VERIFICATION_IDENTITY" to Verifications.MSG_IDENTITY,
+            "MSG_VERIFICATION_TASK_BUSY" to Verifications.MSG_TASK_BUSY,
+            "MSG_VERIFICATION_SANDBOX_BUSY" to Verifications.MSG_SANDBOX_BUSY,
+            "MSG_VERIFICATION_CORE_BUSY" to Verifications.MSG_CORE_BUSY,
+            "MSG_VERIFICATION_SHUTTING_DOWN" to Verifications.MSG_SHUTTING_DOWN,
+            "MSG_COMMAND_NOT_FOUND" to Verifications.MSG_COMMAND_NOT_FOUND,
+            "MSG_COMMAND_REVOKED" to Verifications.MSG_COMMAND_REVOKED,
+            "MSG_COMMAND_OTHER_PROJECT" to Verifications.MSG_COMMAND_OTHER_PROJECT,
+            "MSG_RUN_NOT_FOUND" to Verifications.MSG_RUN_NOT_FOUND,
+            "MSG_TASK_NOT_FOUND" to Verifications.MSG_TASK_NOT_FOUND,
+            "MSG_TOO_MANY_COMMANDS" to Verifications.MSG_TOO_MANY_COMMANDS,
+            "MSG_VERSION_UNREADABLE" to Verifications.MSG_VERSION_UNREADABLE,
+            "MSG_PROJECT_VERIFICATION_RUNNING" to Verifications.MSG_PROJECT_VERIFICATION_RUNNING,
+            "MSG_CONVERSATION_VERIFICATION_RUNNING" to Verifications.MSG_CONVERSATION_VERIFICATION_RUNNING,
+            "MSG_SANDBOX_VERIFICATION_RUNNING" to Verifications.MSG_SANDBOX_VERIFICATION_RUNNING,
+            "MSG_COMMAND_NO_LONGER_PASSES" to Verifications.MSG_COMMAND_NO_LONGER_PASSES,
+            "MSG_RUN_SECRET_CHECK_UNAVAILABLE" to Verifications.MSG_RUN_SECRET_CHECK_UNAVAILABLE,
+        )
+        for ((name, kotlin) in svc) assertEquals(rustStringConst(verificationSvc, name), kotlin, "$name drifted from verification.rs")
+        // Every message const Core declares there is mirrored (a new refusal must not ship unworded).
+        val rustNames = Regex("""pub const (MSG_[A-Z_]+): &str""").findAll(verificationSvc).map { it.groupValues[1] }.toSet()
+        assertEquals(svc.map { it.first }.toSet(), rustNames, "verification.rs gained or lost a message const")
+        assertEquals(rustStringConst(verificationCore, "MSG_SECRET_CHECK_UNAVAILABLE"), Verifications.MSG_SECRET_CHECK_UNAVAILABLE)
+        assertEquals(rustStringConst(verificationCore, "SECRET_REFUSAL_HINT"), Verifications.SECRET_REFUSAL_HINT)
+        assertTrue(verificationSvc.contains("serde_json::json!({ \"hint\": vcore::SECRET_REFUSAL_HINT })"), "the hint left details.hint")
+        // The templates the copy matches by prefix / suffix.
+        assertEquals(
+            Verifications.EXEC_UNVERIFIED_PREFIX + "{version}" + Verifications.EXEC_UNVERIFIED_SUFFIX,
+            rustFormat(verificationSvc, "msg_exec_unverified"),
+        )
+        assertEquals(
+            Verifications.NOT_RUNNING_PREFIX.replace("\"", "\\\"") + "{name}" + Verifications.NOT_RUNNING_SUFFIX.replace("\"", "\\\""),
+            rustFormat(verificationSvc, "msg_sandbox_not_running"),
+        )
+        assertEquals("{repo} is busy: {holder}" + Verifications.REPO_BUSY_SUFFIX, rustFormat(verificationSvc, "msg_verification_repo_busy"))
+        assertEquals(
+            Verifications.SHAPE_NO_LONGER_PASSES_PREFIX + "{why}" + Verifications.SHAPE_NO_LONGER_PASSES_SUFFIX,
+            rustFormat(verificationSvc, "msg_command_shape_no_longer_passes"),
+        )
+        // The secret-refusal templates live in match arms; pinned by their fixed parts.
+        assertTrue(verificationCore.contains("\"argument {number} looks like a secret ({}); approved commands cannot hold \\"))
+        assertTrue(verificationCore.contains("\"the label looks like a secret ({}); approved commands cannot hold secrets; \\"))
+        assertTrue(verificationCore.contains("\"the arguments together look like a secret ({}); approved commands cannot hold \\"))
+        assertTrue(
+            Regex("""secrets; nothing was approved""").findAll(verificationCore.substringBefore("#[cfg(test)]")).count() >= 3,
+            "a secret-refusal template changed its ending",
+        )
+        assertTrue(Verifications.isSecretRefusal("argument 3 looks like a secret (token); approved commands cannot hold secrets; nothing was approved"))
+        assertTrue(Verifications.isSecretRefusal("the label looks like a secret (auth-header); approved commands cannot hold secrets; nothing was approved"))
+        // The frame refusal.
+        assertTrue(verificationSvc.contains("\"the response would exceed the frame limit ({bytes} bytes, the limit is \\"))
+        assertTrue(verificationSvc.contains("{MAX_RESPONSE_BYTES}); {what}; nothing was returned\""))
+        // The argv shape messages Core prefixes with "argv: " / "label: ".
+        assertTrue(verificationSvc.contains("invalid(format!(\"label: {e}\"))"))
+        assertTrue(verificationSvc.contains("invalid(format!(\"argv: {e}\"))"))
+        assertTrue(validation.contains("return shape(format!(\"argument {n} contains a control character\"));"))
+        // The three delete refusals are CONFLICT at their use sites.
+        assertTrue(Regex("""ErrorCode::Conflict,\s*MSG_SANDBOX_VERIFICATION_RUNNING\.to_string\(\)""").containsMatchIn(service))
+        assertTrue(Regex("""ErrorCode::Conflict,\s*crate::MSG_CONVERSATION_VERIFICATION_RUNNING\.to_string\(\)""").containsMatchIn(conversationLifecycle))
+        assertTrue(projectLifecycle.contains("return Ok(Some(crate::MSG_PROJECT_VERIFICATION_RUNNING));"))
+        // ... and each is worded "nothing was deleted" by this client.
+        assertTrue(
+            ProjectOutcomes.describeFailure(
+                CoreMethods.PROJECT_DELETE,
+                CoreRpcException(CoreErrorCodes.CONFLICT, Verifications.MSG_PROJECT_VERIFICATION_RUNNING),
+                true,
+            ).body.contains("nothing was deleted"),
+        )
+        assertTrue(
+            ConversationOutcomes.describeFailure(
+                CoreMethods.CONVERSATION_DELETE,
+                CoreRpcException(CoreErrorCodes.CONFLICT, Verifications.MSG_CONVERSATION_VERIFICATION_RUNNING),
+                true,
+            ).body.contains("nothing was deleted"),
+        )
+        // UNSUPPORTED_SBX_VERSION is the version gate's code.
+        assertTrue(Regex("""ErrorCode::UnsupportedSbxVersion,\s*[\s\S]{0,80}msg_exec_unverified\(""").containsMatchIn(verificationSvc) ||
+            Regex("""UnsupportedSbxVersion[\s\S]{0,200}msg_exec_unverified""").containsMatchIn(verificationSvc),
+            "the version gate no longer raises UNSUPPORTED_SBX_VERSION with msg_exec_unverified")
+    }
+
+    /** Feature, outcomes, wire shapes (field order), limits, event kinds and the deadline of A7. */
+    @Test
+    fun verificationShapesOutcomesEventsAndDeadlineMatchCore() {
+        assertEquals("verification", labs.dkv.sandpane.model.CoreFeatures.VERIFICATION)
+        assertEquals(6, labs.dkv.sandpane.model.CoreFeatures.KNOWN.size)
+        fun fields(struct: String) = (Regex("""pub struct $struct \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1)
+            ?: fail("$struct not found")).let { body -> Regex("""pub ([a-z_]+):""").findAll(body).map { it.groupValues[1] }.toList() }
+        assertEquals(listOf("id", "project_id", "label", "argv", "approved_at"), fields("VerificationCommand"))
+        assertEquals(listOf("project_id"), fields("VerificationListParams"))
+        assertEquals(listOf("commands"), fields("VerificationListResult"))
+        assertEquals(listOf("project_id", "label", "argv"), fields("VerificationApproveParams"))
+        assertEquals(listOf("command"), fields("VerificationApproveResult"))
+        assertEquals(listOf("command_id"), fields("VerificationRevokeParams"))
+        assertEquals(listOf("revoked"), fields("VerificationRevokeResult"))
+        assertEquals(
+            listOf("task_id", "command_id", "expected_sandbox_name", "expected_workspace_mode", "idempotency_key"),
+            fields("VerificationRunParams"),
+        )
+        assertTrue(rust.contains("pub expected_workspace_mode: WorkspaceMode,"))
+        assertEquals(listOf("run_id", "started_sequence", "replayed"), fields("VerificationRunResult"))
+        assertEquals(listOf("run_id"), fields("VerificationResultParams"))
+        assertEquals(listOf("best_effort", "replacements", "by_kind", "output_withheld"), fields("OutputRedaction"))
+        assertEquals(
+            listOf(
+                "run_id", "task_id", "command_id", "label", "argv", "sandbox", "workspace_mode", "outcome", "exit_code",
+                "stdout", "stderr", "stdout_truncated", "stderr_truncated", "redactions", "elapsed_ms", "started_at",
+                "finished_at", "output_incomplete",
+            ),
+            fields("VerificationResult"),
+        )
+        assertTrue(rust.contains("pub outcome: String,"), "outcome is no longer an open string")
+        assertEquals(listOf("project_id"), fields("ProjectContextParams"))
+        assertEquals(listOf("manifest", "suggested_commands", "notes"), fields("DetectedManifest"))
+        assertEquals(listOf("repo_path", "detected", "unreadable"), fields("RepositoryContext"))
+        assertEquals(listOf("repositories", "approved"), fields("ProjectContextResult"))
+        // The Kotlin run params serialize in that order (the A2 fingerprint order), key omitted when null.
+        val run = CoreJson.encodeToJsonElement(
+            labs.dkv.sandpane.model.VerificationRunParams.serializer(),
+            labs.dkv.sandpane.model.VerificationRunParams("t", "c", "atlas-demo", labs.dkv.sandpane.model.WorkspaceMode.DIRECT_MOUNT, "k"),
+        ) as kotlinx.serialization.json.JsonObject
+        assertEquals(listOf("taskId", "commandId", "expectedSandboxName", "expectedWorkspaceMode", "idempotencyKey"), run.keys.toList())
+        // Outcomes: Core's constants are the set this client words.
+        val outcomes = Regex("""pub const OUTCOME_[A-Z_]+: &str = "([a-z_]+)";""").findAll(verificationCore).map { it.groupValues[1] }.toList()
+        assertEquals(Verifications.KNOWN_OUTCOMES, outcomes)
+        // Event kinds, appended through constants.
+        assertEquals(rustStringConst(verificationSvc, "EVENT_VERIFICATION_STARTED"), labs.dkv.sandpane.model.CoreEventKinds.VERIFICATION_STARTED)
+        assertEquals(rustStringConst(verificationSvc, "EVENT_VERIFICATION_FINISHED"), labs.dkv.sandpane.model.CoreEventKinds.VERIFICATION_FINISHED)
+        assertTrue(labs.dkv.sandpane.model.CoreEventKinds.ALL.containsAll(labs.dkv.sandpane.model.CoreEventKinds.VERIFICATION))
+        assertTrue(taskEventSchema.contains("verification.started") && taskEventSchema.contains("verification.finished"))
+        // Limits the client mirrors for early feedback only (never stricter).
+        fun usize(src: String, name: String) = Regex("""pub const $name: usize = ([0-9_ *]+);""").find(src)?.groupValues?.get(1)
+            ?.split("*")?.map { it.trim().replace("_", "").toInt() }?.fold(1) { a, b -> a * b } ?: fail("no $name")
+        assertEquals(usize(validation, "MAX_VERIFICATION_ARGS"), VerificationGuards.MAX_ARGS)
+        assertEquals(usize(validation, "MAX_VERIFICATION_ARG_BYTES"), VerificationGuards.MAX_ARG_BYTES)
+        assertEquals(usize(validation, "MAX_VERIFICATION_ARGV_BYTES"), VerificationGuards.MAX_ARGV_BYTES)
+        assertTrue(verificationSvc.contains("pub const MAX_COMMANDS_PER_PROJECT: i64 = 50;"))
+        // The copy's "64 KiB" and "10 minutes" are Core's RunLimits::VERIFICATION.
+        val processRs = read("core/crates/sandpane-core/src/process.rs")
+        val limits = Regex("""pub const VERIFICATION: RunLimits = RunLimits \{([\s\S]*?)\};""").find(processRs)?.groupValues?.get(1)
+            ?: fail("RunLimits::VERIFICATION not found")
+        assertTrue(limits.contains("Duration::from_secs(${Verifications.TIMEOUT_MINUTES * 60})"), limits)
+        assertEquals(2, Regex("""${Verifications.MAX_OUTPUT_KIB} \* 1024""").findAll(limits).count(), limits)
+        // Deadlines: project.context reads files (the 45 s git deadline). verification.run gates on
+        // `sbx version` (RunLimits::PROBE) and the sandbox identity (RunLimits::QUERY) synchronously
+        // BEFORE its durable start, so its floor must outlast PROBE + QUERY; the other four use the default.
+        assertEquals(45_000, MethodDeadlines.PROJECT_CONTEXT_MS)
+        assertEquals(45_000, MethodDeadlines.forMethod(CoreMethods.PROJECT_CONTEXT, 15_000))
+        fun limitSecs(name: String): Int =
+            Regex("""pub const $name: RunLimits = RunLimits \{\s*timeout: Duration::from_secs\((\d+)\)""").find(processRs)
+                ?.groupValues?.get(1)?.toInt() ?: fail("process.rs has no RunLimits::$name with a from_secs timeout")
+        val gates = (limitSecs("PROBE") + limitSecs("QUERY")) * 1000
+        val start = verificationSvc.indexOf("let run_id = uuid::Uuid::new_v4()")
+        assertTrue(start > 0, "verification.run's durable start (run_id) is no longer where this test looks")
+        val version = verificationSvc.lastIndexOf("version_gate(inner, &program, &ctx)?;", start)
+        val identity = verificationSvc.lastIndexOf("identity_gate(inner, &program, &ctx, &plan)?;", start)
+        assertTrue(version in 0 until start && identity in 0 until start, "Core's run gates moved; re-derive the run deadline")
+        assertEquals(45_000, MethodDeadlines.VERIFICATION_RUN_MS)
+        assertTrue(MethodDeadlines.VERIFICATION_RUN_MS > gates, "the run floor (${MethodDeadlines.VERIFICATION_RUN_MS} ms) no longer outlasts Core's gates ($gates ms)")
+        assertEquals(45_000, MethodDeadlines.forMethod(CoreMethods.VERIFICATION_RUN, 15_000))
+        assertEquals(120_000, MethodDeadlines.forMethod(CoreMethods.VERIFICATION_RUN, 120_000), "a longer user setting still wins")
+        for (m in CoreMethods.ADDITIVE_A7 - CoreMethods.PROJECT_CONTEXT - CoreMethods.VERIFICATION_RUN) {
+            assertEquals(15_000, MethodDeadlines.forMethod(m, 15_000), m)
+        }
+        // Read-only classification: list / result / context; approve / revoke / run are writes.
+        assertEquals(setOf("verification.list", "verification.result", "project.context"), CoreMethods.VERIFICATION_READ_ONLY)
+        // Never replay-safe in Core's own sense.
+        assertFalse(Regex("""replay_safe[\s\S]{0,400}Verification""").containsMatchIn(rust + service), "a verification method became replay-safe")
+        // Schemas carry the new shapes.
+        assertTrue(verificationSchema.contains("\"outputWithheld\"") && verificationSchema.contains("\"outputIncomplete\""))
+        assertTrue(contextSchema.contains("\"suggestedCommands\"") && contextSchema.contains("\"unreadable\""))
+        // project.context notes Core always adds; the client shows them in full (capped at Core's 512 bytes).
+        assertEquals(512, Regex("""pub const MAX_NOTE_BYTES: usize = (\d+);""").find(contextCore)?.groupValues?.get(1)?.toInt())
+        assertTrue(Verifications.MAX_ITEM_CODE_POINTS >= 512, "a note Core sends must never be cut by the client")
     }
 
     /** A4 (\u00A73.4): the mode values, the normalisation and the exact refusal are Core's. */

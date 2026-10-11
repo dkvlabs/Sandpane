@@ -28,7 +28,7 @@ pub struct Database {
 }
 
 /// Newest schema version this build understands.
-pub const LATEST_SCHEMA_VERSION: i64 = 7;
+pub const LATEST_SCHEMA_VERSION: i64 = 8;
 
 /// Schema v1: the entity set from specs/02 §3.
 const MIGRATION_V1: &str = r#"
@@ -249,6 +249,69 @@ ALTER TABLE tasks ADD COLUMN chosen_sandbox_name TEXT;
 CREATE INDEX idx_tasks_chosen_sandbox_name ON tasks(chosen_sandbox_name);
 "#;
 
+/// Schema v8 (A7, design 2026-10-09 §3.7 item 7): user-approved
+/// verification commands and their runs.
+///
+/// `verification_commands` — an exact argv (`argv_json`, a JSON array of
+/// strings proven clean of secrets at approve) plus its label. A revoke
+/// TOMBSTONES the row (`revoked_at`), never deletes it, so older events'
+/// `commandId` still resolves; the partial unique index allows one LIVE row
+/// per (project, argv) — approving the same argv again returns that row.
+///
+/// `verification_runs` — one row per `verification.run`. `status` is
+/// `running` until exactly ONE terminal write (`UPDATE … WHERE status =
+/// 'running'`) makes it `finished` (or `interrupted` at shutdown / restart
+/// reconciliation); `outcome` is the open outcome string. `stdout`/`stderr`
+/// hold the capped (64 KiB) output AFTER best-effort redaction — the only
+/// place output is kept (never in events). `sandbox_name`, `workspace_mode`,
+/// `argv_json` and `label` are copied at start, so later revokes or relabels
+/// never change what a run says it ran. `elapsed_ms` is an addition to the
+/// §3.7 item 7 column list (the result's `elapsedMs` needs millisecond
+/// precision that the RFC 3339 timestamps do not have).
+///
+/// The unused pre-A7 `verifications` table stays as is. Explicit delete
+/// order (A3a/A3b): runs before tasks; commands before projects (`ON DELETE
+/// CASCADE` is only a backstop).
+const MIGRATION_V8: &str = r#"
+CREATE TABLE verification_commands (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    label       TEXT NOT NULL,
+    argv_json   TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    revoked_at  TEXT
+);
+CREATE UNIQUE INDEX idx_verification_commands_live_argv
+    ON verification_commands(project_id, argv_json) WHERE revoked_at IS NULL;
+CREATE INDEX idx_verification_commands_project
+    ON verification_commands(project_id, approved_at);
+
+CREATE TABLE verification_runs (
+    id               TEXT PRIMARY KEY,
+    task_id          TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    command_id       TEXT NOT NULL REFERENCES verification_commands(id) ON DELETE CASCADE,
+    sandbox_name     TEXT NOT NULL,
+    workspace_mode   TEXT NOT NULL,
+    argv_json        TEXT NOT NULL,
+    label            TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('running', 'finished', 'interrupted')),
+    exit_code        INTEGER,
+    outcome          TEXT,
+    stdout           TEXT NOT NULL DEFAULT '',
+    stderr           TEXT NOT NULL DEFAULT '',
+    stdout_truncated INTEGER NOT NULL DEFAULT 0,
+    stderr_truncated INTEGER NOT NULL DEFAULT 0,
+    redactions_json  TEXT,
+    started_sequence INTEGER NOT NULL,
+    started_at       TEXT NOT NULL,
+    finished_at      TEXT,
+    elapsed_ms       INTEGER,
+    output_incomplete INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_verification_runs_task ON verification_runs(task_id);
+CREATE INDEX idx_verification_runs_status ON verification_runs(status);
+"#;
+
 impl Database {
     /// Open (or create) the database at `path` and migrate to the latest
     /// schema. Refuses databases from a newer schema version.
@@ -325,6 +388,9 @@ impl Database {
         }
         if current < 7 {
             self.apply_migration(7, MIGRATION_V7)?;
+        }
+        if current < 8 {
+            self.apply_migration(8, MIGRATION_V8)?;
         }
         Ok(())
     }
@@ -419,6 +485,10 @@ mod tests {
             "idx_tasks_worktree_path",
             "idempotency_keys",
             "idx_idempotency_keys_created",
+            "verification_commands",
+            "verification_runs",
+            "idx_verification_commands_live_argv",
+            "idx_verification_runs_task",
         ] {
             assert!(names.iter().any(|n| n == expected), "missing {expected}");
         }
@@ -854,8 +924,7 @@ mod tests {
             .unwrap();
         }
         let db = Database::open(&path).unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 7);
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let row: (String, Option<String>, Option<String>) = db
             .conn()
             .query_row(
@@ -911,27 +980,191 @@ mod tests {
         assert_eq!(overloaded, 0);
         drop(db);
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         assert!(!dir.path().join("core.sqlite3.pre-v7.bak.1").exists());
     }
 
-    /// A database written by a NEWER Core (v8) is refused untouched — no
-    /// pragma, no backup, no migration (no silent downgrade).
+    /// A7 migration: a REAL v7 file (v1..v7 SQL, a project + task written
+    /// the pre-A7 way) upgrades forward to v8: rows intact, the two
+    /// verification tables present and empty, a consistent `.pre-v8.bak` of
+    /// the v7 file taken, the unused pre-A7 `verifications` table kept as
+    /// is, one LIVE command per (project, argv) enforced, and the run
+    /// status set constrained.
     #[test]
-    fn v8_database_is_refused_by_a_v7_core() {
+    fn v7_database_migrates_forward_to_v8_with_verification_tables_and_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("core.sqlite3");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 8).unwrap();
+            for sql in [
+                MIGRATION_V1,
+                MIGRATION_V2,
+                MIGRATION_V3,
+                MIGRATION_V4,
+                MIGRATION_V5,
+                MIGRATION_V6,
+                MIGRATION_V7,
+            ] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 7).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO conversations (id,project_id,title,agent_id,created_at)
+                     VALUES ('c1','p1','Chat','codex','t');
+                 INSERT INTO tasks (id,conversation_id,status,created_at,updated_at,mode)
+                     VALUES ('t1','c1','queued','t','t','task');
+                 INSERT INTO verifications (id,task_id,command_label,created_at)
+                     VALUES ('v-old','t1','legacy','t');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(LATEST_SCHEMA_VERSION, 8);
+        assert_eq!(db.schema_version().unwrap(), 8);
+        let c = db.conn();
+        let one = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            one("SELECT COUNT(*) FROM tasks WHERE id='t1' AND mode='task'"),
+            1
+        );
+        assert_eq!(
+            one("SELECT COUNT(*) FROM verifications"),
+            1,
+            "pre-A7 table kept"
+        );
+        assert_eq!(one("SELECT COUNT(*) FROM verification_commands"), 0);
+        assert_eq!(one("SELECT COUNT(*) FROM verification_runs"), 0);
+        let backup = dir.path().join("core.sqlite3.pre-v8.bak");
+        assert!(backup.exists());
+        let b = Connection::open(&backup).unwrap();
+        let v: i64 = b
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 7);
+        let tables: i64 = b
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('verification_commands', 'verification_runs')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "the backup is the untouched v7 schema");
+        // Columns exactly as §3.7 item 7 lists them (+ elapsed_ms).
+        let cols = |t: &str| -> Vec<String> {
+            let mut st = c
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{t}') ORDER BY cid"
+                ))
+                .unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            cols("verification_commands"),
+            [
+                "id",
+                "project_id",
+                "label",
+                "argv_json",
+                "approved_at",
+                "revoked_at"
+            ]
+        );
+        assert_eq!(
+            cols("verification_runs"),
+            [
+                "id",
+                "task_id",
+                "command_id",
+                "sandbox_name",
+                "workspace_mode",
+                "argv_json",
+                "label",
+                "status",
+                "exit_code",
+                "outcome",
+                "stdout",
+                "stderr",
+                "stdout_truncated",
+                "stderr_truncated",
+                "redactions_json",
+                "started_sequence",
+                "started_at",
+                "finished_at",
+                "elapsed_ms",
+                "output_incomplete"
+            ]
+        );
+        c.execute_batch(
+            "INSERT INTO verification_commands (id,project_id,label,argv_json,approved_at)
+                 VALUES ('vc1','p1','tests','[\"make\",\"test\"]','t');",
+        )
+        .unwrap();
+        // The same argv twice while live is refused by the index…
+        assert!(c
+            .execute(
+                "INSERT INTO verification_commands (id,project_id,label,argv_json,approved_at)
+                 VALUES ('vc2','p1','again','[\"make\",\"test\"]','t')",
+                [],
+            )
+            .is_err());
+        // …but allowed once the first is revoked (tombstone, never deleted).
+        c.execute(
+            "UPDATE verification_commands SET revoked_at='t2' WHERE id='vc1'",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO verification_commands (id,project_id,label,argv_json,approved_at)
+             VALUES ('vc2','p1','again','[\"make\",\"test\"]','t')",
+            [],
+        )
+        .unwrap();
+        let run = |id: &str, status: &str| {
+            c.execute(
+                "INSERT INTO verification_runs (id,task_id,command_id,sandbox_name,workspace_mode,
+                     argv_json,label,status,started_sequence,started_at)
+                 VALUES (?1,'t1','vc1','atlas-auth','mountless','[]','tests',?2,1,'t')",
+                rusqlite::params![id, status],
+            )
+        };
+        run("r1", "running").unwrap();
+        assert!(run("r2", "paused").is_err(), "status is constrained");
+        // A run references its task and command (foreign keys on).
+        assert!(c
+            .execute(
+                "INSERT INTO verification_runs (id,task_id,command_id,sandbox_name,workspace_mode,
+                     argv_json,label,status,started_sequence,started_at)
+                 VALUES ('r3','nope','vc1','a','mountless','[]','x','running',1,'t')",
+                [],
+            )
+            .is_err());
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 8);
+        assert!(!dir.path().join("core.sqlite3.pre-v8.bak.1").exists());
+    }
+
+    /// A database written by a NEWER Core (v9) is refused untouched — no
+    /// pragma, no backup, no migration (no silent downgrade).
+    #[test]
+    fn v9_database_is_refused_by_a_v8_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 9).unwrap();
         }
         let err = Database::open(&path).unwrap_err();
         assert!(
             matches!(
                 err,
                 DbError::TooNew {
-                    found: 8,
-                    supported: 7
+                    found: 9,
+                    supported: 8
                 }
             ),
             "{err}"
@@ -948,7 +1181,7 @@ mod tests {
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 8, "left untouched");
+        assert_eq!(v, 9, "left untouched");
     }
 
     #[test]

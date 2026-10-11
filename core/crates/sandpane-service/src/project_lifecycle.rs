@@ -311,6 +311,13 @@ fn delete_blocker(
     conn: &Connection,
     id: &str,
 ) -> Result<Option<&'static str>, SvcError> {
+    // A7 (§3.7 item 5, W7): a verification in flight for any task of the
+    // project. First, so it is named even though its live binding would
+    // also block (a run always has one). The registry is a leaf lock read
+    // under the DB mutex, the same critical section a run starts in.
+    if inner.verifications.running_for_project(id) {
+        return Ok(Some(crate::MSG_PROJECT_VERIFICATION_RUNNING));
+    }
     // Non-terminal tasks. FAIL CLOSED: a stored status Core cannot read is
     // treated as not finished (`awaiting_review` is not terminal either).
     let mut stmt = conn
@@ -580,11 +587,17 @@ fn delete_confirmed(inner: &ServerInner, id: &str, token: &str) -> Result<(), Sv
         return Err(conflict(m));
     }
     for sql in [
+        // A7: verification runs before tasks…
+        "DELETE FROM verification_runs WHERE task_id IN
+             (SELECT t.id FROM tasks t JOIN conversations c ON c.id = t.conversation_id
+              WHERE c.project_id = ?1)",
         "DELETE FROM tasks WHERE conversation_id IN
              (SELECT id FROM conversations WHERE project_id = ?1)",
         "DELETE FROM conversations WHERE project_id = ?1",
         "DELETE FROM sandbox_bindings WHERE project_id = ?1",
         "DELETE FROM repositories WHERE project_id = ?1",
+        // …and verification commands before projects.
+        "DELETE FROM verification_commands WHERE project_id = ?1",
         "DELETE FROM projects WHERE id = ?1",
     ] {
         tx.execute(sql, params![id]).map_err(internal)?;

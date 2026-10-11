@@ -139,8 +139,8 @@ async function main() {
 
   // ---- method advertisement (the discovery revision) --------------------
   check(
-    'system.probe advertises exactly the 28 methods the client allowlists',
-    Array.isArray(caps.methods) && caps.methods.length === 28 && caps.methods.join(',') === CORE_METHODS.join(','),
+    'system.probe advertises exactly the 34 methods the client allowlists',
+    Array.isArray(caps.methods) && caps.methods.length === 34 && caps.methods.join(',') === CORE_METHODS.join(','),
     (caps.methods ?? []).join(','),
   );
   const schemaMethods = JSON.parse(
@@ -196,8 +196,10 @@ async function main() {
   // A2: advertisement only. This harness never sends a keyed sandbox.create
   // (it would drive the real sbx); keyed sends are not exercised here either.
   check(
-    'A2/A3b/A4/A6: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent, conversation-sandbox-id, conversation-send-mode, git-apply)',
+    'A2/A3b/A4/A6/A7: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent, conversation-sandbox-id, conversation-send-mode, git-apply, verification)',
     Array.isArray(caps.features) &&
+      KNOWN_FEATURES.length === 6 &&
+      KNOWN_FEATURES.includes('verification') &&
       KNOWN_FEATURES.every((f) => caps.features.includes(f)) &&
       KNOWN_FEATURES.every((f) => coreAdvertisesFeature(caps, f)),
     JSON.stringify(caps.features ?? null),
@@ -380,6 +382,63 @@ async function main() {
       abortReason === 'task has no Git context (repo binding + base_commit); nothing was written' &&
       applyResult?.partial !== true,
     JSON.stringify(applyResult ?? { code: applyError?.code, message: abortReason.slice(0, 160) }),
+  );
+
+  // A7: read-only list of a fresh project, and an approve Core must refuse
+  // as secret-shaped (no sbx is involved in either; verification.run is
+  // NEVER called here — it would drive the real `sbx exec`).
+  check(
+    'A7: Core advertises the six verification methods after git.apply, and the feature "verification"',
+    ['verification.list', 'verification.approve', 'verification.revoke', 'verification.run', 'verification.result', 'project.context']
+      .every((m, i) => (caps.methods ?? []).indexOf(m) === (caps.methods ?? []).indexOf('git.apply') + 1 + i) &&
+      coreAdvertisesFeature(caps, 'verification'),
+    (caps.methods ?? []).slice((caps.methods ?? []).indexOf('git.apply')).join(','),
+  );
+  let verificationListResult = null;
+  let verificationListError = null;
+  await commands
+    .verificationList(project.id)
+    .then((r) => {
+      verificationListResult = r;
+    })
+    .catch((e) => {
+      verificationListError = e;
+    });
+  check(
+    'A7: verification.list of a fresh project answers {commands: []}',
+    verificationListResult !== null &&
+      Array.isArray(verificationListResult.commands) &&
+      verificationListResult.commands.length === 0 &&
+      Object.keys(verificationListResult).join(',') === 'commands',
+    JSON.stringify(verificationListResult ?? { code: verificationListError?.code, message: verificationListError?.message }),
+  );
+  // Built at runtime so no token-shaped literal sits in the source. Its value
+  // is never printed: only the code and Core's message (which names the kind).
+  const secretLike = `ghp_${'A1b2C3d4E5'.repeat(4)}`;
+  let approveResult = null;
+  let approveError = null;
+  await commands
+    .verificationApprove({ projectId: project.id, label: 'live check', argv: ['gh', secretLike] })
+    .then((r) => {
+      approveResult = r;
+    })
+    .catch((e) => {
+      approveError = e;
+    });
+  const approveHint = approveError?.details?.hint;
+  check(
+    'A7: verification.approve with a secret-like argument answers VALIDATION_FAILED (nothing approved)',
+    approveResult === null && approveError?.code === 'VALIDATION_FAILED',
+    approveError
+      ? `${approveError.code}: ${String(approveError.message).replaceAll(secretLike, '<redacted>')}` +
+          (typeof approveHint === 'string' ? ` · hint: ${approveHint}` : ' · no details.hint')
+      : 'Core APPROVED it',
+  );
+  const afterApprove = await commands.verificationList(project.id).catch(() => null);
+  check(
+    'A7: the refused approve left the list empty',
+    Array.isArray(afterApprove?.commands) && afterApprove.commands.length === 0,
+    JSON.stringify(afterApprove === null ? null : { commands: afterApprove.commands.length }),
   );
 
   // ---- unknown method: the client blocks it, and so does Core ----------

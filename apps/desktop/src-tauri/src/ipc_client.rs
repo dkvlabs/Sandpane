@@ -70,6 +70,15 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
         // (prepare 20 + write 15 + verify 6) inside its 45 s client deadline.
         // A write: a lost answer keeps MAY_HAVE_BEEN_APPLIED_SUFFIX.
         Method::GitApply => 43_000,
+        // A7 (design §3.7 item 9): `project.context` reads each registered
+        // repository's root manifests (race-safe, capped) — the git budget.
+        Method::ProjectContext => 43_000,
+        // A7 review: before its durable start, `verification.run` runs Core's
+        // version gate (`RunLimits::PROBE`, 3 s) and identity gate
+        // (`RunLimits::QUERY`, 30 s) synchronously, so it gets the git budget
+        // too. A write: a lost answer keeps MAY_HAVE_BEEN_APPLIED_SUFFIX.
+        // list / approve / revoke / result are Core DB work: the default.
+        Method::VerificationRun => 43_000,
         _ => PROXY_DEADLINE_MS,
     }
 }
@@ -117,6 +126,13 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
 /// 2026-10-09 §3.5 item 5); its lost answer is surfaced as "no file was
 /// changed", never re-sent.
 ///
+/// None of the six A7 methods is here (design 2026-10-09 §3.7). Approve,
+/// revoke and run write: run starts an `sbx exec` and carries its own
+/// idempotency key, which only an explicit "Retry safely" in the webview may
+/// reuse. `verification.list`, `verification.result` and `project.context`
+/// are reads, but they stay out for the A-series uniformity: a lost answer is
+/// surfaced and the user refreshes.
+///
 /// `src/lib/core-client.ts` mirrors this list as `REPLAY_SAFE_METHODS`; the
 /// drift test parses this `matches!` and fails if the two ever differ.
 fn replay_safe(method: Method) -> bool {
@@ -141,6 +157,12 @@ fn replay_safe(method: Method) -> bool {
 /// saying "may have been applied" about them would be false (A5 review W4).
 /// Every replay-safe method is read-only (tested), never the reverse.
 ///
+/// A7 (design 2026-10-09 §3.7): `verification.list`, `verification.result`
+/// and `project.context` are reads (Core's database; `project.context` reads
+/// repository manifests). `verification.approve` and `verification.revoke`
+/// write Core's database, and `verification.run` starts an `sbx exec` inside
+/// the sandbox, so a lost answer to any of those three may have applied.
+///
 /// An exhaustive `match` with no wildcard: a new `Method` variant does not
 /// compile until someone decides whether it can change state.
 fn is_read_only(method: Method) -> bool {
@@ -154,7 +176,10 @@ fn is_read_only(method: Method) -> bool {
         | Method::TaskList
         | Method::TaskSubscribe
         | Method::GitReview
-        | Method::GitDiff => true,
+        | Method::GitDiff
+        | Method::VerificationList
+        | Method::VerificationResult
+        | Method::ProjectContext => true,
         Method::ProjectCreate
         | Method::ProjectUpdate
         | Method::ProjectArchive
@@ -172,6 +197,9 @@ fn is_read_only(method: Method) -> bool {
         | Method::ConversationUnarchive
         | Method::ConversationDelete
         | Method::TaskCancel
+        | Method::VerificationApprove
+        | Method::VerificationRevoke
+        | Method::VerificationRun
         | Method::GitApply => false,
     }
 }
@@ -769,13 +797,19 @@ mod tests {
             "conversation.delete",
             "conversation.export",
             "git.diff",
+            "verification.list",
+            "verification.approve",
+            "verification.revoke",
+            "verification.run",
+            "verification.result",
+            "project.context",
         ] {
             assert!(
                 validate_frame(&frame(method)).is_ok(),
                 "{method} must be allowlisted because Core's crate parses it"
             );
         }
-        assert_eq!(Method::ALL.len(), 28);
+        assert_eq!(Method::ALL.len(), 34);
         // Wire names are lowercase snake_case segments; camelCase is not a method.
         assert_eq!(
             validate_frame(&frame("project.addRepository"))
@@ -888,6 +922,13 @@ mod tests {
             Method::ConversationExport,
             // A5: a read, but out of the replay-safe set like every A-series method.
             Method::GitDiff,
+            // A7: three writes and three reads, none replay-safe.
+            Method::VerificationList,
+            Method::VerificationApprove,
+            Method::VerificationRevoke,
+            Method::VerificationRun,
+            Method::VerificationResult,
+            Method::ProjectContext,
         ] {
             assert!(!replay_safe(m), "{m:?} must never be re-sent");
         }
@@ -961,6 +1002,11 @@ mod tests {
             Method::ConversationUnarchive,
             Method::ConversationDelete,
             Method::ConversationExport,
+            // A7: Core DB work only.
+            Method::VerificationList,
+            Method::VerificationApprove,
+            Method::VerificationRevoke,
+            Method::VerificationResult,
         ] {
             assert_eq!(proxy_deadline_ms(m), PROXY_DEADLINE_MS, "{m:?}");
         }
@@ -973,6 +1019,83 @@ mod tests {
         assert_eq!(proxy_deadline_ms(Method::GitDiff), 43_000);
         // A6: git.apply's whole Core budget is 41 s (45 s client deadline).
         assert_eq!(proxy_deadline_ms(Method::GitApply), 43_000);
+        // A7: project.context reads repository files (webview waits 45 s).
+        assert_eq!(proxy_deadline_ms(Method::ProjectContext), 43_000);
+        // A7: verification.run gates on sbx synchronously before its durable
+        // start (webview waits 45 s).
+        assert_eq!(proxy_deadline_ms(Method::VerificationRun), 43_000);
+    }
+
+    /// A7 review: before `verification.run` records its durable start, Core
+    /// runs `sbx version` under `RunLimits::PROBE` (3 s) and `sbx ls --json`
+    /// under `RunLimits::QUERY` (30 s), synchronously. On the default budget
+    /// the proxy would report a lost answer ("the run may have started")
+    /// while Core was still gating. This crate does not depend on
+    /// `sandpane-core`, so the two limits are literals here; the webview's
+    /// drift test reads them from `process.rs`.
+    #[test]
+    fn verification_run_budget_covers_cores_synchronous_gates() {
+        const CORE_PROBE_MS: u64 = 3_000;
+        const CORE_QUERY_MS: u64 = 30_000;
+        let gates = CORE_PROBE_MS + CORE_QUERY_MS;
+        assert!(
+            PROXY_DEADLINE_MS < gates,
+            "the default could not cover the gates"
+        );
+        assert!(proxy_deadline_ms(Method::VerificationRun) > gates);
+        for m in [
+            Method::VerificationList,
+            Method::VerificationApprove,
+            Method::VerificationRevoke,
+            Method::VerificationResult,
+        ] {
+            assert_eq!(proxy_deadline_ms(m), PROXY_DEADLINE_MS, "{m:?}");
+        }
+    }
+
+    /// A7 (design 2026-10-09 §3.7): `verification.approve`, `revoke` and
+    /// `run` change state (run starts an `sbx exec`), so a lost answer keeps
+    /// the "may have been applied" suffix whatever the transport failure;
+    /// `verification.list`, `verification.result` and `project.context` are
+    /// reads and never get it. None of the six is replay-safe.
+    #[test]
+    fn a7_writes_keep_the_suffix_and_a7_reads_never_get_it() {
+        let codes = [
+            "TIMEOUT",
+            "CONNECTION_CLOSED",
+            "MALFORMED_FRAME",
+            "FRAME_TOO_LARGE",
+        ];
+        for m in [
+            Method::VerificationApprove,
+            Method::VerificationRevoke,
+            Method::VerificationRun,
+        ] {
+            assert!(!is_read_only(m), "{m:?}");
+            assert!(!replay_safe(m), "{m:?}");
+            for code in codes {
+                let lost = after_write(m, ProxyError::new(code, "Core went quiet"));
+                assert!(lost.may_have_been_applied, "{m:?} {code}");
+                assert_eq!(
+                    lost.message,
+                    format!("Core went quiet{MAY_HAVE_BEEN_APPLIED_SUFFIX}"),
+                    "{m:?} {code}"
+                );
+            }
+        }
+        for m in [
+            Method::VerificationList,
+            Method::VerificationResult,
+            Method::ProjectContext,
+        ] {
+            assert!(is_read_only(m), "{m:?}");
+            assert!(!replay_safe(m), "{m:?}");
+            for code in codes {
+                let lost = after_write(m, ProxyError::new(code, "Core went quiet"));
+                assert!(!lost.may_have_been_applied, "{m:?} {code}");
+                assert_eq!(lost.message, "Core went quiet", "{m:?} {code}");
+            }
+        }
     }
 
     /// A6 (design 2026-10-09 §3.6 items 8 and 10): `git.apply` writes the

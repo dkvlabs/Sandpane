@@ -37,6 +37,61 @@ pub const MAX_PROJECT_NAME_CHARS: usize = 120;
 /// A3b §3.3 item 7), in characters.
 pub const MAX_CONVERSATION_TITLE_CHARS: usize = 200;
 
+/// `verification.approve` label cap (A7 §3.7 item 2), in characters, after
+/// leading/trailing whitespace is trimmed.
+pub const MAX_VERIFICATION_LABEL_CHARS: usize = 80;
+/// `verification.approve` argv element count cap (A7 §3.7 item 2).
+pub const MAX_VERIFICATION_ARGS: usize = 64;
+/// Per-element byte cap of an approved argv (A7 §3.7 item 2).
+pub const MAX_VERIFICATION_ARG_BYTES: usize = 4096;
+/// Whole-argv byte cap of an approved argv (A7 §3.7 item 2).
+pub const MAX_VERIFICATION_ARGV_BYTES: usize = 16 * 1024;
+
+/// Invisible characters a verification LABEL refuses (A7 §3.7 item 2, "no
+/// bidi or invisible format characters"), beyond [`is_spoofing_format_char`]:
+/// every Unicode general-category Cf (format) character as of Unicode 15.1,
+/// plus the default-ignorable non-Cf characters that render as nothing
+/// (combining grapheme joiner U+034F, the Hangul fillers U+115F/U+1160/
+/// U+3164/U+FFA0, Khmer U+17B4/U+17B5, Mongolian free variation selectors
+/// U+180B-180D/U+180F). Emoji/variation selectors U+FE00-FE0F and
+/// U+E0100-E01EF are deliberately NOT refused (they only select a glyph of
+/// the visible character before them, e.g. "✅").
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+            | '\u{034F}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180D}'
+            | '\u{180F}'
+            | '\u{3164}'
+            | '\u{FFA0}'
+    )
+}
+
 /// Unicode format characters that can hide or reorder displayed text
 /// (review I1): line/paragraph separators (Zl/Zp) and the bidi controls —
 /// LRM/RLM, ALM, the embeddings/overrides U+202A-202E and the isolates
@@ -363,6 +418,76 @@ impl Validator {
             return Err(ValidationError::DisallowedChar { found: c });
         }
         Ok(value)
+    }
+
+    /// A verification command LABEL (A7 §3.7 item 2): leading and trailing
+    /// whitespace is trimmed, then 1..=[`MAX_VERIFICATION_LABEL_CHARS`]
+    /// characters with NO control character (every Cc), no line/paragraph
+    /// separator, no bidi control and no invisible format character
+    /// ([`is_invisible_format_char`]). Returns the trimmed label.
+    pub fn verification_label(raw: &str) -> Result<String, ValidationError> {
+        let label = raw.trim();
+        Self::bounded(label, MAX_VERIFICATION_LABEL_CHARS)?;
+        if let Some(c) = label
+            .chars()
+            .find(|c| c.is_control() || is_spoofing_format_char(*c) || is_invisible_format_char(*c))
+        {
+            return Err(ValidationError::DisallowedChar { found: c });
+        }
+        Ok(label.to_string())
+    }
+
+    /// The SHAPE of an approved argv (A7 §3.7 item 2) — nothing is
+    /// interpreted: no shell, no splitting, no globbing, no path or
+    /// allowlist check on `argv[0]`, and shell metacharacters are plain data
+    /// (the vector is never given to a shell). 1..=[`MAX_VERIFICATION_ARGS`]
+    /// elements; each at most [`MAX_VERIFICATION_ARG_BYTES`] bytes and all
+    /// together at most [`MAX_VERIFICATION_ARGV_BYTES`]; no NUL and no other
+    /// control character except TAB and LF (C0, DEL and C1 are refused:
+    /// security review W1; a Rust `String` is valid UTF-8 already);
+    /// `argv[0]` non-empty and not starting
+    /// with `-` (hygiene only, I1: after `sbx exec --` no element can become
+    /// an sbx flag). The secret check is separate
+    /// (`sandpane_core::verification::check_approval`).
+    pub fn verification_argv(argv: &[String]) -> Result<(), ValidationError> {
+        let shape = |reason: String| Err(ValidationError::InvalidShape { reason });
+        if argv.is_empty() || argv.len() > MAX_VERIFICATION_ARGS {
+            return shape(format!(
+                "argv must have 1 to {MAX_VERIFICATION_ARGS} elements (it has {})",
+                argv.len()
+            ));
+        }
+        let mut total = 0usize;
+        for (i, a) in argv.iter().enumerate() {
+            let n = i + 1;
+            if a.len() > MAX_VERIFICATION_ARG_BYTES {
+                return shape(format!(
+                    "argument {n} is longer than {MAX_VERIFICATION_ARG_BYTES} bytes"
+                ));
+            }
+            if a.contains('\0') {
+                return shape(format!("argument {n} contains a NUL character"));
+            }
+            // Security review W1: C0 controls other than TAB and LF, DEL and
+            // C1 controls are refused (each serializes as a 6-byte `\u00XX`
+            // escape; they are also unreadable in every confirmation).
+            if a.chars().any(|c| c.is_control() && c != '\t' && c != '\n') {
+                return shape(format!("argument {n} contains a control character"));
+            }
+            total += a.len();
+        }
+        if total > MAX_VERIFICATION_ARGV_BYTES {
+            return shape(format!(
+                "argv is longer than {MAX_VERIFICATION_ARGV_BYTES} bytes in total"
+            ));
+        }
+        if argv[0].is_empty() {
+            return shape("argument 1 (the program) is empty".into());
+        }
+        if argv[0].starts_with('-') {
+            return shape("argument 1 (the program) must not start with '-'".into());
+        }
+        Ok(())
     }
 
     /// Message content and other human text destined
@@ -877,5 +1002,114 @@ mod tests {
         assert_eq!(contains_forbidden_arg_char("safe-name_1"), None);
         assert_eq!(contains_forbidden_arg_char("a;b"), Some(';'));
         assert_eq!(contains_forbidden_arg_char("a b"), Some(' '));
+    }
+
+    /// A7 §3.7 item 2: the label is trimmed, 1..=80 characters, and refuses
+    /// every control character, line/paragraph separators, bidi controls and
+    /// invisible format characters.
+    #[test]
+    fn verification_label_trims_bounds_and_refuses_invisible_text() {
+        assert_eq!(
+            Validator::verification_label("  unit tests \t").unwrap(),
+            "unit tests"
+        );
+        assert_eq!(
+            Validator::verification_label("✅ tests").unwrap(),
+            "✅ tests"
+        );
+        let max = "a".repeat(MAX_VERIFICATION_LABEL_CHARS);
+        assert_eq!(Validator::verification_label(&max).unwrap(), max);
+        for bad in [
+            String::new(),
+            "   ".to_string(),
+            "a".repeat(MAX_VERIFICATION_LABEL_CHARS + 1),
+            "tests\nnow".into(),
+            "tests\u{7}".into(),
+            "te\u{85}sts".into(),
+            "tests\u{1b}[31m".into(),
+            "a\u{2028}b".into(),
+            "a\u{202E}b".into(),
+            "a\u{2066}b".into(),
+            "a\u{200B}b".into(),
+            "a\u{200D}b".into(),
+            "a\u{2060}b".into(),
+            "a\u{FEFF}b".into(),
+            "a\u{00AD}b".into(),
+            "a\u{034F}b".into(),
+            "a\u{3164}b".into(),
+            "a\u{E0041}b".into(),
+            "a\u{180E}b".into(),
+        ] {
+            assert!(
+                Validator::verification_label(&bad).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    /// A7 §3.7 item 2: argv shape — 1..=64 elements, each <= 4096 bytes,
+    /// all together <= 16 KiB, no NUL, argv[0] non-empty and not `-`-led.
+    /// Nothing else is interpreted (metacharacters are DATA here).
+    #[test]
+    fn verification_argv_shape_rules() {
+        let ok = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(Validator::verification_argv(&ok(&["npm", "run", "test"])).is_ok());
+        assert!(Validator::verification_argv(&ok(&["sh", "-c", "a && b | c $(d) `e`"])).is_ok());
+        assert!(
+            Validator::verification_argv(&ok(&["printf", "[%s]\n", "-u", "--privileged", ""]))
+                .is_ok()
+        );
+        let many: Vec<String> = (0..MAX_VERIFICATION_ARGS)
+            .map(|i| format!("a{i}"))
+            .collect();
+        assert!(Validator::verification_argv(&many).is_ok());
+        let too_many: Vec<String> = (0..=MAX_VERIFICATION_ARGS)
+            .map(|i| format!("a{i}"))
+            .collect();
+        assert!(Validator::verification_argv(&too_many).is_err());
+        assert!(Validator::verification_argv(&[]).is_err());
+        assert!(Validator::verification_argv(&ok(&[""])).is_err());
+        assert!(Validator::verification_argv(&ok(&["-rf"])).is_err());
+        assert!(Validator::verification_argv(&ok(&["--", "x"])).is_err());
+        assert!(Validator::verification_argv(&ok(&["make", "a\0b"])).is_err());
+        let long = "x".repeat(MAX_VERIFICATION_ARG_BYTES);
+        assert!(Validator::verification_argv(&["echo".into(), long.clone()]).is_ok());
+        assert!(Validator::verification_argv(&["echo".into(), format!("{long}y")]).is_err());
+        // Multi-byte: the bound is BYTES, not characters.
+        let wide = "é".repeat(MAX_VERIFICATION_ARG_BYTES / 2 + 1);
+        assert!(Validator::verification_argv(&["echo".into(), wide]).is_err());
+        let quarter = "x".repeat(MAX_VERIFICATION_ARG_BYTES);
+        let total: Vec<String> = std::iter::once("echo".to_string())
+            .chain(std::iter::repeat_n(quarter, 4))
+            .collect();
+        assert!(
+            Validator::verification_argv(&total).is_err(),
+            "> 16 KiB in total"
+        );
+    }
+
+    /// Security review W1: every C0 control except TAB and LF, DEL and every
+    /// C1 control is refused in any element (each would serialize as a
+    /// 6-byte `\u00XX` escape and could push a list past the frame cap).
+    #[test]
+    fn verification_argv_refuses_control_characters() {
+        let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(Validator::verification_argv(&v(&["printf", "a\tb\n"])).is_ok());
+        for c in [
+            '\u{1}', '\u{1b}', '\r', '\u{7f}', '\u{80}', '\u{85}', '\u{9b}', '\u{9f}',
+        ] {
+            let e = Validator::verification_argv(&v(&["echo", &format!("a{c}b")])).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "value has an invalid shape: argument 2 contains a control character",
+                "{c:?}"
+            );
+        }
+        let e = Validator::verification_argv(&v(&["x\u{1}"])).unwrap_err();
+        assert!(e
+            .to_string()
+            .ends_with("argument 1 contains a control character"));
+        // Non-control multi-byte text stays allowed.
+        assert!(Validator::verification_argv(&v(&["echo", "\u{a0}é漢"])).is_ok());
     }
 }

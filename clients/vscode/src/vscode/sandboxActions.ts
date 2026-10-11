@@ -18,6 +18,7 @@ import type {
 import { DEFAULT_SBX_AGENT, SBX_AGENTS } from '../core-client/protocol';
 import { inspectHidden, plainText } from '../text/visibleText';
 import { selectedWorkspaceMode } from '../state/sessionPolicy';
+import { STOP_ENDS_RUN } from './verification';
 
 /** At most this many `impact` lines are listed; the rest are counted. */
 export const MAX_IMPACT_LINES = 20;
@@ -164,6 +165,8 @@ export function stopOutcomeView(name: string, result: SandboxStopResult): StopOu
 export function stopConfirmation(
   name: string,
   activeTasks: number | null,
+  /** A7: this client saw `verification.started` (and no finished) for this sandbox. */
+  verificationRunning = false,
 ): { message: string; detail: string } {
   const shown = plainText(name, MAX_IDENTITY_CHARS);
   const warning =
@@ -180,6 +183,7 @@ export function stopConfirmation(
         : `Stop sandbox "${shown}"?`,
     detail:
       `${warning}\n\n` +
+      (verificationRunning ? `WARNING: ${STOP_ENDS_RUN}.\n\n` : '') +
       'sbx stops the sandbox; processes running inside it end. ' +
       'Core re-queries sbx afterwards and the state shown is what sbx reports. ' +
       'Start is not available from Sandpane (sbx v0.47 has no start command).',

@@ -29,6 +29,8 @@ import { ProjectSidebar } from "../../components/project/ProjectSidebar";
 import { ChatPanel } from "../../components/chat/ChatPanel";
 import { ActivityTimeline, TaskHeader } from "../../components/chat/ActivityTimeline";
 import { ReviewPanel } from "../../components/review/ReviewPanel";
+import { VerificationPanel } from "../../components/verification/VerificationPanel";
+import { VerificationRunPanel } from "../../components/verification/VerificationRunPanel";
 import {
   Badge,
   Button,
@@ -284,6 +286,16 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
             blockedReason={actions.blockedReason}
           />
           {selectedTask !== null && (
+            <VerificationRunPanel
+              taskId={selectedTask}
+              task={selectedRow}
+              projectId={projectId === "" ? null : projectId}
+            />
+          )}
+          {projectId !== "" && (
+            <VerificationPanel projectId={projectId} archived={project !== null && isArchived(project)} />
+          )}
+          {selectedTask !== null && (
             <Panel title="Task actions">
               <div className="row-actions">
                 <Button
@@ -318,8 +330,10 @@ export function ProjectWorkspaceView({ route }: { route: Route }) {
           )}
           <Panel title="Inspector">
             <p className="muted">
-              Changes, tests, context and preview tabs are DT3/DT4 surfaces. Only{" "}
-              <Mono>git.review</Mono> has a Core method today, and it is rendered above.
+              Preview and richer test tabs are DT3/DT4 surfaces. Core methods rendered above:{" "}
+              <Mono>git.review</Mono> / <Mono>git.diff</Mono> / <Mono>git.apply</Mono> for changes, and{" "}
+              <Mono>verification.*</Mono> / <Mono>project.context</Mono> for approved verification commands
+              (shown only when this Core advertises them).
             </p>
             <p className="muted">
               <a href={href("sandboxes")}>Sandboxes</a> ·{" "}

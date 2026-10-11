@@ -109,6 +109,26 @@
         "title": "Sandpane: Apply Reviewed Task Files (git.apply, asks for confirmation)"
       },
       {
+        "command": "sandpane.approveVerification",
+        "title": "Sandpane: Add Verification Command…"
+      },
+      {
+        "command": "sandpane.approveVerificationSuggestion",
+        "title": "Sandpane: Approve a Suggested Verification Command…"
+      },
+      {
+        "command": "sandpane.revokeVerification",
+        "title": "Sandpane: Revoke Verification Command…"
+      },
+      {
+        "command": "sandpane.runVerification",
+        "title": "Sandpane: Run Verification on a Task…"
+      },
+      {
+        "command": "sandpane.showVerificationResult",
+        "title": "Sandpane: Show Verification Result…"
+      },
+      {
         "command": "sandpane.stopSandbox",
         "title": "Sandpane: Stop Sandbox"
       },
@@ -151,6 +171,17 @@
         }
       ]
     },
+    "languages": [
+      {
+        "id": "sandpane-verification-output",
+        "extensions": [
+          ".sandpane-verification"
+        ],
+        "aliases": [
+          "Sandpane Verification Output"
+        ]
+      }
+    ],
     "configuration": {
       "title": "Sandpane",
       "description": "Client-side UI defaults. Sandpane Core owns all authoritative project/task/sandbox state (specs/02 §1); these values are never a second source of truth.",
@@ -213,6 +244,11 @@
           "scope": "machine",
           "description": "Override the Core Unix socket path (user/machine setting only — a workspace's .vscode/settings.json cannot set it). Empty uses SANDPANE_SOCKET, then the per-user default data directory (mirrors sandpane_service::default_socket_path). Before attaching, the extension refuses any path that is not a Unix socket owned by you with mode 0600."
         }
+      }
+    },
+    "configurationDefaults": {
+      "[sandpane-verification-output]": {
+        "editor.links": false
       }
     }
   },

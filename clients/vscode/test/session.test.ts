@@ -1376,6 +1376,18 @@ describe('A2 idempotency keys: create / send', () => {
     session.dispose();
   });
 
+  it('24 h key retention: a "Retry safely" click 23 h after the first send says too late and sends nothing', async () => {
+    const core = new ScriptedCore();
+    const { session } = await unknownCreate(core);
+    clock.now += 23 * 60 * 60 * 1000;
+    stub.clicks.shift()?.('Retry safely');
+    await settle(30);
+    expect(core.calls('sandbox.create')).toHaveLength(1);
+    expect(stub.errors.at(-1)).toMatch(/^sandbox\.create — Too late to retry safely/);
+    expect(stub.errors.at(-1)).toContain('Nothing was sent');
+    session.dispose();
+  });
+
   it('W1: the click-time gate also refuses on a live connection whose Core changed features', async () => {
     const core = new ScriptedCore();
     const { session } = await unknownCreate(core);

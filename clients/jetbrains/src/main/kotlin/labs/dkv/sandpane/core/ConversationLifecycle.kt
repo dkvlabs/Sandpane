@@ -219,6 +219,11 @@ object ConversationOutcomes {
             CoreErrorCodes.VALIDATION_FAILED,
             "This conversation's project is archived — unarchive the project first.",
         ),
+        // A7 (\u00A73.7 item 5): Core's verification.rs constant, raised before the task check.
+        Verifications.MSG_CONVERSATION_VERIFICATION_RUNNING to Known(
+            CoreErrorCodes.CONFLICT,
+            "A verification is running for a task of this conversation \u2014 wait for it to finish.",
+        ),
     )
 
     /** Every exact message this client words (for the drift test). */

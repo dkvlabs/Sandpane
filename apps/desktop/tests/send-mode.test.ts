@@ -48,7 +48,13 @@ import {
   taskSendFacts,
   type SendVariables,
 } from "../src/lib/send-mode";
-import { A3B_CORE_METHODS, A4_CORE_FEATURES, A6_CORE_FEATURES, FakeCore } from "./support/fake-core";
+import {
+  A3B_CORE_METHODS,
+  A4_CORE_FEATURES,
+  A6_CORE_FEATURES,
+  A7_CORE_FEATURES,
+  FakeCore,
+} from "./support/fake-core";
 import { SERVICE_RUST, protocolRustSource, rustStrConst, serviceRustSource } from "./support/rust-source";
 
 const cp = (n: number): string => String.fromCodePoint(n);
@@ -86,10 +92,11 @@ describe("A4 drift against the Rust sources", () => {
     expect(FEATURE_CONVERSATION_SEND_MODE).toBe("conversation-send-mode");
     expect(names).toContain(FEATURE_CONVERSATION_SEND_MODE);
     // The A4 double advertises the A4 prefix of Core's list (A6 appended
-    // git-apply); the A6 double advertises all of it (plus one unknown string
-    // clients ignore).
+    // git-apply, A7 verification); the A6 double advertises the A6 prefix and
+    // the A7 double all of it (each plus one unknown string clients ignore).
     expect(A4_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names.slice(0, 4));
-    expect(A6_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names);
+    expect(A6_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names.slice(0, 5));
+    expect(A7_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names);
   });
 
   it("the mode values and the refusal message are Core's", () => {

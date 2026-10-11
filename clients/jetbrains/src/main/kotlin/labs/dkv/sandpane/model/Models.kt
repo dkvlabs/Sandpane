@@ -171,7 +171,16 @@ object CoreMethods {
     /** A5: one file's patch from a task's `git.review` change list. Read-only, display-only. */
     const val GIT_DIFF: String = "git.diff"
 
-    /** Wire order of `Method::ALL` — 28 methods as of protocol-v1 addition A5 (A6 adds none). */
+    // A7 verification commands + project.context (design 2026-10-09 \u00A73.7). list / result /
+    // context are read-only; approve / revoke / run are writes (run carries an idempotency key).
+    const val VERIFICATION_LIST: String = "verification.list"
+    const val VERIFICATION_APPROVE: String = "verification.approve"
+    const val VERIFICATION_REVOKE: String = "verification.revoke"
+    const val VERIFICATION_RUN: String = "verification.run"
+    const val VERIFICATION_RESULT: String = "verification.result"
+    const val PROJECT_CONTEXT: String = "project.context"
+
+    /** Wire order of `Method::ALL` — 34 methods as of protocol-v1 addition A7 (A6 added none). */
     val ALL: List<String> = listOf(
         SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST,
         PROJECT_UPDATE, PROJECT_ARCHIVE, PROJECT_UNARCHIVE, PROJECT_DELETE,
@@ -182,6 +191,8 @@ object CoreMethods {
         CONVERSATION_RENAME, CONVERSATION_ARCHIVE, CONVERSATION_UNARCHIVE, CONVERSATION_DELETE,
         CONVERSATION_EXPORT,
         TASK_CANCEL, TASK_LIST, TASK_SUBSCRIBE, GIT_REVIEW, GIT_DIFF, GIT_APPLY,
+        VERIFICATION_LIST, VERIFICATION_APPROVE, VERIFICATION_REVOKE, VERIFICATION_RUN,
+        VERIFICATION_RESULT, PROJECT_CONTEXT,
     )
 
     /**
@@ -213,7 +224,20 @@ object CoreMethods {
     /** The method addition A5 ADDED (design §3.5); a pre-A5 Core does NOT dispatch it. */
     val ADDITIVE_A5: Set<String> = setOf(GIT_DIFF)
 
-    val REQUIRES_ADVERTISEMENT: Set<String> = ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A + ADDITIVE_A3B + ADDITIVE_A5
+    /**
+     * The methods addition A7 ADDED (design \u00A73.7); a pre-A7 Core does NOT dispatch them. Calling
+     * them additionally needs the `verification` FEATURE ([CoreFeatures.VERIFICATION]).
+     */
+    val ADDITIVE_A7: Set<String> = setOf(
+        VERIFICATION_LIST, VERIFICATION_APPROVE, VERIFICATION_REVOKE, VERIFICATION_RUN,
+        VERIFICATION_RESULT, PROJECT_CONTEXT,
+    )
+
+    /** A7: the three read-only methods (no state changes in Core). The other three are writes. */
+    val VERIFICATION_READ_ONLY: Set<String> = setOf(VERIFICATION_LIST, VERIFICATION_RESULT, PROJECT_CONTEXT)
+
+    val REQUIRES_ADVERTISEMENT: Set<String> =
+        ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A + ADDITIVE_A3B + ADDITIVE_A5 + ADDITIVE_A7
 
     /**
      * The honest unsupported state for starting a sandbox (design 2026-10-09 §3 row A1). Shown to the
@@ -267,9 +291,17 @@ object CoreEventKinds {
 
     val APPLY: Set<String> = setOf(GIT_APPLY_STARTED, GIT_APPLIED, GIT_APPLY_FAILED, GIT_APPLY_RECONCILED)
 
+    // A7 (\u00A73.7 item 5): durable verification records. Output is NEVER in them (it is read
+    // through `verification.result`), and they never change task status (AGENTS.md rule 3).
+    // Interruption is `verification.finished {outcome: "interrupted"}`; there is no third kind.
+    const val VERIFICATION_STARTED = "verification.started"
+    const val VERIFICATION_FINISHED = "verification.finished"
+
+    val VERIFICATION: Set<String> = setOf(VERIFICATION_STARTED, VERIFICATION_FINISHED)
+
     val ALL: Set<String> = setOf(
         TASK_CREATED, STATUS_CHANGED, MESSAGE_USER, ADAPTER_UNAVAILABLE, SCHEDULER_DEFERRED,
-    ) + APPLY
+    ) + APPLY + VERIFICATION
 }
 
 // ---------------------------------------------------------------------------
@@ -588,8 +620,17 @@ object CoreFeatures {
      */
     const val GIT_APPLY: String = "git-apply"
 
+    /**
+     * A7 (design 2026-10-09 \u00A73.7): the verification surface (`verification.*` and
+     * `project.context`). The verification UI is enabled ONLY when this is advertised; otherwise it
+     * is shown as visibly unsupported and nothing is sent. Running is additionally gated in Core on a
+     * PROVEN sbx version (none in A7, so every real run is refused with UNSUPPORTED_SBX_VERSION).
+     */
+    const val VERIFICATION: String = "verification"
+
     val KNOWN: List<String> = listOf(
         IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT, CONVERSATION_SANDBOX_ID, CONVERSATION_SEND_MODE, GIT_APPLY,
+        VERIFICATION,
     )
 }
 

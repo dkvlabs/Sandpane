@@ -27,8 +27,10 @@ import {
   FEATURE_CONVERSATION_SANDBOX_ID,
   FEATURE_CONVERSATION_SEND_MODE,
   FEATURE_GIT_APPLY,
+  FEATURE_VERIFICATION,
   KNOWN_FEATURES,
   METHODS,
+  VERIFICATION_METHODS,
   coreAdvertisesFeature,
   coreAdvertisesMethod,
   type Method,
@@ -112,27 +114,30 @@ describeLive("real Core answers the way the mirror claims", () => {
       "conversation.history",
       // A3b: the five conversation-lifecycle methods.
       ...CONVERSATION_LIFECYCLE_METHODS,
-      // A5: git.diff (28 in all).
+      // A5: git.diff.
       "git.diff",
+      // A7: the five verification methods and project.context (34 in all).
+      ...VERIFICATION_METHODS,
     ];
     for (const method of additive) {
       expect(coreAdvertisesMethod(outcome.capabilities, method)).toBe(true);
     }
     // Every advertised name must be one this client is allowed to call, and an
-    // A5 Core advertises exactly this client's 28, in Method::ALL order.
+    // A7 Core advertises exactly this client's 34, in Method::ALL order.
     const allowlist: readonly string[] = METHODS;
     for (const advertised of outcome.capabilities.methods ?? []) {
       expect(allowlist).toContain(advertised);
     }
     expect(outcome.capabilities.methods).toEqual([...METHODS]);
-    expect(METHODS).toHaveLength(28);
+    expect(METHODS).toHaveLength(34);
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SANDBOX_ID)).toBe(true);
-    // A4: conversation-send-mode; A6: git-apply. An A6 Core advertises
-    // exactly this client's 5 known features (A4 and A6 added no method; A5
-    // added git.diff: 28).
+    // A4: conversation-send-mode; A6: git-apply; A7: verification. An A7
+    // Core advertises exactly this client's 6 known features (A4 and A6 added
+    // no method; A5 added git.diff; A7 added six methods: 34).
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SEND_MODE)).toBe(true);
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_GIT_APPLY)).toBe(true);
-    expect(KNOWN_FEATURES).toHaveLength(5);
+    expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_VERIFICATION)).toBe(true);
+    expect(KNOWN_FEATURES).toHaveLength(6);
     expect(outcome.capabilities.features).toEqual([...KNOWN_FEATURES]);
   });
 
@@ -152,6 +157,27 @@ describeLive("real Core answers the way the mirror claims", () => {
     const conversations = await client.listConversations({ projectId: created.id });
     expect(Array.isArray(conversations)).toBe(true);
     expect(conversations).toHaveLength(0);
+  });
+
+  it("A7: a fresh project lists no verification commands, and a secret-like argv is refused", async () => {
+    const created = (await client.createProject({
+      name: `Nova Demo ${stamp}`,
+      repositories: [],
+    })) as { id: string };
+    // The raw frame, so the exact wire shape is pinned.
+    expect(await client.request("verification.list", { projectId: created.id })).toEqual({ commands: [] });
+    // The same token shape Core's own test proves is refused
+    // (sandpane-service/tests/verification.rs approve_refuses_secrets_and_stores_nothing).
+    const token = `ghp_${"A1b2C3d4E5".repeat(4)}`;
+    await expect(
+      client.request("verification.approve", {
+        projectId: created.id,
+        label: "push",
+        argv: ["gh", token, "x"],
+      }),
+    ).rejects.toMatchObject({ source: "core", code: "VALIDATION_FAILED" });
+    // Nothing was stored.
+    expect(await client.request("verification.list", { projectId: created.id })).toEqual({ commands: [] });
   });
 
   it("refuses a blank scoping id with VALIDATION_FAILED — the guard mirrors the verdict", async () => {

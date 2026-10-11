@@ -87,6 +87,13 @@ client) implementing the JB0/JB1 surface of
 > UNVERIFIED end to end: no task created over the wire has Git context until A4b, the chooser and the
 > confirmation were never shown in an IDE, and no apply request reached a running Core.
 >
+> A7 client work (12.10.2026: verification commands + `project.context`, design 2026-10-09 §3.7;
+> method pin **28 → 34**, feature `verification` = **6** known features, 45 s `project.context`
+> and `verification.run` deadlines, a "Verification" tool-window tab). Gate counts are in "Checks actually run" below. A7 is
+> UNVERIFIED end to end: running is disabled for every real sbx version until captures C-1, C-2, C-5
+> and C-7 exist (Core answers `UNSUPPORTED_SBX_VERSION`), no task created over the wire is bound to a
+> sandbox until A4b, and nothing of A7 was ever run in a real editor, app or IDE.
+>
 > **Proven on this host** (exact commands and outputs in "Checks actually run" below):
 > `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
 > (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
@@ -275,7 +282,7 @@ clients/jetbrains/
     │   │   ├── core/ReplayCursors.kt         # per-task cursor seam behind task.subscribe's afterSequences
     │   │   ├── core/ErrorAttribution.kt      # provenance of a failure: this plugin refused vs Core answered
     │   │   ├── core/EventStream.kt           # per-task checkpoint, bounded window, fan-out
-    │   │   ├── model/Models.kt               # kotlinx mirrors of sandpane-protocol (wire names, 28 methods)
+    │   │   ├── model/Models.kt               # kotlinx mirrors of sandpane-protocol (wire names, 34 methods)
     │   │   ├── model/WorkspaceModeView.kt    # workspaceMode rendering; absence => UNVERIFIED/live-writable
     │   │   ├── ui/ChatPanel.kt               # Swing list/composer/pickers/attachments/status + 50 ms flush
     │   │   ├── actions/{StartTask,ReviewChanges,ApplyTask,RefreshSandboxes}Action.kt
@@ -301,6 +308,11 @@ clients/jetbrains/
     │   │   ├── services/ApplyPlan.kt         # A6: selectability, flags (a)/(b)/(c), mismatch refusal, submit
     │   │   ├── ui/ApplyConfirmation.kt       # A6: confirmation text (repository, every file, flags, statement)
     │   │   ├── ui/ApplyDialogs.kt            # A6: per-file checkbox chooser + modal confirmation (DialogWrapper)
+    │   │   ├── model/Verification.kt         # A7: verification + project.context wire types (tolerant, open strings)
+    │   │   ├── core/Verification.kt          # A7: Core messages, argv guard mirror, run target, single flight, copy, activity
+    │   │   ├── ui/VerificationText.kt        # A7: approve/run/revoke confirmations (DialogHtml), result header
+    │   │   ├── ui/VerificationDialogs.kt     # A7: argv list editor, confirmations, run picker, plain-text output viewer
+    │   │   ├── ui/VerificationPanel.kt       # A7: the "Verification" tool-window tab (commands, suggestions, tasks, runs)
     │   │   ├── services/{SandpaneContextProvider,EditorDiffProvider,SbxService,TaskMonitorService}.kt
     │   │   ├── services/FolderMatching.kt    # folder → Core project, pure and canonicalized on both sides
     │   │   └── settings/{SandpaneSettings,SandpaneConfigurable}.kt
@@ -314,12 +326,14 @@ clients/jetbrains/
         ├── core/GitApplyTest.kt              # A6 frames (verbatim entries, reviewId, no selectedFiles), gate, copy, CONFLICT kinds, lost answers, events (22 tests)
         ├── services/ApplyPlanTest.kt         # A6 session, selectability, verbatim entries, mismatch refusal, flags (14 tests)
         ├── ui/ApplyConfirmationTest.kt       # A6 every file listed, flags, buttons, opens only from actionPerformed (5 tests)
+        ├── core/VerificationTest.kt          # A7 frames (byte-exact argv), gating, guards, run target, keys/retry, copy, events, retry window, claim copy, row spaces (23 tests)
+        ├── ui/VerificationUiTest.kt          # A7 output reveal, confirmations, argv fields keep LF, dialogs only from click handlers, no HTML, context on click, toString, edited notes (13 tests)
         ├── core/SendModeTest.kt              # A4 send frames, mode gate, keyed retry, open-string mode, copy, no echo (11 tests)
         ├── core/CoreCommandsTest.kt          # guards, gates, the three cursor shapes  (30 tests)
         ├── core/SandboxLifecycleTest.kt      # A1 frames, token flow, stop report       (27 tests)
         ├── core/IdempotencyTest.kt           # A2 keys, features, CONFLICT copy, replay, A6 create-busy CONFLICT (20 tests)
         ├── core/ErrorAttributionTest.kt      # failure provenance sentences             (13 tests)
-        ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (20 tests)
+        ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (29 tests)
         ├── core/ReplayCursorSemanticsTest.kt # per-task vs shared-scalar replay         (7 tests)
         ├── services/FolderMatchingTest.kt    # folder matching + workspace-mode views  (12 tests)
         ├── services/SnapshotGapTest.kt       # why the sandbox list is missing          (3 tests)
@@ -329,8 +343,9 @@ clients/jetbrains/
 
 Module layout deviates from specs/04 §2's sketch in two deliberate ways: models live in one
 `model/Models.kt` (protocol mirror is easier to parity-check as a single surface than split
-across `Projects/Chats/Tasks/Sandboxes.kt`), and `ui/` currently holds only `ChatPanel.kt`
-(the tool window has one panel until JB2 adds tabs). Both are named here rather than silently.
+across `Projects/Chats/Tasks/Sandboxes.kt`; the A7 wire types are the one exception, in
+`model/Verification.kt`), and the tool window has two contents: the chat panel and, since A7, the
+"Verification" tab (`ui/VerificationPanel.kt`). Both are named here rather than silently.
 
 ---
 
@@ -370,23 +385,26 @@ truth; `schemas/*.json` is hand-synced with it): camelCase payload fields, snake
 dotted `AgentEvent` discriminators, `v/id/method/params` frames with flattened `ok`/`err`, and
 `MAX_FRAME_BYTES = 4 MiB` from `sandpane-service`.
 
-The method surface is **28** (`Method::ALL` in Rust), of which **11** are the original protocol-v1
+The method surface is **34** (`Method::ALL` in Rust), of which **11** are the original protocol-v1
 baseline, **3** are the additive discovery reads (`task.list`, `conversation.list`,
 `conversation.history`), **2** are addition A1 (`sandbox.stop`, `sandbox.remove`), **6** are
 addition A3a (`project.update`, `project.archive`, `project.unarchive`, `project.delete`,
 `project.add_repository`, `project.remove_repository`) and **5** are addition A3b
 (`conversation.rename`, `conversation.archive`, `conversation.unarchive`, `conversation.delete`,
-`conversation.export` — in `Method::ALL` right after `conversation.history`, not at the end) and **1** is
-addition A5 (`git.diff`, right after `git.review`). All seventeen
+`conversation.export` — in `Method::ALL` right after `conversation.history`, not at the end), **1** is
+addition A5 (`git.diff`, right after `git.review`) and **6** are addition A7 (`verification.list`,
+`verification.approve`, `verification.revoke`, `verification.run`, `verification.result`,
+`project.context`, after `git.apply`). All twenty-three
 additive methods are gated on `system.probe`'s `methods` (`CoreMethods.REQUIRES_ADVERTISEMENT`):
 not advertised ⇒ the action is visibly disabled and nothing is sent. A6 adds **no** method: `git.apply` is
 baseline, and its reviewed-file form is gated on the `git-apply` feature (the fifth entry of
-`CoreFeatures.KNOWN`, drift-tested against Rust `FEATURES` and the schema examples). There is deliberately **no**
+`CoreFeatures.KNOWN`, drift-tested against Rust `FEATURES` and the schema examples). The A7 methods
+additionally need the `verification` feature (the sixth entry of `CoreFeatures.KNOWN`). There is deliberately **no**
 `sandbox.start` (sbx v0.47 has none); the Start Sandbox action only shows that unsupported state. The additive fields are `CoreCapabilities.methods`,
 `Project.repositories`, `SandboxSummary.workspaceMode` and the optional
 `TaskSubscribeParams.afterSequences`.
 
-This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (27 tests), which
+This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (29 tests), which
 reads the Rust sources and the schemas out of the working tree and compares them against the
 Kotlin mirror: method names **and their order**, the `Method::parse` arms, the
 `rpc-request.schema.json` `method` enum, every `pub const` numeric bound (evaluated, not copied), the
@@ -770,7 +788,49 @@ discovery revision this client is now synced to**):
     "Core restarted during an apply and cannot know for sure what was written … check `git status`"
     for reconciled). Payloads are read as optional/open and never echoed when unreadable.
   - **Display:** a host_worktree pure rename's empty patch reads "renamed, content unchanged".
-- **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **28** protocol
+- **Verification commands and project context (A7, design 2026-10-09 §3.7).** A "Verification"
+  tab in the tool window (`ui/VerificationPanel.kt`) lists the chosen project's approved commands
+  (`verification.list`, read automatically), Core's detected suggestions (`project.context`, 45 s
+  deadline, read ONLY when the user clicks **Detect suggestions** — never on reload, reconnect or a
+  project switch), the project's tasks and the runs this IDE has seen. Everything is gated on the method being advertised
+  **and** the `verification` feature; otherwise the controls are disabled and nothing is sent.
+  - **Approve** (Add…, or Approve on a suggestion): a list editor with ONE text field per argv
+    element (no one-line field, no shell-like splitting; `filterNewlines` is off so a pre-filled LF
+    survives), then a modal confirmation listing every element revealed on its own row, with the
+    count, "do not put secrets in commands", that approval binds this exact list to this project,
+    and the suggestion's notes — only while the argv is byte-for-byte the suggestion's; an edited
+    list drops the notes and says so. Every confirmation (approve, run, revoke) is PLAIN text: a
+    non-editable `JTextArea` with `html.disable`, one revealed line per row — no HTML view anywhere
+    in A7. In list rows and dialog lines, spaces other than U+0020 (U+00A0, U+2000–U+200A, U+202F,
+    U+205F, U+3000, …) and the `⟨ ⟩` delimiters inside an element are shown as `\uXXXX`, so one
+    element never looks like two. Client checks mirror Core's `verification_argv` exactly (64 elements, 4096 bytes each,
+    16 KiB total, NUL, control characters except TAB/LF, empty or `-`-leading program); the label
+    check is blank-only. Nothing is ever approved or run automatically from a suggestion.
+  - **Run** (per task): the target is the task's BINDING (`TaskSummary.sandboxName`, never the A4
+    chosen sandbox name) and the mode of the single `sandbox.list` entry with exactly that name; no
+    binding, no list, not exactly one match or an unknown mode means "this task is not bound to a
+    sandbox" and nothing is sent. The modal run dialog picks from Core's approved list only and shows
+    the sandbox, the mode and its warning (direct mount is live-writable; a host worktree is the
+    task's worktree). Each gesture mints a fresh idempotency key; "Retry safely" (same key, same
+    params) is offered only after a LOST answer (the run request waits 45 s, longer than Core's
+    synchronous version + identity gates, `RunLimits::PROBE` + `QUERY`, before it starts the run), which reads "may have started", and only within
+    23 h of the ORIGINAL send (Core keeps keys 24 h); after that the claim is released and the copy
+    says it is too late to retry safely. Single flight per task; while a lost answer holds the claim,
+    the disabled Run says to choose Retry safely or Do not retry in the Notifications tool window. A
+    started run follows the task's events on the EDT without passing the list's (possibly stale)
+    `TaskSummary`, so starting a verification never changes a task's displayed status. `toString` of
+    every A7 type shows ids, sizes and counts only. Run needs Core's idempotency-keys feature. A Stop Sandbox on a sandbox with a run this IDE
+    saw start (and not finish) asks first.
+  - **Output** (`verification.result`): a non-modal dialog with read-only monospaced plain
+    `JTextArea`s (stdout / stderr tabs). CR shows as `\r`, every C0/C1 control except LF and TAB is
+    escaped; never a console, a hyperlink filter or HTML. The header shows the outcome as an open
+    string — exit status N "as reported by sbx exec", never "passed" or green — and every
+    disclosure (truncated, redaction best-effort counts, output withheld, output incomplete).
+  - **Copy:** `UNSUPPORTED_SBX_VERSION` is shown as the version gate (not a command failure);
+    frame and secret refusals show Core's message plus its `details` / hint (`CoreRpcException`
+    now carries `details`); `verification.started` / `.finished` events are notes that never carry
+    output and never change the task status. Output, argv and notes are never logged.
+- **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **34** protocol
   method names before writing a byte; there is no free-form RPC. The refusal is a
   `CoreValidationException` — this client's own word — and not a `CoreRpcException`, because Core
   never saw the request.
@@ -853,6 +913,8 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Gate after the A5 client work (git.diff, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 15s`; **402 tests, 0 failures, 0 errors, 0 skipped**, 36 result files (GitDiffTest 12, ProtocolDriftGuardTest 25, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 83 source files (50 main, 33 test); zip 1 676 534 bytes; the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A5 files) |
 | Gate after the A5 review fixes (W3 CR reveal, I3 VCS root, 11.10.2026) | same two commands | `BUILD SUCCESSFUL`; **410 tests, 0 failures, 0 errors, 0 skipped**, 37 result files (GitDiffTest 15, ReviewRootTest 5); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` |
 | Gate after the A6 client work (git.apply for reviewed files, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL`; **445 tests, 0 failures, 0 errors, 0 skipped**, 39 result files after the combined-review items J-I1/J-I4 (443 before; GitApplyTest 22, IdempotencyTest 20, ApplyPlanTest 14, ApplyConfirmationTest 5, GitDiffTest 16, ProtocolDriftGuardTest 27); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 90 source files (54 main, 36 test); the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A6 files). RED evidence: 18 deliberate mutations of the A6 code (gate, mismatch check, timeout/partial/CONFLICT copy, symlink rule, flag (a)/(c), default button, rename copy, event notes, full listing, deadline, Core-message drift, dialog outside `actionPerformed`, lost connection, typed re-encoding of entries) each turned the named test red, and were reverted |
+| Gate after the A7 client work (verification + project.context, 12.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL`; **474 tests, 0 failures, 0 errors, 0 skipped**, 41 result files (VerificationTest 19, VerificationUiTest 8, ProtocolDriftGuardTest 29, CoreClientFramingTest 29, GitApplyTest 22, ProjectLifecycleTest 39, ConversationLifecycleTest 46); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; 97 source files (59 main, 38 test); zip 1 920 514 bytes; invisible-character scan of the 25 changed files: 0. RED evidence: before the change the drift gate failed 3 tests (methods/order, advertisement, features) against Core's A7; 12 deliberate mutations of the A7 code (feature gate, CRLF folding, argv newline filter, Retry always offered, exit 0 as passed, constant key, run target fallback, deferred dialog, dropped hint/details, dropped outputIncomplete, unsupported version worded as failure, missing binding statement) each turned the named test red, and were reverted |
+| Gate after the A7 review fixes (J-W1, J-W2, J-I1, J-I2, J-I3, J-I5, D-I4, D-I5, run deadline; 12.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL`; **483 tests, 0 failures, 0 errors, 0 skipped**, 41 result files (VerificationTest 23, VerificationUiTest 13, ProtocolDriftGuardTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; 97 source files; zip 1 930 649 bytes. RED evidence: 10 new tests failed against the pre-fix behaviour (kept behind minimal seams), the run-deadline drift assertion failed with the constant unwired (`expected:<45000> but was:<15000>`), and 11 mutations of the fixes (track on the io pool, generic claim copy, raw NBSP, raw delimiters, inclusive 23 h window, key-blind send time, expiring pending sends, notes kept for an edited list, label in `Run.toString`, context read on reload, an HTML content type) each turned the named test red and were reverted |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |
@@ -861,7 +923,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Toolchain actually used | `./gradlew --version`, `./gradlew javaToolchains` | Gradle 9.8.1, Launcher JVM 23 (GraalVM CE); toolchain 25 = `Eclipse Temurin JDK 25 (25.0.3+9-LTS)`, `Detected by: Auto-provisioned by Gradle` |
 | Wrapper integrity | `shasum -a 256 gradle/wrapper/gradle-wrapper.jar` | `3b8a2577…8e98` = the published `gradle-9.8.1-wrapper.jar.sha256` |
 | Drift gate can fail (negative control) | mutated Kotlin mirror, then a mutated **copy** of the Rust sources via `-PsandpaneRepoRoot` | red in both directions with a message naming the drifted wire string; green after restore — see "Drift gate and its negative control" (recorded before U4; the gate ran green again in the suite above) |
-| Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 28 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
+| Protocol parity | `ProtocolDriftGuardTest` (runs with the suite) | 34 method names **in `Method::ALL` order**, service bounds evaluated from `pub const`, enum sets vs Rust **and** schemas, additive field names on both sides, cursor rules matched against the Rust text |
 | Subprocess misuse (`ProcessBuilder`, `Runtime.exec`, `sh -c`, `bash -lc`) | grep over `src/main/kotlin` | **none** — no subprocess surface exists in this module |
 | Internal/private API references (`com.intellij.internal`, JetBrains AI, `setAccessible`, `Unsafe`, reflection) | grep, plus Plugin Verifier | none |
 | TCP / network surface | grep | none — every `TCP` hit is prose stating it is never used |
@@ -926,6 +988,14 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
   the mismatch refusal and every result kind are tested against fabricated answers shaped like
   Core's output. With a split-mode/remote backend, the VFS refresh looks up Core's `repoPath` on
   the backend's file system (skipped when it is not found) — UNVERIFIED there.
+- **A7 verification + project.context** (12.10.2026): UNVERIFIED end to end. Running is disabled
+  for every real sbx version until captures C-1, C-2, C-5 and C-7 exist, so over the wire Run can
+  only receive Core's `UNSUPPORTED_SBX_VERSION` refusal; no task created over the wire is bound to a
+  sandbox until A4b; no A7 request from this plugin has reached a running Core. The tab, the argv
+  editor, the confirmations (focus and default button included), the run picker and the output
+  viewer were never shown in a real editor, app or IDE; `JEditorPane` and dialog layout are untested
+  headless. Frames, gating, guards, copy and the output reveal are tested against fabricated answers
+  shaped like Core's output.
 - **Older/newer Core compatibility** (testing this client against an older and a newer Core within
   the compatibility policy) has not been done; advertisement gating is tested against fabricated
   capability lists only.

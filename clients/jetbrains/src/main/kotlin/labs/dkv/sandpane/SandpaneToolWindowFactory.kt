@@ -9,6 +9,7 @@ import com.intellij.ui.content.ContentFactory
 import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.settings.SandpaneSettings
 import labs.dkv.sandpane.ui.ChatPanel
+import labs.dkv.sandpane.ui.VerificationPanel
 
 /**
  * Registers and fills the Sandpane tool window (docs/specs/04 §2 "Tool WindowFactory":
@@ -38,6 +39,14 @@ class SandpaneToolWindowFactory : DumbAware, ToolWindowFactory {
         content.setDisposer(panel)
         toolWindow.contentManager.addContent(content)
 
+        // A7: the Verification section (design 2026-10-09 \u00A73.7), a second native Swing tab. Its
+        // controls are enabled only when Core advertises the `verification` feature. Closing the
+        // content disposes the panel's listeners only; Core and every run keep going.
+        val verification = VerificationPanel(project)
+        val verificationContent = ContentFactory.getInstance().createContent(verification, VERIFICATION_TITLE, false)
+        verificationContent.setDisposer(verification)
+        toolWindow.contentManager.addContent(verificationContent)
+
         val connection = ConnectionManager.instance()
         if (SandpaneSettings.instance().autoConnect && !connection.isReady) {
             connection.connectAsync("tool window activated")
@@ -58,5 +67,6 @@ class SandpaneToolWindowFactory : DumbAware, ToolWindowFactory {
         const val TOOL_WINDOW_ID: String = "Sandpane"
 
         private const val CONTENT_TITLE = "Chat"
+        private const val VERIFICATION_TITLE = "Verification"
     }
 }

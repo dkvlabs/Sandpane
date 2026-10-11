@@ -9,8 +9,9 @@
  */
 
 import type { AgentEvent, TaskEvent, TaskStatus } from '../core-client/events';
-import { APPLY_EVENT_KINDS, isTaskStatus, normalizeAgentEvent, statusFromEvent } from '../core-client/events';
+import { APPLY_EVENT_KINDS, VERIFICATION_EVENT_KINDS, isTaskStatus, normalizeAgentEvent, statusFromEvent } from '../core-client/events';
 import { plainText } from '../text/visibleText';
+import { finishedEventSummary, finishedEventText, startedEventText } from '../vscode/verification';
 import type { TaskSummary } from '../core-client/protocol';
 
 export type TranscriptRole = 'user' | 'agent' | 'tool' | 'system';
@@ -31,6 +32,23 @@ export interface ToolView {
   name: string;
   state: 'started' | 'finished_ok' | 'finished_failed';
   summary?: string;
+}
+
+/**
+ * A7: one verification run as Core's durable events describe it. Display
+ * only: a run never changes the task's status, and `finished` is null until
+ * Core recorded `verification.finished` for it.
+ */
+export interface VerificationRunView {
+  runId: string;
+  /** Revealed, capped label from `verification.started`. */
+  label: string;
+  /** Core's raw sandbox name (compared, never shown unrevealed). */
+  sandbox: string | null;
+  startedSequence: number;
+  /** Honest outcome copy (never pass/fail); null = no finished event seen. */
+  finished: string | null;
+  outcome: string | null;
 }
 
 export interface TaskView {
@@ -55,6 +73,8 @@ export interface TaskView {
   lastTimestamp?: string;
   /** Set from Core's `task.completed`/terminal statuses for badge rendering. */
   completedOk?: boolean;
+  /** A7: verification runs named by Core's events (newest last; bounded). */
+  verifications?: VerificationRunView[];
 }
 
 export interface TaskViewState {
@@ -80,6 +100,8 @@ export type TaskViewAction =
 export const EMPTY_STATE: TaskViewState = { tasks: {}, order: [] };
 
 const MAX_LINES = 500;
+/** Runs kept per task for display (Core keeps every record). */
+const MAX_VERIFICATION_RUNS = 50;
 
 function blankTask(taskId: string): TaskView {
   return {
@@ -279,6 +301,18 @@ function applyTaskEvent(state: TaskViewState, event: TaskEvent): TaskViewState {
     case APPLY_EVENT_KINDS.reconciled:
       // A6: display only — an apply never moves the task status (Core owns it).
       return withTask(state, pushLine(task, { role: 'system', text: applyEventText(event.kind, payload), sequence: event.sequence }));
+    case VERIFICATION_EVENT_KINDS.started:
+    case VERIFICATION_EVENT_KINDS.finished:
+      // A7: display only — a verification never moves the task status (Core
+      // owns it) and its output is never in an event.
+      return withTask(
+        state,
+        pushLine(applyVerificationEvent(task, event.kind, event.sequence, event.payload), {
+          role: 'system',
+          text: event.kind === VERIFICATION_EVENT_KINDS.started ? startedEventText(event.payload) : finishedEventText(event.payload),
+          sequence: event.sequence,
+        }),
+      );
     case 'adapter.unavailable':
     case 'message.agent': {
       // `adapter.unavailable` carries a normalized AgentEvent; so may a future
@@ -307,6 +341,43 @@ function applyTaskEvent(state: TaskViewState, event: TaskEvent): TaskViewState {
       );
     }
   }
+}
+
+/** Record a run from `verification.started` / `verification.finished` (open fields). */
+function applyVerificationEvent(task: TaskView, kind: string, sequence: number, payload: unknown): TaskView {
+  const runs = task.verifications ?? [];
+  const p = objectPayload(payload);
+  if (kind === VERIFICATION_EVENT_KINDS.started) {
+    const runId = p?.['runId'];
+    if (typeof runId !== 'string' || runs.some((r) => r.runId === runId)) return task;
+    const run: VerificationRunView = {
+      runId,
+      label: typeof p?.['label'] === 'string' ? plainText(p['label'], 120) : '(no label recorded)',
+      sandbox: typeof p?.['sandbox'] === 'string' ? p['sandbox'] : null,
+      startedSequence: sequence,
+      finished: null,
+      outcome: null,
+    };
+    const next = [...runs, run];
+    return { ...task, verifications: next.length > MAX_VERIFICATION_RUNS ? next.slice(next.length - MAX_VERIFICATION_RUNS) : next };
+  }
+  const summary = finishedEventSummary(payload);
+  if (summary === null) return task;
+  const known = runs.some((r) => r.runId === summary.runId);
+  const next = known
+    ? runs.map((r) => (r.runId === summary.runId ? { ...r, finished: summary.text, outcome: summary.outcome } : r))
+    : [
+        ...runs,
+        {
+          runId: summary.runId,
+          label: '(its started event is not in this view)',
+          sandbox: null,
+          startedSequence: summary.startedSequence ?? sequence,
+          finished: summary.text,
+          outcome: summary.outcome,
+        },
+      ];
+  return { ...task, verifications: next.length > MAX_VERIFICATION_RUNS ? next.slice(next.length - MAX_VERIFICATION_RUNS) : next };
 }
 
 /**

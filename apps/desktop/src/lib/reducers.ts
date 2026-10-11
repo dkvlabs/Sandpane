@@ -9,6 +9,7 @@
 import { conversationMessageCopy } from "./conversation-messages";
 import { createRepoBusyKind, gitMessageCopy } from "./git-messages";
 import { projectMessageCopy } from "./project-messages";
+import { verificationDeleteRefusalCopy } from "./verification-messages";
 import { MAX_HISTORY_BYTES, MAX_LIST_LIMIT, TASK_STATUSES } from "./protocol";
 import type {
   AgentCapability,
@@ -762,6 +763,32 @@ export type TimelineEntry =
       phase: "started" | "applied" | "failed" | "reconciled";
       tone: StatusTone;
       text: string;
+    }
+  | {
+      /**
+       * A7 durable verification record (`verification.started` /
+       * `verification.finished`). Display only: it NEVER changes the task's
+       * status (rule 3, I6), and output is never in it (read it with
+       * `verification.result`). `text` is revealed and capped; the raw
+       * fields are UNTRUSTED and must be revealed wherever they are shown.
+       */
+      kind: "verification";
+      sequence: number;
+      timestamp: string;
+      phase: "started" | "finished";
+      /** Core's `runId`, or null when the payload did not carry a readable one. */
+      runId: string | null;
+      tone: StatusTone;
+      text: string;
+      /** started: the command Core recorded (raw, untrusted). */
+      label?: string;
+      argv?: string[];
+      sandbox?: string;
+      workspaceMode?: string;
+      /** finished: Core's raw outcome (open string), exit status and disclosures. */
+      outcome?: string;
+      exitCode?: number;
+      disclosures?: string[];
     };
 
 export interface TaskProjection {
@@ -898,6 +925,10 @@ function applyEvent(p: TaskProjection, event: TaskEvent): TaskProjection {
     case "git.apply.reconciled":
       // A6: shown honestly, never folded into the task status.
       return withSequence(p, event, {}, gitApplyEntry(kind, payload, sequence, timestamp));
+    case "verification.started":
+    case "verification.finished":
+      // A7: shown honestly, never folded into the task status (I6).
+      return withSequence(p, event, {}, verificationEntry(kind, payload, sequence, timestamp));
     case "adapter.unavailable":
     case "scheduler.deferred": {
       const detail =
@@ -996,6 +1027,214 @@ function gitApplyEntry(
       };
     }
   }
+}
+
+export interface OutcomeView {
+  label: string;
+  /** Never "success": exit 0 is not a pass until C-2 is captured (I4). */
+  tone: Exclude<StatusTone, "success">;
+}
+
+/** "exit status N (as reported by sbx exec)" — never "passed" / "failed". */
+export function exitStatusText(exitCode: number | undefined): string {
+  return exitCode === undefined
+    ? "exit status not reported"
+    : `exit status ${exitCode} (as reported by sbx exec)`;
+}
+
+/**
+ * Honest copy for an OPEN `outcome` string. Unknown values are shown as-is
+ * (revealed); nothing is ever coloured or worded as a pass or a fail.
+ */
+export function outcomeView(outcome: string, exitCode: number | undefined): OutcomeView {
+  switch (outcome) {
+    case "exited":
+      return { label: exitStatusText(exitCode), tone: "neutral" };
+    case "signaled":
+      return { label: "ended by a signal (no exit status)", tone: "attention" };
+    case "timed_out":
+      return {
+        label: "stopped after 10 minutes; the command may still be running inside the sandbox",
+        tone: "attention",
+      };
+    case "interrupted":
+      return {
+        label:
+          "Core restarted (or stopped) while this ran; the result is unknown; the command may still be running inside the sandbox",
+        tone: "attention",
+      };
+    case "possibly_sbx_error":
+      return {
+        label: `possibly sbx's own error, or the command's own output — ${exitStatusText(exitCode)}`,
+        tone: "attention",
+      };
+    case "spawn_failed":
+      return { label: "Core could not start sbx exec (spawn_failed)", tone: "attention" };
+    case "read_failed":
+      return {
+        label: "Core could not read the command's output (read_failed); the exit status is unknown",
+        tone: "attention",
+      };
+    case "running":
+      return { label: "running — Core has not recorded an outcome yet", tone: "info" };
+    default:
+      return {
+        label: `Core reported outcome "${displayRevealed(outcome, 64).text}", which this Sandpane build does not recognise`,
+        tone: "attention",
+      };
+  }
+}
+
+
+export const DISCLOSURE_OUTPUT_INCOMPLETE =
+  "output may be incomplete: a process kept the output open after the command exited";
+export const DISCLOSURE_OUTPUT_WITHHELD = "output was not stored because the secret check was unavailable";
+export const DISCLOSURE_BEST_EFFORT =
+  "Output is redacted before Core stores it, on a best-effort basis; it was decoded lossily, and a secret cut at the 64 KiB cap can survive as a partial token.";
+
+export function redactedCountText(n: number): string {
+  return `${n} ${n === 1 ? "value was" : "values were"} redacted (best effort)`;
+}
+
+
+/** Display caps for a verification timeline entry. */
+const VERIFICATION_LABEL_CHARS = 120;
+const VERIFICATION_NAME_CHARS = 120;
+
+/** Disclosures carried by a `verification.finished` payload (flags only; never output). */
+function finishedDisclosures(payload: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  if (payload.stdoutTruncated === true) out.push("stdout was cut at Core's 64 KiB cap");
+  if (payload.stderrTruncated === true) out.push("stderr was cut at Core's 64 KiB cap");
+  if (payload.outputIncomplete === true) out.push(DISCLOSURE_OUTPUT_INCOMPLETE);
+  const redactions =
+    typeof payload.redactions === "object" && payload.redactions !== null
+      ? (payload.redactions as Record<string, unknown>)
+      : {};
+  if (redactions.outputWithheld === true) out.push(DISCLOSURE_OUTPUT_WITHHELD);
+  if (typeof redactions.replacements === "number" && redactions.replacements > 0) {
+    out.push(redactedCountText(redactions.replacements));
+  }
+  if (payload.reconciledAfterRestart === true) {
+    out.push("Core found this run unfinished after a restart; its result is unknown");
+  }
+  return out;
+}
+
+/**
+ * A7 verification events, decoded as OPEN payloads (every field optional).
+ * Output is never in an event; the outcome copy is the same as the result
+ * view's, and nothing is ever coloured as a pass.
+ */
+function verificationEntry(
+  kind: "verification.started" | "verification.finished",
+  rawPayload: unknown,
+  sequence: number,
+  timestamp: string,
+): TimelineEntry {
+  const payload =
+    typeof rawPayload === "object" && rawPayload !== null ? (rawPayload as Record<string, unknown>) : {};
+  const runId = typeof payload.runId === "string" ? payload.runId : null;
+  const at = { kind: "verification" as const, sequence, timestamp, runId };
+  if (kind === "verification.started") {
+    const label = typeof payload.label === "string" ? payload.label : undefined;
+    const argv =
+      Array.isArray(payload.argv) && payload.argv.every((a) => typeof a === "string")
+        ? (payload.argv as string[])
+        : undefined;
+    const sandbox = typeof payload.sandbox === "string" ? payload.sandbox : undefined;
+    const workspaceMode = typeof payload.workspaceMode === "string" ? payload.workspaceMode : undefined;
+    const shownLabel = label === undefined ? "(label not readable)" : displayRevealed(label, VERIFICATION_LABEL_CHARS).text;
+    const shownSandbox =
+      sandbox === undefined ? "(sandbox not readable)" : displayRevealed(sandbox, VERIFICATION_NAME_CHARS).text;
+    return {
+      ...at,
+      phase: "started",
+      tone: "info",
+      text: `Verification started: ${shownLabel} in sandbox ${shownSandbox} (Core recorded the start before running sbx exec)`,
+      ...(label === undefined ? {} : { label }),
+      ...(argv === undefined ? {} : { argv: [...argv] }),
+      ...(sandbox === undefined ? {} : { sandbox }),
+      ...(workspaceMode === undefined ? {} : { workspaceMode }),
+    };
+  }
+  const outcome = typeof payload.outcome === "string" && payload.outcome.length > 0 ? payload.outcome : undefined;
+  const exitCode =
+    typeof payload.exitCode === "number" && Number.isInteger(payload.exitCode) ? payload.exitCode : undefined;
+  const view =
+    outcome === undefined
+      ? { label: "Core did not report a readable outcome", tone: "attention" as const }
+      : outcomeView(outcome, exitCode);
+  return {
+    ...at,
+    phase: "finished",
+    tone: view.tone,
+    text: `Verification finished: ${view.label}`,
+    ...(outcome === undefined ? {} : { outcome }),
+    ...(exitCode === undefined ? {} : { exitCode }),
+    disclosures: finishedDisclosures(payload),
+  };
+}
+
+/** One verification run as the task's durable events describe it. */
+export interface VerificationRunRecord {
+  runId: string;
+  startedSequence: number;
+  startedAt: string;
+  /** Raw, untrusted (render revealed). */
+  label: string | null;
+  argv: string[] | null;
+  sandbox: string | null;
+  workspaceMode: string | null;
+  /** The `verification.finished` entry, or null while none has been seen. */
+  finished: { sequence: number; outcome: string | null; exitCode?: number; disclosures: string[] } | null;
+}
+
+/** Every run the projection's events started, oldest first, each with its finish if seen. */
+export function verificationRunsOf(projection: Pick<TaskProjection, "entries"> | null): VerificationRunRecord[] {
+  if (projection === null) return [];
+  const runs = new Map<string, VerificationRunRecord>();
+  for (const entry of projection.entries) {
+    if (entry.kind !== "verification" || entry.runId === null) continue;
+    if (entry.phase === "started") {
+      if (!runs.has(entry.runId)) {
+        runs.set(entry.runId, {
+          runId: entry.runId,
+          startedSequence: entry.sequence,
+          startedAt: entry.timestamp,
+          label: entry.label ?? null,
+          argv: entry.argv ?? null,
+          sandbox: entry.sandbox ?? null,
+          workspaceMode: entry.workspaceMode ?? null,
+          finished: null,
+        });
+      }
+      continue;
+    }
+    const run = runs.get(entry.runId);
+    if (run === undefined || run.finished !== null) continue;
+    run.finished = {
+      sequence: entry.sequence,
+      outcome: entry.outcome ?? null,
+      ...(entry.exitCode === undefined ? {} : { exitCode: entry.exitCode }),
+      disclosures: entry.disclosures ?? [],
+    };
+  }
+  return [...runs.values()];
+}
+
+/** Runs the events show started in sandbox `name` and not yet finished (any task). */
+export function verificationsRunningIn(
+  projections: Iterable<Pick<TaskProjection, "entries">>,
+  name: string,
+): number {
+  let count = 0;
+  for (const projection of projections) {
+    for (const run of verificationRunsOf(projection)) {
+      if (run.finished === null && run.sandbox === name) count += 1;
+    }
+  }
+  return count;
 }
 
 function applyPayloadEvent(p: TaskProjection, event: TaskEvent): TaskProjection {
@@ -1988,7 +2227,9 @@ function describeCoreErrorUnrevealed(err: CoreRequestError): ErrorCopy {
     const lifecycle =
       projectMessageCopy(String(err.code), err.message) ??
       conversationMessageCopy(String(err.code), err.message) ??
-      gitMessageCopy(String(err.code), err.message, err.method);
+      gitMessageCopy(String(err.code), err.message, err.method) ??
+      // A7: a delete refused while a verification runs ("nothing was deleted").
+      verificationDeleteRefusalCopy(String(err.code), err.message);
     if (lifecycle !== null) {
       return {
         title: lifecycle.title,

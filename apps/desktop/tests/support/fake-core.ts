@@ -121,6 +121,21 @@ export const A6_CORE_FEATURES: readonly string[] = [
 ];
 
 /**
+ * What the A7 Core advertises (Rust `FEATURES`, 6, drift-tested in
+ * `tests/verification.test.ts`), plus a future unknown one clients must ignore.
+ * Feature pin only: this double does NOT model the verification methods.
+ */
+export const A7_CORE_FEATURES: readonly string[] = [
+  "idempotency-keys",
+  "sandbox-create-agent",
+  "conversation-sandbox-id",
+  "conversation-send-mode",
+  "git-apply",
+  "verification",
+  "some-future-feature",
+];
+
+/**
  * A2 CONFLICT messages, verbatim from `sandpane-service` (`IDEM_MSG_*`). The
  * idempotency behaviour of `sandbox.create` / `conversation.send` below is
  * MODELED on the service source (design §3.1), NOT captured from a live Core.
@@ -191,6 +206,22 @@ export const A5_CORE_METHODS: readonly string[] = (() => {
   const at = A3B_CORE_METHODS.indexOf("git.review") + 1;
   return [...A3B_CORE_METHODS.slice(0, at), "git.diff", ...A3B_CORE_METHODS.slice(at)];
 })();
+
+/**
+ * Every method the A7 Core dispatches (34), in `Method::ALL` order: the five
+ * `verification.*` methods and `project.context` sit right after `git.apply`.
+ * Advertisement pin only: this double answers them `VALIDATION_FAILED`
+ * ("unknown method"), it does NOT model them.
+ */
+export const A7_CORE_METHODS: readonly string[] = [
+  ...A5_CORE_METHODS,
+  "verification.list",
+  "verification.approve",
+  "verification.revoke",
+  "verification.run",
+  "verification.result",
+  "project.context",
+];
 
 /** One change-set entry the double serves (MODELED A5 git.review / git.diff). */
 export interface FakeGitChange {

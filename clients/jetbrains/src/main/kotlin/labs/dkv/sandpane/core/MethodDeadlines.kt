@@ -50,6 +50,26 @@ object MethodDeadlines {
      */
     const val GIT_APPLY_MS: Int = 45_000
 
+    /**
+     * `project.context` (A7, \u00A73.7 item 9): Core reads the registered repositories' root
+     * manifests (bounded, read-only, no tool runs), so it gets the 45 s git deadline. Read-only: a
+     * timeout is "no answer in time", nothing changed.
+     *
+     * `verification.list` / `verification.result` (DB reads) and `approve` / `revoke` (short DB
+     * writes) use the configured default.
+     */
+    const val PROJECT_CONTEXT_MS: Int = 45_000
+
+    /**
+     * `verification.run` (A7): BEFORE its durable start Core synchronously runs a version gate
+     * (`sbx version`, `RunLimits::PROBE`, 3 s) and an identity gate (`RunLimits::QUERY`, 30 s), so
+     * the default 15 s could report "may have started" while Core is still gating. It gets the 45 s
+     * git deadline, which ProtocolDriftGuardTest checks outlasts PROBE + QUERY read from
+     * `process.rs`. The command itself runs after the answer (bounded by Core's 600 s limit) and is
+     * observed through events and `verification.result`.
+     */
+    const val VERIFICATION_RUN_MS: Int = 45_000
+
     /** The deadline for [method] given the user's [configuredMs]; never shorter than [configuredMs]. */
     fun forMethod(method: String, configuredMs: Int): Int = when (method) {
         CoreMethods.SANDBOX_STOP -> maxOf(configuredMs, SANDBOX_STOP_MS)
@@ -58,6 +78,8 @@ object MethodDeadlines {
         CoreMethods.GIT_REVIEW -> maxOf(configuredMs, GIT_REVIEW_MS)
         CoreMethods.GIT_DIFF -> maxOf(configuredMs, GIT_DIFF_MS)
         CoreMethods.GIT_APPLY -> maxOf(configuredMs, GIT_APPLY_MS)
+        CoreMethods.PROJECT_CONTEXT -> maxOf(configuredMs, PROJECT_CONTEXT_MS)
+        CoreMethods.VERIFICATION_RUN -> maxOf(configuredMs, VERIFICATION_RUN_MS)
         else -> configuredMs
     }
 }

@@ -3461,7 +3461,8 @@ fn features_are_advertised_from_the_single_const_list() {
             "sandbox-create-agent",
             "conversation-sandbox-id",
             "conversation-send-mode",
-            "git-apply"
+            "git-apply",
+            "verification"
         ])
     );
 }

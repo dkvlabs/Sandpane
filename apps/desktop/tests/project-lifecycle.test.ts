@@ -27,6 +27,7 @@ import {
   CONVERSATION_LIFECYCLE_METHODS,
   METHODS,
   PROJECT_LIFECYCLE_METHODS,
+  VERIFICATION_METHODS,
   type ConfirmationRequest,
   type Project,
 } from "../src/lib/protocol";
@@ -140,16 +141,20 @@ function scripted(answer: (method: string) => { ok?: unknown; err?: unknown }) {
 // ---------------------------------------------------------------------------
 
 describe("A3a drift against the Rust sources", () => {
-  it("the six methods sit right after project.list, in Method::ALL order (28 total since A5)", () => {
+  it("the six methods sit right after project.list, in Method::ALL order (34 total since A7)", () => {
     const all = rustMethodAll().names;
-    expect(all).toHaveLength(28);
+    expect(all).toHaveLength(34);
     expect(METHODS).toEqual(all);
     const at = METHODS.indexOf("project.list");
     expect(METHODS.slice(at + 1, at + 7)).toEqual([...PROJECT_LIFECYCLE_METHODS]);
-    // The A3a Core's set is today's minus the five A3b conversation methods.
+    // The A3a Core's set is today's minus the five A3b conversation methods,
+    // A5's git.diff and the six A7 methods.
     expect(A3A_CORE_METHODS).toEqual(
       METHODS.filter(
-        (m) => !(CONVERSATION_LIFECYCLE_METHODS as readonly string[]).includes(m) && m !== "git.diff",
+        (m) =>
+          !(CONVERSATION_LIFECYCLE_METHODS as readonly string[]).includes(m) &&
+          !(VERIFICATION_METHODS as readonly string[]).includes(m) &&
+          m !== "git.diff",
       ),
     );
   });
@@ -182,7 +187,7 @@ describe("A3a drift against the Rust sources", () => {
     }
     expect(deadlineBody).toContain("Method::ProjectCreate => 43_000,");
     expect(deadlineBody).toContain("Method::ProjectAddRepository => 43_000,");
-    expect(proxy).toContain("assert_eq!(Method::ALL.len(), 28);");
+    expect(proxy).toContain("assert_eq!(Method::ALL.len(), 34);");
   });
 
   it("every exact message equals the Rust const of the same name", () => {

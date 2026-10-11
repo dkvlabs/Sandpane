@@ -47,6 +47,13 @@ import {
   type TaskStatus,
   type TaskSummary,
   type WorkspaceMode,
+  type DetectedManifest,
+  type OutputRedaction,
+  type ProjectContextResult,
+  type RepositoryContext,
+  type VerificationCommand,
+  type VerificationResult,
+  type VerificationRunResult,
 } from "./protocol";
 import { MalformedFrameError } from "./framing";
 
@@ -814,4 +821,185 @@ export function isCoreEventKind(kind: string): boolean {
   return (CORE_EVENT_KINDS as readonly string[]).includes(
     kind as (typeof CORE_EVENT_KINDS)[number],
   );
+}
+
+// ---------------------------------------------------------------------------
+// A7 — verification commands + project.context (design 2026-10-09 §3.7)
+//
+// Every message below names a FIELD, never a value: labels, argv, output,
+// notes and paths are untrusted and are never echoed into an error or a log.
+// ---------------------------------------------------------------------------
+
+/** A required array of strings (each element kept byte for byte). */
+function strArray(rec: Rec, key: string, what: string): string[] {
+  return arr(rec, key, what).map((item, index) => {
+    if (typeof item !== "string") {
+      throw new MalformedFrameError(`${what}.${key}[${index}] must be a string`);
+    }
+    return item;
+  });
+}
+
+/** An optional, finite, whole number (absent or null stays absent). */
+function optInt(rec: Rec, key: string, what: string): number | undefined {
+  const v = rec[key];
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "number" || !Number.isInteger(v)) {
+    throw new MalformedFrameError(`${what}.${key} must be a whole number`);
+  }
+  return v;
+}
+
+/** An optional boolean flag that is present only as `true` in the decoded value. */
+function optFlag(rec: Rec, key: string, what: string): boolean | undefined {
+  const v = optBool(rec, key, what);
+  return v === null ? undefined : v;
+}
+
+/** One approved command. `argv` elements are kept exactly (tab, newline, quotes, non-ASCII). */
+export function decodeVerificationCommand(value: unknown): VerificationCommand {
+  const c = asRecord(value, "VerificationCommand");
+  return {
+    id: str(c, "id", "VerificationCommand"),
+    projectId: str(c, "projectId", "VerificationCommand"),
+    label: str(c, "label", "VerificationCommand"),
+    argv: strArray(c, "argv", "VerificationCommand"),
+    approvedAt: str(c, "approvedAt", "VerificationCommand"),
+  };
+}
+
+function commandList(rec: Rec, key: string, what: string): VerificationCommand[] {
+  return arr(rec, key, what).map(decodeVerificationCommand);
+}
+
+/** `verification.list` → the live commands, in Core's order. */
+export function decodeVerificationList(value: unknown): VerificationCommand[] {
+  return commandList(asRecord(value, "VerificationListResult"), "commands", "VerificationListResult");
+}
+
+/** `verification.approve` → `{command}`. */
+export function decodeVerificationApprove(value: unknown): VerificationCommand {
+  const r = asRecord(value, "VerificationApproveResult");
+  return decodeVerificationCommand(r.command);
+}
+
+/** `verification.revoke` → `{revoked: true}`; anything else is not a revoke. */
+export function decodeVerificationRevoke(value: unknown): { revoked: true } {
+  const r = asRecord(value, "VerificationRevokeResult");
+  if (r.revoked !== true) {
+    throw new MalformedFrameError("VerificationRevokeResult.revoked must be true");
+  }
+  return { revoked: true };
+}
+
+/**
+ * `verification.run` → `{runId, startedSequence, replayed?}`. A present
+ * non-boolean `replayed` reads as "maybe replayed" (Core answered: the run
+ * may have started), never as a failure.
+ */
+export function decodeVerificationRunResult(value: unknown): VerificationRunResult {
+  const r = asRecord(value, "VerificationRunResult");
+  const startedSequence = num(r, "startedSequence", "VerificationRunResult");
+  if (!Number.isInteger(startedSequence)) {
+    throw new MalformedFrameError("VerificationRunResult.startedSequence must be a whole number");
+  }
+  return {
+    runId: str(r, "runId", "VerificationRunResult"),
+    startedSequence,
+    ...(replayedMarker(r) ?? {}),
+  };
+}
+
+function decodeOutputRedaction(value: unknown): OutputRedaction {
+  const r = asRecord(value, "OutputRedaction");
+  const replacements = num(r, "replacements", "OutputRedaction");
+  const byKindRaw = asRecord(r.byKind, "OutputRedaction.byKind");
+  const byKind: Record<string, number> = {};
+  for (const [kind, count] of Object.entries(byKindRaw)) {
+    if (typeof count !== "number" || !Number.isFinite(count)) {
+      throw new MalformedFrameError("OutputRedaction.byKind values must be numbers");
+    }
+    byKind[kind] = count;
+  }
+  const withheld = optFlag(r, "outputWithheld", "OutputRedaction");
+  return {
+    bestEffort: bool(r, "bestEffort", "OutputRedaction"),
+    replacements,
+    byKind,
+    ...(withheld === undefined ? {} : { outputWithheld: withheld }),
+  };
+}
+
+/**
+ * `verification.result`. `outcome` and `workspaceMode` are OPEN strings
+ * (never mapped onto a known value here); `exitCode`, `elapsedMs`,
+ * `finishedAt` and `outputIncomplete` are optional and stay absent.
+ */
+export function decodeVerificationResult(value: unknown): VerificationResult {
+  const w = "VerificationResult";
+  const r = asRecord(value, w);
+  const exitCode = optInt(r, "exitCode", w);
+  const elapsedMs = optInt(r, "elapsedMs", w);
+  const finishedAt = optStr(r, "finishedAt", w);
+  const outputIncomplete = optFlag(r, "outputIncomplete", w);
+  return {
+    runId: str(r, "runId", w),
+    taskId: str(r, "taskId", w),
+    commandId: str(r, "commandId", w),
+    label: str(r, "label", w),
+    argv: strArray(r, "argv", w),
+    sandbox: str(r, "sandbox", w),
+    workspaceMode: str(r, "workspaceMode", w),
+    outcome: str(r, "outcome", w),
+    ...(exitCode === undefined ? {} : { exitCode }),
+    stdout: str(r, "stdout", w),
+    stderr: str(r, "stderr", w),
+    stdoutTruncated: bool(r, "stdoutTruncated", w),
+    stderrTruncated: bool(r, "stderrTruncated", w),
+    redactions: decodeOutputRedaction(r.redactions),
+    ...(outputIncomplete === undefined ? {} : { outputIncomplete }),
+    ...(elapsedMs === undefined ? {} : { elapsedMs }),
+    startedAt: str(r, "startedAt", w),
+    ...optField("finishedAt", finishedAt),
+  };
+}
+
+function decodeDetectedManifest(value: unknown): DetectedManifest {
+  const w = "DetectedManifest";
+  const d = asRecord(value, w);
+  return {
+    manifest: str(d, "manifest", w),
+    suggestedCommands: arr(d, "suggestedCommands", w).map((cmd, index) => {
+      if (!Array.isArray(cmd)) {
+        throw new MalformedFrameError(`${w}.suggestedCommands[${index}] must be an array of strings`);
+      }
+      return cmd.map((item, at) => {
+        if (typeof item !== "string") {
+          throw new MalformedFrameError(`${w}.suggestedCommands[${index}][${at}] must be a string`);
+        }
+        return item;
+      });
+    }),
+    notes: strArray(d, "notes", w),
+  };
+}
+
+function decodeRepositoryContext(value: unknown): RepositoryContext {
+  const w = "RepositoryContext";
+  const r = asRecord(value, w);
+  return {
+    repoPath: str(r, "repoPath", w),
+    detected: arr(r, "detected", w).map(decodeDetectedManifest),
+    unreadable: strArray(r, "unreadable", w),
+  };
+}
+
+/** `project.context` → per-repository detections plus the approved commands. */
+export function decodeProjectContext(value: unknown): ProjectContextResult {
+  const w = "ProjectContextResult";
+  const r = asRecord(value, w);
+  return {
+    repositories: arr(r, "repositories", w).map(decodeRepositoryContext),
+    approved: commandList(r, "approved", w),
+  };
 }

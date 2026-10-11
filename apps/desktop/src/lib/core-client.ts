@@ -42,6 +42,12 @@ import {
   type TaskListParams,
   type TaskSubscribeParams,
   type TaskSummary,
+  type ProjectContextResult,
+  type VerificationApproveParams,
+  type VerificationCommand,
+  type VerificationResult,
+  type VerificationRunParams,
+  type VerificationRunResult,
 } from "./protocol";
 import { FrameTooLargeError, MalformedFrameError, encodeFrame } from "./framing";
 import {
@@ -64,6 +70,12 @@ import {
   decodeTaskEvents,
   decodeTaskSummaries,
   decodeTaskSummary,
+  decodeProjectContext,
+  decodeVerificationApprove,
+  decodeVerificationList,
+  decodeVerificationResult,
+  decodeVerificationRevoke,
+  decodeVerificationRunResult,
 } from "./decode";
 import {
   CoreValidationError,
@@ -88,6 +100,11 @@ import {
   buildTaskSubscribeParams,
   buildGitApplyParams,
   buildGitDiffParams,
+  buildVerificationApproveParams,
+  buildVerificationProjectParams,
+  buildVerificationResultParams,
+  buildVerificationRevokeParams,
+  buildVerificationRunParams,
 } from "./guards";
 
 /** The only thing the client needs from a transport. */
@@ -226,6 +243,15 @@ export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
   // A6 (design §3.6 item 10): Core's whole apply budget is 41 s (prepare 20 +
   // write 15 + verify 6), inside its 45 s client deadline (CLIENT_APPLY_DEADLINE).
   "git.apply": 45_000,
+  // A7 (design §3.7 item 9): project.context reads each registered
+  // repository's root manifests, so it gets the git deadline.
+  "project.context": 45_000,
+  // A7 review: before its durable start, verification.run runs Core's version
+  // gate (RunLimits::PROBE, 3 s) and identity gate (RunLimits::QUERY, 30 s)
+  // synchronously; on the default 15 s the client would report "the run may
+  // have started" while Core is still gating. list / approve / revoke /
+  // result keep the default.
+  "verification.run": 45_000,
 };
 
 /** The webview deadline for one method with the default options. */
@@ -683,7 +709,7 @@ export class CoreClient {
    * so the copy can say whether a retry is safe.
    */
   private async keyedWrite<P extends { idempotencyKey?: string }, R>(
-    method: "sandbox.create" | "conversation.send",
+    method: "sandbox.create" | "conversation.send" | "verification.run",
     params: P,
     decode: (value: unknown) => R,
   ): Promise<R> {
@@ -702,6 +728,7 @@ export class CoreClient {
         "MALFORMED_FRAME",
         `Core answered ${method}, but this desktop build could not read the answer. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
         { mayHaveBeenApplied: true, idempotencyKeyed: keyed },
+        method,
       );
     }
   }
@@ -825,6 +852,82 @@ export class CoreClient {
       // a client MALFORMED_FRAME for git.apply (never "nothing was written").
       const error = asCoreRequestError(err);
       throw new CoreRequestError(error.source, error.code, error.message, error.details, "git.apply");
+    }
+  }
+
+  // -- A7 verification + project.context (design 2026-10-09 §3.7) ---------
+
+  /** `verification.list` `{projectId}`: the live approved commands, decoded. */
+  async listVerificationCommands(projectId: string): Promise<VerificationCommand[]> {
+    const params = preflight(() => buildVerificationProjectParams(projectId));
+    return decodeVerificationList(await this.request("verification.list", params));
+  }
+
+  /**
+   * `verification.approve` `{projectId, label, argv}` — argv exactly as the
+   * user built it. A Core `INTERNAL`, a lost answer, or an `ok` this build
+   * cannot read is an UNKNOWN outcome (Core may have stored it): re-read the
+   * list, never a blind retry. Not replay-safe; never retried.
+   */
+  async approveVerificationCommand(params: VerificationApproveParams): Promise<VerificationCommand> {
+    const payload = preflight(() => buildVerificationApproveParams(params));
+    return this.unkeyedWrite("verification.approve", payload, decodeVerificationApprove);
+  }
+
+  /** `verification.revoke` `{commandId}` (idempotent in Core; never retried here). */
+  async revokeVerificationCommand(commandId: string): Promise<{ revoked: true }> {
+    const payload = preflight(() => buildVerificationRevokeParams(commandId));
+    return this.unkeyedWrite("verification.revoke", payload, decodeVerificationRevoke);
+  }
+
+  /**
+   * `verification.run` as a keyed write (A2 rules): the frame carries the
+   * caller's key for THIS gesture, and only an explicit "Retry safely"
+   * resends it. A lost or unreadable answer means the run MAY HAVE STARTED.
+   */
+  async runVerification(params: VerificationRunParams): Promise<VerificationRunResult> {
+    const payload = preflight(() => buildVerificationRunParams(params));
+    return this.keyedWrite("verification.run", payload, decodeVerificationRunResult);
+  }
+
+  /** `verification.result` `{runId}`: the stored result (output is untrusted text). */
+  async getVerificationResult(runId: string): Promise<VerificationResult> {
+    const params = preflight(() => buildVerificationResultParams(runId));
+    return decodeVerificationResult(await this.request("verification.result", params));
+  }
+
+  /** `project.context` `{projectId}`: detected manifests (read-only; Core runs no tool). */
+  async getProjectContext(projectId: string): Promise<ProjectContextResult> {
+    const params = preflight(() => buildVerificationProjectParams(projectId));
+    return decodeProjectContext(await this.request("project.context", params));
+  }
+
+  /**
+   * A write without an idempotency key: Core `INTERNAL` or a lost answer is an
+   * UNKNOWN outcome, and so is an `ok` this build cannot decode (Core applied
+   * it). The payload is never echoed.
+   */
+  private async unkeyedWrite<R>(
+    method: "verification.approve" | "verification.revoke",
+    params: unknown,
+    decode: (value: unknown) => R,
+  ): Promise<R> {
+    let raw: unknown;
+    try {
+      raw = await this.request(method, params);
+    } catch (err) {
+      throw markInternalUnknown(asCoreRequestError(err));
+    }
+    try {
+      return decode(raw);
+    } catch {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        `Core answered ${method}, but this desktop build could not read the answer. ${MAY_HAVE_BEEN_APPLIED_COPY}`,
+        { mayHaveBeenApplied: true },
+        method,
+      );
     }
   }
 

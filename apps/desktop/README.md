@@ -20,10 +20,10 @@ an earlier revision of this README claimed that while the crate did not compile 
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A6 git.apply pass, 2026-10-11
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A7 verification pass, 2026-10-12
 
-Run fresh after the A6 `git.apply` client work (protocol design 2026-10-09 §3.6), against the A6
-Core + schema in the working tree, on top of the A5 `git.diff` work (§3.5), the A4 send-mode work
+Run fresh after the A7 verification / `project.context` client work (protocol design 2026-10-09
+§3.7) and its review fixes (D-I1 to D-I5), against the A7 Core + schema in the working tree, on top of the A6 `git.apply` work (§3.6), the A5 `git.diff` work (§3.5), the A4 send-mode work
 (§3.4), the A3b conversation-lifecycle work (§3.3) and
 the A3a project-lifecycle work (§3.2), the A2 idempotency work and its review fixes
 (W1–W4, I4, I5) and the A1 sandbox-lifecycle work and its review fixes. Every row below is a command that was actually run, with its actual
@@ -32,13 +32,13 @@ result, except where a row says it was not re-run:
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **22 files, 672 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
-| `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
+| `npm test` (`vitest run`) | OK — **24 files, 735 tests passed**; 1 file (9 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm run build` (`tsc --noEmit && vite build`) | OK — `dist/` emitted (612.55 kB JS, 24.03 kB CSS). Vite warns that one chunk is over 500 kB; no code splitting yet, and the size was not compared with a pre-A7 build in this pass (the 2026-10-09 run reported 338.83 kB JS) |
 | `cd src-tauri && cargo fmt --check` | OK — no diff |
-| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b / A4 / A5 / A6 passes (`clippy --all-targets` below compiles the crate) |
+| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b / A4 / A5 / A6 / A7 passes (`clippy --all-targets` below compiles the crate) |
 | `cd src-tauri && cargo clippy --all-targets -- -D warnings` | OK — no warnings |
-| `cd src-tauri && cargo test` | OK — **34 passed; 0 failed** (A6: `git.apply` is on a 43 s budget, is neither `is_read_only` nor `replay_safe`, and a lost answer to it keeps the maybe-applied suffix for TIMEOUT / CONNECTION_CLOSED / MALFORMED_FRAME / FRAME_TOO_LARGE; earlier: frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 28; the six A3a project methods, the five A3b conversation methods and A5's `git.diff` are allowlisted and never replay-safe; the A3a and A3b methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s, and `git.review` / `git.diff` are at 43 s; a lost answer to an `is_read_only` method — `git.diff` and `conversation.export` included — is never marked maybe-applied) |
-| `make desktop-check` (repo root) | NOT re-run in the A3b / A4 / A5 / A6 passes (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
+| `cd src-tauri && cargo test` | OK — **36 passed; 0 failed** (A7: `Method::ALL` is 34; `verification.list` / `verification.result` / `project.context` are `is_read_only`, `verification.approve` / `verification.revoke` / `verification.run` keep the maybe-applied suffix, none of the six is `replay_safe`, `project.context` and `verification.run` are on a 43 s budget (`run` covers Core's 3 s PROBE + 30 s QUERY gates) and the other four on the default. A6: `git.apply` is on a 43 s budget, is neither `is_read_only` nor `replay_safe`, and a lost answer to it keeps the maybe-applied suffix for TIMEOUT / CONNECTION_CLOSED / MALFORMED_FRAME / FRAME_TOO_LARGE; earlier: frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` was 28 before A7; the six A3a project methods, the five A3b conversation methods and A5's `git.diff` are allowlisted and never replay-safe; the A3a and A3b methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s, and `git.review` / `git.diff` are at 43 s; a lost answer to an `is_read_only` method — `git.diff` and `conversation.export` included — is never marked maybe-applied) |
+| `make desktop-check` (repo root) | NOT re-run in the A3b / A4 / A5 / A6 / A7 passes (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
 | `npm run lint --if-present` | No `lint` script in this package — nothing ran |
 
 **Correction of an earlier claim.** A previous revision of this table reported `cargo check` OK
@@ -226,6 +226,102 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 | Clipboard write inside the Tauri webview | **UNVERIFIED** — the Copy path is tested with an injected clipboard; WebKit permission behaviour in the native window was never exercised |
 | `ChatPanel` wiring (settings section, disabled Send on an archived chat) | Not SSR-renderable in this suite (external-store hooks); the pieces it composes are tested, the panel itself is **UNVERIFIED** |
 | `tests/live-core.test.ts` A3b pins (27 methods, `conversation-sandbox-id` advertised) | Updated, **not run** (skips without `SANDPANE_SOCKET`) |
+
+### A7 verification commands and project.context — what the desktop does, and status
+
+Verification runs one **approved** argument list inside a task's sandbox with `sbx exec` and
+stores what it printed. The desktop helps approve exact argument lists, starts a run only from a
+deliberate confirmation, and shows the stored result as inert text. It never claims more than
+Core said.
+
+- **Methods: 34. Features: 6.** The six new methods are appended to `METHODS` after `git.apply`, in
+  `Method::ALL` order: `verification.list`, `verification.approve`, `verification.revoke`,
+  `verification.run`, `verification.result` and `project.context`. `KNOWN_FEATURES` gains
+  `verification`. `CORE_EVENT_KINDS` gains `verification.started` and `verification.finished`.
+  All of these are drift-tested against the Rust sources and FakeCore's `A7_CORE_*` pins. The
+  panels render only when Core advertises the `verification` feature and the method each one uses;
+  otherwise they show the feature-gate notice.
+- **Proxy classification.** `verification.list`, `verification.result` and `project.context` are
+  `is_read_only`, so a lost answer is never marked "may have been applied".
+  `verification.approve`, `verification.revoke` and `verification.run` are writes, so a lost
+  answer keeps the suffix. None of the six is `replay_safe`.
+- **Deadlines.** `verification.list`, `verification.approve`, `verification.revoke` and
+  `verification.result` use the default budget: webview 15 s, proxy 12 s. `project.context` and
+  `verification.run` get the git deadline: webview 45 s, proxy 43 s. Before its durable start,
+  `verification.run` runs Core's version gate (`RunLimits::PROBE`, 3 s) and identity gate
+  (`RunLimits::QUERY`, 30 s) synchronously. On the default budget, the client would report "the
+  run may have started" while Core was still gating. Both sides are pinned against the Rust
+  source, and a drift test reads PROBE and QUERY from `process.rs` to check that the budget
+  covers them.
+- **Project panel (Verification).**
+  - It lists the approved commands, each argument shown on its own line, never joined into one.
+  - Revoke goes through a confirmation.
+  - An editor takes a label and one field per argument.
+  - "Approve…" opens an `alertdialog` only from a trusted click. Cancel has focus. The dialog
+    says the approval binds this exact argument list, that it must hold no secrets, and that no
+    shell interprets it.
+  - "Detect suggestions" calls `project.context`, only when the user asks. Each suggestion shows
+    Core's notes, and its "Approve…" only fills in the editor; approving still needs the same
+    confirmation.
+  - Early feedback on labels and arguments mirrors Core's rules and is never stricter. Core
+    decides.
+  - A secret refusal shows Core's hint in full, as advice.
+- **Task Run control (Tasks & Review, and the project workspace).**
+  - The expected sandbox is the task's binding (`sandboxName`, never `chosenSandboxName`). Its
+    mode comes from that sandbox's `sandbox.list` entry.
+  - Run opens an `alertdialog` only from a trusted click. It shows the command, the sandbox, the
+    mode badge, the direct-mount / host-worktree warnings and the arguments, and notes that a run
+    cannot be cancelled from here.
+  - Confirm sends one frame with a fresh idempotency key when keys are advertised. There is one
+    run in flight per task: a keyed mutation in the cache refuses a second submit while one is
+    pending.
+  - "Retry safely" appears only after a lost answer to a keyed request. It re-checks that keys,
+    the `verification` feature and `verification.run` are still advertised, then resends the
+    identical request with the same key. A lost run reads "Outcome unknown — the run may have
+    started".
+  - `UNSUPPORTED_SBX_VERSION` reads "Nothing was run — running is disabled for this sbx
+    version". It is not shown as a command failure.
+- **Results.**
+  - A result is read with `verification.result` when the task's events record the finish, or
+    when the user presses Refresh. Nothing polls.
+  - Each outcome has its own wording, and none is coloured as a pass. Exit 0 reads "exit status 0
+    (as reported by sbx exec)", not "passed".
+  - `timed_out` and `interrupted` say the command may still be running inside the sandbox.
+  - Incomplete and withheld output and the redaction counts are disclosed, along with the
+    best-effort redaction note.
+  - Output is one React text child in a `<pre>`, never `dangerouslySetInnerHTML`. LF and TAB are
+    kept, CR shows as `\r`, and every other C0/C1 control, bidi or invisible character becomes a
+    `\u` escape. Output is capped at 2000 lines of 2000 characters, and the cut is counted.
+  - Labels, arguments, notes, sandbox names and paths are revealed and capped the same way.
+- **Review fixes (D-I1 to D-I5).**
+  - D-I1: Core's `approvedAt`, `startedAt` and `finishedAt`, and the run id prefix, are revealed
+    and capped like every other Core string in the verification components.
+  - D-I2: an earlier run whose answer was lost does not block Run. A new gesture can run again,
+    and its confirmation says "An earlier run of this task may have started; check Results
+    first."
+  - D-I3: Revoke… opens its confirmation only from a trusted click, like Approve… and Run….
+  - D-I4: once an element of a suggested argv is edited, added or removed, the draft and the
+    confirmation drop "Suggested from …" and Core's notes, which described the original argv.
+  - D-I5: Core keeps idempotency keys for 24 h (`RETENTION_SECS`, drift-pinned). "Retry safely"
+    is offered only within 23 h of the key's first send. After that, the notice reads "Too
+    late to retry safely — the earlier run may have started; check Results before running
+    again." The window is checked again right before a retry is sent.
+- **Elsewhere.**
+  - The activity timeline and Dashboard show `verification.started` and
+    `verification.finished`. These never change a task's status, and a client never decides a
+    task's lifecycle.
+  - The Stop dialog says when a verification is running in that sandbox.
+  - Remove refused with Core's "verification is running" CONFLICT reads "Nothing was removed — …".
+  - A project-delete refusal because of verification data reads "Nothing was deleted — …".
+
+| Item | Status |
+| --- | --- |
+| Frames, decoders, gating, openers, binding, single flight, idempotency, early feedback, outcomes, disclosures, events, refusal copy, drift, SSR rendering (ESC, OSC 8, OSC 52, `<script>`, bidi characters in output, label, argv and notes), the Stop-dialog note | Functional headless: `tests/verification.test.ts` (44 tests) and `tests/verification-fixes.test.ts` (19 tests, the review fixes, with an injected clock), against a scripted transport and TanStack's `MutationObserver`. **UNVERIFIED live**: never run against a real A7 Core and never in the running desktop app |
+| Core answers used in the tests (result shapes, refusal texts) | **Illustrative**, written from the Core sources, whose message constants and templates are drift-tested. **Not captured.** FakeCore does not model verification: it pins only the feature and the methods |
+| A real run | **UNVERIFIED and not reachable today.** Core disables running for every real sbx version until C-1, C-2, C-5 and C-7 are captured. No task created over the wire is bound to a sandbox until A4b. The desktop shows both as refusals with nothing run. Never run against the real `sbx`, or in a real editor, app or IDE |
+| `VerificationPanel` / `VerificationRunPanel` wiring (radio selection, editor, focus on Cancel, Escape, focus trap, `isTrusted` in WKWebView) | Not SSR-rendered, and this suite has no DOM. The dialogs, `OutputBlock`, the pure helpers and a source pin on each opener are tested. The live behaviour is **UNVERIFIED** |
+| `tests/live-core.test.ts` A7 pins (34 methods, 6 features, `verification` advertised) and its new test (a fresh project lists `{commands: []}`; an approve with a secret-like argument answers `VALIDATION_FAILED`) | Written, **not run** in this pass. The orchestrator runs it |
+| Tauri native build / signing | Deferred (not run on this host in this pass) |
 
 ### A6 git.apply for reviewed files — what the desktop does, and status
 
@@ -642,9 +738,9 @@ one that happens, and the drop count is exposed rather than hidden.
 | --- | --- | --- |
 | `#/` | Dashboard | `system.probe`, `project.list`, event replay, `task.list` when advertised |
 | `#/projects` | Projects | `project.list` (incl. `repositories`), `project.create` |
-| `#/projects/:id`, `#/projects/:id/conversations/:cid` | ProjectWorkspace | `conversation.list` (Core's chats, not just this window's), `conversation.history`, sandbox picker + chat + activity timeline + review |
+| `#/projects/:id`, `#/projects/:id/conversations/:cid` | ProjectWorkspace | `conversation.list` (Core's chats, not just this window's), `conversation.history`, sandbox picker + chat + activity timeline + review; the Verification panel (`verification.list` / `approve` / `revoke`, `project.context` on request) and the selected task's Run control when `verification` is advertised |
 | `#/chats` | Chats | `conversation.list` when advertised (cross-client chats reopen here); falls back to this window's list and says so |
-| `#/tasks`, `#/tasks/:id` | Tasks & Review | `task.list` + event replay, `task.cancel`, `git.review`, `git.apply`; the review's live-writable disclosure comes from the task's own sandbox (`sandboxName` → `sandbox.list` mode), unknown = UNVERIFIED |
+| `#/tasks`, `#/tasks/:id` | Tasks & Review | `task.list` + event replay, `task.cancel`, `git.review`, `git.apply`, the task's verification Run control (`verification.run` / `verification.result`); the review's live-writable disclosure comes from the task's own sandbox (`sandboxName` → `sandbox.list` mode), unknown = UNVERIFIED |
 | `#/sandboxes`, `#/sandboxes/new` | Sandboxes + wizard | `sandbox.list` (incl. `workspaceMode`, `agent`), `sandbox.create` (incl. the optional sbx `agent`, default `shell`), `sandbox.stop` and two-step `sandbox.remove` when advertised (both behind confirmations); Start is shown as unsupported (sbx v0.47 has no `start`) |
 | `#/agents` | Agents | `system.probe` `agents[]` |
 | `#/templates` | Templates | read-only unsupported state (no template RPC) |
@@ -735,8 +831,10 @@ a non-compiling shell can no longer hide behind a green `make check`.
   `sandbox.create`.
 - **DT3:** read-only per-file diff text is implemented (A5 `git.diff`; see "A5 git.diff" under
   Verification), and so is selective apply of reviewed files with a confirmation (A6 `git.apply`;
-  see "A6 git.apply" under Verification — UNVERIFIED live until A4b). Still deferred: a
-  side-by-side viewer, verification history, "open in IDE", approval responses (no approval RPC
+  see "A6 git.apply" under Verification — UNVERIFIED live until A4b), and so are approved
+  verification commands with per-task runs and stored results (A7; see "A7 verification" under
+  Verification — running UNVERIFIED and disabled by Core for every real sbx today). Still
+  deferred: a side-by-side viewer, "open in IDE", approval responses (no approval RPC
   exists).
 - **DT4:** network policy, port publishing (loopback by default), templates, MCP, secret
   presence, redacted diagnostics export, native-app/SSH wizard.

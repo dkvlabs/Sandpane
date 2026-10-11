@@ -389,6 +389,9 @@ class TaskMonitorService(private val project: Project) : Disposable {
 
     private fun onBatch(taskId: String, batch: List<TaskEvent>) {
         for (event in batch) {
+            // A7: remember which runs Core reports started / finished (for the stop dialog and the
+            // Verification section). Payloads only; the task row's status is never touched by it.
+            labs.dkv.sandpane.core.VerificationActivity.observe(taskId, event.kind, event.payload)
             val rendered = event.toRenderedEvent()
             val current = views[taskId]
                 ?: TaskView(taskId, null, null, null, null, null, 0, null, emptyList())

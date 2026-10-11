@@ -88,3 +88,24 @@ export function plainText(value: unknown, max = 500): string {
   const points = Array.from(revealed);
   return points.length > max ? `${points.slice(0, max).join('')}… (truncated)` : revealed;
 }
+
+/**
+ * One line of untrusted multi-line text (a patch line, a verification output
+ * line) made safe to look at: every hidden / bidi / control / line-separator
+ * character is escaped (`\uXXXX`, CR as `\r`) EXCEPT the tab, which is kept
+ * as real content. The caller splits on LF first, so LF and TAB are the only
+ * control characters that ever reach the screen raw. `altered` = something
+ * was escaped.
+ */
+export function revealKeepingTabs(line: string): Revealed {
+  let altered = false;
+  const text = line
+    .split('\t')
+    .map((segment) => {
+      const revealed = inspectHidden(segment);
+      altered = altered || revealed.altered;
+      return revealed.text;
+    })
+    .join('\t');
+  return { text, altered };
+}

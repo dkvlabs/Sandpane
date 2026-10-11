@@ -71,6 +71,10 @@ export const MAX_SCOPING_ID_LEN = 200;
  * A3b (design §3.3) added the five conversation lifecycle methods; they sit
  * right after `conversation.history` in `Method::ALL` (27 in total then; A5's
  * `git.diff` makes 28).
+ *
+ * A7 (design §3.7) added the six verification methods right after
+ * `git.apply` (34 in total). None takes a command string: `verification.run`
+ * names an APPROVED command by id, never argv.
  */
 export const CORE_METHODS = [
   'system.probe',
@@ -102,6 +106,14 @@ export const CORE_METHODS = [
   // A5 (§3.5): read-only, display-only patch for ONE `git.review` entry.
   'git.diff',
   'git.apply',
+  // A7 (§3.7): read-only list / result / context; approve, revoke and run are
+  // writes, each reached only from a confirmed user gesture.
+  'verification.list',
+  'verification.approve',
+  'verification.revoke',
+  'verification.run',
+  'verification.result',
+  'project.context',
 ] as const;
 
 export type CoreMethodName = (typeof CORE_METHODS)[number];
@@ -232,6 +244,10 @@ export const KNOWN_FEATURES = [
   // A6 (§3.6): `git.apply` applies reviewed host_worktree entries (reviewId +
   // entries). Without it Apply stays in its "not implemented" state.
   'git-apply',
+  // A7 (§3.7): the verification surface (list / approve / revoke / run /
+  // result and project.context). The UI is enabled ONLY when advertised.
+  // Running is additionally gated by Core on a PROVEN sbx version.
+  'verification',
 ] as const;
 
 export type CoreFeature = (typeof KNOWN_FEATURES)[number];
@@ -805,4 +821,117 @@ export interface ApplyResult {
    * content could not be verified). Never success, never "nothing written".
    */
   partial?: boolean | null;
+}
+
+// ---------------------------------------------------------------------------
+// A7 — verification commands + project.context (design 2026-10-09 §3.7)
+// ---------------------------------------------------------------------------
+
+/**
+ * A user-approved exact argv (`VerificationCommand`). `label` and `argv` are
+ * UNTRUSTED display text: shown revealed, element by element, never run here.
+ */
+export interface VerificationCommand {
+  id: string;
+  projectId: string;
+  label: string;
+  argv: string[];
+  approvedAt: string;
+}
+
+/** `verification.list` result: live (not revoked) commands, by `approvedAt`. */
+export interface VerificationListResult {
+  commands: VerificationCommand[];
+}
+
+/** `verification.approve` params. Core trims the label and checks for secrets. */
+export interface VerificationApproveParams {
+  projectId: string;
+  label: string;
+  argv: readonly string[];
+}
+
+/**
+ * `verification.run` params, in the A2 fingerprint order. Never argv: only an
+ * approved command can run. `expectedSandboxName` is the task's BINDING
+ * (`TaskSummary.sandboxName`, never `chosenSandboxName`) and
+ * `expectedWorkspaceMode` that sandbox's `sandbox.list` mode — what the run
+ * dialog showed the user.
+ */
+export interface VerificationRunParams {
+  taskId: string;
+  commandId: string;
+  expectedSandboxName: string;
+  expectedWorkspaceMode: WorkspaceMode;
+  /** A2 rules: a fresh key per gesture, reused only by "Retry safely". */
+  idempotencyKey?: string;
+}
+
+/** `verification.run` answer: the run STARTED (asynchronously). */
+export interface VerificationRunResult {
+  runId: string;
+  /** Sequence of the durable `verification.started` task event. */
+  startedSequence: number;
+  /** A keyed replay of the FIRST answer; it never runs twice. */
+  replayed?: boolean;
+}
+
+/**
+ * What best-effort redaction did to a run's stored output. `outputWithheld`
+ * = the redactor was unavailable, so NO output was stored.
+ */
+export interface OutputRedaction {
+  bestEffort: boolean;
+  replacements: number;
+  byKind: Record<string, number>;
+  outputWithheld?: boolean;
+}
+
+/**
+ * `verification.result`. `outcome` is an OPEN string (`running`, `exited`,
+ * `signaled`, `timed_out`, `spawn_failed`, `read_failed`,
+ * `possibly_sbx_error`, `interrupted` today; an unknown value is shown
+ * as-is). `exitCode` is the exit status of `sbx exec` (UNVERIFIED that it is
+ * the command's own). `stdout` / `stderr` are capped, lossily decoded,
+ * redacted before storage and UNTRUSTED.
+ */
+export interface VerificationResult {
+  runId: string;
+  taskId: string;
+  commandId: string;
+  label: string;
+  argv: string[];
+  sandbox: string;
+  workspaceMode: string;
+  outcome: string;
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  redactions: OutputRedaction;
+  elapsedMs?: number;
+  startedAt: string;
+  finishedAt?: string;
+  outputIncomplete?: boolean;
+}
+
+/** One detected root manifest. Suggestions and notes are UNTRUSTED display strings. */
+export interface DetectedManifest {
+  manifest: string;
+  suggestedCommands: string[][];
+  notes: string[];
+}
+
+/** One registered repository's detection; `unreadable` = names nothing was taken from. */
+export interface RepositoryContext {
+  repoPath: string;
+  detected: DetectedManifest[];
+  unreadable: string[];
+}
+
+/** `project.context` result; `approved` repeats `verification.list`. */
+export interface ProjectContextResult {
+  repositories: RepositoryContext[];
+  approved: VerificationCommand[];
 }

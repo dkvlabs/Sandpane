@@ -35,6 +35,20 @@ import {
   asCoreRequestError,
   type ProbeOutcome,
 } from "./core-client";
+import {
+  approveMutationOptions,
+  revokeMutationOptions,
+  runMutationFilters,
+  runMutationOptions,
+  runOutcomeView,
+  submitRun,
+  verificationKeys,
+  type ApproveVariables,
+  type RunMutationState,
+  type RunOutcomeView,
+  type RunVariables,
+} from "./verification-mutations";
+import { runKeyRecheckFromProbe, verificationGate } from "./verification";
 import { TaskEventStore } from "./event-store";
 import {
   ProjectDeletionFlow,
@@ -116,6 +130,9 @@ import {
   type SandboxSummary,
   type TaskStatus,
   type TaskSummary,
+  type ProjectContextResult,
+  type VerificationCommand,
+  type VerificationResult,
 } from "./protocol";
 
 export interface AppDeps {
@@ -1049,4 +1066,157 @@ export function useConversationExport(): {
   const controller = ref.current;
   const state = useSyncExternalStore(controller.subscribe, controller.getState);
   return { controller, state };
+}
+
+// ---------------------------------------------------------------------------
+// A7 verification + project.context (design 2026-10-09 §3.7)
+//
+// Reads: `retry: false`, no polling, no refetch on focus or reconnect — a
+// frame refusal is never re-asked by itself, and `project.context` reads the
+// user's repository files only when asked. Writes: `networkMode: "always"`
+// (D-C1), never retried.
+// ---------------------------------------------------------------------------
+
+/** The verification feature gate (feature AND all six methods), from the probe. */
+export function useVerificationGate(): FeatureGate {
+  const link = useCoreLink();
+  return verificationGate(capabilitiesOf(link));
+}
+
+/** `verification.list` for one project. */
+export function useVerificationCommands(projectId: string | null, enabled: boolean): {
+  commands: VerificationCommand[] | null;
+  isLoading: boolean;
+  error: CoreRequestError | null;
+  refetch: () => void;
+} {
+  const deps = useDeps();
+  const on = enabled && projectId !== null && projectId.length > 0 && deps.transportAvailable;
+  const query = useQuery<VerificationCommand[]>({
+    queryKey: verificationKeys.commands(projectId ?? ""),
+    queryFn: () => deps.client.listVerificationCommands(projectId ?? ""),
+    enabled: on,
+    retry: false,
+    staleTime: 10_000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+  return {
+    commands: query.data ?? null,
+    isLoading: on && query.isPending,
+    error: query.error ? asCoreRequestError(query.error) : null,
+    refetch: () => void query.refetch(),
+  };
+}
+
+/** `project.context` for one project — read only after the user asked (it reads repository files). */
+export function useProjectContext(projectId: string | null, requested: boolean): {
+  context: ProjectContextResult | null;
+  isLoading: boolean;
+  error: CoreRequestError | null;
+  refetch: () => void;
+} {
+  const deps = useDeps();
+  const on = requested && projectId !== null && projectId.length > 0 && deps.transportAvailable;
+  const query = useQuery<ProjectContextResult>({
+    queryKey: verificationKeys.context(projectId ?? ""),
+    queryFn: () => deps.client.getProjectContext(projectId ?? ""),
+    enabled: on,
+    retry: false,
+    staleTime: 30_000,
+    gcTime: 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+  return {
+    context: query.data ?? null,
+    isLoading: on && query.isPending,
+    error: query.error ? asCoreRequestError(query.error) : null,
+    refetch: () => void query.refetch(),
+  };
+}
+
+/**
+ * `verification.result` for one run. Fetched when the task's events show the
+ * run finished (the key carries the finish sequence, so the finish triggers
+ * exactly one read) or when the user presses Refresh — never on a timer.
+ */
+export function useVerificationResult(
+  runId: string | null,
+  finishedSequence: number | null,
+  userRequested: boolean,
+): {
+  result: VerificationResult | null;
+  isLoading: boolean;
+  error: CoreRequestError | null;
+  refetch: () => void;
+} {
+  const deps = useDeps();
+  const on = runId !== null && deps.transportAvailable && (finishedSequence !== null || userRequested);
+  const query = useQuery<VerificationResult>({
+    queryKey: [...verificationKeys.result(runId ?? ""), finishedSequence ?? "unfinished"],
+    queryFn: () => deps.client.getVerificationResult(runId ?? ""),
+    enabled: on,
+    retry: false,
+    staleTime: finishedSequence === null ? 0 : Number.POSITIVE_INFINITY,
+    gcTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+  return {
+    result: query.data ?? null,
+    isLoading: on && query.isPending,
+    error: query.error ? asCoreRequestError(query.error) : null,
+    refetch: () => void query.refetch(),
+  };
+}
+
+/** `verification.approve` for one project (the list and context are re-read after every outcome). */
+export function useApproveVerification(projectId: string) {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  return useMutation<VerificationCommand, CoreRequestError, ApproveVariables>(
+    approveMutationOptions(deps.client, qc, projectId),
+  );
+}
+
+/** `verification.revoke` for one project (the list and context are re-read after every outcome). */
+export function useRevokeVerification(projectId: string) {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  return useMutation<{ revoked: true }, CoreRequestError, { commandId: string }>(
+    revokeMutationOptions(deps.client, qc, projectId),
+  );
+}
+
+/**
+ * `verification.run` for ONE task, keyed in the client's mutation cache:
+ * `pending` counts a run started from an earlier mount (single flight
+ * survives a task switch) and `view` keeps a lost-answer outcome (with its
+ * key) after switching away and back. `submit` sends nothing while a run of
+ * this task is pending. `recheck` re-probes Core right before Retry safely.
+ */
+export function useRunVerification(taskId: string): {
+  submit: (variables: RunVariables) => boolean;
+  pending: boolean;
+  view: RunOutcomeView;
+  recheck: () => Promise<KeyRecheck>;
+  forgetSettled: () => void;
+} {
+  const deps = useDeps();
+  const qc = useQueryClient();
+  const mutation = useMutation(runMutationOptions(deps.client, taskId));
+  const filters = runMutationFilters(taskId);
+  const pending = useIsMutating(filters) > 0;
+  const states = useMutationState<RunMutationState>({ filters, select: (m) => m.state as RunMutationState });
+  return {
+    submit: (variables) => submitRun(qc, taskId, (v) => mutation.mutate(v), variables),
+    pending,
+    view: runOutcomeView(states),
+    recheck: async () => runKeyRecheckFromProbe(await deps.client.probe()),
+    forgetSettled: () => {
+      const cache = qc.getMutationCache();
+      for (const m of cache.findAll(filters)) if (m.state.status !== "pending") cache.remove(m);
+    },
+  };
 }

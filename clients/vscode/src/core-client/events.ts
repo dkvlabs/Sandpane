@@ -220,6 +220,17 @@ export const APPLY_EVENT_KINDS = {
   reconciled: 'git.apply.reconciled',
 } as const;
 
+/**
+ * A7 (§3.7 item 5) verification events (sandpane-service verification.rs;
+ * drift-tested). Display only: they NEVER change task status (rule 3), and
+ * output is never in them (fetched with `verification.result`). Interruption
+ * is `verification.finished {outcome: "interrupted"}` — there is no third kind.
+ */
+export const VERIFICATION_EVENT_KINDS = {
+  started: 'verification.started',
+  finished: 'verification.finished',
+} as const;
+
 /** Read the `to` status out of a `status.changed` payload; undefined if absent/invalid. */
 export function statusFromEvent(kind: string, payload: unknown): TaskStatus | undefined {
   if (kind !== 'status.changed') return undefined;

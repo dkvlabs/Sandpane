@@ -585,6 +585,138 @@ class CoreCommands(
             }
     }
 
+    // -----------------------------------------------------------------------
+    // A7: verification commands + project.context (design 2026-10-09 \u00A73.7)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Why an A7 [method] may not be sent, or null: it must be ADVERTISED (a pre-A7 Core does not
+     * dispatch it) AND Core must advertise the `verification` feature (\u00A73.7 item 1: the UI is
+     * enabled only then). Nothing reaches the socket otherwise.
+     */
+    fun verificationGap(method: String): MethodNotSupportedException? {
+        advertisementGap(method)?.let { return it }
+        val caps = capabilities()
+            ?: return MethodNotSupportedException(method, "this plugin is not connected to Core, so its features are not known yet")
+        if (caps.hasFeature(labs.dkv.sandpane.model.CoreFeatures.VERIFICATION)) return null
+        return MethodNotSupportedException(
+            method,
+            "Core ${caps.coreVersion} does not advertise the verification feature. Nothing was sent.",
+        )
+    }
+
+    private fun <T> verificationCall(
+        method: String,
+        build: () -> JsonElement,
+        decode: (JsonElement) -> T,
+    ): CompletableFuture<T> {
+        verificationGap(method)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            build()
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(method, payload).thenApply { ok -> decodeOrFixed(method) { decode(ok) } }
+    }
+
+    /** `verification.list {projectId}` (read-only) \u2192 the project's live commands, in Core's order. */
+    fun verificationList(projectId: String): CompletableFuture<List<labs.dkv.sandpane.model.VerificationCommand>> =
+        verificationCall(CoreMethods.VERIFICATION_LIST, { buildVerificationListPayload(projectId) }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.VerificationListResult.serializer(), it).commands
+        }
+
+    /**
+     * `verification.approve {projectId, label, argv}`: the EXACT list the user confirmed, element by
+     * element (no trim, split, join or normalization). Refused locally only for a shape Core refuses
+     * too ([VerificationGuards], never stricter); the secret check is Core's.
+     */
+    fun verificationApprove(
+        projectId: String,
+        label: String,
+        argv: List<String>,
+    ): CompletableFuture<labs.dkv.sandpane.model.VerificationCommand> =
+        verificationCall(CoreMethods.VERIFICATION_APPROVE, { buildVerificationApprovePayload(projectId, label, argv) }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.VerificationApproveResult.serializer(), it).command
+        }
+
+    /** `verification.revoke {commandId}` \u2192 Core's `revoked` flag (idempotent). */
+    fun verificationRevoke(commandId: String): CompletableFuture<Boolean> =
+        verificationCall(CoreMethods.VERIFICATION_REVOKE, { buildVerificationRevokePayload(commandId) }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.VerificationRevokeResult.serializer(), it).revoked
+        }
+
+    /**
+     * `verification.run` with params from [VerificationRuns] (a fresh key per gesture, the same key
+     * only for "Retry safely"). NOT read-only and NOT replay-safe: the caller never retries on its own.
+     */
+    fun verificationRun(
+        params: labs.dkv.sandpane.model.VerificationRunParams,
+    ): CompletableFuture<labs.dkv.sandpane.model.VerificationRunResult> =
+        verificationCall(CoreMethods.VERIFICATION_RUN, { buildVerificationRunPayload(params) }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.VerificationRunResult.serializer(), it)
+        }
+
+    /** `verification.result {runId}` (read-only). Output is never echoed if the answer does not decode. */
+    fun verificationResult(runId: String): CompletableFuture<labs.dkv.sandpane.model.VerificationResult> =
+        verificationCall(CoreMethods.VERIFICATION_RESULT, { buildVerificationResultPayload(runId) }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.VerificationResult.serializer(), it)
+        }
+
+    /** `project.context {projectId}` (read-only; 45 s deadline, [MethodDeadlines.PROJECT_CONTEXT_MS]). */
+    fun projectContext(projectId: String): CompletableFuture<labs.dkv.sandpane.model.ProjectContextResult> =
+        verificationCall(CoreMethods.PROJECT_CONTEXT, { buildProjectContextPayload(projectId) }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.ProjectContextResult.serializer(), it)
+        }
+
+    internal fun buildVerificationListPayload(projectId: String): JsonElement =
+        CoreJson.encodeToJsonElement(
+            labs.dkv.sandpane.model.VerificationListParams.serializer(),
+            labs.dkv.sandpane.model.VerificationListParams(CoreGuards.requireId(projectId, "projectId")),
+        )
+
+    internal fun buildVerificationApprovePayload(projectId: String, label: String, argv: List<String>): JsonElement {
+        val id = CoreGuards.requireId(projectId, "projectId")
+        VerificationGuards.labelProblem(label)?.let { throw CoreValidationException("label", "$it; nothing was sent") }
+        VerificationGuards.argvProblem(argv)?.let { throw CoreValidationException("argv", "$it; nothing was sent") }
+        return CoreJson.encodeToJsonElement(
+            labs.dkv.sandpane.model.VerificationApproveParams.serializer(),
+            labs.dkv.sandpane.model.VerificationApproveParams(projectId = id, label = label, argv = argv),
+        )
+    }
+
+    internal fun buildVerificationRevokePayload(commandId: String): JsonElement =
+        CoreJson.encodeToJsonElement(
+            labs.dkv.sandpane.model.VerificationRevokeParams.serializer(),
+            labs.dkv.sandpane.model.VerificationRevokeParams(CoreGuards.requireId(commandId, "commandId")),
+        )
+
+    internal fun buildVerificationRunPayload(params: labs.dkv.sandpane.model.VerificationRunParams): JsonElement {
+        val key = params.idempotencyKey
+        if (key != null && !IdempotencyKeys.isValid(key)) {
+            throw CoreValidationException("idempotencyKey", "not in Core's format; nothing was sent")
+        }
+        return CoreJson.encodeToJsonElement(
+            labs.dkv.sandpane.model.VerificationRunParams.serializer(),
+            params.copy(
+                taskId = CoreGuards.requireId(params.taskId, "taskId"),
+                commandId = CoreGuards.requireId(params.commandId, "commandId"),
+                expectedSandboxName = CoreGuards.requireAddressableSandboxName(params.expectedSandboxName),
+            ),
+        )
+    }
+
+    internal fun buildVerificationResultPayload(runId: String): JsonElement =
+        CoreJson.encodeToJsonElement(
+            labs.dkv.sandpane.model.VerificationResultParams.serializer(),
+            labs.dkv.sandpane.model.VerificationResultParams(CoreGuards.requireId(runId, "runId")),
+        )
+
+    internal fun buildProjectContextPayload(projectId: String): JsonElement =
+        CoreJson.encodeToJsonElement(
+            labs.dkv.sandpane.model.ProjectContextParams.serializer(),
+            labs.dkv.sandpane.model.ProjectContextParams(CoreGuards.requireId(projectId, "projectId")),
+        )
+
     private fun conversationCall(method: String, build: () -> JsonElement): CompletableFuture<Conversation> {
         advertisementGap(method)?.let { return CompletableFuture.failedFuture(it) }
         val payload = try {

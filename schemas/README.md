@@ -13,6 +13,8 @@ formats — never Docker SBX / Codex / Claude wire formats.
 | [task-event.schema.json](task-event.schema.json) | durable replayable log entry | `sandpane_protocol::TaskEvent` |
 | [sandbox-create-spec.schema.json](sandbox-create-spec.schema.json) | `sandbox.create` params | `sandpane_protocol::SandboxCreateSpec` |
 | [change-set.schema.json](change-set.schema.json) | `git.review` result | `sandpane_protocol::ChangeSet` |
+| [verification.schema.json](verification.schema.json) | A7 `verification.*` params and results (`$defs`) | `sandpane_protocol::Verification*`, `OutputRedaction` |
+| [project-context.schema.json](project-context.schema.json) | A7 `project.context` params and result | `sandpane_protocol::ProjectContext*`, `RepositoryContext`, `DetectedManifest` |
 
 ## Sync status
 
@@ -107,7 +109,41 @@ checks passed). The task events `git.apply.started`, `git.applied`,
 `git.apply.failed` and `git.apply.reconciled` are open `kind` strings, not
 enum values; `git.applied` / `git.apply.failed` payloads carry
 `startedSequence` (the `git.apply.started` event they close), which restart
-reconciliation matches on. Client adoption pending (A6 client step). The
+reconciliation matches on. Client adoption pending (A6 client step). A7
+(design 2026-10-09 §3.7) adds six methods — `verification.list`,
+`verification.approve`, `verification.revoke`, `verification.run`,
+`verification.result` and `project.context`, in that order right after
+`git.apply` in `rpc-request`'s enum (34 methods) — and the `verification`
+feature in `core-capabilities` (6 features); both sets are gated by
+`schema-drift`. Their params and results are the first A-series shapes with
+their own files: `verification.schema.json` (`$defs` for every
+`verification.*` param and result, `VerificationCommand` and
+`OutputRedaction`) and `project-context.schema.json`. These two files are
+syntax-linted by `schema-lint` but **not** compared by `schema-drift` (it
+compares value sets, and they define no enum); the Rust types are the source
+of truth and the protocol test `a7_verification_wire_shapes` pins the wire
+shapes. `outcome` is an OPEN string (`running` while in flight, then
+`exited`, `signaled`, `timed_out`, `spawn_failed`, `read_failed`,
+`possibly_sbx_error` or `interrupted`), never an enum; `exitCode` is the exit
+status of `sbx exec` (UNVERIFIED pass-through, C-2). The task events
+`verification.started {runId, commandId, label, argv, sandbox,
+workspaceMode}` and `verification.finished {runId, startedSequence, outcome,
+exitCode?, stdoutBytes, stderrBytes, stdoutTruncated, stderrTruncated,
+redactions, elapsedMs, outputIncomplete?}` are open `kind` strings (documented in
+`task-event.schema.json`); exactly one `verification.finished` closes each
+start, interruption (graceful shutdown or restart reconciliation, the latter
+with `reconciledAfterRestart: true`) carries only `{runId, startedSequence,
+outcome: "interrupted"}`, and command OUTPUT is never in an event — it is read
+with `verification.result`. `outputIncomplete: true` (on the result and on
+`verification.finished`, absent otherwise) means `sbx exec` exited while an
+escaped descendant still held its output open past the kill grace: the exit
+status is kept, the output may lack a tail. `verification.list`,
+`project.context` and `verification.result` measure their response and,
+above `MAX_FRAME_BYTES` − 64 KiB, answer `VALIDATION_FAILED` "the response
+would exceed the frame limit (…); …; nothing was returned" (details:
+`commandIds` for the list, `repositories` / `repositoryCount` /
+`approvedBytes` for the context, `runId` for the result) instead of an
+oversized frame. Client adoption pending (A7 client step). The
 `docs/specs/02 §2` contract blocks are the
 human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7

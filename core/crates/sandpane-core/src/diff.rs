@@ -677,6 +677,146 @@ fn read_link_at(dir: &OwnedFd, name: &CString) -> Result<Vec<u8>, UntrackedError
     Ok(buf)
 }
 
+// ---------------------------------------------------------------------------
+// A7 `project.context` (design 2026-10-09 §3.7 item 9): the SAME race-safe
+// leaf read as A5/A6, from an already-opened directory descriptor.
+// ---------------------------------------------------------------------------
+
+/// Open a repository ROOT for `project.context` (W8): `O_DIRECTORY |
+/// O_NOFOLLOW` (a symlink as the last component is refused), then the
+/// identity check against the registered canonical path — the path must
+/// still canonicalize to itself (no symlink anywhere in it now) and the
+/// opened descriptor must be the same inode as `lstat(path)`. `Err` carries
+/// a short reason; nothing is read.
+pub fn open_root_checked(path: &Path) -> Result<OwnedFd, String> {
+    let c = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| "the path contains a NUL byte".to_string())?;
+    // SAFETY: NUL-terminated path; the result is checked and then owned.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("cannot open it: {}", last_os_error()));
+    }
+    // SAFETY: `fd` was just returned by a successful `open`.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    match std::fs::canonicalize(path) {
+        Ok(p) if p == path => {}
+        Ok(_) => return Err("it no longer resolves to its registered canonical path".into()),
+        Err(e) => return Err(format!("cannot resolve it: {e}")),
+    }
+    let opened = fstat(&fd).map_err(|e| e.to_string())?;
+    let named = lstat(&c).map_err(|e| e.to_string())?;
+    if !same_file(&opened, &named) || opened.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err("the opened directory is not the registered one".into());
+    }
+    Ok(fd)
+}
+
+/// `lstat(path)` (no symlink followed).
+fn lstat(path: &CString) -> std::io::Result<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `path` is NUL-terminated and `st` valid for writes.
+    let rc = unsafe { libc::lstat(path.as_ptr(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(last_os_error());
+    }
+    // SAFETY: a successful `lstat` initialized `st`.
+    Ok(unsafe { st.assume_init() })
+}
+
+/// The entry names in `dir` that EXACTLY equal one of `wanted` (bytes,
+/// case-sensitive — on a case-insensitive volume this is how Core learns the
+/// real spelling, e.g. `Makefile` vs `makefile`). Reads a duplicate of the
+/// descriptor; at most `max_entries` entries are examined.
+pub fn exact_names_in(
+    dir: &OwnedFd,
+    wanted: &[&str],
+    max_entries: usize,
+) -> std::io::Result<Vec<String>> {
+    // SAFETY: `dir` is live; F_DUPFD_CLOEXEC returns a new close-on-exec
+    // descriptor (never inherited by a concurrently spawned child) or -1.
+    let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(last_os_error());
+    }
+    // SAFETY: `dup` is a fresh descriptor owned by the stream from here on
+    // (closedir closes it).
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        let e = last_os_error();
+        // SAFETY: `fdopendir` failed, so `dup` is still ours to close.
+        unsafe { libc::close(dup) };
+        return Err(e);
+    }
+    // SAFETY: rewind the shared offset so a reused descriptor starts at 0.
+    unsafe { libc::rewinddir(stream) };
+    let mut found = Vec::new();
+    for _ in 0..max_entries {
+        // SAFETY: `stream` is a live DIR*; readdir returns NULL at the end.
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: `d_name` is a NUL-terminated array inside the entry.
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if let Some(w) = wanted.iter().find(|w| w.as_bytes() == name.to_bytes()) {
+            found.push((*w).to_string());
+        }
+    }
+    // SAFETY: `stream` is live and closed exactly once.
+    unsafe { libc::closedir(stream) };
+    Ok(found)
+}
+
+/// What [`read_regular_at`] found for one name directly in `dir`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegularLeaf {
+    Absent,
+    /// A regular file: at most `cap` bytes; `over_cap` when more existed.
+    File {
+        bytes: Vec<u8>,
+        over_cap: bool,
+    },
+    /// A symlink, directory, FIFO, socket or device: nothing was read.
+    NotRegular,
+}
+
+/// Read `name` directly in `dir` with the A5 race-safe leaf read
+/// (`fstatat(AT_SYMLINK_NOFOLLOW)` first, then `O_NOFOLLOW | O_NONBLOCK`
+/// open and the inode re-check). Only a regular file is read; a symlink is
+/// never followed (its target is not read either).
+pub fn read_regular_at(
+    dir: &OwnedFd,
+    name: &str,
+    cap: usize,
+) -> Result<RegularLeaf, UntrackedError> {
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(UntrackedError::Escapes(format!(
+            "{name:?} is not a plain name"
+        )));
+    }
+    let c = CString::new(name)
+        .map_err(|_| UntrackedError::Escapes(format!("{name:?} is not a plain name")))?;
+    let first = match stat_at_nofollow(dir, &c) {
+        Ok(st) => st,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(RegularLeaf::Absent),
+        Err(e) => return Err(UntrackedError::Io(e)),
+    };
+    if first.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Ok(RegularLeaf::NotRegular);
+    }
+    match read_classified_leaf(dir, &c, &first, name, cap, false)? {
+        UntrackedContent::File {
+            bytes, over_cap, ..
+        } => Ok(RegularLeaf::File { bytes, over_cap }),
+        UntrackedContent::Symlink { .. } => Ok(RegularLeaf::NotRegular),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

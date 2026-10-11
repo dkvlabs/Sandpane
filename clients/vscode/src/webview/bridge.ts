@@ -58,7 +58,46 @@ export interface TaskRow {
   mode?: string;
   /** A4: the name the task's chat chose — NOT where it runs; revealed and capped. */
   chosenSandboxName?: string;
+  /** A7: the per-task Verify… / Results… buttons. */
+  verification?: TaskVerificationRow;
 }
+
+/** A7 per-task verification row. Every string is already plain text. */
+export interface TaskVerificationRow {
+  /** Verify… is enabled (Core advertises verification, the task is bound, no run is being started). */
+  runEnabled: boolean;
+  /** Why Verify… is disabled (shown as the button's tooltip and next to it). */
+  runReason: string | null;
+  /** One line per run named by Core's events (label — honest outcome copy). */
+  runs: string[];
+}
+
+/** A7: one approved command as the sidebar shows it (label + `[i] "literal"` lines). */
+export interface VerificationCommandRow {
+  label: string;
+  argv: string[];
+}
+
+/** A7: Core's detection for one registered repository (display only). */
+export interface VerificationRepositoryRow {
+  repoPath: string;
+  manifests: { manifest: string; suggestions: string[]; notes: string[] }[];
+  unreadable: string[];
+}
+
+/** A7 per-project Verification section. */
+export interface VerificationPanelView {
+  /** Core advertises the six A7 methods and the feature `verification`. */
+  supported: boolean;
+  /** Why the section is empty or unavailable, when it is. */
+  note: string | null;
+  commands: VerificationCommandRow[];
+  repositories: VerificationRepositoryRow[];
+}
+
+export const VERIFICATION_ACTIONS = ['add', 'approveSuggestion', 'revoke', 'refresh'] as const;
+
+export type VerificationAction = (typeof VERIFICATION_ACTIONS)[number];
 
 export interface CapabilitySummary {
   coreVersion: string;
@@ -143,6 +182,8 @@ export interface SidebarState {
   gitApplySupported: boolean;
   /** A6: an apply flow is running (review → pick → modal → answer): Apply is disabled. */
   applyInFlight: boolean;
+  /** A7: the selected project's Verification section. */
+  verification: VerificationPanelView;
   lines: ChatLine[];
   /** What the stream shows: one conversation, or every task of the project. */
   transcript: { scope: 'conversation' | 'project'; label: string };
@@ -190,7 +231,17 @@ export type WebviewToExtension =
   | { type: 'selectConversation'; conversationId: string }
   /** A3b: one lifecycle action on a Core-listed conversation (native dialogs follow). */
   | { type: 'conversationAction'; action: ConversationAction; conversationId: string }
-  | { type: 'toggleArchivedConversations' };
+  | { type: 'toggleArchivedConversations' }
+  /**
+   * A7: open a native dialog filled from Core (add / approve a suggestion /
+   * revoke) or re-read the section. Carries NO argv, command id or label: the
+   * dialog reads them from Core.
+   */
+  | { type: 'verificationAction'; action: VerificationAction }
+  /** A7: open the Run dialog for this task (command picked there, from Core's list). */
+  | { type: 'runVerification'; taskId: string }
+  /** A7: pick one of the task's runs (named by Core's events) and open its result. */
+  | { type: 'showVerificationResults'; taskId: string };
 
 export type ExtensionToWebview = { type: 'state'; state: SidebarState };
 
@@ -207,6 +258,9 @@ export const WEBVIEW_MESSAGE_KINDS: readonly string[] = [
   'selectConversation',
   'conversationAction',
   'toggleArchivedConversations',
+  'verificationAction',
+  'runVerification',
+  'showVerificationResults',
 ];
 
 /** Upper bound on a conversation id from the webview (Core's scoping-id bound). */
@@ -265,6 +319,18 @@ export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefine
       const id = webviewId((raw as { taskId?: unknown }).taskId, false);
       return id === undefined ? undefined : { type: 'applyTask', taskId: id };
     }
+    case 'verificationAction': {
+      const action = (raw as { action?: unknown }).action;
+      return (VERIFICATION_ACTIONS as readonly unknown[]).includes(action)
+        ? { type: 'verificationAction', action: action as VerificationAction }
+        : undefined;
+    }
+    case 'runVerification':
+    case 'showVerificationResults': {
+      const id = webviewId((raw as { taskId?: unknown }).taskId, false);
+      if (id === undefined) return undefined;
+      return type === 'runVerification' ? { type: 'runVerification', taskId: id } : { type: 'showVerificationResults', taskId: id };
+    }
     case 'cancelTask':
     case 'reviewTask': {
       const r = raw as { taskId?: unknown };
@@ -299,6 +365,7 @@ export function emptySidebarState(connection: ConnectionTone): SidebarState {
     gitDiffSupported: false,
     gitApplySupported: false,
     applyInFlight: false,
+    verification: { supported: false, note: null, commands: [], repositories: [] },
     lines: [],
     transcript: { scope: 'project', label: 'Transcript of all tasks in this project (no conversation selected)' },
     tasks: [],

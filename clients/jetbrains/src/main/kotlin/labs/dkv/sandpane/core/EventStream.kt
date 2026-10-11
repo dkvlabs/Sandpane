@@ -284,6 +284,8 @@ fun TaskEvent.toRenderedEvent(): RenderedEvent {
         }
     }
     GitApplies.eventNote(kind, payload)?.let { return RenderedEvent(this, null, it) }
+    // A7: a note only (never output, never a status change; \u00A73.7 item 5, AGENTS.md rule 3).
+    Verifications.eventNote(kind, payload)?.let { return RenderedEvent(this, null, it) }
     return when {
         EventStream.isCoreLifecycleKind(kind) -> RenderedEvent(this, null, "core event '$kind'")
         else -> RenderedEvent(this, null, "unrecognized event kind '$kind'")

@@ -36,6 +36,7 @@ import {
   featureGate,
   type FeatureGate,
 } from "./reducers";
+import { MSG_SANDBOX_VERIFICATION_RUNNING } from "./verification-messages";
 
 // ---------------------------------------------------------------------------
 // Gating on `system.probe`
@@ -294,7 +295,18 @@ export function removalFailureCopy(err: unknown): FailureCopy {
         action: "Request a new confirmation if you still want to remove it.",
         coreMessage,
       };
-    case "CONFLICT":
+    case "CONFLICT": {
+      // A7: Core refused because a verification is running in this sandbox
+      // (exact text; checked before anything is removed).
+      if (error.message === MSG_SANDBOX_VERIFICATION_RUNNING) {
+        return {
+          title: "Nothing was removed — a verification is running in this sandbox",
+          body: "Core refused before removing anything because a verification is running in this sandbox.",
+          action:
+            "Wait for it to finish, then request a new confirmation. Stopping the sandbox is still allowed and ends the run.",
+          coreMessage,
+        };
+      }
       // Core uses CONFLICT for two different situations; Core's own message
       // (shown beside this copy) says which one happened.
       return {
@@ -307,6 +319,7 @@ export function removalFailureCopy(err: unknown): FailureCopy {
           "Wait for any running operation to finish, re-probe, and review the sandbox before requesting a new confirmation.",
         coreMessage,
       };
+    }
     case "NOT_FOUND":
       return {
         title: "The sandbox is already gone",
@@ -504,6 +517,12 @@ export async function countActiveTasksOn(
     return null;
   }
 }
+
+/**
+ * A7 (design §3.7 item 14): shown in the stop confirmation when this client
+ * knows a verification is in flight in the sandbox. Stop stays allowed.
+ */
+export const STOP_ENDS_VERIFICATION = "a verification is running in this sandbox; stopping it ends the run";
 
 /** Exact cross-client copy when Core does not record a task's sandbox. */
 export const TASK_SANDBOX_UNRECORDED_COPY =

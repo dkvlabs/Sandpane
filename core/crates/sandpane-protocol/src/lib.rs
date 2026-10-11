@@ -176,6 +176,24 @@ pub enum Method {
     GitDiff,
     #[serde(rename = "git.apply")]
     GitApply,
+    /// A7 (§3.7 item 1): the project's live approved verification commands.
+    #[serde(rename = "verification.list")]
+    VerificationList,
+    /// A7: approve an exact user-entered argv + label (secret-checked).
+    #[serde(rename = "verification.approve")]
+    VerificationApprove,
+    /// A7: tombstone an approved command (never deleted).
+    #[serde(rename = "verification.revoke")]
+    VerificationRevoke,
+    /// A7: run an approved command in the task's sandbox (asynchronous).
+    #[serde(rename = "verification.run")]
+    VerificationRun,
+    /// A7: one run's state and (redacted, capped) output.
+    #[serde(rename = "verification.result")]
+    VerificationResult,
+    /// A7 (§3.7 item 9): read-only manifest detection + approved commands.
+    #[serde(rename = "project.context")]
+    ProjectContext,
 }
 
 impl Method {
@@ -184,7 +202,7 @@ impl Method {
     /// from the enum rather than hand-written, and `dispatch` must match
     /// exhaustively over the same enum, so an advertised method always really
     /// exists and a handled method is always advertised.
-    pub const ALL: [Method; 28] = [
+    pub const ALL: [Method; 34] = [
         Self::SystemProbe,
         Self::ProjectCreate,
         Self::ProjectList,
@@ -213,6 +231,12 @@ impl Method {
         Self::GitReview,
         Self::GitDiff,
         Self::GitApply,
+        Self::VerificationList,
+        Self::VerificationApprove,
+        Self::VerificationRevoke,
+        Self::VerificationRun,
+        Self::VerificationResult,
+        Self::ProjectContext,
     ];
 
     /// Wire names of every method in [`Method::ALL`] — derived, never a list a
@@ -251,6 +275,12 @@ impl Method {
             "git.review" => Self::GitReview,
             "git.diff" => Self::GitDiff,
             "git.apply" => Self::GitApply,
+            "verification.list" => Self::VerificationList,
+            "verification.approve" => Self::VerificationApprove,
+            "verification.revoke" => Self::VerificationRevoke,
+            "verification.run" => Self::VerificationRun,
+            "verification.result" => Self::VerificationResult,
+            "project.context" => Self::ProjectContext,
             _ => return None,
         })
     }
@@ -285,6 +315,12 @@ impl Method {
             Self::GitReview => "git.review",
             Self::GitDiff => "git.diff",
             Self::GitApply => "git.apply",
+            Self::VerificationList => "verification.list",
+            Self::VerificationApprove => "verification.approve",
+            Self::VerificationRevoke => "verification.revoke",
+            Self::VerificationRun => "verification.run",
+            Self::VerificationResult => "verification.result",
+            Self::ProjectContext => "project.context",
         }
     }
 }
@@ -313,12 +349,20 @@ impl Method {
 ///   carries `taskBlob` / `taskMode`, and `git.apply` takes `reviewId` +
 ///   `entries` and answers the additive `ApplyResult` fields. Without it a
 ///   client keeps Apply in its "not implemented" state (§3.6 item 10).
-pub const FEATURES: [&str; 5] = [
+/// * `verification` — the A7 verification surface (design 2026-10-09 §3.7):
+///   `verification.list` / `approve` / `revoke` / `run` / `result` and
+///   `project.context`. Clients enable the verification UI only when it is
+///   advertised. Running is additionally gated on a PROVEN sbx version:
+///   `verification.run` answers `UNSUPPORTED_SBX_VERSION` for every sbx
+///   version whose `exec` argument passing is not captured (all of them in
+///   A7) — the feature is real, running is gated on proof.
+pub const FEATURES: [&str; 6] = [
     "idempotency-keys",
     "sandbox-create-agent",
     "conversation-sandbox-id",
     "conversation-send-mode",
     "git-apply",
+    "verification",
 ];
 
 /// [`FEATURES`] as owned strings — the one derivation `system.probe` uses.
@@ -1238,6 +1282,201 @@ pub struct ApplyResult {
     pub partial: Option<bool>,
 }
 
+// ---------------------------------------------------------------------------
+// A7 — verification commands + project.context (design 2026-10-09 §3.7)
+// ---------------------------------------------------------------------------
+
+/// A user-approved exact argv (§3.7 item 1). `argv` is UNTRUSTED display
+/// text for clients (shown revealed, element by element), proven free of
+/// secret-shaped strings at approve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationCommand {
+    pub id: String,
+    pub project_id: String,
+    pub label: String,
+    pub argv: Vec<String>,
+    pub approved_at: String,
+}
+
+/// `verification.list` / `project.context` params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationListParams {
+    pub project_id: String,
+}
+
+/// `verification.list` result: live commands ordered by `approvedAt`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationListResult {
+    pub commands: Vec<VerificationCommand>,
+}
+
+/// `verification.approve` params (§3.7 item 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationApproveParams {
+    pub project_id: String,
+    pub label: String,
+    pub argv: Vec<String>,
+}
+
+/// `verification.approve` result. Approving a byte-equal live argv again
+/// returns the existing command, label unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationApproveResult {
+    pub command: VerificationCommand,
+}
+
+/// `verification.revoke` params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationRevokeParams {
+    pub command_id: String,
+}
+
+/// `verification.revoke` result (idempotent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationRevokeResult {
+    pub revoked: bool,
+}
+
+/// `verification.run` params (§3.7 items 1 and 5). Never argv, never a
+/// path: only an approved command can run. The two `expected*` values are
+/// what the run dialog showed the user; Core compares them with the task's
+/// binding. Field order is the A2 fingerprint order; `idempotencyKey` is
+/// skipped when absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationRunParams {
+    pub task_id: String,
+    pub command_id: String,
+    pub expected_sandbox_name: String,
+    pub expected_workspace_mode: WorkspaceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// `verification.run` result: the run started (asynchronously).
+/// `startedSequence` is the `verification.started` task event's sequence.
+/// A keyed replay is the FIRST response plus `replayed: true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationRunResult {
+    pub run_id: String,
+    pub started_sequence: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
+}
+
+/// `verification.result` params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationResultParams {
+    pub run_id: String,
+}
+
+/// What best-effort redaction did to a run's stored output (§3.7 item 6).
+/// `outputWithheld: true` = the redactor was unavailable, so NO output was
+/// stored (stdout/stderr are empty) — never raw output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputRedaction {
+    pub best_effort: bool,
+    pub replacements: u64,
+    pub by_kind: std::collections::BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_withheld: Option<bool>,
+}
+
+impl Default for OutputRedaction {
+    fn default() -> Self {
+        Self {
+            best_effort: true,
+            replacements: 0,
+            by_kind: std::collections::BTreeMap::new(),
+            output_withheld: None,
+        }
+    }
+}
+
+/// `verification.result` (§3.7 item 1, W1). `outcome` is an OPEN string:
+/// `running`, `exited`, `signaled`, `timed_out`, `spawn_failed`,
+/// `read_failed`, `possibly_sbx_error`, `interrupted` today; clients must
+/// show an unknown value as-is. `exitCode` is the exit status of `sbx exec`
+/// (UNVERIFIED that it is the command's own, C-2); present for `exited`
+/// and `possibly_sbx_error` only. `stdout`/`stderr` are capped (64 KiB
+/// each), decoded lossily and redacted (best effort) BEFORE storage, and
+/// are UNTRUSTED text. `elapsedMs` / `finishedAt` are absent while running.
+/// `outputIncomplete: true` = `sbx exec` exited but its output pipes were
+/// still held open (an escaped descendant) after the kill grace, so the
+/// stored output may be missing a tail; the exit status is kept as is.
+/// Absent otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationResult {
+    pub run_id: String,
+    pub task_id: String,
+    pub command_id: String,
+    pub label: String,
+    pub argv: Vec<String>,
+    pub sandbox: String,
+    pub workspace_mode: String,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub redactions: OutputRedaction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_incomplete: Option<bool>,
+}
+
+/// `project.context` params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextParams {
+    pub project_id: String,
+}
+
+/// One detected root manifest (§3.7 item 9). Suggestions and notes are
+/// UNTRUSTED display strings: never auto-approved, never run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedManifest {
+    pub manifest: String,
+    pub suggested_commands: Vec<Vec<String>>,
+    pub notes: Vec<String>,
+}
+
+/// One registered repository's detection. `unreadable` lists root file
+/// names nothing was taken from (`"."` = the root itself).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryContext {
+    pub repo_path: String,
+    pub detected: Vec<DetectedManifest>,
+    pub unreadable: Vec<String>,
+}
+
+/// `project.context` result; `approved` repeats `verification.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextResult {
+    pub repositories: Vec<RepositoryContext>,
+    pub approved: Vec<VerificationCommand>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,7 +1534,7 @@ mod tests {
     /// A3b added the five conversation lifecycle methods (§3.3 item 1).
     #[test]
     fn all_twenty_seven_methods_round_trip() {
-        const EXPECTED: [&str; 28] = [
+        const EXPECTED: [&str; 34] = [
             "system.probe",
             "project.create",
             "project.list",
@@ -1324,6 +1563,13 @@ mod tests {
             "git.review",
             "git.diff",
             "git.apply",
+            // A7 (§3.7 item 1), in this order after git.apply.
+            "verification.list",
+            "verification.approve",
+            "verification.revoke",
+            "verification.run",
+            "verification.result",
+            "project.context",
         ];
         assert_eq!(Method::ALL.len(), EXPECTED.len());
         assert_eq!(Method::wire_names(), EXPECTED.to_vec());
@@ -1431,7 +1677,8 @@ mod tests {
                 "sandbox-create-agent",
                 "conversation-sandbox-id",
                 "conversation-send-mode",
-                "git-apply"
+                "git-apply",
+                "verification"
             ]
         );
         assert_eq!(
@@ -1441,7 +1688,8 @@ mod tests {
                 "sandbox-create-agent".to_string(),
                 "conversation-sandbox-id".to_string(),
                 "conversation-send-mode".to_string(),
-                "git-apply".to_string()
+                "git-apply".to_string(),
+                "verification".to_string()
             ]
         );
         // A pre-A2 Core omits `features`: still parses, as "nothing advertised".
@@ -1459,9 +1707,141 @@ mod tests {
                 "sandbox-create-agent",
                 "conversation-sandbox-id",
                 "conversation-send-mode",
-                "git-apply"
+                "git-apply",
+                "verification"
             ])
         );
+    }
+
+    /// A7 (§3.7 item 1): the wire shapes clients will build and read.
+    #[test]
+    fn a7_verification_wire_shapes() {
+        let cmd = VerificationCommand {
+            id: "vc".into(),
+            project_id: "p".into(),
+            label: "unit tests".into(),
+            argv: vec!["npm".into(), "run".into(), "test".into()],
+            approved_at: "2026-10-11T00:00:00Z".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&cmd).unwrap(),
+            serde_json::json!({"id": "vc", "projectId": "p", "label": "unit tests",
+                               "argv": ["npm", "run", "test"], "approvedAt": "2026-10-11T00:00:00Z"})
+        );
+        let list: VerificationListParams =
+            serde_json::from_value(serde_json::json!({"projectId": "p"})).unwrap();
+        assert_eq!(list.project_id, "p");
+        let a: VerificationApproveParams = serde_json::from_value(
+            serde_json::json!({"projectId": "p", "label": "t", "argv": ["make"]}),
+        )
+        .unwrap();
+        assert_eq!(a.argv, vec!["make".to_string()]);
+        let r: VerificationRevokeParams =
+            serde_json::from_value(serde_json::json!({"commandId": "vc"})).unwrap();
+        assert_eq!(r.command_id, "vc");
+        assert_eq!(
+            serde_json::to_value(VerificationRevokeResult { revoked: true }).unwrap(),
+            serde_json::json!({"revoked": true})
+        );
+        // run: the key is optional and skipped when absent (A2 hash rule).
+        let run: VerificationRunParams = serde_json::from_value(serde_json::json!({
+            "taskId": "t", "commandId": "vc", "expectedSandboxName": "atlas-auth",
+            "expectedWorkspaceMode": "direct_mount"
+        }))
+        .unwrap();
+        assert_eq!(run.expected_workspace_mode, WorkspaceMode::DirectMount);
+        assert_eq!(run.idempotency_key, None);
+        assert_eq!(
+            serde_json::to_value(&run).unwrap(),
+            serde_json::json!({"taskId": "t", "commandId": "vc",
+                "expectedSandboxName": "atlas-auth", "expectedWorkspaceMode": "direct_mount"})
+        );
+        assert!(
+            serde_json::from_value::<VerificationRunParams>(serde_json::json!({
+                "taskId": "t", "commandId": "vc", "expectedSandboxName": "a",
+                "expectedWorkspaceMode": "bogus"
+            }))
+            .is_err()
+        );
+        let started = VerificationRunResult {
+            run_id: "r".into(),
+            started_sequence: 4,
+            replayed: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            serde_json::json!({"runId": "r", "startedSequence": 4})
+        );
+        let _: VerificationResultParams =
+            serde_json::from_value(serde_json::json!({"runId": "r"})).unwrap();
+        // result: exitCode/finishedAt absent while running; outcome is an
+        // OPEN string; output never interpreted.
+        let running = VerificationResult {
+            run_id: "r".into(),
+            task_id: "t".into(),
+            command_id: "vc".into(),
+            label: "tests".into(),
+            argv: vec!["make".into()],
+            sandbox: "atlas-auth".into(),
+            workspace_mode: "mountless".into(),
+            outcome: "running".into(),
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            redactions: OutputRedaction::default(),
+            elapsed_ms: None,
+            started_at: "s".into(),
+            finished_at: None,
+            output_incomplete: None,
+        };
+        let v = serde_json::to_value(&running).unwrap();
+        assert!(
+            v.get("exitCode").is_none() && v.get("finishedAt").is_none(),
+            "{v}"
+        );
+        assert!(v.get("elapsedMs").is_none(), "{v}");
+        assert!(v.get("outputIncomplete").is_none(), "{v}");
+        assert_eq!(
+            v["redactions"],
+            serde_json::json!({"bestEffort": true, "replacements": 0, "byKind": {}})
+        );
+        let done: VerificationResult = serde_json::from_value(serde_json::json!({
+            "runId": "r", "taskId": "t", "commandId": "vc", "label": "tests", "argv": ["make"],
+            "sandbox": "atlas-auth", "workspaceMode": "mountless", "outcome": "some_future_outcome",
+            "exitCode": 7, "stdout": "o", "stderr": "e", "stdoutTruncated": true,
+            "stderrTruncated": false,
+            "redactions": {"bestEffort": true, "replacements": 1, "byKind": {"token": 1},
+                           "outputWithheld": true},
+            "elapsedMs": 12, "startedAt": "s", "finishedAt": "f", "outputIncomplete": true
+        }))
+        .unwrap();
+        assert_eq!(done.outcome, "some_future_outcome");
+        assert_eq!(done.output_incomplete, Some(true));
+        assert_eq!(done.redactions.output_withheld, Some(true));
+        // project.context
+        let ctx = ProjectContextResult {
+            repositories: vec![RepositoryContext {
+                repo_path: "/r".into(),
+                detected: vec![DetectedManifest {
+                    manifest: "package.json".into(),
+                    suggested_commands: vec![vec!["npm".into(), "run".into(), "test".into()]],
+                    notes: vec!["n".into()],
+                }],
+                unreadable: vec!["go.mod".into()],
+            }],
+            approved: vec![cmd],
+        };
+        let v = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(v["repositories"][0]["repoPath"], "/r");
+        assert_eq!(
+            v["repositories"][0]["detected"][0]["suggestedCommands"],
+            serde_json::json!([["npm", "run", "test"]])
+        );
+        assert_eq!(v["approved"][0]["id"], "vc");
+        let _: ProjectContextParams =
+            serde_json::from_value(serde_json::json!({"projectId": "p"})).unwrap();
     }
 
     /// A3b: `archivedAt` / `sandboxId` are additive — absent when unset (and

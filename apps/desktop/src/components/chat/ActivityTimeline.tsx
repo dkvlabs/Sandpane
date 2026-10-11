@@ -161,6 +161,18 @@ function TimelineRow({ entry }: { entry: TimelineEntry }) {
           <Seq entry={entry} />
         </li>
       );
+    case "verification":
+      // A7: display only; never a task status, never coloured as a pass.
+      return (
+        <li className="timeline__row">
+          <Badge tone={entry.tone}>verification</Badge>
+          <span className="timeline__text">{entry.text}</span>
+          {entry.disclosures !== undefined && entry.disclosures.length > 0 && (
+            <span className="muted"> — {entry.disclosures.join("; ")}</span>
+          )}
+          <Seq entry={entry} />
+        </li>
+      );
     case "unmodelled":
       return (
         <li className="timeline__row timeline__row--unknown">

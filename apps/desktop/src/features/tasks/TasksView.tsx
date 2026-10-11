@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import {
   useCancelTask,
+  useCoreConversations,
   useCoreLink,
   useProjects,
   useSandboxes,
@@ -26,6 +27,7 @@ import {
 import { ProjectSidebar } from "../../components/project/ProjectSidebar";
 import { ActivityTimeline, TaskHeader } from "../../components/chat/ActivityTimeline";
 import { ReviewPanel } from "../../components/review/ReviewPanel";
+import { VerificationRunPanel } from "../../components/verification/VerificationRunPanel";
 import {
   Badge,
   Button,
@@ -259,6 +261,11 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
   // OR its event log disables cancel, review and apply together, and is never
   // described as terminal — this build cannot tell what it is.
   const actions = taskActionGate(row, projection);
+  // A7: the task's project, from Core's conversation list (archived included),
+  // so Run lists THAT project's approved commands. Unknown = Run disabled.
+  const conversations = useCoreConversations(null, row?.conversationId != null, true);
+  const projectId =
+    conversations.conversations.find((c) => c.id === row?.conversationId)?.projectId ?? null;
 
   return (
     <div className="grid grid--workspace">
@@ -314,7 +321,10 @@ function TaskDetail({ taskId, row }: { taskId: string; row: TaskIndexEntry | nul
           )}
         </Panel>
       </div>
-      <ReviewPanel taskId={taskId} isolation={isolation} blockedReason={actions.blockedReason} />
+      <div>
+        <ReviewPanel taskId={taskId} isolation={isolation} blockedReason={actions.blockedReason} />
+        <VerificationRunPanel taskId={taskId} task={row} projectId={projectId} />
+      </div>
     </div>
   );
 }

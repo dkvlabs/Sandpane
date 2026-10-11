@@ -33,9 +33,9 @@ describe('contributed commands match the registered ones', () => {
   const extension = readFileSync(join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
   const registered = [...extension.matchAll(/registerCommand\('(sandpane\.[A-Za-z]+)'/g)].map((m) => m[1]);
 
-  it('every contributed command is registered and vice versa (21, incl. the 8 A3a project commands and A5 Show Task Patch)', () => {
+  it('every contributed command is registered and vice versa (26, incl. the 8 A3a project commands, A5 Show Task Patch and the 5 A7 verification commands)', () => {
     expect([...contributed].sort()).toEqual([...registered].sort());
-    expect(contributed).toHaveLength(21);
+    expect(contributed).toHaveLength(26);
     for (const id of [
       'sandpane.showTaskPatch',
       'sandpane.renameProject',
@@ -46,6 +46,11 @@ describe('contributed commands match the registered ones', () => {
       'sandpane.addRepository',
       'sandpane.removeRepository',
       'sandpane.deleteProject',
+      'sandpane.approveVerification',
+      'sandpane.approveVerificationSuggestion',
+      'sandpane.revokeVerification',
+      'sandpane.runVerification',
+      'sandpane.showVerificationResult',
     ]) {
       expect(contributed).toContain(id);
     }
@@ -65,5 +70,17 @@ describe('A5 patch view wiring', () => {
       'vscode.workspace.registerTextDocumentContentProvider(APPLY_LIST_SCHEME, session.applyListDocuments)',
     );
     expect(extension).toContain("import { APPLY_LIST_SCHEME } from './vscode/gitApply';");
+  });
+});
+
+describe('A7 verification output wiring', () => {
+  it('extension.ts registers the session verification store as the sandpane-verification content provider', () => {
+    const extension = readFileSync(join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
+    expect(extension).toContain(
+      'vscode.workspace.registerTextDocumentContentProvider(VERIFICATION_SCHEME, session.verificationDocuments)',
+    );
+    expect(extension).toContain("import { VERIFICATION_SCHEME } from './vscode/verification';");
+    // Never a terminal or a pseudoterminal for verification output.
+    expect(extension).not.toMatch(/createTerminal|Pseudoterminal/);
   });
 });

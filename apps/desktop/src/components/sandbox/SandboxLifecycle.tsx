@@ -4,6 +4,7 @@ import {
   useSandboxRemovalFlow,
   useStopConfirm,
   useStopSandbox,
+  useTaskProjections,
 } from "../../lib/hooks";
 import type { CoreRequestError } from "../../lib/core-client";
 import {
@@ -14,6 +15,7 @@ import {
   startUnsupportedCopy,
   EXTERNAL_BANNER,
   EXTERNAL_TEXT,
+  STOP_ENDS_VERIFICATION,
   stopConfirmationCopy,
   stopOutcomeView,
   type ActiveTaskCount,
@@ -28,7 +30,7 @@ import type {
   SandboxStopResult,
   SandboxSummary,
 } from "../../lib/protocol";
-import { displayRevealed } from "../../lib/reducers";
+import { displayRevealed, verificationsRunningIn } from "../../lib/reducers";
 import { Button, ConfirmDialog, Mono, Warning } from "../ui/primitives";
 import { ErrorPanel } from "../../features/projects/ProjectsView";
 
@@ -192,12 +194,18 @@ export function SandboxLifecycleControls({
  */
 export function SandboxLifecycleNotices({ lifecycle }: { lifecycle: SandboxLifecycle }) {
   const { flow, removal, stopOutcomes, dismissStop, stopDialog } = lifecycle;
+  // A7: runs this window's task events show started in that sandbox and not
+  // yet finished. Informational only — stop stays allowed and ends the run.
+  const projections = useTaskProjections();
+  const verificationsRunning =
+    stopDialog.kind === "confirming" ? verificationsRunningIn(projections, stopDialog.name) : 0;
   return (
     <>
       {stopDialog.kind === "confirming" && (
         <StopDialog
           name={stopDialog.name}
           active={stopDialog.active}
+          verificationsRunning={verificationsRunning}
           onCancel={() => lifecycle.stopConfirm.cancel()}
           onConfirm={lifecycle.confirmStop}
         />
@@ -226,11 +234,14 @@ export function SandboxLifecycleNotices({ lifecycle }: { lifecycle: SandboxLifec
 export function StopDialog({
   name,
   active,
+  verificationsRunning = 0,
   onCancel,
   onConfirm,
 }: {
   name: string;
   active: ActiveTaskCount;
+  /** A7: verification runs this window knows are in flight in this sandbox. */
+  verificationsRunning?: number;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -247,6 +258,11 @@ export function StopDialog({
           <p className={copy.tasksAtRisk ? "stop-tasks stop-tasks--risk" : "stop-tasks"} role="status">
             {copy.taskLine}
           </p>
+          {verificationsRunning > 0 && (
+            <p className="stop-tasks stop-tasks--risk" role="note">
+              {STOP_ENDS_VERIFICATION}
+            </p>
+          )}
           <p>{copy.body}</p>
         </div>
       }

@@ -108,7 +108,9 @@ export const ERROR_CODES: readonly ErrorCode[] = [
  * The six A3a project-lifecycle methods (design §3.2) are additive too, and so
  * are the five A3b conversation-lifecycle methods (design §3.3), which sit right
  * after `conversation.history` — not at the end. A5's `git.diff` (design §3.5)
- * sits between `git.review` and `git.apply` (28 in all).
+ * sits between `git.review` and `git.apply`. The six A7 methods (design §3.7:
+ * the five `verification.*` methods and `project.context`) sit right after
+ * `git.apply` (34 in all).
  */
 export const METHODS = [
   "system.probe",
@@ -139,9 +141,30 @@ export const METHODS = [
   "git.review",
   "git.diff",
   "git.apply",
+  "verification.list",
+  "verification.approve",
+  "verification.revoke",
+  "verification.run",
+  "verification.result",
+  "project.context",
 ] as const;
 
 export type Method = (typeof METHODS)[number];
+
+/**
+ * The six A7 methods (design 2026-10-09 §3.7), in `Method::ALL` order right
+ * after `git.apply`. The verification UI needs every one of them advertised
+ * AND the `verification` feature.
+ */
+export const VERIFICATION_METHODS = [
+  "verification.list",
+  "verification.approve",
+  "verification.revoke",
+  "verification.run",
+  "verification.result",
+  "project.context",
+] as const satisfies readonly Method[];
+export type VerificationMethod = (typeof VERIFICATION_METHODS)[number];
 
 export function isMethod(value: string): value is Method {
   return (METHODS as readonly string[]).includes(value);
@@ -253,6 +276,14 @@ export const FEATURE_CONVERSATION_SEND_MODE = "conversation-send-mode" as const;
  * when this is advertised; otherwise the review stays read-only here.
  */
 export const FEATURE_GIT_APPLY = "git-apply" as const;
+/**
+ * A7 (design 2026-10-09 §3.7): approved verification commands, runs inside the
+ * task's sandbox and `project.context`. The verification UI is enabled ONLY
+ * when this is advertised. Running is additionally gated on a PROVEN sbx
+ * version in Core: an A7 Core answers `verification.run` with
+ * `UNSUPPORTED_SBX_VERSION` for every sbx version.
+ */
+export const FEATURE_VERIFICATION = "verification" as const;
 
 /**
  * Every feature this desktop build knows, in Rust `FEATURES` order
@@ -265,6 +296,7 @@ export const KNOWN_FEATURES = [
   FEATURE_CONVERSATION_SANDBOX_ID,
   FEATURE_CONVERSATION_SEND_MODE,
   FEATURE_GIT_APPLY,
+  FEATURE_VERIFICATION,
 ] as const;
 export type KnownFeature = (typeof KNOWN_FEATURES)[number];
 
@@ -1020,4 +1052,139 @@ export const CORE_EVENT_KINDS = [
   "git.applied",
   "git.apply.failed",
   "git.apply.reconciled",
+  // A7 (design §3.7 item 5): one durable start and exactly one durable finish
+  // per verification run. OPEN payloads; output is NEVER in an event (read it
+  // with verification.result), and they never change the task's status.
+  "verification.started",
+  "verification.finished",
 ] as const;
+
+// ---------------------------------------------------------------------------
+// A7 — verification commands + project.context (design 2026-10-09 §3.7)
+// ---------------------------------------------------------------------------
+
+/**
+ * A user-approved EXACT argv. `label` and every `argv` element are UNTRUSTED
+ * display text: shown revealed and capped, element by element, never as
+ * HTML/Markdown, never in a terminal, never joined into a shell line.
+ */
+export interface VerificationCommand {
+  id: string;
+  projectId: string;
+  label: string;
+  argv: string[];
+  approvedAt: string;
+}
+
+/** `verification.list` result: live commands, ordered by `approvedAt`. */
+export interface VerificationListResult {
+  commands: VerificationCommand[];
+}
+
+/**
+ * `verification.approve` params. `argv` travels exactly as the user built it
+ * (element by element, never split, trimmed or joined); Core trims the label.
+ */
+export interface VerificationApproveParams {
+  projectId: string;
+  label: string;
+  argv: string[];
+}
+
+/**
+ * `verification.run` params, in Core's fingerprint order. Never argv, never a
+ * path: only an approved command can run. The two `expected*` values are what
+ * the run dialog showed: the task's BINDING (`TaskSummary.sandboxName`, never
+ * `chosenSandboxName`) and that sandbox's `sandbox.list` workspace mode.
+ */
+export interface VerificationRunParams {
+  taskId: string;
+  commandId: string;
+  expectedSandboxName: string;
+  expectedWorkspaceMode: WorkspaceMode;
+  idempotencyKey?: string;
+}
+
+/**
+ * `verification.run` result: the run STARTED (asynchronously). A keyed replay
+ * is the FIRST answer plus `replayed: true` — never a second run.
+ */
+export interface VerificationRunResult {
+  runId: string;
+  startedSequence: number;
+  replayed?: true;
+  /** CLIENT-SIDE ONLY: Core sent a non-boolean `replayed` — maybe a replay. */
+  replayedUncertain?: true;
+}
+
+/**
+ * What best-effort redaction did to a run's stored output. `outputWithheld`
+ * means the redactor was unavailable and NO output was stored.
+ */
+export interface OutputRedaction {
+  bestEffort: boolean;
+  replacements: number;
+  byKind: Record<string, number>;
+  outputWithheld?: boolean;
+}
+
+/** Outcome strings Core sends today. `outcome` stays an OPEN string. */
+export const VERIFICATION_OUTCOMES = [
+  "running",
+  "exited",
+  "signaled",
+  "timed_out",
+  "spawn_failed",
+  "read_failed",
+  "possibly_sbx_error",
+  "interrupted",
+] as const;
+export type KnownVerificationOutcome = (typeof VERIFICATION_OUTCOMES)[number];
+
+/**
+ * `verification.result`. `outcome` is an OPEN string (an unknown value is
+ * shown as-is). `exitCode` is the exit status of `sbx exec` — UNVERIFIED that
+ * it is the command's own (C-2) — so it is never coloured or worded as a pass
+ * or a fail. `stdout` / `stderr` are capped, lossily decoded, redacted (best
+ * effort) and UNTRUSTED text. `workspaceMode` is an open string here.
+ */
+export interface VerificationResult {
+  runId: string;
+  taskId: string;
+  commandId: string;
+  label: string;
+  argv: string[];
+  sandbox: string;
+  workspaceMode: string;
+  outcome: string;
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  redactions: OutputRedaction;
+  outputIncomplete?: boolean;
+  elapsedMs?: number;
+  startedAt: string;
+  finishedAt?: string;
+}
+
+/** One detected root manifest. Suggestions and notes are UNTRUSTED display text. */
+export interface DetectedManifest {
+  manifest: string;
+  suggestedCommands: string[][];
+  notes: string[];
+}
+
+/** One registered repository's detection; `unreadable` names root files nothing was taken from. */
+export interface RepositoryContext {
+  repoPath: string;
+  detected: DetectedManifest[];
+  unreadable: string[];
+}
+
+/** `project.context` result; `approved` repeats `verification.list`. */
+export interface ProjectContextResult {
+  repositories: RepositoryContext[];
+  approved: VerificationCommand[];
+}

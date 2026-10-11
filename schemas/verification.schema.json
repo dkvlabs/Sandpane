@@ -1,0 +1,349 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/verification.schema.json",
+  "title": "SandpaneVerification",
+  "description": "A7 verification methods (design 2026-10-09 §3.7): params and results of verification.list, verification.approve, verification.revoke, verification.run and verification.result. Hand-synced with sandpane_protocol::{VerificationCommand, VerificationListParams, VerificationListResult, VerificationApproveParams, VerificationApproveResult, VerificationRevokeParams, VerificationRevokeResult, VerificationRunParams, VerificationRunResult, VerificationResultParams, VerificationResult, OutputRedaction}. Only syntax-checked by `make schema-lint`; the value-set drift gate does not read this file. Commands run ONLY inside the task's sandbox via `sbx exec -- <name> <argv...>`, never on the host; spawning is gated on a captured-proof sbx version (none in A7, so verification.run answers UNSUPPORTED_SBX_VERSION).",
+  "$defs": {
+    "VerificationCommand": {
+      "type": "object",
+      "required": [
+        "id",
+        "projectId",
+        "label",
+        "argv",
+        "approvedAt"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Trimmed; no control, bidi or invisible format characters. UNTRUSTED display text."
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "description": "An exact argument vector: argv[0] is the program (non-empty, not starting with '-'). Each element at most 4096 BYTES, all together at most 16384 bytes, no NUL and no other control character except TAB and LF (C0, DEL and C1 U+0080-U+009F are refused at approve; a stored command that fails this check is refused at run). Never split, globbed or given to a shell. UNTRUSTED display text: render revealed, element by element, as plain text with C0/C1 controls (except LF and TAB) escaped visibly."
+        },
+        "approvedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "VerificationListParams": {
+      "type": "object",
+      "required": [
+        "projectId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "projectId": {
+          "type": "string"
+        }
+      }
+    },
+    "VerificationListResult": {
+      "type": "object",
+      "required": [
+        "commands"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "$ref": "#/$defs/VerificationCommand"
+          },
+          "description": "Live (not revoked) commands, ordered by approvedAt."
+        }
+      }
+    },
+    "VerificationApproveParams": {
+      "type": "object",
+      "required": [
+        "projectId",
+        "label",
+        "argv"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "projectId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "description": "An exact argument vector: argv[0] is the program (non-empty, not starting with '-'). Each element at most 4096 BYTES, all together at most 16384 bytes, no NUL and no other control character except TAB and LF (C0, DEL and C1 U+0080-U+009F are refused at approve; a stored command that fails this check is refused at run). Never split, globbed or given to a shell. UNTRUSTED display text: render revealed, element by element, as plain text with C0/C1 controls (except LF and TAB) escaped visibly."
+        }
+      }
+    },
+    "VerificationApproveResult": {
+      "type": "object",
+      "required": [
+        "command"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/VerificationCommand"
+        }
+      },
+      "description": "A byte-equal live argv approved again returns the existing command, label unchanged."
+    },
+    "VerificationRevokeParams": {
+      "type": "object",
+      "required": [
+        "commandId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "commandId": {
+          "type": "string"
+        }
+      }
+    },
+    "VerificationRevokeResult": {
+      "type": "object",
+      "required": [
+        "revoked"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "revoked": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "VerificationRunParams": {
+      "type": "object",
+      "required": [
+        "taskId",
+        "commandId",
+        "expectedSandboxName",
+        "expectedWorkspaceMode"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "taskId": {
+          "type": "string"
+        },
+        "commandId": {
+          "type": "string"
+        },
+        "expectedSandboxName": {
+          "type": "string",
+          "description": "The task's bound sandbox name the run dialog showed (TaskSummary.sandboxName)."
+        },
+        "expectedWorkspaceMode": {
+          "type": "string",
+          "enum": [
+            "direct_mount",
+            "sbx_clone",
+            "host_worktree",
+            "mountless"
+          ]
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "description": "A2 key; looked up BEFORE every other check. Fingerprint = {taskId, commandId, expectedSandboxName, expectedWorkspaceMode}."
+        }
+      }
+    },
+    "VerificationRunResult": {
+      "type": "object",
+      "required": [
+        "runId",
+        "startedSequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runId": {
+          "type": "string"
+        },
+        "startedSequence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Sequence of the verification.started task event."
+        },
+        "replayed": {
+          "type": "boolean",
+          "const": true,
+          "description": "Present only on a keyed replay (the FIRST response, not current state)."
+        }
+      }
+    },
+    "VerificationResultParams": {
+      "type": "object",
+      "required": [
+        "runId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runId": {
+          "type": "string"
+        }
+      }
+    },
+    "OutputRedaction": {
+      "type": "object",
+      "required": [
+        "bestEffort",
+        "replacements",
+        "byKind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bestEffort": {
+          "type": "boolean",
+          "const": true
+        },
+        "replacements": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "byKind": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "Redaction kind -> count; zero-count kinds absent."
+        },
+        "outputWithheld": {
+          "type": "boolean",
+          "const": true,
+          "description": "Present only when the redactor was unavailable: NO output was stored (stdout and stderr are empty); never raw output."
+        }
+      }
+    },
+    "VerificationResult": {
+      "type": "object",
+      "required": [
+        "runId",
+        "taskId",
+        "commandId",
+        "label",
+        "argv",
+        "sandbox",
+        "workspaceMode",
+        "outcome",
+        "stdout",
+        "stderr",
+        "stdoutTruncated",
+        "stderrTruncated",
+        "redactions",
+        "startedAt"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "commandId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "description": "An exact argument vector: argv[0] is the program (non-empty, not starting with '-'). Each element at most 4096 BYTES, all together at most 16384 bytes, no NUL and no other control character except TAB and LF (C0, DEL and C1 U+0080-U+009F are refused at approve; a stored command that fails this check is refused at run). Never split, globbed or given to a shell. UNTRUSTED display text: render revealed, element by element, as plain text with C0/C1 controls (except LF and TAB) escaped visibly."
+        },
+        "sandbox": {
+          "type": "string"
+        },
+        "workspaceMode": {
+          "type": "string",
+          "description": "Open string (the binding's mode at start)."
+        },
+        "outcome": {
+          "type": "string",
+          "description": "OPEN string, not an enum: running, exited, signaled, timed_out, spawn_failed, read_failed, possibly_sbx_error, interrupted today; show unknown values as-is.",
+          "examples": [
+            "running",
+            "exited",
+            "signaled",
+            "timed_out",
+            "spawn_failed",
+            "read_failed",
+            "possibly_sbx_error",
+            "interrupted"
+          ]
+        },
+        "exitCode": {
+          "type": "integer",
+          "description": "The exit status of `sbx exec` (UNVERIFIED that it is the command's own, C-2). Present for exited and possibly_sbx_error only. Never present a 0 as 'passed'."
+        },
+        "stdout": {
+          "type": "string",
+          "maxLength": 65536,
+          "description": "Capped at 64 KiB of captured bytes, decoded lossily, best-effort redacted BEFORE storage. UNTRUSTED text: plain text only, never HTML/Markdown/terminal; escape C0/C1 except LF/TAB visibly."
+        },
+        "stderr": {
+          "type": "string",
+          "maxLength": 65536
+        },
+        "stdoutTruncated": {
+          "type": "boolean"
+        },
+        "stderrTruncated": {
+          "type": "boolean"
+        },
+        "redactions": {
+          "$ref": "#/$defs/OutputRedaction"
+        },
+        "elapsedMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "finishedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "outputIncomplete": {
+          "const": true,
+          "description": "Present (true) only when `sbx exec` exited but its output pipes were still held open, by a descendant that left the process group, after the kill grace: the stored output may be missing a tail. outcome and exitCode are kept as reported; this is never rewritten to timed_out. Absent otherwise."
+        }
+      }
+    }
+  }
+}

@@ -115,3 +115,21 @@ export const REPLAY_NOTICE =
   'Core returned the result of your earlier identical request (replayed). It may be out of date; refreshing from Core.';
 
 export const RETRY_SAFELY = 'Retry safely';
+
+/**
+ * Core keeps a completed key for `RETENTION_SECS` (24 h,
+ * `sandpane_core::idempotency`, drift-pinned). After that the same key is a
+ * NEW request, so "Retry safely" could run it twice.
+ */
+export const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
+/** "Retry safely" is offered (and honoured at click time) only within this of the FIRST send — 1 h of margin. */
+export const SAFE_RETRY_WINDOW_MS = 23 * 60 * 60 * 1000;
+/** A clock that moved back more than this cannot prove the key's age. */
+const CLOCK_SKEW_TOLERANCE_MS = 60 * 60 * 1000;
+
+/** Whether a retry with the key first sent at `firstSentAt` is still safe at `now`. Unknown = no. */
+export function safeRetryWindowOpen(firstSentAt: number | undefined, now: number): boolean {
+  if (firstSentAt === undefined || !Number.isFinite(firstSentAt) || !Number.isFinite(now)) return false;
+  const age = now - firstSentAt;
+  return age > -CLOCK_SKEW_TOLERANCE_MS && age < SAFE_RETRY_WINDOW_MS;
+}

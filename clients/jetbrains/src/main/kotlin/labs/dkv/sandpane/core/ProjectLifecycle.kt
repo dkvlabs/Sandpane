@@ -196,6 +196,11 @@ object ProjectOutcomes {
         MSG_PROJECT_NOT_FOUND to Known(CoreErrorCodes.NOT_FOUND, "Core no longer has this project."),
         MSG_REPOSITORY_NOT_REGISTERED to Known(CoreErrorCodes.NOT_FOUND, "That repository is not registered with this project."),
         MSG_UPDATE_NEEDS_A_FIELD to Known(CoreErrorCodes.VALIDATION_FAILED, "Nothing to change was given."),
+        // A7 (\u00A73.7 item 5): Core's verification.rs constant, raised first in the delete checks.
+        Verifications.MSG_PROJECT_VERIFICATION_RUNNING to Known(
+            CoreErrorCodes.CONFLICT,
+            "A verification is running for a task of this project \u2014 wait for it to finish.",
+        ),
     )
 
     /** Every exact message this client words (for the drift test). */

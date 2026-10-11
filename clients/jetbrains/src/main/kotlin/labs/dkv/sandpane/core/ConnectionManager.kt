@@ -196,7 +196,7 @@ class ConnectionManager(private val application: Application?) : Disposable {
                 val frame = active.request(method, params).get(timeoutMs, TimeUnit.MILLISECONDS)
                 val error = frame.err
                 if (error != null) {
-                    future.completeExceptionally(CoreRpcException(error.code, error.message))
+                    future.completeExceptionally(CoreRpcException.fromCore(error))
                 } else {
                     val ok = frame.ok
                         ?: throw CoreRpcException(

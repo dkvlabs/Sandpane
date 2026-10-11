@@ -191,15 +191,18 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("A3b drift against the Rust sources", () => {
-  it("the five methods sit right after conversation.history, in Method::ALL order (28 total since A5)", () => {
+  it("the five methods sit right after conversation.history, in Method::ALL order (34 total since A7)", () => {
     const all = rustMethodAll().names;
-    expect(all).toHaveLength(28);
+    expect(all).toHaveLength(34);
     expect(METHODS).toEqual(all);
     expect(schemaMethodEnum()).toEqual(all);
     const at = METHODS.indexOf("conversation.history");
     expect(METHODS.slice(at + 1, at + 6)).toEqual([...CONVERSATION_LIFECYCLE_METHODS]);
-    // The A3b Core's set is today's minus A5's git.diff.
-    expect(A3B_CORE_METHODS).toEqual(METHODS.filter((m) => m !== "git.diff"));
+    // The A3b Core's set is today's up to git.apply, minus A5's git.diff
+    // (A7's six methods sit after git.apply).
+    expect(A3B_CORE_METHODS).toEqual(
+      METHODS.slice(0, METHODS.indexOf("git.apply") + 1).filter((m) => m !== "git.diff"),
+    );
   });
 
   it("none of the five is replay-safe on either side, and each keeps the default deadline", () => {
@@ -222,7 +225,7 @@ describe("A3b drift against the Rust sources", () => {
       expect(replayBody).not.toContain(`Method::${variant}`);
       expect(deadlineBody).not.toContain(`Method::${variant}`);
     }
-    expect(proxy).toContain("assert_eq!(Method::ALL.len(), 28);");
+    expect(proxy).toContain("assert_eq!(Method::ALL.len(), 34);");
   });
 
   it("every exact message equals the Rust const of the same name", () => {

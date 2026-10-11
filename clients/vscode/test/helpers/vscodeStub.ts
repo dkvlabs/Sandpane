@@ -46,6 +46,10 @@ function makeUri(parts: { scheme: string; path: string; query: string; fragment:
 
 export const stub = {
   config: new Map<string, unknown>(),
+  /** Language-scoped settings, keyed `<languageId>:<section>.<key>` (A7 `editor.links`). */
+  languageConfig: new Map<string, unknown>(),
+  /** Every `getConfiguration(section, {languageId})` call (language-scoped reads only). */
+  configScopes: [] as { section: string; languageId: string }[],
   remoteName: undefined as string | undefined,
   workspaceFolders: undefined as { uri: StubUri; name: string }[] | undefined,
   commands: [] as RecordedCommand[],
@@ -82,6 +86,8 @@ export const stub = {
     options: unknown;
   }[],
   pickIndex: undefined as number | undefined,
+  /** When non-empty, single-pick answers are taken from here in order (`undefined` = dismissed). */
+  pickQueue: [] as (number | undefined)[],
   /** For `canPickMany` pickers: the item indexes the user checks (undefined = dismissed). */
   pickIndexes: undefined as number[] | undefined,
   /** Content providers registered per scheme. */
@@ -92,6 +98,8 @@ export const stub = {
   shownDocuments: [] as { document: StubTextDocument; options: unknown }[],
   reset(): void {
     this.config.clear();
+    this.languageConfig.clear();
+    this.configScopes.length = 0;
     this.remoteName = undefined;
     this.workspaceFolders = undefined;
     this.commands.length = 0;
@@ -111,6 +119,7 @@ export const stub = {
     this.writeError = null;
     this.quickPickCalls.length = 0;
     this.pickIndex = undefined;
+    this.pickQueue.length = 0;
     this.pickIndexes = undefined;
     this.contentProviders.clear();
     this.openedDocuments.length = 0;
@@ -168,9 +177,19 @@ export const env = {
 };
 
 export const workspace = {
-  getConfiguration: () => ({
-    get: <T>(key: string, fallback: T): T => (stub.config.has(key) ? (stub.config.get(key) as T) : fallback),
-  }),
+  getConfiguration: (section?: string, scope?: { languageId?: string }) => {
+    const languageId = scope?.languageId;
+    if (languageId !== undefined) stub.configScopes.push({ section: section ?? '', languageId });
+    return {
+      get: <T>(key: string, fallback?: T): T | undefined => {
+        if (languageId !== undefined) {
+          const scoped = `${languageId}:${section ?? ''}.${key}`;
+          return stub.languageConfig.has(scoped) ? (stub.languageConfig.get(scoped) as T) : fallback;
+        }
+        return stub.config.has(key) ? (stub.config.get(key) as T) : fallback;
+      },
+    };
+  },
   get workspaceFolders() {
     return stub.workspaceFolders;
   },
@@ -182,7 +201,13 @@ export const workspace = {
     return new Disposable(() => stub.contentProviders.delete(scheme));
   },
   openTextDocument: (uri: StubUri): Promise<StubTextDocument> => {
-    const document = { uri, languageId: uri.path.endsWith('.diff') ? 'diff' : 'plaintext' };
+    // Like VS Code's extension → language association (the A7 one is contributed in package.json).
+    const languageId = uri.path.endsWith('.diff')
+      ? 'diff'
+      : uri.path.endsWith('.sandpane-verification')
+        ? 'sandpane-verification-output'
+        : 'plaintext';
+    const document = { uri, languageId };
     stub.openedDocuments.push(document);
     return Promise.resolve(document);
   },
@@ -232,7 +257,8 @@ export const window = {
           .filter((item): item is T => item !== undefined && item.kind !== QuickPickItemKind.Separator),
       );
     }
-    return Promise.resolve(stub.pickIndex === undefined ? undefined : items[stub.pickIndex]);
+    const index = stub.pickQueue.length > 0 ? stub.pickQueue.shift() : stub.pickIndex;
+    return Promise.resolve(index === undefined ? undefined : items[index]);
   },
   showTextDocument: (document: StubTextDocument, options?: unknown) => {
     stub.shownDocuments.push({ document, options });
