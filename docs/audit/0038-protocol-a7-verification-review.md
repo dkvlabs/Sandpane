@@ -152,7 +152,7 @@ This covers the whole A7 addition, built to [§3.7 of the design of record](../p
 
 ## Verification evidence
 
-The orchestrator ran all of the following fresh on `bd48a10`'s tree before committing it:
+The orchestrator ran all of the following fresh before committing `bd48a10`. After the gates, only two docs-only edits were made: the root README status counts and §3.7 item 14. Neither is read by any test or gate.
 
 - **Frozen wire:** `shasum -a 256 -c a7-wire-freeze.sha` gave OK for all 14 frozen files after every Core follow-up and again before the commit.
 - **Core gate:**

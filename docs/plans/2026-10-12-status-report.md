@@ -94,12 +94,12 @@ All of these run against a disposable, provider-free `shell` sandbox. The A7 one
 | C-6 | `sbx exec -- <name> env` with a canary variable | environment isolation |
 | C-7 | `sbx exec -- <name> id` | no elevation (A7 gate) |
 | C-8 | `sbx ports <name> --json` with no published port, then with one | `sandbox.ports.list` (A8b) |
-| C-9 | `sbx ports <name> --publish 127.0.0.1::8080 --json`, then `--unpublish 127.0.0.1:<port>:8080`; include the text output and a stopped-sandbox publish | `sandbox.ports.publish/unpublish` (A8b) |
+| C-9 | `sbx ports <name> --publish 8080/tcp4`, `sbx ports <name> --publish 127.0.0.1:18080:8080/tcp4`, each followed by `sbx ports <name> --json`; then `--unpublish 127.0.0.1:<hostPort>:8080/tcp4`; plus one publish on a stopped sandbox. Optionally `--publish 8080/tcp6`, to learn how sbx writes `::1` | `sandbox.ports.publish/unpublish` (A8b) |
 | C-10 | `sbx policy ls --json` and `sbx policy ls <name> --json` | policy listing (A8c) |
 | C-11 | `sbx template ls --json` | template listing (A8c) |
 | C-12 | `sbx mcp ls --json` (no servers, and with one if the user has any) | MCP listing (A8c) |
 | C-13 | `sbx secret ls --json` with no secrets; then, only if the user chooses, with one dummy secret the user sets | secret presence listing (A8c) |
-| C-14 | `sbx diagnose --json` (never `--upload`), and `sbx daemon status --json` with the daemon stopped | `sbx.status` details (A8a) |
+| C-14 | `sbx diagnose --json` (never `--upload`), and `sbx daemon status --json` with the daemon stopped (only the running JSON and both text forms are captured today) | `sbx.status` details (A8a) |
 | C-15 | `sbx prune --dry-run --json` (never without `--dry-run`) | A9 reporting of stopped sandboxes |
 
 Each capture is stored under `core/crates/sandpane-core/tests/fixtures/sbx/captured/<version>/` with `$HOME` and workspace paths sanitized. Its `_meta.json` must say `fixture_status: captured`.
@@ -125,7 +125,8 @@ Each capture is stored under `core/crates/sandpane-core/tests/fixtures/sbx/captu
 
 ### 6.2 A8a — `sbx.status` (read-only, ships advertised)
 
-- **Shape:** `{} → { path, version, daemon: { running: boolean, … captured fields }, captured: boolean, surfaces: { exec, ports, policy, templates, mcp, secrets: "verified" | "unverified" } }`.
+- **Source:** `sbx version` and `sbx daemon status` in its **text** form. `Status: running` / `Status: stopped` is captured for both states, while the JSON form is captured only for a running daemon. `--json` is used only after C-14 captures the stopped JSON.
+- **Shape:** `{} → { path, version, daemon: { running: boolean }, captured: boolean, surfaces: { exec, ports, policy, templates, mcp, secrets: "verified" | "unverified" } }`.
 - `captured` is true only when `version` is in the fixture set Core was built with. `surfaces` tells clients which A8 methods to expect, and is derived from the same `VERIFIED_*` lists that drive advertisement.
 - **`policyInitialized` is omitted.** The only non-mutating probe would be `policy ls --json`, which is not captured (C-10). The design of record listed it as optional, so leaving it out is honest.
 - Read-only and replay-safe. Deadline 15 s.
@@ -139,14 +140,18 @@ Each capture is stored under `core/crates/sandpane-core/tests/fixtures/sbx/captu
 
 - **list:** `{ name } → { ports: [{ hostIp, hostPort, sandboxPort, protocol }] }`, built from `sbx ports <name> --json`. Read-only. Advertised after C-8.
 - **publish:** `{ name, sandboxPort, hostPort?, protocol?, idempotencyKey? }`.
-  - Core builds the spec itself as `127.0.0.1:[hostPort]:sandboxPort/proto`, or `[::1]` for `tcp6`/`udp6`. The client never supplies a host IP, so a non-loopback bind is impossible over the wire.
+  - Core builds the spec itself, and the client never supplies a host IP. The forms follow the captured grammar `[[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]`, where a host IP requires a host port:
+    - Without `hostPort`, Core sends `<sandboxPort>/tcp4` (or `udp4`). With no `HOST_IP`, sbx binds loopback, and `tcp4` binds only 127.0.0.1, per the captured help.
+    - With `hostPort`, Core sends `127.0.0.1:<hostPort>:<sandboxPort>/<proto4>`.
+  - The answer comes from a fresh re-list. If the resulting mapping's host IP is not loopback, Core unpublishes it at once and reports a failure (defence in depth).
+  - The IPv6 forms (`tcp6`/`udp6`, how `::1` is written) are deferred until C-9 shows them. The exact strings stay UNVERIFIED until C-9.
   - Ports are integers in 1–65535, and `hostPort` must be ≥ 1024 (no privileged host ports).
-  - `protocol` must be one of `tcp4 | tcp6 | udp4 | udp6`. Dual-stack `tcp` and `udp` are refused, to keep exactly one loopback family per mapping.
+  - In the first pass, `protocol` must be one of `tcp4 | udp4` (default `tcp4`). Dual-stack `tcp` and `udp` are refused, to keep exactly one loopback family per mapping.
   - The answer re-lists the ports and returns the resulting mapping.
   - Keyed write (A2), not replay-safe.
   - **Disclosure (from captured help):** "publishing starts a stopped sandbox". The confirmation states it, and the impact names the sandbox state.
   - Advertised after C-9.
-- **unpublish:** `{ name, hostPort, sandboxPort, protocol }`. Core builds `127.0.0.1:<hostPort>:<sandboxPort>/<proto>`. Not destructive to data, so no token. The answer re-lists ports, so anything left behind is shown, as sbx reports it.
+- **unpublish:** `{ name, hostPort, sandboxPort, protocol }`. Core builds `127.0.0.1:<hostPort>:<sandboxPort>/<proto4>`, the documented `[HOST_IP:]HOST_PORT:SANDBOX_PORT[/PROTOCOL]` form. Not destructive to data, so no token. The answer re-lists ports, so anything left behind is shown, as sbx reports it.
 - **Locking:** both take the per-sandbox-name lock that A1 uses for create and remove, so a publish cannot race a remove.
 - **Event:** a durable `sandbox.port.published` / `sandbox.port.unpublished` event, appended before notify. Its payload is the mapping only.
 - **Clients:**
@@ -199,14 +204,17 @@ Each capture is stored under `core/crates/sandpane-core/tests/fixtures/sbx/captu
 
 These are retention targets Core owns, all on this machine:
 
-1. **Host worktrees** Core created for tasks that are terminal (`done`, `failed`, `cancelled`, `interrupted` and reviewed or abandoned), or whose project or conversation is deleted. It uses the existing fail-closed discard path from C3:
+1. **Host worktrees** Core created, in two groups:
+   - **Tracked:** worktrees of tasks in a final state (`completed`, `rejected`, `failed`, `cancelled`, from the `TaskStatus` enum). `interrupted` tasks are included only after the retention period, because a restart may leave a task `interrupted` that the user still wants to review. Each goes through the existing fail-closed discard path from C3.
+   - **Orphans:** directories under Core's own worktree root (`<data>/worktrees`) that no task row references. They are left behind on purpose by the A3a/A3b two-step deletes, which hard-delete the rows (`DELETE FROM tasks …`) but never touch host files, worktrees or branches. Orphans are matched to a registered repository through their `.git` file, read by Core, never by running git in them (W-D). An orphan whose repository is still registered gets the same discard path. Any other orphan is **listed only**, with the `git worktree remove` command the user can run themselves.
+   For both groups:
    - never with uncommitted or unreviewed changes;
    - never a worktree Core did not create;
    - never while a verification run or an apply holds that task (A7 I-c, A6 writer lock).
 2. **Task branches** (`sandpane/task-…`) of discarded worktrees, removed only when the branch tip is reachable from the base or the user explicitly confirms an unmerged branch. These are listed separately as `unmerged`, and the default is to keep them.
 3. **`verification_runs` output.** After a retention period (default 30 days), the stored stdout and stderr are deleted, and the row keeps its status, exit code, timestamps and `outputPruned: true`. (§3.7 requires A9 to cover these rows.)
 4. **Expired idempotency keys** (older than 24 h, `done` or `unknown`).
-5. **Events and rows of deleted projects and conversations** that the two-step delete marked removed, after a retention period. **Events of live tasks are never pruned**, because the event log is append-only for live state.
+5. **Events:** nothing to prune for deleted entities, because the conversation delete already hard-deletes their `task_events` (and messages, sessions, artifacts, runs). For live tasks the event log is append-only and **never pruned** by A9. A size-based event retention, if one is ever wanted, is a separate design.
 6. **Export and diagnostic artifacts** Core wrote to its data dir.
 
 **Out of scope (machine-wide or user-owned):**
