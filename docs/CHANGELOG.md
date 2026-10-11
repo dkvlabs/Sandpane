@@ -734,4 +734,48 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0035 — Protocol A4: conversation.send mode (Task / Discuss)
+
+- **date:** 2026-10-11
+- **phase:** protocol v1 addition A4 ([design §3.4](plans/2026-10-09-protocol-v1-additions.md)), with all three clients
+- **commit:** `d6b17dd` (feat(protocol): conversation.send mode — Task / Discuss (A4))
+- **details:**
+  - **Wire:**
+    - `conversation.send {mode?: "task"|"discuss"}`, behind the feature `conversation-send-mode` (now 4 features).
+    - An explicit `"task"` (or `null`) is normalized to absent before the idempotency fingerprint. The pre-A4 fingerprints are pinned and were recomputed independently.
+    - Any other value is refused with `mode must be "task" or "discuss"` and nothing is written.
+    - The method count is unchanged at 27.
+  - **Behaviour:**
+    - A discuss task never gets a writable workspace. This is refused at the internal API, before any Git side effect.
+    - Both modes still record PERMISSION_DENIED and stay queued, and the scaffold events name the mode.
+  - **Task summary:**
+    - `TaskSummary.mode?` is an open string.
+    - The new additive `TaskSummary.chosenSandboxName?` carries the sandbox name the task's chat chose. It is never a binding.
+    - **`sandboxName` keeps its pre-A4 binding-only meaning.** This is a review-driven amendment to §3.4: overloading it would have made shipped clients show a verified isolation label and false "stopping it ends them" counts.
+  - **Migration v7:** adds `tasks.mode`, `tasks.chosen_sandbox_name` and an index on it, with a backup; a v8 database is refused.
+  - **`sandbox.remove`:** step 1 gains a line describing unfinished tasks sent from chats that chose the name. It never refuses; if the count cannot be read, it says so instead of failing.
+  - **Clients:**
+    - a Task / Discuss choice, gated on the feature;
+    - Discuss is never downgraded to Task: a fresh probe or capability check runs before a Discuss send or retry, and the request is refused visibly otherwise;
+    - "Send mode" and "sandbox chosen by its chat — not where it runs" are shown read-only;
+    - `chosenSandboxName` is proven by tests never to feed isolation labels or stop/remove counts;
+    - JetBrains no longer echoes undecodable replies.
+  - **Deviations:**
+    - `mode` is `Option<String>` rather than a serde enum, so Core returns its exact message.
+    - The design was amended during review (the field split and the v7 column rename).
+    - The desktop withholds a Discuss retry after feature loss through a new `not-retried` keyed outcome.
+- **files:**
+  - `core/crates/**` (new `tests/send_mode.rs`), `schemas/core-capabilities.schema.json`, `schemas/README.md`
+  - `clients/vscode/**`, `clients/jetbrains/**`, `apps/desktop/**`
+  - `docs/plans/2026-10-09-protocol-v1-additions.md`, `README.md`
+- **verification:**
+  - `make check` exited 0: Core 379; schemas in sync (27 methods, 4 features); VS Code 592; desktop 583 + 8 opt-in skipped; Tauri 32.
+  - JetBrains, run alone: 389 tests; `verifyPlugin` Compatible.
+  - Live checks against an isolated Core with no `sbx`: VS Code 60/60, desktop 8/8.
+  - 0 raw invisible characters in 53 files; the secret gate was clean.
+  - UNVERIFIED: never run against a real `sbx` or in a real editor, app or IDE; no Discuss send was made through the live scripts.
+- **review:** [audit/0035-protocol-a4-send-mode-review.md](audit/0035-protocol-a4-send-mode-review.md) — `security-reviewer` on Core (BLOCK: C1 and C2 fixed via a §3.4 amendment, I1–I7 fixed) plus one combined security/phase pass on the clients (PASS-WITH-WARNINGS: W1–W3 and the Info items fixed); no Critical remains
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
