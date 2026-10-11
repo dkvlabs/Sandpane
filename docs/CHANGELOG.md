@@ -828,4 +828,63 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0037 — Protocol A6: git.apply for reviewed files
+
+- **date:** 2026-10-11
+- **phase:** protocol v1 addition A6 ([design §3.6](plans/2026-10-09-protocol-v1-additions.md)), with all three clients
+- **commits:**
+  - `bde5870` (docs(plan): A6 git.apply design decisions (§3.6))
+  - `dbdf9c1` (feat(protocol): git.apply for reviewed files (A6))
+- **details:**
+  - **Wire:**
+    - `git.apply {taskId, expectedBase, reviewId, entries}` → `{applied, abortReason?, conflictedFiles, appliedFiles?, modeChanges?, snapshotTree?, partial?}`.
+    - `entries` are copied verbatim from the `git.review` answer that produced `reviewId`. `selectedFiles` is refused. At most 1000 entries.
+    - `ChangeSet` gains `reviewId?` and `hostHooksPath?`. `FileChange` and `GitDiffResult` gain `taskBlob?` / `taskMode?`.
+    - New feature `git-apply`, making **5 features**; methods stay at **28**.
+    - Additive event kinds: `git.apply.started`, `git.applied`, `git.apply.failed`, `git.apply.reconciled`.
+  - **What it does:**
+    - It applies reviewed `host_worktree` changes into your working tree and stages them; nothing is committed.
+    - `direct_mount` and `sbx_clone` are refused.
+    - The content Core hashed at review time (`taskBlob` = git blob id with sha1dc or SHA-256) is exactly what gets written. An entry that changed since review is refused.
+  - **Safety:**
+    - No git process reads the task worktree; Core reads files through an `openat` walk.
+    - The snapshot is built in an object quarantine, so a refusal leaves your `.git/objects` unchanged.
+    - Host gates before any write: HEAD/base, touched-path status (untracked and ignored too), hidden index entries, symlinked leading paths, filter attributes and submodules.
+    - The write is `apply --check --index` then `apply --index` under 13 pinned config keys, followed by a post-write verify.
+    - Durable events come before the response, and restarts are reconciled.
+    - One writer lock per repository is shared with `direct_mount` `sandbox.create`.
+    - Per-phase deadlines total 41 s, inside the 45 s client deadline.
+    - A partial outcome is reported as partial, naming `git status`.
+  - **Clients:**
+    - per-file selection over one review;
+    - a confirmation reachable only from a user gesture, listing every file and flagging (a) unseen content, (b) executable files, (c) paths that run automatically;
+    - VS Code adds a typed-count step, because its modal cannot default to Cancel;
+    - a diff/entry mismatch refuses to send;
+    - single flight, never retried automatically;
+    - the desktop sets TanStack `networkMode: "always"` app-wide.
+  - **Deviations:**
+    - Core changed after the clients were briefed (the re-verification fixes added four messages). The combined client review was run against the final Core, and all three clients key the final texts.
+    - The VS Code confirmation adds a typed second step that is not in §3.6 item 9; it is stricter.
+  - **Open:** W-D, the A4b precondition. A5 review and diff still run git inside a `host_worktree` task worktree.
+- **files:**
+  - `core/crates/**`: new `sandpane-core/src/apply.rs` and `objects.rs`, `testdata/sha-mbles-1.bin` and its NOTICE, `sandpane-service/src/git_apply.rs`, `tests/git_apply.rs`, `tests/global_config_pins.rs`
+  - `core/Cargo.lock`
+  - `schemas/change-set.schema.json`, `schemas/core-capabilities.schema.json`, `schemas/task-event.schema.json`, `schemas/README.md`
+  - `clients/vscode/**`, `clients/jetbrains/**`, `apps/desktop/**`
+  - `docs/plans/2026-10-09-protocol-v1-additions.md`, `README.md`
+- **verification:**
+  - Core: `cargo test` 509 passed, 0 failed; fmt and clippy clean.
+  - `make check` exited 0 on `dbdf9c1`'s tree: schemas in sync (28 methods, 5 features); VS Code 709; desktop 672 + 8 opt-in skipped; Tauri shell 34.
+  - JetBrains, run alone: 445 tests, 0 failures; `verifyPlugin` Compatible (IU-262.10968.63).
+  - Live checks against an isolated Core with no `sbx`: VS Code 62/62, including the A6 wire refusal "task has no Git context …; nothing was written"; desktop 8/8.
+  - 0 raw invisible characters in 106 staged text files. The secret gate flagged only fictional fixture paths, with 0 real paths.
+  - The new dependency `sha1collisiondetection` 0.3.4 is MIT, and its tree is MIT or MIT-or-Apache-2.0 (checked from the crates' manifests). `cargo-audit` / `cargo-deny` are not installed.
+  - UNVERIFIED:
+    - never run against a real `sbx` or in a real editor, app or IDE;
+    - no wire-created task has Git context until A4b, so real applies are exercised only by Core integration tests on real temporary repositories;
+    - no real-seconds test of the phase budgets.
+- **review:** [audit/0037-protocol-a6-git-apply-review.md](audit/0037-protocol-a6-git-apply-review.md) — `security-reviewer` on Core (PASS-WITH-WARNINGS: W-A, W-B, W-C, I1–I3, I5 and I6 fixed), then a `security-reviewer` re-verification (PASS-WITH-WARNINGS: W-N1, W-N2, I-N1–I-N3 and N14 fixed), plus one combined security/phase pass on the clients (BLOCK on desktop D-C1, a confirmed apply resumable by an `online` event: fixed, along with every dispatched Warning and Info); no Critical remains
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
