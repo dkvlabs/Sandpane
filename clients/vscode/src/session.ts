@@ -43,6 +43,7 @@ import type {
   CoreCapabilities,
   CoreFeature,
   CoreMethodName,
+  FileChange,
   Project,
   ProjectListParams,
   SandboxCreateSpec,
@@ -92,12 +93,43 @@ import {
 } from './vscode/sandboxActions';
 import { plainText } from './text/visibleText';
 import {
+  APPLY_IN_FLIGHT,
+  APPLY_LIST_GONE_TEXT,
+  APPLY_LIST_SCHEME,
+  MODAL_LIST_CAP,
+  TYPED_NOT_CONFIRMED,
+  createBusyCopy,
+  renderApplyListDocument,
+  typedConfirmation,
+  typedConfirmed,
+  APPLY_NOT_IMPLEMENTED,
+  CORE_RESTARTED,
+  GIT_APPLY_FEATURE,
+  MALFORMED_REVIEW,
+  NO_REVIEW_ID,
+  REVIEW_AGAIN,
+  ReviewedDiffs,
+  applyConfirmationView,
+  applyErrorView,
+  applyPickPlan,
+  applyResultView,
+  diffMismatch,
+  malformedApplyCopy,
+  mismatchCopy,
+  notApplicableCopy,
+  parseApplyChangeSet,
+  plainChangeLabel,
+  parseApplyResult,
+  type ApplyOutcomeView,
+} from './vscode/gitApply';
+import {
   MALFORMED_DIFF_COPY,
   PATCH_SCHEME,
   PatchDocumentStore,
   changeLabel,
   changeSetNotes,
   gitErrorCopy,
+  labelText,
   parseGitDiffResult,
   renderPatchDocument,
 } from './vscode/gitDiff';
@@ -1429,6 +1461,18 @@ export class SandpaneSession {
       this.emit();
       return summary;
     } catch (error) {
+      // V-W3: Core's "repository busy" CONFLICT is not a task-state or keyed
+      // conflict: own copy, Core's text kept, no "Re-read task state" and no
+      // "Retry safely".
+      const busy = createBusyCopy(error);
+      if (busy !== null) {
+        const said = error instanceof Error ? plainText(error.message, 2_000).replace(/\$\(/g, '$ (') : '';
+        void vscode.window.showErrorMessage(`sandbox.create \u2014 ${busy}\n\nCore said: ${said}`);
+        this.setStatus('error', `sandbox.create: ${busy}`);
+        this.log(`sandbox.create refused (repository busy): ${said}`);
+        this.emit();
+        return undefined;
+      }
       this.reportKeyedFailure(
         error,
         'sandbox.create',
@@ -2198,6 +2242,10 @@ export class SandpaneSession {
       this.emit();
       return false;
     }
+    // A6: what the user saw (content id, binary/truncated/lossy) — memory only,
+    // per Core instance; the apply confirmation and mismatch rule read it.
+    this.reviewedDiffs.sync(this.capabilities?.instanceId ?? null);
+    this.reviewedDiffs.record(taskId, result);
     const rendered = renderPatchDocument({ taskId, result, maxBytes: DEFAULT_DIFF_BYTES });
     const { path } = this.patchDocuments.put(result.path, rendered.text);
     try {
@@ -2222,55 +2270,258 @@ export class SandpaneSession {
     return true;
   }
 
-  /** Apply = explicit confirmed Git operation through Core, never a file write. */
+  /** A6: the `git.diff` answers the user opened this session (memory only). */
+  readonly reviewedDiffs = new ReviewedDiffs();
+  /** A6 V-W1: in-memory backing store of the read-only `sandpane-apply:` full lists. */
+  readonly applyListDocuments = new PatchDocumentStore(APPLY_LIST_GONE_TEXT, '.txt');
+  /** A6: one apply flow at a time — review, pick, modal and Core's answer. */
+  private applyInFlight = false;
+
+  /**
+   * A6 Apply (design 2026-10-09 §3.6): an explicit, confirmed Git operation
+   * through Core, never a file write by this client. Reached ONLY from a user
+   * gesture: the `sandpane.applyTask` command, the sidebar's Apply button, or
+   * the "Review again" button of an earlier apply notification — never from
+   * chat / agent / tool text, a timer, a poll or a reconnect.
+   *
+   * Flow: fresh probe (`git.apply` + feature `git-apply`) → ONE `git.review`
+   * → the user picks applicable entries → native modal (repository, every
+   * file, flags (a)/(b)/(c), the binding sentence) → only "Apply N files"
+   * sends `git.apply {taskId, expectedBase, reviewId, entries}` with the
+   * entries copied verbatim. Single-flight; never retried ("Retry safely" is
+   * not offered: Core gives no idempotency for git.apply).
+   */
   async applyTask(taskId: string): Promise<void> {
-    let changeSet: ChangeSet;
-    try {
-      changeSet = await this.commands.gitReview(taskId);
-    } catch (error) {
-      this.reportError(error, 'git.review', gitErrorCopy(error, 'git.review') ?? undefined);
-      return;
-    }
-    // A5: exact paths are revealed (a real newline must not pose as a new row).
-    const listing = changeSet.changes
-      .map((c) => `· ${c.status} ${changeLabel(c)}`)
-      .join('\n');
-    const notes = changeSetNotes(changeSet);
-    const message =
-      `Apply task ${taskId.slice(0, 8)} into the host repository?\n\n` +
-      `base: ${changeSet.baseCommit}\n` +
-      `host dirty: ${changeSet.hostDirty ? 'YES — Core will abort rather than overwrite your work' : 'no'}\n` +
-      (notes.length > 0 ? `${notes.join('\n')}\n` : '') +
-      `\n${listing || '· (no changes reported)'}`;
-    const answer = await vscode.window.showWarningMessage(
-      message,
-      { modal: true, detail: 'Core performs the Git operation; this client never writes host files.' },
-      'Apply via Core',
-    );
-    if (answer !== 'Apply via Core') {
-      this.setStatus('info', 'Apply not confirmed; nothing changed.');
+    if (this.applyInFlight) {
+      void vscode.window.showWarningMessage(APPLY_IN_FLIGHT);
+      this.setStatus('info', APPLY_IN_FLIGHT);
       this.emit();
       return;
     }
+    this.applyInFlight = true;
+    this.emit();
+    let followUp: ApplyOutcomeView | null = null;
     try {
-      const result = await this.commands.gitApply({
-        taskId,
-        expectedBase: changeSet.baseCommit,
-        selectedFiles: null,
-      });
-      if (result.applied) {
-        this.setStatus('ok', `Core applied task ${taskId.slice(0, 8)}`);
+      followUp = await this.runApply(taskId);
+    } finally {
+      this.applyInFlight = false;
+      this.emit();
+    }
+    if (followUp) this.presentApplyOutcome(taskId, followUp);
+  }
+
+  /** One apply flow; returns the notification to show once it has ended. */
+  private async runApply(taskId: string): Promise<ApplyOutcomeView | null> {
+    if (!(await this.ensureAdvertised('git.apply', 'Apply task changes'))) return null;
+    if (!this.coreHasFeature(GIT_APPLY_FEATURE)) {
+      void vscode.window.showWarningMessage(APPLY_NOT_IMPLEMENTED);
+      this.setStatus('error', APPLY_NOT_IMPLEMENTED);
+      this.emit();
+      return null;
+    }
+    const instanceAtReview = this.capabilities?.instanceId ?? null;
+    this.reviewedDiffs.sync(instanceAtReview);
+    let raw: unknown;
+    try {
+      raw = await this.commands.gitReview(taskId);
+    } catch (error) {
+      const copy = gitErrorCopy(error, 'git.review');
+      this.reportError(error, 'git.review (for apply)', copy ? `${copy} Nothing was sent to git.apply.` : undefined);
+      return null;
+    }
+    const changeSet = parseApplyChangeSet(raw);
+    if (!changeSet) {
+      void vscode.window.showErrorMessage(`git.review \u2014 ${MALFORMED_REVIEW}`);
+      this.setStatus('error', `git.review: ${MALFORMED_REVIEW}`);
+      this.log('git.review answer failed the apply shape check (payload not logged)');
+      this.emit();
+      return null;
+    }
+    const notes = changeSetNotes(changeSet);
+    if (changeSet.changes.length === 0) {
+      this.setStatus('info', ['Core lists no changed file for this task, so there is nothing to apply; nothing was sent', ...notes].join(' \u00b7 '));
+      this.emit();
+      return null;
+    }
+    const reviewId = changeSet.reviewId;
+    if (typeof reviewId !== 'string' || reviewId.length === 0) {
+      void vscode.window.showWarningMessage(NO_REVIEW_ID);
+      this.setStatus('error', NO_REVIEW_ID);
+      this.emit();
+      return null;
+    }
+    const diffFor = (change: FileChange) => this.reviewedDiffs.get(taskId, change);
+    const plan = applyPickPlan(changeSet, diffFor);
+    if (plan.selectable.length === 0) {
+      const text =
+        `None of the ${changeSet.changes.length} entries Core listed can be applied: ` +
+        `${plan.disabled.slice(0, 10).map((d) => `${plainChangeLabel(d.entry)} (${d.reason})`).join('; ')}` +
+        `${plan.disabled.length > 10 ? ` (and ${plan.disabled.length - 10} more)` : ''}. Nothing was sent.`;
+      void vscode.window.showWarningMessage(text);
+      this.setStatus('error', text);
+      this.emit();
+      return null;
+    }
+    const picks = await vscode.window.showQuickPick(
+      plan.items.map((item) => ({
+        label: item.label,
+        ...(item.description !== undefined ? { description: item.description } : {}),
+        picked: false,
+        // The header above the rows that cannot be applied.
+        ...(item.separator ? { kind: vscode.QuickPickItemKind.Separator } : {}),
+        entry: item.entry,
+        applicable: item.applicable,
+      })),
+      {
+        canPickMany: true,
+        ignoreFocusOut: true,
+        matchOnDescription: true,
+        // Core text in a QuickPick goes through labelText (`$(` broken).
+        title: labelText(
+          `Apply which files of task ${taskId.slice(0, 8)}? (review ${reviewId.slice(0, 8)}; the top checkbox selects all)`,
+        ),
+        placeHolder: labelText(
+          [
+            `${plan.selectable.length} of ${changeSet.changes.length} entries can be applied`,
+            ...(plan.disabled.length > 0
+              ? [`${plan.disabled.length} cannot \u2014 shown last with the reason; checking them sends nothing`]
+              : []),
+            ...notes,
+          ].join(' \u00b7 '),
+        ),
+      },
+    );
+    const chosen = new Set((picks ?? []).map((p) => p.entry).filter((e): e is FileChange => e !== undefined));
+    // Review order, the ORIGINAL objects (sent verbatim), applicable only.
+    const selected = plan.selectable.filter((entry) => chosen.has(entry));
+    // Rows that cannot be applied are inert: checked ones are disclosed, never sent.
+    const ignored = plan.disabled.filter((d) => chosen.has(d.entry));
+    if (selected.length === 0) {
+      if (ignored.length > 0) {
+        const text = notApplicableCopy(ignored);
+        void vscode.window.showWarningMessage(text);
+        this.setStatus('error', text);
       } else {
-        this.setStatus(
-          'error',
-          `Apply did not happen: ${result.abortReason ?? 'no reason given by Core'}` +
-            (result.conflictedFiles.length > 0 ? ` · conflicts: ${result.conflictedFiles.join(', ')}` : ''),
-        );
+        this.setStatus('info', 'No file selected; nothing was sent.');
       }
       this.emit();
-    } catch (error) {
-      this.reportError(error, 'git.apply');
+      return null;
     }
+    // §3.6 item 9: an opened diff showed other content than the entry binds.
+    const mismatched = selected.filter((entry) => diffMismatch(entry, diffFor(entry)));
+    if (mismatched.length > 0) {
+      // Those records describe content that is gone: the next review flags
+      // the entries as not shown instead of refusing forever.
+      for (const entry of mismatched) this.reviewedDiffs.forget(taskId, entry);
+      const text = mismatchCopy(mismatched);
+      this.setStatus('error', text);
+      this.emit();
+      return { tone: 'error', text, reReview: true };
+    }
+    const confirmInput = {
+      taskId,
+      repoPath: changeSet.repoPath,
+      hostDirty: changeSet.hostDirty,
+      hostHooksPath: changeSet.hostHooksPath,
+      entries: selected,
+      diffFor,
+      ignored,
+    };
+    const view = applyConfirmationView(confirmInput);
+    // V-W1: a list the modal caps is opened in full FIRST (read-only, in memory).
+    if (selected.length > MODAL_LIST_CAP) {
+      const { path } = this.applyListDocuments.put('apply-list', renderApplyListDocument(confirmInput));
+      try {
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.from({ scheme: APPLY_LIST_SCHEME, path }));
+        await vscode.window.showTextDocument(document, { preview: true });
+      } catch (error) {
+        this.reportError(error, 'open apply list', 'The full list of files could not be shown, so nothing was sent.');
+        return null;
+      }
+    }
+    const answer = await vscode.window.showWarningMessage(view.message, { modal: true, detail: view.detail }, view.button);
+    if (answer !== view.button) {
+      this.setStatus('info', 'Apply not confirmed; nothing was sent.');
+      this.emit();
+      return null;
+    }
+    // V-W1: the modal's button may be the default (Enter); a typed number is
+    // required on top. Never pre-filled; Escape / focus loss sends nothing.
+    const typed = await vscode.window.showInputBox(typedConfirmation(selected.length, changeSet.repoPath));
+    if (!typedConfirmed(typed, selected.length)) {
+      this.setStatus('info', TYPED_NOT_CONFIRMED);
+      this.emit();
+      return null;
+    }
+    // Core keeps reviews in memory: a restart while the modal was open voids it.
+    if ((this.capabilities?.instanceId ?? null) !== instanceAtReview) {
+      this.setStatus('error', CORE_RESTARTED);
+      this.emit();
+      return { tone: 'error', text: CORE_RESTARTED, reReview: true };
+    }
+    let outcome: ApplyOutcomeView;
+    try {
+      const answered = await this.commands.gitApply({
+        taskId,
+        expectedBase: changeSet.baseCommit,
+        reviewId,
+        entries: selected,
+      });
+      const result = parseApplyResult(answered);
+      if (result) {
+        outcome = applyResultView(result, { repoPath: changeSet.repoPath, selected: selected.length });
+      } else {
+        this.log('git.apply answer failed the shape check (payload not logged)');
+        outcome = { tone: 'warning', text: malformedApplyCopy(changeSet.repoPath), reReview: false };
+      }
+    } catch (error) {
+      const view = applyErrorView(error, changeSet.repoPath);
+      if (!view) {
+        // Provably unsent (not attached, untrusted socket …): generic copy.
+        this.reportError(error, 'git.apply', 'Nothing was sent to Core, so nothing was applied.');
+        return null;
+      }
+      this.log(`git.apply failed: ${plainText(describe(error), 2_000)}`);
+      outcome = view;
+    }
+    // I2: partial and lost answers are not "info".
+    this.setStatus(outcome.tone === 'ok' ? 'ok' : 'error', `git.apply: ${outcome.text}`);
+    this.emit();
+    await this.refreshReviewAfterApply(taskId, outcome);
+    return outcome;
+  }
+
+  /**
+   * After Core answered (or did not): re-read the review, read-only, so the
+   * status shows what Core lists NOW. The touched paths are staged after a
+   * success, so a retry is refused by Core's dirty gate — which is correct.
+   */
+  private async refreshReviewAfterApply(taskId: string, outcome: ApplyOutcomeView): Promise<void> {
+    try {
+      const fresh = parseApplyChangeSet(await this.commands.gitReview(taskId));
+      if (!fresh) return;
+      this.setStatus(
+        outcome.tone === 'ok' ? 'ok' : 'error',
+        `git.apply: ${outcome.text} \u00b7 review refreshed: Core now lists ${fresh.changes.length} changed file(s) for this task`,
+      );
+      this.emit();
+    } catch (error) {
+      this.log(`git.review after git.apply failed: ${plainText(describe(error), 2_000)} \u2014 the review was not refreshed`);
+    }
+  }
+
+  /** The apply notification; "Review again" (a user click) starts a fresh flow. */
+  private presentApplyOutcome(taskId: string, view: ApplyOutcomeView): void {
+    const buttons = view.reReview ? [REVIEW_AGAIN] : [];
+    const shown =
+      view.tone === 'ok'
+        ? vscode.window.showInformationMessage(view.text, ...buttons)
+        : view.tone === 'warning'
+          ? vscode.window.showWarningMessage(view.text, ...buttons)
+          : vscode.window.showErrorMessage(view.text, ...buttons);
+    void Promise.resolve(shown).then((choice) => {
+      if (choice === REVIEW_AGAIN) void this.applyTask(taskId);
+    });
   }
 
   /**
@@ -2361,6 +2612,10 @@ export class SandpaneSession {
         break;
       case 'reviewTask':
         void this.reviewChanges(message.taskId);
+        break;
+      case 'applyTask':
+        // A6: the sidebar's Apply button (a click); the modal still decides.
+        void this.applyTask(message.taskId);
         break;
       case 'selectConversation':
         this.selectConversation(message.conversationId);
@@ -2459,6 +2714,8 @@ export class SandpaneSession {
       composerBlocked: this.composerBlockedReason(),
       sendModeSupported: this.coreHasFeature(SEND_MODE_FEATURE),
       gitDiffSupported: this.coreAdvertises('git.diff'),
+      gitApplySupported: this.coreAdvertises('git.apply') && this.coreHasFeature(GIT_APPLY_FEATURE),
+      applyInFlight: this.applyInFlight,
       lines: transcript.lines.map((line) => ({
         role: line.role,
         text: line.text,

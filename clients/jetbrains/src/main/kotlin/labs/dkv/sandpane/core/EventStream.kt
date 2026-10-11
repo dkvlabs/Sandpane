@@ -283,6 +283,7 @@ fun TaskEvent.toRenderedEvent(): RenderedEvent {
             RenderedEvent(this, decoded, null)
         }
     }
+    GitApplies.eventNote(kind, payload)?.let { return RenderedEvent(this, null, it) }
     return when {
         EventStream.isCoreLifecycleKind(kind) -> RenderedEvent(this, null, "core event '$kind'")
         else -> RenderedEvent(this, null, "unrecognized event kind '$kind'")

@@ -443,7 +443,7 @@ The design-level `security-reviewer` pass on the first draft returned **BLOCK**.
      - a modify or delete target's leaf must be a regular file (`fstatat AT_SYMLINK_NOFOLLOW`);
      - otherwise: "<path> lies under a symlink or a file in your working tree; nothing was written".
      
-     Residual (disclosed): the window between this walk and git's write. With the writer lock (item 8), only the user's own concurrent actions can use it.
+     Residual (disclosed): the window between this walk and git's write. The writer lock (item 8) and the refusal while any live `direct_mount` sandbox or task mounts the same repository (code review W-C) leave it usable only by the user's own concurrent actions.
    - **filtered paths (R5):** a touched path whose host attributes name a `filter` (e.g. LFS) is refused, because filters are blanked and it would receive raw content. This is evaluated with `git check-attr -z filter -- <raw paths>` in the host repository WITHOUT the `GIT_ATTR_SOURCE` override: the host's `.gitattributes` are the user's, and `check-attr` executes nothing. A selected entry that adds or modifies `.gitattributes` is flagged in the confirmation.
 6. **Write.**
    - `git apply --check --index --whitespace=nowarn <patchfile>`, then `git apply --index --whitespace=nowarn <patchfile>`.
@@ -475,7 +475,33 @@ The design-level `security-reviewer` pass on the first draft returned **BLOCK**.
     - The new feature `git-apply` (5 features) is advertised only by a Core that implements items 1–9. Clients enable Apply only when it is advertised; otherwise they keep the current "not implemented" state.
     - The method count stays 28.
     - `git.apply` uses the 45 s git deadline (desktop proxy 43 s). A timeout is reported as a lost answer, per item 8.
-11. **Verification.**
+11. **Code review outcome (recorded at A6 Core review, PASS-WITH-WARNINGS).**
+    - **Fixed before commit:**
+      - W-A: new content is capped at 64 MiB per call (`MSG_CONTENT_TOO_LARGE`), the deadline is checked per entry, and the cheap host gates run before any `hash-object -w`, so a refusal writes no objects;
+      - W-B: one deadline per phase, each covering its config probes (prepare + check 20 s, write 15 s, verify 6 s, total 41 s against the 45 s client deadline). A write cut off before `git apply` starts is a non-partial `MSG_WRITE_NOT_RUN`; a verify that cannot finish is a partial;
+      - W-C: apply returns CONFLICT (`msg_mounted`) while a non-removed `direct_mount` sandbox binding or a non-terminal `direct_mount` task uses the same canonical repository. It is checked after the lock, after prepare, and right before `git.apply.started`; an unknown mode counts as direct;
+      - I1: the enumeration requires empty stderr, plus a nonexistent-gitdir C3 trap (that condition's mutation survives: no git input was found that exits 1 with stderr);
+      - I2: outcome events carry `startedSequence`, and reconciliation closes only matching starts;
+      - I3: a `--check` timeout or failure (`MSG_CHECK_UNAVAILABLE`) is worded separately from "does not apply";
+      - I5: a single-test binary with a temporary hostile `HOME` gitconfig proves the command-scope pins win;
+      - I6: the SHA-1 collision test vector carries a provenance and MIT notice.
+    - **Accepted:** I4 (splitIndex together with manyFiles gets a misleading label, but the apply still fails closed); I7 (a pure rename has an empty patch, covered by the display note below).
+    - **Re-verification (PASS-WITH-WARNINGS), fixed before commit:**
+      - W-N1: a `direct_mount` `sandbox.create` holds the repository writer lock for the whole create. It returns CONFLICT ("…; nothing was created") while an apply, writer task or discard holds the lock. An apply during such a create returns CONFLICT `msg_mount_being_created`.
+      - W-N2: every snapshot-phase git call runs in an object quarantine (`GIT_OBJECT_DIRECTORY` under Core's temp dir, with the host objects as a C-quoted alternate). Any refusal therefore leaves the host object store unchanged. `snapshotTree` names the tree Core built from the reviewed entries, but it is built in that temporary quarantine and removed after the call: it is not stored in your repository's object store and does not identify any commit. The patch alone applies on the host, as tested for text, binary literal and delta, mode-only, add and delete.
+      - I-N1: the write-phase config probe is capped at 3 s, and `git apply` is not started with less than 5 s left (`MSG_WRITE_TOO_LATE`, non-partial).
+      - I-N3: a direct-mount binding with no repository counts as a match.
+      - I-N2: a SQL prefilter that only excludes safe values.
+      - N14: a unit test now covers the stderr condition.
+    - **Accepted residuals:**
+      - I-N4: outcome events written before `startedSequence` existed are reconciled once (development databases only).
+      - I-N5: INTERNAL messages carry capped git stderr (pre-existing).
+      - A crash during prepare can leave one call's quarantine (≤ ~64 MiB) under Core's `<data>/tmp`, outside your repository; there is no startup sweep yet.
+      - A worktree discard during a direct-mount create gets the existing `msg_locked` text, whose parenthetical does not name that holder.
+      - `core.hooksPath=.` (the repository root) yields no `hostHooksPath`, so clients cannot raise flag (c) for root-level hook files. Hooks must be executable to run, so flag (b) (`100755`) still marks them.
+    - **Still open, as the recorded A4b precondition (W-D):** A5 `git.review`/`git.diff` on `host_worktree` run git in the task worktree (item 2).
+    - **Display note:** on `host_worktree`, `git.diff` headers use Core temp names, and a pure rename returns an empty patch. Clients render it as "renamed, content unchanged".
+12. **Verification.**
     - Core integration tests seed `host_worktree` tasks through the internal API, on real temporary repositories with a real linked worktree, and send real `git.apply` frames. They cover:
       - modified, added, deleted, renamed, exec-bit and binary entries;
       - tab, newline and quote paths;

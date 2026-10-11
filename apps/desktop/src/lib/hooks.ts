@@ -11,7 +11,9 @@
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import {
   useInfiniteQuery,
+  useIsMutating,
   useMutation,
+  useMutationState,
   useQuery,
   useQueryClient,
   type InfiniteData,
@@ -19,6 +21,13 @@ import {
 } from "@tanstack/react-query";
 
 import { useDeps } from "../app/context";
+import {
+  applyMutationFilters,
+  applyMutationOptions,
+  lastApplyState,
+  type ApplyMutationState,
+  type ApplyVariables,
+} from "./apply-mutation";
 
 import {
   CoreClient,
@@ -73,7 +82,6 @@ import {
   type ConversationLifecycleGates,
 } from "./conversation-lifecycle";
 import {
-  decodeApplyResult,
   decodeConversation,
   decodeProject,
 } from "./decode";
@@ -733,6 +741,9 @@ export function useTaskReview(taskId: string | null, enabled: boolean) {
     queryFn: () => deps.client.reviewChangeSet(taskId ?? ""),
     enabled: enabled && taskId !== null && deps.transportAvailable,
     staleTime: 10_000,
+    // A6: every git.review answer has a NEW reviewId and the apply selection
+    // belongs to one answer, so a window focus must never silently re-review.
+    refetchOnWindowFocus: false,
   });
   return {
     changeSet: query.data ?? null,
@@ -770,15 +781,49 @@ export function useTaskDiff(
   };
 }
 
-export function useApplyChanges() {
+/**
+ * A6 "Review again": forget every cached `git.diff` of this task, so a diff
+ * reopened after a re-review is read fresh (a cached patch from before the
+ * change would carry the OLD `taskBlob`).
+ */
+export function useForgetTaskDiffs(): (taskId: string) => void {
+  const qc = useQueryClient();
+  return (taskId) => qc.removeQueries({ queryKey: ["core", "git", "diff", taskId] });
+}
+
+/**
+ * A6 `git.apply` (reviewed entries) for ONE task. The mutation is keyed per
+ * task and kept in the client's mutation cache (`apply-mutation.ts`), so:
+ * - `pending` counts an apply started from an earlier mount of the panel
+ *   (single flight survives a task switch, A6 review W2);
+ * - `last` is the newest outcome for this task, still there after switching
+ *   away and back (a partial or a lost answer is never silently dropped);
+ * - `networkMode: "always"`: sent at the click or failed then (D-C1).
+ * NEVER retried, no keyed "Retry safely"; the review is re-read after every
+ * outcome.
+ */
+export function useApplyChanges(taskId: string): {
+  mutate: (variables: ApplyVariables, options?: { onSettled?: () => void }) => void;
+  pending: boolean;
+  last: ApplyMutationState | null;
+  /** Drop this task's settled outcomes (only ever a clean refusal). */
+  forgetSettled: () => void;
+} {
   const deps = useDeps();
   const qc = useQueryClient();
-  return useMutation<ApplyResult, CoreRequestError, GitApplyParams>({
-    mutationFn: async (params) => decodeApplyResult(await deps.client.applyChanges(params)),
-    onSuccess: (_data, variables) => {
-      void qc.invalidateQueries({ queryKey: ["core", "git", "review", variables.taskId] });
+  const mutation = useMutation(applyMutationOptions(deps.client, qc, taskId));
+  const filters = applyMutationFilters(taskId);
+  const pending = useIsMutating(filters) > 0;
+  const states = useMutationState<ApplyMutationState>({ filters, select: (m) => m.state as ApplyMutationState });
+  return {
+    mutate: (variables, options) => mutation.mutate(variables, options),
+    pending,
+    last: lastApplyState(states),
+    forgetSettled: () => {
+      const cache = qc.getMutationCache();
+      for (const m of cache.findAll(filters)) if (m.state.status !== "pending") cache.remove(m);
     },
-  });
+  };
 }
 
 // ---------------------------------------------------------------------------

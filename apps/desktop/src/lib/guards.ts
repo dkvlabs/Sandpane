@@ -23,6 +23,8 @@ import {
   MAX_SUBSCRIBE_CURSORS,
   TASK_STATUSES,
   type ConversationExportParams,
+  type ApplyEntry,
+  type GitApplyParams,
   type GitDiffParams,
   type ConversationHistoryParams,
   type ConversationListParams,
@@ -612,4 +614,54 @@ export function buildGitDiffParams(params: GitDiffParams): GitDiffParams {
     out.maxBytes = Math.min(GIT_DIFF_MAX_BYTES, Math.max(1, Math.floor(params.maxBytes)));
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// A6 git.apply (design §3.6)
+// ---------------------------------------------------------------------------
+
+/** Core's `MAX_APPLY_ENTRIES` (drift-tested). */
+export const MAX_APPLY_ENTRIES = 1000;
+
+/**
+ * One wire entry: the five `FileChange` wire fields, each copied exactly as
+ * decoded (the same JS string Core's JSON produced — never trimmed,
+ * normalized, re-encoded or rebuilt from another field), an optional field
+ * only when it was present. Nothing else travels: never the client-only
+ * `unrecognizedStatus`.
+ */
+export function applyEntryOf(entry: ApplyEntry): ApplyEntry {
+  return {
+    path: entry.path,
+    status: entry.status,
+    ...(entry.oldPath === undefined ? {} : { oldPath: entry.oldPath }),
+    ...(entry.taskBlob === undefined ? {} : { taskBlob: entry.taskBlob }),
+    ...(entry.taskMode === undefined ? {} : { taskMode: entry.taskMode }),
+  };
+}
+
+/**
+ * The exact `git.apply` frame params: `{taskId, expectedBase, reviewId,
+ * entries}` and nothing else — `selectedFiles` is never sent (an A6 Core
+ * refuses it). Refused here exactly as Core refuses them (never stricter): an
+ * empty `reviewId`, an empty entry list (it never means "all"), and more than
+ * `MAX_APPLY_ENTRIES` entries. Paths are NOT validated: Core's review binding
+ * is the judge.
+ */
+export function buildGitApplyParams(params: GitApplyParams): GitApplyParams {
+  if (params.reviewId.length === 0) {
+    throw new CoreValidationError("reviewId", "value is empty; review the changes first");
+  }
+  if (params.entries.length === 0) {
+    throw new CoreValidationError("entries", "select at least one reviewed file; an empty list never means all");
+  }
+  if (params.entries.length > MAX_APPLY_ENTRIES) {
+    throw new CoreValidationError("entries", `at most ${MAX_APPLY_ENTRIES} entries can be applied at once`);
+  }
+  return {
+    taskId: params.taskId,
+    expectedBase: params.expectedBase,
+    reviewId: params.reviewId,
+    entries: params.entries.map(applyEntryOf),
+  };
 }

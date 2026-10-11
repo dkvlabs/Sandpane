@@ -11,14 +11,12 @@ import labs.dkv.sandpane.core.ErrorAttribution
 import labs.dkv.sandpane.core.EventStream
 import labs.dkv.sandpane.core.RenderedEvent
 import labs.dkv.sandpane.core.toRenderedEvent
-import labs.dkv.sandpane.model.ApplyResult
 import labs.dkv.sandpane.model.CancelAccepted
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.ConversationSendParams
 import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.model.CoreEventKinds
 import labs.dkv.sandpane.model.CoreMethods
-import labs.dkv.sandpane.model.GitApplyParams
 import labs.dkv.sandpane.model.Reported
 import labs.dkv.sandpane.model.ReportedTaskStatusSerializer
 import labs.dkv.sandpane.model.describe
@@ -124,8 +122,12 @@ class TaskMonitorService(private val project: Project) : Disposable {
 
     private val tracked = ConcurrentHashMap<String, Tracking>()
 
-    /** taskId → the change set this client reviewed, so apply can assert the same base. */
-    private val reviewedBases = ConcurrentHashMap<String, ChangeSet>()
+    /**
+     * taskId → the LAST `git.review` answer this window received ([ReviewSession]): its base (which
+     * apply asserts), its `reviewId`, its exact entry objects and the diffs opened for it. A new
+     * review replaces the whole session, so a selection never outlives the review it was made in.
+     */
+    private val reviews = ConcurrentHashMap<String, ReviewSession>()
     private val listeners = CopyOnWriteArrayList<ViewListener>()
     private val conversationTasks = ConcurrentHashMap<String, CopyOnWriteArrayList<String>>()
 
@@ -334,36 +336,41 @@ class TaskMonitorService(private val project: Project) : Disposable {
             CancelAccepted.serializer(),
         )
 
-    /** The real change set versus the recorded base. Never reconstructed client-side. */
+    /**
+     * The real change set versus the recorded base. Never reconstructed client-side. The answer is
+     * kept whole ([ReviewSession.fromAnswer]) so A6 apply can send its entries verbatim; the session
+     * remembers which Core instance answered, because Core keeps `reviewId` in memory only.
+     */
     fun review(taskId: String): CompletableFuture<ChangeSet> {
         track(taskId)
-        return connection.call(
+        return connection.callJson(
             CoreMethods.GIT_REVIEW,
             CoreJson.encodeToJsonElement(TaskAccepted.serializer(), TaskAccepted(taskId)),
-            ChangeSet.serializer(),
-        ).thenApply { recordReview(it) }
-    }
-
-    /** Remember the reviewed base so apply can assert it (docs/specs/06 §6). */
-    fun recordReview(changeSet: ChangeSet): ChangeSet {
-        reviewedBases[changeSet.taskId] = changeSet
-        return changeSet
+        ).thenApply { answer ->
+            val session = ReviewSession.fromAnswer(answer, connection.capabilities?.instanceId)
+            reviews[session.changeSet.taskId] = session
+            session.changeSet
+        }
     }
 
     /** The change set this client last reviewed for a task, or null if it never did. */
-    fun reviewedChangeSet(taskId: String): ChangeSet? = reviewedBases[taskId]
+    fun reviewedChangeSet(taskId: String): ChangeSet? = reviews[taskId]?.changeSet
+
+    /** The whole last review of [taskId] (entries, reviewId, opened diffs), or null. */
+    fun reviewSession(taskId: String): ReviewSession? = reviews[taskId]
+
+    /** Forget a review (its selection and diff evidence) — after an apply, or when Core restarted. */
+    fun discardReview(taskId: String) {
+        reviews.remove(taskId)
+    }
 
     /**
-     * Apply is an explicit Git operation performed by Core, gated by the base recorded at
-     * review time — a mismatch aborts there (docs/specs/06 §6). Nothing is written here.
+     * Record a `git.diff` answer the user opened for [taskId] into the CURRENT review session. The
+     * answer describes Core's current task content, so it is evidence for whichever review is
+     * current (a different `taskBlob` is exactly the "changed after you reviewed it" case).
      */
-    fun apply(params: GitApplyParams): CompletableFuture<ApplyResult> {
-        require(params.expectedBase.isNotBlank()) { "expectedBase is required for an apply" }
-        return connection.call(
-            CoreMethods.GIT_APPLY,
-            CoreJson.encodeToJsonElement(GitApplyParams.serializer(), params),
-            ApplyResult.serializer(),
-        )
+    fun recordDiff(taskId: String, result: labs.dkv.sandpane.model.GitDiffResult) {
+        reviews[taskId]?.recordDiff(result)
     }
 
     fun replay(taskId: String, afterSequence: Long = 0): CompletableFuture<List<TaskEvent>> =
@@ -372,7 +379,7 @@ class TaskMonitorService(private val project: Project) : Disposable {
     /** Detach every view of this project. Core keeps running; other windows keep their streams. */
     override fun dispose() {
         tracked.keys().toList().forEach { untrack(it) }
-        reviewedBases.clear()
+        reviews.clear()
         listeners.clear()
     }
 

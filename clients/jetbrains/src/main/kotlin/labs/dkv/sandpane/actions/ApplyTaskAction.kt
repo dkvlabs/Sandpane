@@ -1,34 +1,52 @@
 package labs.dkv.sandpane.actions
 
+import com.intellij.notification.NotificationAction
+import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vcs.changes.VcsDirtyScopeManager
+import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VfsUtil
+import labs.dkv.sandpane.core.ApplyInFlight
 import labs.dkv.sandpane.core.ConnectionManager
-import labs.dkv.sandpane.core.ErrorAttribution
+import labs.dkv.sandpane.core.GitApplies
 import labs.dkv.sandpane.model.ApplyResult
+import labs.dkv.sandpane.model.CoreFeatures
 import labs.dkv.sandpane.model.CoreMethods
-import labs.dkv.sandpane.text.VisibleText
-import labs.dkv.sandpane.ui.ApplyConfirmation
-import labs.dkv.sandpane.ui.PlainText
+import labs.dkv.sandpane.model.FileChange
 import labs.dkv.sandpane.services.ApplyPlan
 import labs.dkv.sandpane.services.TaskMonitorService
+import labs.dkv.sandpane.text.VisibleText
+import labs.dkv.sandpane.ui.ApplyConfirmation
+import labs.dkv.sandpane.ui.ApplyConfirmationDialog
+import labs.dkv.sandpane.ui.ApplySelectionDialog
+import labs.dkv.sandpane.ui.NotificationText
+import labs.dkv.sandpane.ui.PlainText
 
 /**
- * "Apply" from docs/specs/04 §3 / specs/06 §6: hand the reviewed change set back to Core as an
- * explicit Git operation, with the base this client recorded at review time.
+ * "Apply reviewed files" (A6, design 2026-10-09 §3.6; docs/specs/04 §3, specs/06 §6): hand
+ * files the user reviewed back to Core, which writes them into the working tree and STAGES them
+ * (nothing is committed) after its own gates.
  *
  * Safety properties, in order:
- *  1. No apply without a prior review in this window — the base commit has to come from
- *     somewhere real (`reviewedChangeSet`), never from a guess.
- *  2. `hostDirty` refuses client-side as well: Core reports uncommitted host work, and
- *     touching a dirty tree is the exact case specs/04 rule 7 protects.
- *  3. `expectedBase` goes to Core; a divergence aborts THERE and is reported as such.
- *  4. `selectedFiles` is exactly the reviewed paths the dialog listed ([ApplyPlan]); an empty
- *     change set is refused before the dialog rather than sent.
- *  5. This action writes no host file itself. It has no filesystem write path at all.
+ *  1. Gated on Core advertising `git-apply`; otherwise the honest "not implemented by this Core"
+ *     state and nothing is sent.
+ *  2. Only over ONE `git.review` answer this window received from THIS Core instance (Core keeps
+ *     `reviewId` in memory only; another instance means review again).
+ *  3. The selection dialog and the confirmation are opened ONLY here, in [actionPerformed] — a
+ *     direct user gesture on the EDT — never from chat, agent or tool text, a timer or a reconnect.
+ *  4. A diff that showed other content than the entry's `taskBlob` refuses the send ([ApplyPlan]).
+ *  5. The call goes through [ApplyPlan.submit] → `CoreCommands.gitApply`, on ConnectionManager's io
+ *     pool with the 45 s git deadline; the EDT never waits. Single-flight per task
+ *     ([ApplyInFlight]); never retried (no idempotency in Core).
+ *  6. This action writes no host file itself. Afterwards it only marks the VCS view dirty and asks
+ *     the IDE to re-read the repository (both read-only), and refreshes the review.
  */
 class ApplyTaskAction : AnAction() {
 
@@ -38,19 +56,23 @@ class ApplyTaskAction : AnAction() {
         val project = event.project
         val presentation = event.presentation
         if (project == null || DumbService.isDumb(project)) {
-            // Visible-but-disabled while indexing; hidden without a project. (The old order set
-            // isEnabledAndVisible last, which silently re-enabled the action during indexing.)
+            // Visible-but-disabled while indexing; hidden without a project.
             presentation.isVisible = project != null
             presentation.isEnabled = false
             return
         }
-        val problem = ConnectionManager.instance().connectionProblem()
-        val pending = TaskMonitorService.instance(project).awaitingReviewTasks().isNotEmpty()
-        presentation.isEnabled = problem == null && pending
-        presentation.description = problem?.let(PlainText::inert) ?: if (!pending) {
-            "No task is awaiting review"
-        } else {
-            "Apply the reviewed change set through Core"
+        val connection = ConnectionManager.instance()
+        val problem = connection.connectionProblem()
+        val advertised = connection.capabilities?.hasFeature(CoreFeatures.GIT_APPLY) == true
+        val candidate = TaskMonitorService.instance(project).awaitingReviewTasks().firstOrNull()
+        val running = candidate != null && ApplyInFlight.isActive(candidate.taskId)
+        presentation.isEnabled = problem == null && advertised && candidate != null && !running
+        presentation.description = when {
+            problem != null -> PlainText.inert(problem)
+            !advertised -> GitApplies.NOT_IMPLEMENTED
+            candidate == null -> "No task is awaiting review"
+            running -> "An apply for this task is running; wait for its result"
+            else -> "Choose reviewed files and apply them through Core (staged, not committed)"
         }
     }
 
@@ -61,7 +83,11 @@ class ApplyTaskAction : AnAction() {
             notify(project, "Sandpane: Core not ready", it, NotificationType.WARNING)
             return
         }
-
+        val caps = connection.capabilities
+        if (caps == null || !caps.hasFeature(CoreFeatures.GIT_APPLY)) {
+            notify(project, "Sandpane: apply not available", GitApplies.NOT_IMPLEMENTED, NotificationType.INFORMATION)
+            return
+        }
         val tasks = TaskMonitorService.instance(project)
         val candidate = tasks.awaitingReviewTasks().firstOrNull()
         if (candidate == null) {
@@ -73,89 +99,136 @@ class ApplyTaskAction : AnAction() {
             )
             return
         }
-
-        val reviewed = tasks.reviewedChangeSet(candidate.taskId)
-        if (reviewed == null) {
+        val taskId = candidate.taskId
+        val session = tasks.reviewSession(taskId)
+        if (session == null) {
             notify(
                 project,
                 "Sandpane: review first",
-                "Applying needs the base commit Core reported at review time, and this window has not " +
-                    "reviewed task ${VisibleText.reveal(candidate.taskId)}. Run Sandpane: Review Changes first.",
+                "Applying works on the files of one review, and this window has not reviewed task " +
+                    "${VisibleText.reveal(taskId)}. Run Sandpane: Review Changes first. Nothing was sent.",
                 NotificationType.WARNING,
             )
             return
         }
+        if (session.coreInstanceId != caps.instanceId) {
+            tasks.discardReview(taskId)
+            notifyResult(
+                project,
+                taskId,
+                "Sandpane: review again",
+                "Core restarted since this review, and Core keeps reviews in memory only. Review again, then " +
+                    "choose the files again. Nothing was sent.",
+                NotificationType.WARNING,
+                reviewAgain = true,
+            )
+            return
+        }
+        if (ApplyInFlight.isActive(taskId)) {
+            notify(project, "Sandpane: apply already running", "Wait for its result. Nothing was sent.", NotificationType.INFORMATION)
+            return
+        }
+        val diffs = if (connection.commands.advertisementGap(CoreMethods.GIT_DIFF) == null) {
+            { change: FileChange -> connection.commands.gitDiff(taskId, change) }
+        } else {
+            null
+        }
 
-        val plan = when (val decision = ApplyPlan.decide(candidate.taskId, reviewed)) {
+        // Step 1: the per-file checkboxes (modal, EDT, this gesture only).
+        val chooser = ApplySelectionDialog(project, session, diffs)
+        if (!chooser.showAndGet()) return
+        val ready = when (val decision = ApplyPlan.decide(session, chooser.selectedIndices)) {
             is ApplyPlan.Decision.Refused -> {
-                notify(project, "Sandpane: apply refused — nothing sent", VisibleText.reveal(decision.reason), NotificationType.ERROR)
+                if (decision.reviewAgain) tasks.discardReview(taskId)
+                notifyResult(
+                    project,
+                    taskId,
+                    "Sandpane: apply refused — nothing sent",
+                    VisibleText.reveal(decision.reason),
+                    NotificationType.WARNING,
+                    reviewAgain = decision.reviewAgain,
+                )
                 return
             }
-
             is ApplyPlan.Decision.Ready -> decision
         }
 
-        val message = ApplyConfirmation.message(candidate.taskId, reviewed, plan)
-        if (!confirm(project, "Sandpane: Apply Task Changes", message, "Apply via Core")) {
-            notify(project, "Sandpane: nothing applied", "Cancelled.", NotificationType.INFORMATION)
+        // Step 2: the mandatory confirmation (modal, EDT, same gesture; Cancel is the default).
+        val confirmation = ApplyConfirmationDialog(project, ApplyConfirmation.message(session, ready).build(), ready.entries.size)
+        if (!confirmation.showAndGet()) {
+            notify(project, "Sandpane: nothing applied", "Cancelled. Nothing was sent.", NotificationType.INFORMATION)
             return
         }
-
-        // Exactly the paths the dialog listed (review bug 7) — never `null` after a confirmation
-        // that named files.
-        tasks.apply(plan.params)
-            .whenComplete { result, error ->
-                if (error != null) {
-                    // Attribution seam again: this action must not announce a client-side refusal
-                    // as git.apply failing at Core — an apply that never left is a different fact
-                    // from one Core rejected.
-                    notify(
-                        project,
-                        ErrorAttribution.headline(CoreMethods.GIT_APPLY, error),
-                        ErrorAttribution.describe(CoreMethods.GIT_APPLY, error),
-                        NotificationType.ERROR,
-                    )
-                    return@whenComplete
-                }
-                notifyApplyResult(project, candidate.taskId, result, plan.notSent.size)
-            }
+        if (!ApplyInFlight.begin(taskId)) {
+            notify(project, "Sandpane: apply already running", "Wait for its result. Nothing was sent.", NotificationType.INFORMATION)
+            return
+        }
+        val repoPath = session.changeSet.repoPath
+        val sent = ready.entries.size
+        val pending = ApplyPlan.submit(ready, connection.commands)
+        if (pending == null) {
+            ApplyInFlight.end(taskId)
+            return
+        }
+        pending.whenComplete { result, error ->
+            ApplyInFlight.end(taskId)
+            ApplicationManager.getApplication().invokeLater(
+                { onAnswer(project, taskId, repoPath, sent, result, error) },
+                ModalityState.nonModal(),
+            )
+        }
     }
 
-    private fun notifyApplyResult(project: Project, taskId: String, result: ApplyResult?, notSent: Int) {
-        if (result == null) {
-            notify(project, "Sandpane: git.apply returned nothing", "task ${VisibleText.reveal(taskId)}", NotificationType.WARNING)
-            return
-        }
-        val leftOut = if (notSent > 0) {
-            "\n$notSent file(s) with a status this plugin build does not define were NOT part of the " +
-                "selection and were left unapplied."
+    /** EDT: show the outcome, let the IDE re-read what git may have written, and refresh the review. */
+    private fun onAnswer(project: Project, taskId: String, repoPath: String?, sent: Int, result: ApplyResult?, error: Throwable?) {
+        if (project.isDisposed) return
+        val shown = if (result != null && error == null) {
+            GitApplies.presentResult(result, repoPath, sent)
         } else {
-            ""
+            GitApplies.presentFailure(error, repoPath)
         }
-        val message = when {
-            result.applied -> "Applied. Re-read the files you expect to have changed.$leftOut"
-            // Core's reason is revealed single-line: notify keeps real newlines, and a reason must
-            // not be able to fake a line of this body (S2).
-            else -> "Not applied. Core said: ${result.abortReason?.let(VisibleText::reveal) ?: "no reason given"}" +
-                conflictsLine(result.conflictedFiles) + leftOut
+        if (shown.mayHaveWritten) refreshFromDisk(project, repoPath)
+        val type = when (shown.severity) {
+            GitApplies.Severity.INFO -> NotificationType.INFORMATION
+            GitApplies.Severity.WARNING -> NotificationType.WARNING
+            GitApplies.Severity.ERROR -> NotificationType.ERROR
         }
-        notify(
-            project,
-            "Sandpane: apply ${if (result.applied) "succeeded" else "did not happen"}",
-            message,
-            if (result.applied) NotificationType.INFORMATION else NotificationType.WARNING,
-        )
+        notifyResult(project, taskId, shown.title, shown.body, type, reviewAgain = shown.offerReviewAgain)
+        if (shown.sentToCore) {
+            // The selection and its diff evidence belong to the review that was just used; a fresh,
+            // read-only review shows what is left (applied paths are now staged, so Core refuses them).
+            TaskMonitorService.instance(project).discardReview(taskId)
+            ReviewChangesAction.reviewAndShow(project, taskId)
+        }
     }
 
-    /**
-     * Conflicted paths, each escaped ([ApplyPlan.displayPath]) so a newline in one cannot fake a
-     * line, and bounded like the confirmation list (W2): a change set with thousands of conflicts
-     * must not produce an unreadable notification.
-     */
-    private fun conflictsLine(conflicted: List<String>): String {
-        if (conflicted.isEmpty()) return ""
-        val shown = conflicted.take(ApplyPlan.MAX_LISTED_PATHS).joinToString(", ", transform = ApplyPlan::displayPath)
-        val more = conflicted.size - ApplyPlan.MAX_LISTED_PATHS
-        return "\nconflicts (${conflicted.size}): $shown" + if (more > 0) ", … and $more more" else ""
+    /** Read-only: mark the VCS view dirty and ask the IDE to re-read the repository from disk. */
+    private fun refreshFromDisk(project: Project, repoPath: String?) {
+        VcsDirtyScopeManager.getInstance(project).markEverythingDirty()
+        val root = repoPath?.let { LocalFileSystem.getInstance().findFileByPath(it) } ?: return
+        VfsUtil.markDirtyAndRefresh(true, true, true, root)
+    }
+
+    /** A notification whose title and body are escaped here; optionally offers "Review again". */
+    private fun notifyResult(
+        project: Project,
+        taskId: String,
+        title: String,
+        body: String,
+        type: NotificationType,
+        reviewAgain: Boolean,
+    ) {
+        val group = NotificationGroupManager.getInstance().getNotificationGroup(NOTIFICATION_GROUP_ID) ?: return
+        val notification = group.createNotification(
+            NotificationText.escape(VisibleText.reveal(title)),
+            NotificationText.escapeMultiline(VisibleText.revealMultiline(body)),
+            type,
+        )
+        if (reviewAgain) {
+            notification.addAction(
+                NotificationAction.createSimpleExpiring("Review again") { ReviewChangesAction.reviewAndShow(project, taskId) },
+            )
+        }
+        notification.notify(project)
     }
 }

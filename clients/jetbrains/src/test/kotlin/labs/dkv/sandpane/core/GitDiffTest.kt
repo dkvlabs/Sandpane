@@ -162,6 +162,31 @@ class GitDiffTest {
         }
     }
 
+    /**
+     * A6 display change (§3.6 item 11): on host_worktree a pure rename has an EMPTY patch, the rename
+     * being carried by `status` / `oldPath`. That reads "renamed, content unchanged", never a bare
+     * "empty patch" and never "no changes"; the A6 `taskBlob` / `taskMode` fields decode when present.
+     */
+    @Test
+    fun aPureRenameWithAnEmptyPatchSaysRenamedContentUnchanged() {
+        val decoded = CoreJson.decodeFromString(
+            GitDiffResult.serializer(),
+            """{"path":"new.kt","oldPath":"old.kt","status":"renamed","patch":"","binary":false,"truncated":false,""" +
+                """"lossy":false,"baseBlob":"${"b".repeat(40)}","taskBlob":"${"c".repeat(64)}","taskMode":"100755"}""",
+        )
+        assertEquals("c".repeat(64), decoded.taskBlob)
+        assertEquals("100755", decoded.taskMode)
+        val shown = GitDiffText.disclosures(decoded, null)
+        assertTrue(shown.contains(GitDiffText.RENAMED_UNCHANGED_COPY), shown.toString())
+        assertEquals("renamed, content unchanged", GitDiffText.RENAMED_UNCHANGED_COPY)
+        assertFalse(shown.contains(GitDiffText.EMPTY_COPY), shown.toString())
+        assertFalse(shown.joinToString().lowercase().contains("no changes"))
+        // Any other empty patch keeps the neutral A5 wording.
+        assertTrue(GitDiffText.disclosures(result(patch = ""), null).contains(GitDiffText.EMPTY_COPY))
+        // An absent taskBlob (pre-A6 Core, or not host_worktree) still decodes.
+        assertNull(result().taskBlob)
+    }
+
     /** Core's untracked symlink patch (mode 120000): its one `+` line is the link text, never content. */
     private fun symlinkPatch(path: String, target: String) =
         "diff --git a/$path b/$path\nnew file mode 120000\n--- /dev/null\n+++ b/$path\n@@ -0,0 +1 @@\n+$target\n\\ No newline at end of file\n"

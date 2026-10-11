@@ -107,6 +107,20 @@ export const A4_CORE_FEATURES: readonly string[] = [
 ];
 
 /**
+ * What the A6 Core advertises (Rust `FEATURES`, 5, drift-tested in
+ * `tests/git-apply.test.ts`), plus a future unknown one clients must ignore.
+ * Feature pin only: this double does NOT model `git.apply`.
+ */
+export const A6_CORE_FEATURES: readonly string[] = [
+  "idempotency-keys",
+  "sandbox-create-agent",
+  "conversation-sandbox-id",
+  "conversation-send-mode",
+  "git-apply",
+  "some-future-feature",
+];
+
+/**
  * A2 CONFLICT messages, verbatim from `sandpane-service` (`IDEM_MSG_*`). The
  * idempotency behaviour of `sandbox.create` / `conversation.send` below is
  * MODELED on the service source (design §3.1), NOT captured from a live Core.

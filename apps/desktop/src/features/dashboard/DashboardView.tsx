@@ -310,6 +310,8 @@ function describeEntry(entry: TimelineEntry): string {
       return `Approval required: ${entry.description}`;
     case "unmodelled":
       return entry.detail;
+    case "git-apply":
+      return entry.text;
     case "user-message":
       return `You: ${entry.text}`;
     case "agent-message":

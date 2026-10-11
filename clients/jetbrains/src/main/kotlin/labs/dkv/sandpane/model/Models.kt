@@ -171,7 +171,7 @@ object CoreMethods {
     /** A5: one file's patch from a task's `git.review` change list. Read-only, display-only. */
     const val GIT_DIFF: String = "git.diff"
 
-    /** Wire order of `Method::ALL` — 28 methods as of protocol-v1 addition A5. */
+    /** Wire order of `Method::ALL` — 28 methods as of protocol-v1 addition A5 (A6 adds none). */
     val ALL: List<String> = listOf(
         SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST,
         PROJECT_UPDATE, PROJECT_ARCHIVE, PROJECT_UNARCHIVE, PROJECT_DELETE,
@@ -257,9 +257,19 @@ object CoreEventKinds {
     const val ADAPTER_UNAVAILABLE = "adapter.unavailable"
     const val SCHEDULER_DEFERRED = "scheduler.deferred"
 
+    // A6 (\u00A73.6 item 8): durable apply records. `started` is appended before the first host
+    // write; `applied` / `failed` after it (both carry `startedSequence`); `reconciled` after a
+    // Core restart interrupted an apply. Payloads are decoded as optional/open (GitApplies).
+    const val GIT_APPLY_STARTED = "git.apply.started"
+    const val GIT_APPLIED = "git.applied"
+    const val GIT_APPLY_FAILED = "git.apply.failed"
+    const val GIT_APPLY_RECONCILED = "git.apply.reconciled"
+
+    val APPLY: Set<String> = setOf(GIT_APPLY_STARTED, GIT_APPLIED, GIT_APPLY_FAILED, GIT_APPLY_RECONCILED)
+
     val ALL: Set<String> = setOf(
         TASK_CREATED, STATUS_CHANGED, MESSAGE_USER, ADAPTER_UNAVAILABLE, SCHEDULER_DEFERRED,
-    )
+    ) + APPLY
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +580,17 @@ object CoreFeatures {
      */
     const val CONVERSATION_SEND_MODE: String = "conversation-send-mode"
 
-    val KNOWN: List<String> = listOf(IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT, CONVERSATION_SANDBOX_ID, CONVERSATION_SEND_MODE)
+    /**
+     * A6 (design 2026-10-09 \u00A73.6): `git.apply` applies reviewed `host_worktree` entries
+     * (`reviewId` + `entries`), `git.review` / `git.diff` carry `reviewId`, `hostHooksPath`,
+     * `taskBlob` and `taskMode`, and [ApplyResult] has the additive fields. Without it Apply stays
+     * in its "not implemented by this Core" state and nothing is sent.
+     */
+    const val GIT_APPLY: String = "git-apply"
+
+    val KNOWN: List<String> = listOf(
+        IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT, CONVERSATION_SANDBOX_ID, CONVERSATION_SEND_MODE, GIT_APPLY,
+    )
 }
 
 /**
@@ -1022,6 +1042,17 @@ data class ChangeSet(
      * is NOT complete and the UI must say so.
      */
     val uninspected: List<String>? = null,
+    /**
+     * A6, additive (\u00A73.6 item 3): an opaque id for THIS answer, set only for `host_worktree`
+     * tasks. Core keeps it in memory only (a Core restart means review again). `git.apply` accepts
+     * only entries copied verbatim from the answer that carried it. Not a human-presence token.
+     */
+    @SerialName("reviewId") val reviewId: String? = null,
+    /**
+     * A6, additive (\u00A73.6 item 9): the host's effective `core.hooksPath`, ONLY when it is
+     * repo-relative. Applied paths under it are flagged "runs automatically".
+     */
+    @SerialName("hostHooksPath") val hostHooksPath: String? = null,
 )
 
 @Serializable
@@ -1035,6 +1066,14 @@ data class FileChange(
     val status: Reported<FileChangeStatus>,
     /** A5, additive: the pre-rename path, set only for `renamed`. Exact, like [path]. */
     @SerialName("oldPath") val oldPath: String? = null,
+    /**
+     * A6, additive: the git blob id of the task-side bytes Core itself read and hashed (40 or 64
+     * hex). Absent for `deleted` entries, for files over the 32 MiB apply cap and for entries Core
+     * could not read. An open string: never validated or normalized here.
+     */
+    @SerialName("taskBlob") val taskBlob: String? = null,
+    /** A6, additive: `"100644"`, `"100755"` or `"120000"` from Core's `lstat`; an open string. */
+    @SerialName("taskMode") val taskMode: String? = null,
 )
 
 /**
@@ -1066,6 +1105,13 @@ data class GitDiffResult(
     val truncated: Boolean,
     val lossy: Boolean,
     @SerialName("baseBlob") val baseBlob: String? = null,
+    /**
+     * A6, additive (\u00A73.6 item 3, C4): for `host_worktree` tasks, the blob id of the task-side
+     * bytes this patch was rendered from. An apply whose entry `taskBlob` differs is never sent.
+     */
+    @SerialName("taskBlob") val taskBlob: String? = null,
+    /** A6, additive: the task-side mode of that same read; an open string. */
+    @SerialName("taskMode") val taskMode: String? = null,
 ) {
     /** The patch is never printed, even from a debug or error path. */
     override fun toString(): String =
@@ -1084,20 +1130,54 @@ enum class FileChangeStatus : WireEnum {
     override val wireName: String get() = serializer().descriptor.getElementName(ordinal)
 }
 
-/** Apply is an explicit Git operation in Core, never a file overwrite here (rule 7). */
+/**
+ * `git.apply` params (A6, \u00A73.6 item 3). Apply is an explicit Git operation in Core, never a file
+ * overwrite here (rule 7).
+ *
+ * [entries] are the change entries EXACTLY as the `git.review` answer that carried [reviewId] sent
+ * them: the answer's own JSON objects, kept and passed through untouched (never rebuilt from the
+ * typed [FileChange], so nothing is normalized, reordered or dropped). The pre-A6 `selectedFiles`
+ * field does not exist in this type, so it can never be sent (an A6 Core refuses it).
+ */
 @Serializable
 data class GitApplyParams(
     @SerialName("taskId") val taskId: String,
-    @SerialName("selectedFiles") val selectedFiles: List<String>? = null,
-    /** The client's recorded base; a mismatch aborts the apply in Core. */
+    /** The task's full recorded base, as Core reported it at review; a mismatch aborts in Core. */
     @SerialName("expectedBase") val expectedBase: String,
+    @SerialName("reviewId") val reviewId: String,
+    val entries: List<JsonObject>,
+) {
+    /** Paths are agent-chosen and may be long; never printed from a debug or error path. */
+    override fun toString(): String = "GitApplyParams(taskId=$taskId, entries=${entries.size})"
+}
+
+/** A6 (\u00A73.6 item 7): an executable-bit change made by an apply; modes are open strings. */
+@Serializable
+data class ModeChange(
+    val path: String,
+    val from: String,
+    val to: String,
 )
 
+/**
+ * `git.apply` result. `applied: true` means written into the working tree AND staged, nothing
+ * committed. `applied: false` without [partial] means nothing was written. [partial] `true` means
+ * files MAY have been written or staged although `applied` is false: never success, never "nothing
+ * was written".
+ */
 @Serializable
 data class ApplyResult(
     val applied: Boolean,
     @SerialName("abortReason") val abortReason: String? = null,
     @SerialName("conflictedFiles") val conflictedFiles: List<String> = emptyList(),
+    /** A6, additive: the entry paths written and staged. */
+    @SerialName("appliedFiles") val appliedFiles: List<String>? = null,
+    /** A6, additive: executable-bit changes among the applied entries. */
+    @SerialName("modeChanges") val modeChanges: List<ModeChange>? = null,
+    /** A6, additive: the tree Core built from the reviewed objects. */
+    @SerialName("snapshotTree") val snapshotTree: String? = null,
+    /** A6, additive: true ONLY when files may have been written although [applied] is false. */
+    val partial: Boolean? = null,
 )
 
 // ---------------------------------------------------------------------------

@@ -136,6 +136,13 @@ export interface SidebarState {
   sendModeSupported: boolean;
   /** A5: Core advertises `git.diff` (the per-task Diff button is enabled). */
   gitDiffSupported: boolean;
+  /**
+   * A6: Core advertises `git.apply` AND the feature `git-apply` (the per-task
+   * Apply button is enabled). Otherwise Apply stays "not implemented".
+   */
+  gitApplySupported: boolean;
+  /** A6: an apply flow is running (review → pick → modal → answer): Apply is disabled. */
+  applyInFlight: boolean;
   lines: ChatLine[];
   /** What the stream shows: one conversation, or every task of the project. */
   transcript: { scope: 'conversation' | 'project'; label: string };
@@ -177,6 +184,8 @@ export type WebviewToExtension =
   | { type: 'reviewTask'; taskId: string }
   /** A5: pick one file of the task's change list and show its patch (read-only). */
   | { type: 'showTaskPatch'; taskId: string }
+  /** A6: start the apply flow (pick files → native modal); nothing is sent without the modal. */
+  | { type: 'applyTask'; taskId: string }
   /** A3b: select a Core-listed conversation; `''` = start a new one on the next send. */
   | { type: 'selectConversation'; conversationId: string }
   /** A3b: one lifecycle action on a Core-listed conversation (native dialogs follow). */
@@ -194,6 +203,7 @@ export const WEBVIEW_MESSAGE_KINDS: readonly string[] = [
   'cancelTask',
   'reviewTask',
   'showTaskPatch',
+  'applyTask',
   'selectConversation',
   'conversationAction',
   'toggleArchivedConversations',
@@ -251,6 +261,10 @@ export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefine
       const id = webviewId((raw as { taskId?: unknown }).taskId, false);
       return id === undefined ? undefined : { type: 'showTaskPatch', taskId: id };
     }
+    case 'applyTask': {
+      const id = webviewId((raw as { taskId?: unknown }).taskId, false);
+      return id === undefined ? undefined : { type: 'applyTask', taskId: id };
+    }
     case 'cancelTask':
     case 'reviewTask': {
       const r = raw as { taskId?: unknown };
@@ -283,6 +297,8 @@ export function emptySidebarState(connection: ConnectionTone): SidebarState {
     composerBlocked: null,
     sendModeSupported: false,
     gitDiffSupported: false,
+    gitApplySupported: false,
+    applyInFlight: false,
     lines: [],
     transcript: { scope: 'project', label: 'Transcript of all tasks in this project (no conversation selected)' },
     tasks: [],

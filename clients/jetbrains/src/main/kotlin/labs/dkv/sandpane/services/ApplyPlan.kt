@@ -1,54 +1,201 @@
 package labs.dkv.sandpane.services
 
+import labs.dkv.sandpane.core.CoreCommands
+import labs.dkv.sandpane.core.GitApplies
+import labs.dkv.sandpane.model.ApplyResult
 import labs.dkv.sandpane.model.ChangeSet
 import labs.dkv.sandpane.model.FileChange
 import labs.dkv.sandpane.model.FileChangeStatus
 import labs.dkv.sandpane.model.GitApplyParams
 import labs.dkv.sandpane.model.Reported
+import labs.dkv.sandpane.text.DisplayCap
 import labs.dkv.sandpane.text.VisibleText
+import java.util.concurrent.CompletableFuture
 import java.text.Normalizer
 import java.util.Locale
 
 /**
- * What a confirmed "Apply" sends to Core, derived ONLY from the change set the user reviewed.
+ * What a confirmed "Apply" sends to Core (A6, design 2026-10-09 \u00A73.6), derived ONLY from one
+ * `git.review` answer ([ReviewSession]) and the user's checkbox selection over it. Pure, no I/O.
  *
- * Review bug 7: the action confirmed "N reviewed files" but sent `selectedFiles = null`, which
- * Core reads as "no selection given". The request now names exactly the reviewed paths, so what
- * the user confirmed and what Core is asked to apply are the same list. Pure, no I/O.
- *
- * Protocol limit (stated, not papered over): `FileChange` carries only `path` and `status` — no
- * original path for a `renamed` entry (sandpane-protocol `FileChange`). The dialog therefore says
- * which entries are renames whose source Core did not report; this plan does not invent one.
- *
- * Protocol tolerance: an entry whose status a newer Core added ([Reported.Unknown]) is listed but
- * never selected — this build cannot know what applying it means. Such paths go to
- * [Decision.Ready.notSent] and are shown as NOT sent; a change set made only of them is refused.
+ *  - An entry is selectable only when it has a known status and is bound to reviewed content:
+ *    `taskBlob` AND `taskMode`, or `deleted` (no content to bind), and never mode `120000`.
+ *  - The wire entries are the review answer's OWN JSON objects for the selected rows, in review
+ *    order (never rebuilt from the typed [FileChange]), with that answer's `reviewId`.
+ *  - If a `git.diff` the user opened in this review showed a `taskBlob` other than the entry's, the
+ *    review is stale: nothing is sent and the user is asked to review again (\u00A73.6 item 9).
+ *  - Nothing is stricter than Core: Core's own 1000-entry limit is the only count limit, an empty
+ *    selection is refused because Core refuses it too, and a dirty host is a disclosure (Core's gate
+ *    covers the touched paths only), not a refusal.
  */
 object ApplyPlan {
 
     sealed class Decision {
-        /**
-         * Ready to confirm and send; [params] carries exactly [paths]. [renamedWithoutSource] lists
-         * the renamed entries, whose original path the protocol does not carry. [notSent] lists
-         * the entries left out of the selection: every entry whose status is unknown to this build,
-         * plus every known-status entry that names the same file as one of those on a
-         * case-insensitive or normalizing filesystem ([foldKey]). [foldCollisions] groups selected
-         * paths that differ only in case or Unicode normalization: legitimate on a case-sensitive
-         * filesystem, the same file on the macOS/Windows default, so the dialog points them out.
-         */
-        data class Ready(
-            val params: GitApplyParams,
-            val paths: List<String>,
-            val renamedWithoutSource: List<String> = emptyList(),
-            val notSent: List<FileChange> = emptyList(),
-            val foldCollisions: List<List<String>> = emptyList(),
-        ) : Decision()
+        /** Ready to confirm and send; [entries] are the typed views of [GitApplyParams.entries]. */
+        data class Ready(val params: GitApplyParams, val entries: List<FileChange>) : Decision()
 
-        /** Nothing is sent; [reason] is user-facing. */
-        data class Refused(val reason: String) : Decision()
+        /** Nothing is sent; [reason] is user-facing. [reviewAgain] offers a fresh `git.review`. */
+        data class Refused(val reason: String, val reviewAgain: Boolean = false) : Decision()
     }
 
-    /** Lines of the confirmation dialog that list paths before collapsing the rest into a count. */
+    const val REASON_SYMLINK: String = "symlinks are never applied"
+    const val REASON_TOO_LARGE: String = "too large or unreadable to apply (over 32 MiB)"
+    const val REASON_NO_CONTENT_ID: String = "no reviewed content id"
+    const val REASON_UNKNOWN_STATUS: String = "status unknown to this plugin build"
+
+    const val UNSEEN_NEVER_OPENED: String = "never opened in the Diff view"
+    const val UNSEEN_BINARY: String = "shown as binary (no text diff)"
+    const val UNSEEN_TRUNCATED: String = "the diff was truncated"
+
+    private const val SYMLINK_MODE = "120000"
+    private const val EXECUTABLE_MODE = "100755"
+
+    /**
+     * Null when [change] may be selected, else why not. Splitting the two "no content" reasons:
+     * with a `reviewId`, an entry Core left without blob AND mode was over the 32 MiB cap or not a
+     * file Core could read; an entry with only one of them, or any entry of a review without a
+     * `reviewId` (not a `host_worktree` task, or a pre-A6 Core), carries no reviewed content id.
+     */
+    fun selectability(changeSet: ChangeSet, change: FileChange): String? {
+        if (change.status is Reported.Unknown) return REASON_UNKNOWN_STATUS
+        if (change.taskMode == SYMLINK_MODE) return REASON_SYMLINK
+        if (changeSet.reviewId.isNullOrEmpty()) return REASON_NO_CONTENT_ID
+        if (change.status == Reported.Known(FileChangeStatus.DELETED)) return null
+        return when {
+            change.taskBlob != null && change.taskMode != null -> null
+            change.taskBlob == null && change.taskMode == null -> REASON_TOO_LARGE
+            else -> REASON_NO_CONTENT_ID
+        }
+    }
+
+    /** The first entry of the review whose opened diff showed other content, or null. */
+    fun changedAfterReview(session: ReviewSession): FileChange? =
+        session.changeSet.changes.firstOrNull { change ->
+            val seen = session.diffFor(change) ?: return@firstOrNull false
+            // Nullable comparison: a diff with no taskBlob for an entry that has one is not proof
+            // the content is the same, so it fails closed as well.
+            seen.taskBlob != change.taskBlob
+        }
+
+    /** The copy for [changedAfterReview] (\u00A73.6 item 9). */
+    fun changedCopy(change: FileChange): String =
+        "${VisibleText.reveal(DisplayCap.cap(change.path))} changed after you reviewed it \u2014 review again"
+
+    fun decide(session: ReviewSession, selected: List<Int>): Decision {
+        val review = session.changeSet
+        val reviewId = review.reviewId
+        if (reviewId.isNullOrEmpty()) {
+            return Decision.Refused(
+                "Core gave this review no reviewId, so none of its files is bound to reviewed content (only " +
+                    "host_worktree tasks can be applied); nothing is sent",
+            )
+        }
+        if (review.baseCommit.isBlank()) {
+            return Decision.Refused("Core reported no base commit for this review; nothing is sent")
+        }
+        val indices = selected.distinct().sorted()
+        if (indices.isEmpty()) return Decision.Refused("no file is selected; nothing is sent")
+        if (indices.size > GitApplies.MAX_ENTRIES) {
+            return Decision.Refused(
+                "Core applies at most ${GitApplies.MAX_ENTRIES} files at once and ${indices.size} are selected; " +
+                    "select fewer. Nothing is sent",
+            )
+        }
+        val out = indices.firstOrNull { it !in review.changes.indices || it !in session.rawChanges.indices }
+        if (out != null) return Decision.Refused("the selection does not match this review; review again", reviewAgain = true)
+        for (i in indices) {
+            selectability(review, review.changes[i])?.let { why ->
+                return Decision.Refused("${displayPath(review.changes[i].path)} cannot be applied: $why; nothing is sent")
+            }
+        }
+        changedAfterReview(session)?.let { return Decision.Refused(changedCopy(it), reviewAgain = true) }
+        return Decision.Ready(
+            GitApplyParams(
+                taskId = review.taskId,
+                expectedBase = review.baseCommit,
+                reviewId = reviewId,
+                entries = indices.map { session.rawChanges[it] },
+            ),
+            indices.map { review.changes[it] },
+        )
+    }
+
+    /**
+     * Send a [Decision.Ready] through [commands]; a [Decision.Refused] sends nothing and returns
+     * null. The ONLY way the Apply action reaches the socket, so a refusal can never leak a frame.
+     */
+    fun submit(decision: Decision, commands: CoreCommands): CompletableFuture<ApplyResult>? = when (decision) {
+        is Decision.Refused -> null
+        is Decision.Ready -> commands.gitApply(decision.params)
+    }
+
+    // -----------------------------------------------------------------------
+    // confirmation flags (\u00A73.6 item 9)
+    // -----------------------------------------------------------------------
+
+    /** (a) Null when the user saw this entry's full content as a text diff in this review, else why not. */
+    fun notFullyShown(session: ReviewSession, change: FileChange): String? {
+        val seen = session.diffFor(change) ?: return UNSEEN_NEVER_OPENED
+        return when {
+            seen.taskBlob != change.taskBlob -> UNSEEN_NEVER_OPENED
+            seen.binary -> UNSEEN_BINARY
+            seen.truncated -> UNSEEN_TRUNCATED
+            else -> null
+        }
+    }
+
+    /** (b) An executable addition or an exec-bit change: the reviewed mode is `100755`. */
+    fun isExecutable(change: FileChange): Boolean = change.taskMode == EXECUTABLE_MODE
+
+    /**
+     * (c) A path that runs automatically. Matched on path COMPONENTS, case-folded ([foldKey]), on
+     * both `path` and a rename's `oldPath`:
+     *  - a directory component `.husky`, `.githooks`, `.vscode` or `.idea` at any depth (hooks and
+     *    editor tasks; a sub-folder opened on its own reads its own);
+     *  - `.github/workflows/` at the root (CI);
+     *  - `.envrc`, `.gitattributes` at ANY depth (direnv and git read nested ones), `.gitmodules`
+     *    at the root;
+     *  - anything under Core's repo-relative `hostHooksPath`, when Core reports one.
+     * Over-matching only adds a flag; it never blocks.
+     */
+    fun runsAutomatically(change: FileChange, hostHooksPath: String?): Boolean =
+        listOfNotNull(change.path, change.oldPath).any { autoRunPath(it, hostHooksPath) }
+
+    private val TOOL_DIRS = setOf(".husky", ".githooks", ".vscode", ".idea")
+    private val ANY_DEPTH_FILES = setOf(".envrc", ".gitattributes")
+
+    private fun components(path: String): List<String> =
+        foldKey(path).split('/').filter { it.isNotEmpty() && it != "." }
+
+    private fun autoRunPath(path: String, hostHooksPath: String?): Boolean {
+        val parts = components(path)
+        if (parts.isEmpty()) return false
+        if (parts.dropLast(1).any { it in TOOL_DIRS }) return true
+        if (parts.size > 2 && parts[0] == ".github" && parts[1] == "workflows") return true
+        if (parts.last() in ANY_DEPTH_FILES) return true
+        if (parts.size == 1 && parts[0] == ".gitmodules") return true
+        val hooks = hostHooksPath?.let(::components).orEmpty()
+        return hooks.isNotEmpty() && parts.size > hooks.size && parts.subList(0, hooks.size) == hooks
+    }
+
+    /**
+     * One checkbox row of the selection dialog: wire status, `oldPath \u2192 path` (revealed and
+     * shortened by [displayPath]) and, for a row that cannot be selected, why not; otherwise the
+     * flags the confirmation will raise for it. Plain text (the dialog never renders it as HTML).
+     */
+    fun rowLabel(session: ReviewSession, change: FileChange): String {
+        val name = change.oldPath?.let { "${displayPath(it)} \u2192 ${displayPath(change.path)}" } ?: displayPath(change.path)
+        val head = "${VisibleText.reveal(change.status.wireName)}  $name"
+        selectability(session.changeSet, change)?.let { return "$head   \u2014 not selectable: $it" }
+        val notes = listOfNotNull(
+            notFullyShown(session, change),
+            "executable (mode 100755)".takeIf { isExecutable(change) },
+            "runs automatically".takeIf { runsAutomatically(change, session.changeSet.hostHooksPath) },
+        )
+        return if (notes.isEmpty()) head else "$head   [${notes.joinToString("; ")}]"
+    }
+
+    /** Lines of a bounded path list (notifications, plain surfaces) before collapsing the rest into a count. */
     const val MAX_LISTED_PATHS = 20
 
     /**
@@ -57,68 +204,11 @@ object ApplyPlan {
      */
     const val HIDDEN_CHARS_FLAG = "[!] hidden, control or look-alike characters, or a literal escape sequence"
 
-    fun decide(taskId: String, reviewed: ChangeSet): Decision {
-        if (reviewed.taskId != taskId) {
-            return Decision.Refused(
-                "the reviewed change set belongs to task ${reviewed.taskId}, not $taskId; review this task first",
-            )
-        }
-        if (reviewed.hostDirty) {
-            return Decision.Refused(
-                "Core reports uncommitted changes in the host working tree for task $taskId. Commit or " +
-                    "stash your own work before applying an agent's change set; Sandpane will not overwrite it.",
-            )
-        }
-        if (reviewed.baseCommit.isBlank()) {
-            return Decision.Refused("Core reported no base commit for task $taskId, so there is nothing to assert")
-        }
-        val blank = reviewed.changes.count { it.path.isBlank() }
-        if (blank > 0) {
-            // Review suggestion 5: a change set with a pathless entry is malformed. Dropping the
-            // entry would send a smaller selection than the one Core reported and the user saw.
-            return Decision.Refused(
-                "Core's change set for task $taskId has $blank entr${if (blank == 1) "y" else "ies"} without a " +
-                    "path; refusing rather than applying a selection that differs from the reviewed one",
-            )
-        }
-        // A path reported with ANY unknown status is left out entirely, even if another entry for
-        // the same path has a known one: this build cannot tell what applying it would do. "The
-        // same path" is compared on [foldKey], so `A.kt` (unknown) also excludes `a.kt` (known):
-        // on a case-insensitive filesystem they are one file.
-        val unknown = reviewed.changes.filter { it.status is Reported.Unknown }
-        val excluded = unknown.map { foldKey(it.path) }.toSet()
-        val unknownPaths = unknown.map { it.path }.toSet()
-        val notSent = reviewed.changes.filter {
-            it.status is Reported.Unknown || (foldKey(it.path) in excluded && it.path !in unknownPaths)
-        }
-        val paths = reviewed.changes.map { it.path }.distinct().filterNot { foldKey(it) in excluded }
-        if (paths.isEmpty() && notSent.isNotEmpty()) {
-            return Decision.Refused(
-                "every file in Core's change set for task $taskId has a status this plugin build does " +
-                    "not define (${unknown.map { it.status.wireName }.distinct().joinToString(", ")}); " +
-                    "nothing is selectable, so nothing is sent — update the plugin",
-            )
-        }
-        if (paths.isEmpty()) {
-            // An empty selection is a different request from "no selection" — and neither is what
-            // a user who reviewed zero files meant. Nothing is sent.
-            return Decision.Refused("Core's change set for task $taskId lists no files; there is nothing to apply")
-        }
-        return Decision.Ready(
-            GitApplyParams(taskId = taskId, selectedFiles = paths, expectedBase = reviewed.baseCommit),
-            paths,
-            reviewed.changes.filter { it.status == Reported.Known(FileChangeStatus.RENAMED) }
-                .map { it.path }.distinct().filterNot { foldKey(it) in excluded },
-            notSent,
-            paths.groupBy(::foldKey).values.filter { it.size > 1 },
-        )
-    }
-
     /**
      * Identity of a path on a case-insensitive, normalizing filesystem (the macOS and Windows
      * defaults): NFC, then locale-independent lower case. An APPROXIMATION of APFS/NTFS folding —
-     * edge cases such as Greek final sigma or NTFS upcase-table entries can differ. A missed twin
-     * means a known-status file is sent as listed; Core's base check still applies.
+     * edge cases such as Greek final sigma or NTFS upcase-table entries can differ. Used to match
+     * the "runs automatically" components of flag (c) case-insensitively (over-matching only flags).
      */
     fun foldKey(path: String): String = Normalizer.normalize(path, Normalizer.Form.NFC).lowercase(Locale.ROOT)
 
@@ -139,25 +229,6 @@ object ApplyPlan {
         }
         return Listing(paths.take(limit).map(::displayPath), overflow)
     }
-
-    /** The entries left out of the selection, each with why, as dialog entries. */
-    fun listNotSent(notSent: List<FileChange>, limit: Int = MAX_LISTED_PATHS): Listing = Listing(
-        notSent.take(limit).map { change ->
-            when (val status = change.status) {
-                is Reported.Unknown -> "${displayPath(change.path)} — unknown status '${status.wireName}'"
-                is Reported.Known ->
-                    "${displayPath(change.path)} — same file as an unknown-status entry on a case-insensitive filesystem"
-            }
-        },
-        if (notSent.size > limit) "… and ${notSent.size - limit} more" else null,
-    )
-
-    /**
-     * Plain-text rendering of [listNotSent] (`  [x<n>] …` lines). The confirmation dialog does not
-     * use it — it lays the same cells out as table rows — but plain surfaces and tests do.
-     */
-    fun describeNotSent(notSent: List<FileChange>, limit: Int = MAX_LISTED_PATHS): String =
-        plain(listNotSent(notSent, limit), "x")
 
     /**
      * Plain-text rendering of [listPaths]: one numbered `  [<n>] ` line per path, then the overflow.

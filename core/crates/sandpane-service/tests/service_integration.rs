@@ -989,53 +989,43 @@ fn git_review_and_apply_gates_on_real_repo() {
         .iter()
         .any(|c| c["path"] == "notes.txt" && c["status"] == "untracked"));
 
-    // Apply with a DIVERGED expected base aborts structurally.
-    let wrong_base = "1".repeat(40);
-    let apply = s.ok(
+    // A6 (§3.6 item 1): an apply must carry a reviewId + entries copied
+    // from a review; the old shape is a structured VALIDATION_FAILED.
+    let err = s.err(
         "4",
         "git.apply",
-        serde_json::json!({"taskId": task_id, "expectedBase": wrong_base}),
-    );
-    assert_eq!(apply["applied"], false);
-    assert!(apply["abortReason"]
-        .as_str()
-        .unwrap()
-        .contains("base diverged"));
-
-    // Apply with the correct base hits the dirty-host gate — user work untouched.
-    let apply = s.ok(
-        "5",
-        "git.apply",
         serde_json::json!({"taskId": task_id, "expectedBase": base}),
     );
-    assert_eq!(apply["applied"], false);
-    assert!(apply["abortReason"]
-        .as_str()
-        .unwrap()
-        .contains("precondition failed"));
+    assert_eq!(err["code"], "VALIDATION_FAILED", "{err}");
+    assert_eq!(
+        err["message"],
+        "git.apply needs reviewId and a non-empty entries list copied from a git.review \
+         answer; nothing was written"
+    );
+    // This legacy row has no workspace mode: it worked in the live host
+    // tree, so it is refused like direct_mount — even with a diverged base,
+    // the mode refusal comes first. User work untouched.
+    let wrong_base = "1".repeat(40);
+    for (id, expected) in [("5", wrong_base.as_str()), ("6", base.as_str())] {
+        let apply = s.ok(
+            id,
+            "git.apply",
+            serde_json::json!({"taskId": task_id, "expectedBase": expected,
+                "reviewId": "r", "entries": [{"path": "app.txt", "status": "modified"}]}),
+        );
+        assert_eq!(apply["applied"], false);
+        assert_eq!(
+            apply["abortReason"],
+            "this task worked directly in your repository; its changes are already in your \
+             working tree, so there is nothing to apply; nothing was written",
+            "{apply}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(repo.join("app.txt")).unwrap(),
+        "feature\n"
+    );
     assert!(repo.join("notes.txt").exists(), "host work must survive");
-
-    // Clean host at the recorded base → honest P4 scaffold abort (never a fake apply).
-    let git_restore = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-    };
-    git_restore(&["checkout", "-q", "--", "app.txt"]);
-    std::fs::remove_file(repo.join("notes.txt")).unwrap();
-    let apply = s.ok(
-        "6",
-        "git.apply",
-        serde_json::json!({"taskId": task_id, "expectedBase": base}),
-    );
-    assert_eq!(apply["applied"], false);
-    assert!(apply["abortReason"]
-        .as_str()
-        .unwrap()
-        .contains("P4 deliverable"));
 
     // Task without Git context → structured VALIDATION_FAILED, not a panic.
     let task2 = s.ok(
@@ -1055,14 +1045,13 @@ fn git_review_and_apply_gates_on_real_repo() {
     let apply = s.ok(
         "9",
         "git.apply",
-        serde_json::json!({"taskId": task2["id"], "expectedBase": base}),
+        serde_json::json!({"taskId": task2["id"], "expectedBase": base,
+            "reviewId": "r", "entries": [{"path": "app.txt", "status": "modified"}]}),
     );
     assert_eq!(apply["applied"], false);
-    assert!(
-        apply["abortReason"]
-            .as_str()
-            .unwrap()
-            .contains("no Git context"),
+    assert_eq!(
+        apply["abortReason"],
+        "task has no Git context (repo binding + base_commit); nothing was written",
         "got: {apply}"
     );
 }
@@ -1158,15 +1147,21 @@ fn git_review_and_apply_refuse_repo_with_submodule() {
     assert!(msg.contains("vendor/lib"), "names the submodule: {msg}");
     assert!(msg.contains("cannot verify"), "{msg}");
 
+    // A legacy (no-mode) task is refused before any repository check (A6
+    // item 1); the host_worktree submodule refusal is covered in
+    // tests/git_apply.rs.
     let apply = s.ok(
         "4",
         "git.apply",
-        serde_json::json!({"taskId": "task-sub-1", "expectedBase": base}),
+        serde_json::json!({"taskId": "task-sub-1", "expectedBase": base,
+            "reviewId": "r", "entries": [{"path": "app.txt", "status": "modified"}]}),
     );
     assert_eq!(apply["applied"], false);
     let reason = apply["abortReason"].as_str().unwrap();
-    assert!(reason.contains("vendor/lib"), "got: {reason}");
-    assert!(reason.contains("submodule"), "got: {reason}");
+    assert!(
+        reason.starts_with("this task worked directly"),
+        "got: {reason}"
+    );
     assert_eq!(
         std::fs::read_to_string(repo.join("vendor/lib/app.txt")).unwrap(),
         "uncommitted\n",
@@ -3465,7 +3460,8 @@ fn features_are_advertised_from_the_single_const_list() {
             "idempotency-keys",
             "sandbox-create-agent",
             "conversation-sandbox-id",
-            "conversation-send-mode"
+            "conversation-send-mode",
+            "git-apply"
         ])
     );
 }

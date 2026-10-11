@@ -29,7 +29,6 @@
 import { CoreConnection } from './connection';
 import type {
   AgentCapability,
-  ApplyResult,
   ChangeSet,
   Conversation,
   ConversationCreateParams,
@@ -358,18 +357,6 @@ export function validateDisplayText(value: string, max: number, field: string): 
   return value;
 }
 
-/**
- * `git.apply` `selectedFiles` entries are EXACT paths as `git.review` lists them
- * (A5: a real tab, CR or newline may occur), and Core's params type
- * (`Option<Vec<String>>`) adds no rule of its own; so only an empty entry or a
- * NUL (never part of a Git path) is refused here. The frame cap still bounds it.
- */
-export function validateSelectedFile(value: string): string {
-  if (typeof value !== 'string' || value.length === 0) throw new CoreValidationError('selectedFiles', 'value is empty');
-  if (value.includes('\0')) throw new CoreValidationError('selectedFiles', 'path contains a NUL byte');
-  return value;
-}
-
 export function validateAbsoluteRepoPath(value: string, field = 'repoPath'): string {
   if (!value.startsWith('/')) {
     throw new CoreValidationError(field, `path is not absolute: ${value}`);
@@ -537,6 +524,17 @@ export const PROJECT_GIT_TIMEOUT_MS = 45_000;
  * read-only, so a timeout changed nothing.
  */
 export const GIT_QUERY_TIMEOUT_MS = PROJECT_GIT_TIMEOUT_MS;
+
+/**
+ * A6 (§3.6 item 10): `git.apply` uses the same 45 s git deadline. Core's own
+ * budget is 41 s (prepare 20 + write 15 + verify 6), inside it. NOT read-only
+ * and NOT replay-safe: a timeout means the apply MAY have happened, so it is
+ * never retried automatically.
+ */
+export const GIT_APPLY_TIMEOUT_MS = GIT_QUERY_TIMEOUT_MS;
+
+/** A6: Core's `MAX_APPLY_ENTRIES` — at most this many entries per call. */
+export const MAX_APPLY_ENTRIES = 1000;
 
 /** A5: `maxBytes` exactly as Core clamps it (1..=MAX_DIFF_BYTES); absent stays absent. */
 export function clampDiffBytes(maxBytes: number | undefined): number | undefined {
@@ -1069,17 +1067,41 @@ export class CoreCommands {
     });
   }
 
-  /** Explicit, base-checked Git integration. Never a file overwrite (specs/06 §6). */
-  gitApply(params: GitApplyParams): Promise<ApplyResult> {
+  /**
+   * A6 (§3.6): `{taskId, expectedBase, reviewId, entries}` → `ApplyResult`.
+   * Explicit, base-checked Git integration through Core, never a file write.
+   * The payload is built from these four keys only (nothing else a caller
+   * passes is forwarded), and `entries` goes out as given: the FileChange
+   * objects of ONE `git.review` answer, copied verbatim. Only what Core also
+   * refuses is refused here (an empty list, more than 1000 entries, an empty
+   * `reviewId`, an entry without a string `path`); Core gates the rest. A
+   * refusal never echoes an entry. 45 s deadline; never retried.
+   */
+  gitApply(params: GitApplyParams): Promise<unknown> {
     return guarded(() => {
+      const reviewId: unknown = params.reviewId;
+      if (typeof reviewId !== 'string' || reviewId.length === 0) {
+        throw new CoreValidationError('reviewId', 'a review id from git.review is required');
+      }
+      const entries: unknown = params.entries;
+      if (!Array.isArray(entries) || entries.length === 0) {
+        throw new CoreValidationError('entries', 'at least one entry copied from git.review is required');
+      }
+      if (entries.length > MAX_APPLY_ENTRIES) {
+        throw new CoreValidationError('entries', `at most ${MAX_APPLY_ENTRIES} entries can be applied at once`);
+      }
+      for (const entry of entries) {
+        if (typeof entry !== 'object' || entry === null || typeof (entry as { path?: unknown }).path !== 'string') {
+          throw new CoreValidationError('entries', 'every entry must be a git.review entry with a path');
+        }
+      }
       const payload: Record<string, unknown> = {
         taskId: requireId(params.taskId, 'taskId'),
         expectedBase: validateGitRef(params.expectedBase),
+        reviewId,
+        entries,
       };
-      if (Array.isArray(params.selectedFiles) && params.selectedFiles.length > 0) {
-        payload['selectedFiles'] = params.selectedFiles.map(validateSelectedFile);
-      }
-      return this.connection.request<ApplyResult>('git.apply', payload);
+      return this.connection.request<unknown>('git.apply', payload, { timeoutMs: GIT_APPLY_TIMEOUT_MS });
     });
   }
 }

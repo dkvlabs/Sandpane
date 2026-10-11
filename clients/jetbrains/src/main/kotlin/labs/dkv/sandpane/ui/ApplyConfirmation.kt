@@ -1,67 +1,91 @@
 package labs.dkv.sandpane.ui
 
-import labs.dkv.sandpane.model.ChangeSet
+import labs.dkv.sandpane.model.FileChange
 import labs.dkv.sandpane.services.ApplyPlan
+import labs.dkv.sandpane.services.ReviewSession
+import labs.dkv.sandpane.text.DisplayCap
+import labs.dkv.sandpane.text.VisibleText
 
 /**
- * The Apply confirmation message (docs/specs/04 §3), separate from the action so its rendered
- * layout can be tested with the platform's own word-wrapping HTML kit.
+ * The A6 Apply confirmation text (design 2026-10-09 §3.6 item 9), separate from the dialog so it
+ * can be unit-tested and laid out by the platform's own word-wrapping HTML kit (DialogLayoutTest).
  *
- * Every Core/agent-supplied value goes through [DialogHtml], which reveals and escapes it; the
- * lists of paths are table rows, so no path can lay itself out as a fake entry or header.
+ * It names the repository, lists EVERY file that will be sent with its status (renames as
+ * `oldPath → path`), separately flags (a) content never fully shown, (b) executable entries and
+ * (c) paths that run automatically, and states what Apply does. Every Core/agent value goes
+ * through [DialogHtml] (revealed single-line, so a CR reads `\r`; HTML-escaped; each list entry in
+ * its own table row), so no path can lay itself out as a fake entry or header.
  */
 object ApplyConfirmation {
 
-    /** Paths shown per case/normalization collision group. */
-    const val MAX_PATHS_PER_GROUP = 5
+    const val TITLE: String = "Sandpane: Apply Reviewed Files"
+    const val CANCEL_LABEL: String = "Cancel"
+    const val STATEMENT: String =
+        "Writes these files into your working tree and stages them. Nothing is committed. " +
+            "The content is the version Core hashed when you reviewed."
 
-    fun message(taskId: String, reviewed: ChangeSet, plan: ApplyPlan.Decision.Ready): DialogHtml {
+    /** The explicit OK button: "Apply N files". */
+    fun okLabel(count: Int): String = if (count == 1) "Apply 1 file" else "Apply $count files"
+
+    /** The three flag lists, each in the order the files are listed. */
+    data class Flags(
+        val notFullyShown: List<Pair<FileChange, String>>,
+        val executable: List<FileChange>,
+        val autoRun: List<FileChange>,
+    )
+
+    fun flags(session: ReviewSession, entries: List<FileChange>): Flags = Flags(
+        entries.mapNotNull { e -> ApplyPlan.notFullyShown(session, e)?.let { e to it } },
+        entries.filter(ApplyPlan::isExecutable),
+        entries.filter { ApplyPlan.runsAutomatically(it, session.changeSet.hostHooksPath) },
+    )
+
+    private fun name(change: FileChange): String =
+        change.oldPath?.let { "${ApplyPlan.displayPath(it)} → ${ApplyPlan.displayPath(change.path)}" }
+            ?: ApplyPlan.displayPath(change.path)
+
+    fun message(session: ReviewSession, ready: ApplyPlan.Decision.Ready): DialogHtml {
+        val review = session.changeSet
+        val entries = ready.entries
         val html = DialogHtml()
-            .line("Apply task ${taskId.take(8)} through Core?")
+            .line("Apply ${entries.size} reviewed file(s) to your repository?")
+            .fields(
+                "repository" to (review.repoPath?.let { DisplayCap.cap(it) } ?: "not reported by Core"),
+                "task" to DisplayCap.cap(review.taskId),
+                "base commit" to DisplayCap.cap(review.baseCommit),
+                "review" to DisplayCap.cap(ready.params.reviewId),
+            )
             .blank()
-            .header("files (${plan.paths.size}) — exactly these are sent as the selection:")
-        val listed = ApplyPlan.listPaths(plan.paths)
-        html.entries("", listed.cells)
-        listed.overflow?.let(html::line)
-        if (plan.foldCollisions.isNotEmpty()) {
+            .header("Files (${entries.size}) — exactly these are sent:")
+            .entries("", entries.map { "${VisibleText.reveal(it.status.wireName)}  ${name(it)}" })
+        val flags = flags(session, entries)
+        if (flags.notFullyShown.isNotEmpty()) {
             html.blank().header(
-                "same file on a case-insensitive filesystem (${plan.foldCollisions.size} group(s)) — these " +
-                    "paths differ only in letter case or Unicode normalization:",
-            )
-            // Bounded like every list here (security re-review W1): an agent must not be able to
-            // bury the dialog under case variants.
-            val groups = plan.foldCollisions
-            html.entries(
-                "c",
-                groups.take(ApplyPlan.MAX_LISTED_PATHS).map { group ->
-                    group.take(MAX_PATHS_PER_GROUP).joinToString("  ⟷  ", transform = ApplyPlan::displayPath) +
-                        if (group.size > MAX_PATHS_PER_GROUP) "  … and ${group.size - MAX_PATHS_PER_GROUP} more" else ""
-                },
-            )
-            if (groups.size > ApplyPlan.MAX_LISTED_PATHS) {
-                html.line("… and ${groups.size - ApplyPlan.MAX_LISTED_PATHS} more group(s)")
-            }
+                "(a) content never fully shown to you (${flags.notFullyShown.size}) — binary, truncated, or never " +
+                    "opened in the Diff view in this review:",
+            ).entries("a", flags.notFullyShown.map { (e, why) -> "${name(e)} — $why" })
         }
-        if (plan.notSent.isNotEmpty()) {
+        if (flags.executable.isNotEmpty()) {
             html.blank().header(
-                "NOT sent (${plan.notSent.size}) — Core reported a file status this plugin build does not " +
-                    "define, so these are not selectable and stay unapplied:",
-            )
-            val notSent = ApplyPlan.listNotSent(plan.notSent)
-            html.entries("x", notSent.cells)
-            notSent.overflow?.let(html::line)
+                "(b) executable (${flags.executable.size}) — mode 100755: an executable addition or an " +
+                    "exec-bit change:",
+            ).entries("b", flags.executable.map(::name))
         }
-        html.blank()
-        if (plan.renamedWithoutSource.isNotEmpty()) {
-            html.line(
-                "renamed (${plan.renamedWithoutSource.size}): Core reports only the new path; the original " +
-                    "path is not part of the protocol's change set, so it is not shown here.",
+        if (flags.autoRun.isNotEmpty()) {
+            html.blank().header(
+                "(c) runs automatically (${flags.autoRun.size}) — git hooks, CI workflows, editor or " +
+                    "environment configuration, git attributes or submodules:",
+            ).entries("c", flags.autoRun.map(::name))
+        }
+        if (review.hostDirty) {
+            html.blank().line(
+                "Core reports other uncommitted changes in your working tree. Core refuses the apply if any " +
+                    "selected file is among them; the rest are not touched.",
             )
         }
         return html
-            .line("base commit: ${reviewed.baseCommit}")
-            .line("host dirty: ${reviewed.hostDirty} (checked again by Core before it touches anything)")
             .blank()
-            .line("This is an explicit Git operation. If the repository moved since the review, Core aborts.")
+            .line(STATEMENT)
+            .line("If your repository moved or a file changed since the review, Core refuses and writes nothing.")
     }
 }

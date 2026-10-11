@@ -18,6 +18,9 @@ object GitDiffText {
     const val BINARY_COPY: String = "treated as binary (possibly by repository attributes) \u2014 no text diff shown"
     const val LOSSY_COPY: String = "contains bytes that are not valid UTF-8; shown with replacement characters"
     const val EMPTY_COPY: String = "Core returned an empty patch"
+
+    /** A6 (\u00A73.6 item 11): a pure host_worktree rename has an empty patch; the rename is in status/oldPath. */
+    const val RENAMED_UNCHANGED_COPY: String = "renamed, content unchanged"
     const val UNSUPPORTED: String =
         "Per-file diff: not supported by this Core (it does not advertise git.diff); nothing is sent."
     /**
@@ -51,8 +54,11 @@ object GitDiffText {
         if (result.truncated) add(truncatedCopy(requestedMaxBytes))
         if (result.lossy) add(LOSSY_COPY)
         if (!result.binary) crlfLineCount(result.patch).takeIf { it > 0 }?.let { add(crlfCopy(it)) }
-        if (result.patch.isEmpty() && !result.binary && !result.truncated) add(EMPTY_COPY)
+        if (result.patch.isEmpty() && !result.binary && !result.truncated) {
+            add(if (result.status == Reported.Known(FileChangeStatus.RENAMED)) RENAMED_UNCHANGED_COPY else EMPTY_COPY)
+        }
         result.baseBlob?.let { add("base blob ${VisibleText.reveal(it.take(12))}") }
+        result.taskBlob?.let { add("reviewed content id (task blob) ${VisibleText.reveal(it.take(12))}") }
     }
 
     /**

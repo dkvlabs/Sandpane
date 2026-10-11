@@ -125,7 +125,7 @@ object DialogText {
  * over-long unbreakable run at the pane width. With one `<br>`-separated line per entry, the
  * wrapped tail of a crafted path started at the left margin — exactly where real `[n]` markers
  * and section headers start — so a path could render a pixel-identical fake entry or a fake
- * "NOT sent" header. Here every entry is one table row: its marker in a `nowrap` column of its
+ * section header. Here every entry is one table row: its marker in a `nowrap` column of its
  * own, its text in the next column. However the text wraps, every tail stays inside the text
  * column, to the right of every real marker; headers sit outside the tables at the left margin and
  * are bold. Escaped text cannot produce HTML bold, but Unicode "mathematical bold" letters LOOK

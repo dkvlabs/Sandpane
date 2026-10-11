@@ -23,7 +23,9 @@ import {
   type ConversationHistoryParams,
   type ConversationHistoryResult,
   type ConversationListParams,
+  type ApplyResult,
   type ChangeSet,
+  type GitApplyParams,
   type GitDiffParams,
   type GitDiffResult,
   type ConfirmationRequest,
@@ -43,6 +45,7 @@ import {
 } from "./protocol";
 import { FrameTooLargeError, MalformedFrameError, encodeFrame } from "./framing";
 import {
+  decodeApplyResult,
   decodeChangeSet,
   decodeGitDiffResult,
   decodeConversation,
@@ -83,6 +86,7 @@ import {
   buildTaskListParams,
   checkIdempotencyKey,
   buildTaskSubscribeParams,
+  buildGitApplyParams,
   buildGitDiffParams,
 } from "./guards";
 
@@ -203,7 +207,8 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
  * 320 s / 40 s / 350 s / 390 s), per-method drift-tested. `project.create` and
  * `project.add_repository` run Core's git canonicalization of a repository path
  * (up to 30 s): 45 s here, 43 s in the proxy, and so do A5's `git.review` and
- * `git.diff` (git under Core's 30 s query limit). The five A3b conversation
+ * `git.diff` (git under Core's 30 s query limit) and A6's `git.apply` (Core's
+ * 41 s apply budget). The five A3b conversation
  * methods keep the default (design §3.3 item 9).
  */
 export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
@@ -218,6 +223,9 @@ export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
   // change list and the diff, so git.review and git.diff get the git deadline.
   "git.review": 45_000,
   "git.diff": 45_000,
+  // A6 (design §3.6 item 10): Core's whole apply budget is 41 s (prepare 20 +
+  // write 15 + verify 6), inside its 45 s client deadline (CLIENT_APPLY_DEADLINE).
+  "git.apply": 45_000,
 };
 
 /** The webview deadline for one method with the default options. */
@@ -801,8 +809,23 @@ export class CoreClient {
     return this.request("git.review", { taskId });
   }
 
-  applyChanges(params: unknown) {
-    return this.request("git.apply", params);
+  /**
+   * `git.apply` (A6): the exact `{taskId, expectedBase, reviewId, entries}`
+   * frame (`buildGitApplyParams` — never `selectedFiles`), decoded. NOT
+   * replay-safe and never retried: a lost answer means the apply MAY have run.
+   */
+  async applyChanges(params: GitApplyParams): Promise<ApplyResult> {
+    // A refused build never reaches `request()`: nothing is written.
+    const payload = preflight(() => buildGitApplyParams(params));
+    const answer = await this.request("git.apply", payload);
+    try {
+      return decodeApplyResult(answer);
+    } catch (err) {
+      // Core DID answer, but unreadably: the apply may have run. Reported as
+      // a client MALFORMED_FRAME for git.apply (never "nothing was written").
+      const error = asCoreRequestError(err);
+      throw new CoreRequestError(error.source, error.code, error.message, error.details, "git.apply");
+    }
   }
 
   /**

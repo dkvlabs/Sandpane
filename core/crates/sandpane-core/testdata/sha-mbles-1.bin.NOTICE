@@ -1,0 +1,50 @@
+sha-mbles-1.bin — provenance and license notice
+================================================
+
+File:      sha-mbles-1.bin (640 bytes)
+SHA-1:     8ac60ba76f1999a1ab70223f225aefdc78d4ddc0 (byte-identical to the
+           upstream copy below)
+Source:    the `test/sha-mbles-1.bin` file shipped in the crates.io package
+           `sha1collisiondetection` 0.3.4
+           (repository: https://gitlab.com/sequoia-pgp/sha1collisiondetection),
+           copied unmodified.
+Content:   one half of the "SHA-1 is a Shambles" chosen-prefix collision
+           (G. Leurent and T. Peyrin, 2020), used upstream as a test vector.
+Use here:  test-only input for sandpane-core `objects.rs`
+           (`a_sha1_collision_attack_is_refused_not_hashed`); never shipped in a
+           release artifact.
+
+The upstream crate is distributed under the MIT License; its license file
+is reproduced below as that license requires.
+
+--------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2017:
+    Marc Stevens
+    Cryptology Group
+    Centrum Wiskunde & Informatica
+    P.O. Box 94079, 1090 GB Amsterdam, Netherlands
+    marc@marc-stevens.nl
+
+    Dan Shumow
+    Microsoft Research
+    danshu@microsoft.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

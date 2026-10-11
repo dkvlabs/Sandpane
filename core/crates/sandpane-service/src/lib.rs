@@ -15,6 +15,12 @@ pub use conversation_lifecycle::{
     CONVERSATION_DELETE_ACTION, MSG_CONVERSATION_ARCHIVED, MSG_CONVERSATION_HAS_TASKS,
     MSG_CONVERSATION_NOT_FOUND, MSG_TITLE_BLANK, UNTITLED_CONVERSATION,
 };
+mod git_apply;
+pub use git_apply::{
+    msg_create_mount_in_progress, msg_create_repo_busy, msg_locked, msg_mount_being_created,
+    reconcile_applies_after_restart, EVENT_APPLIED, EVENT_APPLY_FAILED, EVENT_APPLY_RECONCILED,
+    EVENT_APPLY_STARTED, MAX_REVIEW_ID_LEN,
+};
 pub mod inflight;
 mod project_lifecycle;
 pub use project_lifecycle::{
@@ -43,7 +49,7 @@ use sandpane_core::validation::Validator;
 use sandpane_core::workspace::{self, WorkspaceError};
 use sandpane_core::{git as scoregit, Database, EventLog};
 use sandpane_protocol::{
-    AgentCapability, AgentEvent, ApplyResult, ChangeSet, ConfirmationRequest, ConfirmationTarget,
+    AgentCapability, AgentEvent, ChangeSet, ConfirmationRequest, ConfirmationTarget,
     ConversationCreateParams, ConversationDeleteParams, ConversationExportParams,
     ConversationHistoryParams, ConversationHistoryResult, ConversationIdParams,
     ConversationListParams, ConversationRenameParams, ConversationSendParams, CoreCapabilities,
@@ -181,6 +187,31 @@ pub struct CoreConfig {
     /// `None` in production.
     #[doc(hidden)]
     pub test_before_export_redaction: Option<TestHook>,
+    /// Test seam only (A6 W-N2): called inside prepare, after the snapshot
+    /// and the second host gates, right before `git apply --check`. `None`
+    /// in production.
+    #[doc(hidden)]
+    pub test_apply_before_check: Option<TestHook>,
+    /// Test seam only (A6 W-B/W-C): called by `git.apply` after prepare
+    /// (gates and `--check` passed) and BEFORE the pre-start re-checks and
+    /// the durable `git.apply.started`. `None` in production.
+    #[doc(hidden)]
+    pub test_apply_before_start: Option<TestHook>,
+    /// Test seam only (A6): called by `git.apply` AFTER the durable
+    /// `git.apply.started` event and BEFORE git writes the host repository
+    /// (W1/W6/W7 tests plant a lock, race an apply, or panic here). `None`
+    /// in production.
+    #[doc(hidden)]
+    pub test_apply_before_write: Option<TestHook>,
+    /// Test seam only (A6): called after git's write succeeded and BEFORE
+    /// Core verifies it (W2 tests mutate the host here). `None` in
+    /// production.
+    #[doc(hidden)]
+    pub test_apply_after_write: Option<TestHook>,
+    /// Test seam only (A6 W-B/R6): the apply's time limits instead of
+    /// `sandpane_core::apply::ApplyLimits::default()`. `None` in production.
+    #[doc(hidden)]
+    pub test_apply_limits: Option<sandpane_core::apply::ApplyLimits>,
 }
 
 pub struct ServerInner {
@@ -205,6 +236,13 @@ pub struct ServerInner {
     /// Test seams ([`TestHook`]); `None` in production.
     test_before_task_write: Option<TestHook>,
     pub(crate) test_before_export_redaction: Option<TestHook>,
+    /// A6 R4: the last reviews per task (memory only; they die with Core).
+    pub(crate) reviews: Mutex<sandpane_core::apply::ReviewStore>,
+    pub(crate) test_apply_before_check: Option<TestHook>,
+    pub(crate) test_apply_before_start: Option<TestHook>,
+    pub(crate) test_apply_before_write: Option<TestHook>,
+    pub(crate) test_apply_after_write: Option<TestHook>,
+    pub(crate) test_apply_limits: Option<sandpane_core::apply::ApplyLimits>,
 }
 
 impl ServerInner {
@@ -263,13 +301,18 @@ impl ServerInner {
             config.user_excludes_file.as_deref(),
             config.worktrees_root.as_deref(),
         );
+        let git = scoregit::GitRunner::with_excludes_file(excludes_file);
+        // A6 (§3.6 item 8, W7): an apply whose `git.apply.started` has no
+        // outcome event belongs to a dead Core. The host index decides what
+        // happened — recorded durably before any client connects.
+        git_apply::reconcile_applies_after_restart(&db, &git)?;
         let inner = Arc::new(Self {
             db: Mutex::new(db),
             scheduler: Mutex::new(Scheduler::reconciliation_baseline()),
             sbx_locator,
             sbx_limits: config.sbx_limits,
             instance_id: uuid::Uuid::new_v4().to_string(),
-            git: scoregit::GitRunner::with_excludes_file(excludes_file),
+            git,
             worktrees_root: config.worktrees_root,
             confirmations: Mutex::new(confirm::ConfirmationStore::new()),
             sandbox_ops: inflight::SandboxOpLocks::new(),
@@ -277,6 +320,12 @@ impl ServerInner {
             test_after_create_claim: config.test_after_create_claim,
             test_before_task_write: config.test_before_task_write,
             test_before_export_redaction: config.test_before_export_redaction,
+            reviews: Mutex::new(sandpane_core::apply::ReviewStore::new()),
+            test_apply_before_check: config.test_apply_before_check,
+            test_apply_before_start: config.test_apply_before_start,
+            test_apply_before_write: config.test_apply_before_write,
+            test_apply_after_write: config.test_apply_after_write,
+            test_apply_limits: config.test_apply_limits,
             confirmation_ttl: config
                 .confirmation_ttl
                 .unwrap_or(confirm::CONFIRMATION_TTL)
@@ -313,6 +362,10 @@ impl ServerInner {
 
     pub fn lock_confirmations(&self) -> MutexGuard<'_, confirm::ConfirmationStore> {
         self.confirmations.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn lock_reviews(&self) -> MutexGuard<'_, sandpane_core::apply::ReviewStore> {
+        self.reviews.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -950,8 +1003,8 @@ fn dispatch(
             .and_then(|p| git_diff(inner, p))
             .map_err(Into::into),
         Method::GitApply => parse_params::<GitApplyParams>(params)
-            .and_then(|p| git_apply(inner, p))
-            .map_err(Into::into),
+            .map_err(SvcFailure::from)
+            .and_then(|p| git_apply::git_apply(inner, p)),
     };
     match result {
         Ok(value) => RpcResponse::ok(id, value),
@@ -1630,6 +1683,26 @@ fn sandbox_create(
     // until the winner finishes. Nothing runs twice either way; a retry after
     // the winner completes is a replay.
     let _name_claim = claim_sandbox_name(inner, &spec.name)?;
+    // A6 W-N1: a direct_mount create holds the mounted repository's writer
+    // lock until it returns (binding written, or failure), so no apply runs
+    // while a sandbox that can write the repository is being created, and
+    // no such create starts while an apply, a discard or a writing task
+    // holds it. Taken AFTER the name claim (a same-name race keeps A1's
+    // message) and BEFORE the key claim (a refusal consumes no key).
+    let _repo_lock = match (&spec.workspace_mode, mount.as_deref()) {
+        (WorkspaceMode::DirectMount, Some(path)) => {
+            let repo = path.to_string_lossy().into_owned();
+            let key = git_apply::repo_lock_key(&repo);
+            let lock = git_apply::RepoWriterLock::take(
+                inner,
+                &key,
+                git_apply::create_lock_holder(&spec.name),
+            )
+            .map_err(|holder| git_apply::create_locked(&repo, &holder))?;
+            Some(lock)
+        }
+        _ => None,
+    };
     // Step 4: commit a `pending` claim (its own short transaction).
     let pending = match &keyed {
         None => None,
@@ -3063,6 +3136,23 @@ pub fn discard_task_worktree(
             format!("task {holder} holds the writer lock on {worktree}; refusing to discard it"),
         )));
     }
+    // A6 W6: a discard and a `git.apply` of the same repository exclude each
+    // other (and any writer bound to the repository path) through the
+    // repository's writer lock, held until the discard returns.
+    let _repo_lock = git_apply::RepoWriterLock::take(
+        inner,
+        &git_apply::repo_lock_key(&repo),
+        format!("worktree.discard:{task_id}"),
+    )
+    .map_err(|holder| {
+        SvcFailure::from((
+            ErrorCode::Conflict,
+            format!(
+                "{holder} holds the writer lock on {repo}; refusing to discard the \
+                         worktree of task {task_id}"
+            ),
+        ))
+    })?;
     let plan = workspace::plan_worktree_removal(
         &inner.git,
         Path::new(&repo),
@@ -3661,10 +3751,7 @@ fn git_context(inner: &ServerInner, task_id: &str) -> Result<TaskGitContext, Svc
                 worktree_removed: removed.is_some(),
             })
         }
-        _ => Err((
-            ErrorCode::ValidationFailed,
-            "task has no Git context (repo binding + base_commit)".to_string(),
-        )),
+        _ => Err((ErrorCode::ValidationFailed, MSG_NO_GIT_CONTEXT.to_string())),
     }
 }
 
@@ -3732,21 +3819,16 @@ fn review_target_by_mode(inner: &ServerInner, ctx: &TaskGitContext) -> Result<Pa
             if ctx.worktree_removed {
                 return Err((
                     ErrorCode::ValidationFailed,
-                    "the task's worktree was removed (discarded); there is nothing left to \
-                     review"
-                        .to_string(),
+                    MSG_WORKTREE_REMOVED.to_string(),
                 ));
             }
             let Some(wt) = &ctx.worktree_path else {
-                return Err((
-                    ErrorCode::ValidationFailed,
-                    "host_worktree task has no allocated worktree".to_string(),
-                ));
+                return Err((ErrorCode::ValidationFailed, MSG_NO_WORKTREE.to_string()));
             };
             let Some(root) = &inner.worktrees_root else {
                 return Err((
                     ErrorCode::ValidationFailed,
-                    "this Core instance was started without its worktree directory".to_string(),
+                    MSG_NO_WORKTREE_ROOT.to_string(),
                 ));
             };
             workspace::verify_task_worktree(&inner.git, repo, root, Path::new(wt)).map_err(
@@ -3759,14 +3841,11 @@ fn review_target_by_mode(inner: &ServerInner, ctx: &TaskGitContext) -> Result<Pa
         }
         Some(WorkspaceMode::SbxClone) => Err((
             ErrorCode::ValidationFailed,
-            "review of sbx_clone tasks is not implemented: the agent's commits live in the \
-             sandbox's private clone (reachable through the sandbox-<name> Git remote), so the \
-             host tree would show none of them"
-                .to_string(),
+            MSG_SBX_CLONE_REVIEW.to_string(),
         )),
         Some(WorkspaceMode::Mountless) => Err((
             ErrorCode::ValidationFailed,
-            "mountless task has no repository to review".to_string(),
+            MSG_MOUNTLESS_REVIEW.to_string(),
         )),
     }
 }
@@ -3774,11 +3853,8 @@ fn review_target_by_mode(inner: &ServerInner, ctx: &TaskGitContext) -> Result<Pa
 fn git_review(inner: &ServerInner, task_id: String) -> Result<serde_json::Value, SvcError> {
     let ctx = git_context(inner, &task_id)?;
     let target = review_target(inner, &ctx)?;
-    let Some(base_commit) = ctx.base_commit else {
-        return Err((
-            ErrorCode::ValidationFailed,
-            "task has no Git context (repo binding + base_commit)".to_string(),
-        ));
+    let Some(base_commit) = ctx.base_commit.clone() else {
+        return Err((ErrorCode::ValidationFailed, MSG_NO_GIT_CONTEXT.to_string()));
     };
     let repo = Path::new(&ctx.repo_path);
     // A repository with submodules is REFUSED (VALIDATION_FAILED, naming the
@@ -3788,10 +3864,29 @@ fn git_review(inner: &ServerInner, task_id: String) -> Result<serde_json::Value,
     // `hostDirty` describes the HOST repository (the integration target);
     // the change list comes from the task's own workspace.
     let dirty = inner.git.is_dirty(repo).map_err(review_git_error)?;
-    let changes = inner
+    let raw = inner
         .git
         .change_list(&target, &base_commit)
         .map_err(review_git_error)?;
+    let mut changes: Vec<FileChange> = raw
+        .iter()
+        .map(|c| FileChange {
+            status: file_change_status(&c.status),
+            old_path: c.old_path.clone(),
+            path: c.path.clone(),
+            task_blob: None,
+            task_mode: None,
+        })
+        .collect();
+    // A6: only a `host_worktree` review binds content (item 3), gets a
+    // `reviewId` (R4) and reports `hostHooksPath` (item 9).
+    let host_worktree = is_host_worktree(&ctx);
+    let (review_id, host_hooks_path) = if host_worktree {
+        let r = git_apply::enrich_review(inner, &task_id, repo, &target, &raw, &mut changes)?;
+        (Some(r.review_id), r.host_hooks_path)
+    } else {
+        (None, None)
+    };
     let change_set = ChangeSet {
         task_id,
         base_commit,
@@ -3800,16 +3895,19 @@ fn git_review(inner: &ServerInner, task_id: String) -> Result<serde_json::Value,
         repo_path: Some(ctx.repo_path.clone()),
         // Defined, never produced in A5 (submodules are refused above).
         uninspected: None,
-        changes: changes
-            .into_iter()
-            .map(|c| FileChange {
-                status: file_change_status(&c.status),
-                old_path: c.old_path,
-                path: c.path,
-            })
-            .collect(),
+        review_id,
+        host_hooks_path,
+        changes,
     };
     serde_json::to_value(change_set).map_err(internal)
+}
+
+/// The task stores `host_worktree` (the only mode A6 binds content for).
+fn is_host_worktree(ctx: &TaskGitContext) -> bool {
+    ctx.workspace_mode
+        .as_deref()
+        .and_then(workspace_mode_from_stored)
+        == Some(WorkspaceMode::HostWorktree)
 }
 
 fn file_change_status(raw: &str) -> FileChangeStatus {
@@ -3832,10 +3930,7 @@ fn git_diff(inner: &ServerInner, p: GitDiffParams) -> Result<serde_json::Value, 
     let ctx = git_context(inner, &p.task_id)?;
     let target = review_target(inner, &ctx)?;
     let Some(base_commit) = ctx.base_commit.clone() else {
-        return Err((
-            ErrorCode::ValidationFailed,
-            "task has no Git context (repo binding + base_commit)".to_string(),
-        ));
+        return Err((ErrorCode::ValidationFailed, MSG_NO_GIT_CONTEXT.to_string()));
     };
     let repo = Path::new(&ctx.repo_path);
     // `git.review` refuses a HOST repository with submodules (through its
@@ -3852,7 +3947,10 @@ fn git_diff(inner: &ServerInner, p: GitDiffParams) -> Result<serde_json::Value, 
     let entry = gate_change(changes, &p.path, p.status)?;
     let cap = sandpane_core::diff::clamp_max_bytes(p.max_bytes);
     let status = file_change_status(&entry.status);
-    let result = if status == FileChangeStatus::Untracked {
+    let result = if is_host_worktree(&ctx) {
+        // A6 C4: one read feeds both the display and `taskBlob`.
+        git_apply::host_worktree_diff(inner, repo, &target, &base_commit, entry, status, cap)?
+    } else if status == FileChangeStatus::Untracked {
         untracked_diff(&target, entry, status, cap)?
     } else {
         tracked_diff(inner, &target, &base_commit, entry, status, cap)?
@@ -3961,6 +4059,8 @@ fn tracked_diff(
         truncated,
         lossy,
         base_blob,
+        task_blob: None,
+        task_mode: None,
     })
 }
 
@@ -4019,6 +4119,8 @@ fn untracked_diff(
         truncated,
         lossy,
         base_blob: None,
+        task_blob: None,
+        task_mode: None,
     })
 }
 
@@ -4031,6 +4133,24 @@ fn review_git_error(e: scoregit::GitError) -> SvcError {
         other => (ErrorCode::Internal, other.to_string()),
     }
 }
+
+/// A task with no repository binding + base (review/diff/apply wording).
+pub const MSG_NO_GIT_CONTEXT: &str = "task has no Git context (repo binding + base_commit)";
+/// A `host_worktree` task whose worktree was discarded.
+pub const MSG_WORKTREE_REMOVED: &str =
+    "the task's worktree was removed (discarded); there is nothing left to review";
+/// A `host_worktree` row without a worktree path.
+pub const MSG_NO_WORKTREE: &str = "host_worktree task has no allocated worktree";
+/// Core was started without `<data>/worktrees`.
+pub const MSG_NO_WORKTREE_ROOT: &str =
+    "this Core instance was started without its worktree directory";
+/// `sbx_clone` review/diff/apply refusal.
+pub const MSG_SBX_CLONE_REVIEW: &str =
+    "review of sbx_clone tasks is not implemented: the agent's commits live in the sandbox's \
+     private clone (reachable through the sandbox-<name> Git remote), so the host tree would \
+     show none of them";
+/// `mountless` review/diff/apply refusal.
+pub const MSG_MOUNTLESS_REVIEW: &str = "mountless task has no repository to review";
 
 /// A5 security C1: git resolves the task's work tree somewhere other than
 /// its recorded directory (`git.review` and `git.diff`).
@@ -4049,83 +4169,6 @@ pub const MSG_DIFF_PATH_LISTED_TWICE: &str =
 /// as non-UTF-8 bytes; the lossy display string cannot name the file.
 pub const MSG_DIFF_PATH_NOT_EXACT: &str =
     "this path is not valid UTF-8, so Core cannot name the file exactly; nothing was read";
-
-fn git_apply(inner: &ServerInner, p: GitApplyParams) -> Result<serde_json::Value, SvcError> {
-    // Security W3: the client's base assertion must be a FULL object id and
-    // must equal the Core-recorded base EXACTLY — no prefix matching, so a
-    // 1-character "base" can never satisfy the gate.
-    Validator::full_object_id(&p.expected_base)
-        .map_err(|e| (ErrorCode::ValidationFailed, format!("expected base: {e}")))?;
-    // Real precondition enforcement: when the task carries a Git context, the
-    // dirty-host and base-divergence gates run for real and abort structurally
-    // (specs/06 §6). The merge/patch application itself is a P4 deliverable,
-    // so a passing precondition check still ends in an honest abort here.
-    // FAIL-CLOSED: no usable Git context aborts the apply — it never falls
-    // through to the "preconditions passed" branch (review finding #9).
-    match git_context(inner, &p.task_id) {
-        Ok(TaskGitContext {
-            repo_path,
-            base_commit: Some(base_commit),
-            ..
-        }) => {
-            if !base_commit.eq_ignore_ascii_case(&p.expected_base) {
-                let result = ApplyResult {
-                    applied: false,
-                    abort_reason: Some(format!(
-                        "base diverged: task recorded {base_commit}, client expected {}",
-                        p.expected_base
-                    )),
-                    conflicted_files: vec![],
-                };
-                return serde_json::to_value(result).map_err(internal);
-            }
-            // The CORE-RECORDED base drives the host check, never the
-            // client's value.
-            if let Err(e) =
-                scoregit::preconditions_for_apply(&inner.git, Path::new(&repo_path), &base_commit)
-            {
-                let result = ApplyResult {
-                    applied: false,
-                    abort_reason: Some(format!("precondition failed: {e}")),
-                    conflicted_files: vec![],
-                };
-                return serde_json::to_value(result).map_err(internal);
-            }
-        }
-        Ok(TaskGitContext {
-            base_commit: None, ..
-        }) => {
-            let result = ApplyResult {
-                applied: false,
-                abort_reason: Some(
-                    "apply refused: no Git context for task (no verified base commit)".to_string(),
-                ),
-                conflicted_files: vec![],
-            };
-            return serde_json::to_value(result).map_err(internal);
-        }
-        Err((code, msg)) => {
-            let result = ApplyResult {
-                applied: false,
-                abort_reason: Some(format!(
-                    "apply refused: no Git context for task ({code:?}): {msg}"
-                )),
-                conflicted_files: vec![],
-            };
-            return serde_json::to_value(result).map_err(internal);
-        }
-    }
-    let result = ApplyResult {
-        applied: false,
-        abort_reason: Some(
-            "apply is a P4 deliverable; preconditions passed but merge/patch application \
-             is not implemented in this scaffold"
-                .to_string(),
-        ),
-        conflicted_files: vec![],
-    };
-    serde_json::to_value(result).map_err(internal)
-}
 
 // ---------------------------------------------------------------------------
 // Connection serving
@@ -4372,6 +4415,8 @@ mod tests {
             truncated: true,
             lossy: true,
             base_blob: Some("f".repeat(64)),
+            task_blob: Some("f".repeat(64)),
+            task_mode: Some("100755".into()),
         };
         let frame = serde_json::to_string(&RpcResponse::ok(
             "x".repeat(128),

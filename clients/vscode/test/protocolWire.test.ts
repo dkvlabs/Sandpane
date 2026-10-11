@@ -580,7 +580,17 @@ describe('wire names match the Rust protocol crate', () => {
       ['workspaceMode', 'pub workspace_mode:'],
       ['repoPath', 'pub repo_path:'],
       ['projectId', 'pub project_id:'],
-      ['selectedFiles', 'pub selected_files:'],
+      // A6: Rust keeps `selected_files` only to REFUSE it; the TS client never
+      // sends it (gitApply.test.ts). The A6 fields are pinned instead.
+      ['reviewId', 'pub review_id:'],
+      ['entries', 'pub entries:'],
+      ['hostHooksPath', 'pub host_hooks_path:'],
+      ['taskBlob', 'pub task_blob:'],
+      ['taskMode', 'pub task_mode:'],
+      ['appliedFiles', 'pub applied_files:'],
+      ['modeChanges', 'pub mode_changes:'],
+      ['snapshotTree', 'pub snapshot_tree:'],
+      ['partial', 'pub partial:'],
       ['taskBranch', 'pub task_branch:'],
       ['sandboxName', 'pub sandbox_name:'],
     ];

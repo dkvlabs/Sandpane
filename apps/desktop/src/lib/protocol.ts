@@ -246,6 +246,13 @@ export const FEATURE_CONVERSATION_SANDBOX_ID = "conversation-sandbox-id" as cons
  * this is advertised.
  */
 export const FEATURE_CONVERSATION_SEND_MODE = "conversation-send-mode" as const;
+/**
+ * A6 (design 2026-10-09 §3.6): `git.apply` applies reviewed `host_worktree`
+ * entries (`reviewId` + `entries`), `git.review` / `git.diff` carry
+ * `reviewId`, `hostHooksPath`, `taskBlob` and `taskMode`. Apply is enabled ONLY
+ * when this is advertised; otherwise the review stays read-only here.
+ */
+export const FEATURE_GIT_APPLY = "git-apply" as const;
 
 /**
  * Every feature this desktop build knows, in Rust `FEATURES` order
@@ -257,6 +264,7 @@ export const KNOWN_FEATURES = [
   FEATURE_SANDBOX_CREATE_AGENT,
   FEATURE_CONVERSATION_SANDBOX_ID,
   FEATURE_CONVERSATION_SEND_MODE,
+  FEATURE_GIT_APPLY,
 ] as const;
 export type KnownFeature = (typeof KNOWN_FEATURES)[number];
 
@@ -821,6 +829,17 @@ export interface ChangeSet {
    * ever non-empty the change set is NOT complete and is never called so.
    */
   uninspected?: string[];
+  /**
+   * A6: an opaque id for THIS answer (host_worktree tasks only). Core keeps
+   * the last few per task in memory; a Core restart means review again.
+   * `git.apply` sends it with entries copied verbatim from this answer.
+   */
+  reviewId?: string;
+  /**
+   * A6: the host's effective `core.hooksPath`, ONLY when it is repo-relative.
+   * Applied paths under it are flagged "runs automatically".
+   */
+  hostHooksPath?: string;
 }
 
 export type FileChangeStatus =
@@ -852,6 +871,14 @@ export interface FileChange {
   unrecognizedStatus?: string;
   /** A5: the pre-rename path, only for `renamed`. Exact, like `path`. */
   oldPath?: string;
+  /**
+   * A6: the blob id of the task-side bytes Core hashed at review (40 or 64
+   * hex). Absent for `deleted`, for files over 32 MiB, and for anything Core
+   * could not read as a file. An open string: never validated here.
+   */
+  taskBlob?: string;
+  /** A6: `"100644"`, `"100755"` or `"120000"`, as an OPEN string. */
+  taskMode?: string;
 }
 
 /**
@@ -882,19 +909,66 @@ export interface GitDiffResult {
   truncated: boolean;
   lossy: boolean;
   baseBlob?: string;
+  /**
+   * A6 (host_worktree): the blob id of the task-side bytes THIS patch was
+   * rendered from. When it differs from the reviewed entry's `taskBlob`, the
+   * client MUST NOT send an apply for that review.
+   */
+  taskBlob?: string;
+  /** A6: the task-side mode of that same read (open string). */
+  taskMode?: string;
 }
 
+/**
+ * One `git.apply` entry: the five wire fields of a `FileChange`, copied
+ * VERBATIM from the `git.review` answer that produced `reviewId`. Never the
+ * client-only `unrecognizedStatus`, never the client-only `"unknown"` status.
+ */
+export interface ApplyEntry {
+  path: string;
+  status: FileChangeStatus;
+  oldPath?: string;
+  taskBlob?: string;
+  taskMode?: string;
+}
+
+/**
+ * `git.apply` params (A6). `selectedFiles` is deliberately NOT part of this
+ * type: an A6 Core refuses it, alone or together with `entries`.
+ */
 export interface GitApplyParams {
   taskId: string;
-  selectedFiles?: string[] | null;
-  /** Client's recorded base; a mismatch aborts the apply in Core. */
+  /** The task's full recorded base oid; a mismatch aborts the apply in Core. */
   expectedBase: string;
+  /** The `reviewId` of the `git.review` answer the entries were copied from. */
+  reviewId: string;
+  /** 1..=1000 entries, verbatim from that answer. */
+  entries: ApplyEntry[];
+}
+
+/** A6: an executable-bit change made by an apply (modes are open strings). */
+export interface ModeChange {
+  path: string;
+  from: string;
+  to: string;
 }
 
 export interface ApplyResult {
   applied: boolean;
   abortReason?: string | null;
   conflictedFiles: string[];
+  /** A6: the entry paths written into the working tree and staged. */
+  appliedFiles?: string[];
+  /** A6: executable-bit changes among the applied entries. */
+  modeChanges?: ModeChange[];
+  /** A6: the tree Core built from the reviewed objects. */
+  snapshotTree?: string;
+  /**
+   * A6: `true` when files MAY have been written although `applied` is false
+   * (W1/W2). CLIENT-SIDE: a `partial` that is present but not a boolean also
+   * decodes to `true` — a possible partial is never shown as "nothing written".
+   */
+  partial?: boolean;
 }
 
 /** Normalized agent event union (`specs/02 §4`), discriminated by `type`. */
@@ -940,4 +1014,10 @@ export const CORE_EVENT_KINDS = [
   "message.user",
   "adapter.unavailable",
   "scheduler.deferred",
+  // A6 (design §3.6 item 8): durable apply records. Their payloads are OPEN
+  // (every field optional); they never change the task's status.
+  "git.apply.started",
+  "git.applied",
+  "git.apply.failed",
+  "git.apply.reconciled",
 ] as const;

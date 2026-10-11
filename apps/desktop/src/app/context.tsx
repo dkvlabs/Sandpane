@@ -5,9 +5,10 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { CoreClient, type CoreTransport } from "../lib/core-client";
 import { TaskEventStore } from "../lib/event-store";
+import { createQueryClient } from "../lib/query-client";
 import type { AppDeps } from "../lib/hooks";
 import { loadUiPreferences, subscribeUi, uiPreferences } from "../stores/ui";
 
@@ -26,9 +27,8 @@ export function buildDeps(
   const client = new CoreClient(transport);
   // The coalescing window is a UI preference; `CoreProvider` keeps it live.
   const store = new TaskEventStore(client, { batchMs: uiPreferences.get().eventBatchMs });
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },
-  });
+  // networkMode "always" for every query and mutation (A6 review D-C1).
+  const queryClient = createQueryClient();
   return {
     client,
     store,

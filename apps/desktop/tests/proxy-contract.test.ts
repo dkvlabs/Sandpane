@@ -99,7 +99,9 @@ describe("proxy budget vs webview timeout (drift-gated)", () => {
     expect(requestTimeoutFor("sandbox.create")).toBe(330_000);
     expect(proxy.get("sandbox.list")).toBe(40_000);
     expect(requestTimeoutFor("sandbox.list")).toBe(45_000);
-    expect(requestTimeoutFor("git.apply")).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
+    // A6: git.apply runs inside Core's 41 s apply budget (45 s client deadline).
+    expect(proxy.get("git.apply")).toBe(43_000);
+    expect(requestTimeoutFor("git.apply")).toBe(45_000);
     // Core's git canonicalization of a repository path may take up to 30 s
     // (project.create and A3a project.add_repository share that path).
     for (const method of ["project.create", "project.add_repository"] as const) {
@@ -143,7 +145,9 @@ describe("timeout copy", () => {
     vi.useFakeTimers();
     try {
       const silent = new FakeCore({ dropFirstRequests: 1 });
-      const c = new CoreClient(silent.transport, { requestTimeoutMs: 50 });
+      // A6 gave git.apply its own 45 s deadline; clear the per-method table so
+      // the 50 ms default is the deadline this test exercises.
+      const c = new CoreClient(silent.transport, { requestTimeoutMs: 50, methodTimeoutsMs: {} });
       const inflight = c.request("git.apply", { taskId: "t", expectedBase: "b" });
       let settled: unknown = null;
       inflight.catch((err: unknown) => {

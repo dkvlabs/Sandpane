@@ -223,6 +223,70 @@ fn oracle(wt: &Path, base: &str, paths: &[&str]) -> String {
     String::from_utf8_lossy(&git_out(wt, &args)).into_owned()
 }
 
+/// A6 C4: `host_worktree` patches are rendered between two Core temp files,
+/// so header NAMES are temp names (`a/base`, `b/task`; clients take names
+/// from JSON) and git's rename header lines are absent. Everything else —
+/// mode lines, `index` line, hunks — must equal plain git's output. This
+/// drops exactly the name-bearing header lines from both sides.
+fn body(p: &str) -> String {
+    let mut out = String::new();
+    let mut in_header = true;
+    for (i, line) in p.split_inclusive('\n').enumerate() {
+        if line.starts_with("@@") {
+            in_header = false;
+        }
+        let names = i == 0 && line.starts_with("diff --git ")
+            || in_header
+                && [
+                    "--- ",
+                    "+++ ",
+                    "similarity index ",
+                    "rename from ",
+                    "rename to ",
+                ]
+                .iter()
+                .any(|h| line.starts_with(h));
+        if !names {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Every header name in a `host_worktree` patch is a Core temp name.
+fn assert_temp_names(p: &str) {
+    if p.is_empty() {
+        return;
+    }
+    assert!(
+        [
+            "diff --git a/base b/task\n",
+            "diff --git a/base b/base\n",
+            "diff --git a/task b/task\n"
+        ]
+        .iter()
+        .any(|h| p.starts_with(h)),
+        "{p}"
+    );
+    for line in p.lines().take_while(|l| !l.starts_with("@@")) {
+        if let Some(name) = line
+            .strip_prefix("--- ")
+            .or_else(|| line.strip_prefix("+++ "))
+        {
+            assert!(
+                ["a/base", "b/task", "/dev/null"].contains(&name),
+                "{line:?} in {p}"
+            );
+        }
+    }
+}
+
+/// `ours` (a `host_worktree` display) equals the oracle up to header names.
+fn assert_matches_oracle(ours: &str, oracle: &str) {
+    assert_temp_names(ours);
+    assert_eq!(body(ours), body(oracle), "ours:\n{ours}\noracle:\n{oracle}");
+}
+
 fn blob(wt: &Path, base: &str, path: &str) -> String {
     git(wt, &["rev-parse", &format!("{base}:{path}")])
 }
@@ -339,7 +403,10 @@ fn tracked_entries_match_git_with_base_blobs() {
     // modified
     let d = env.diff(&task, "app.txt");
     assert_eq!(d["status"], "modified");
-    assert_eq!(d["patch"], oracle(&wt, &base, &["app.txt"]).as_str());
+    assert_matches_oracle(
+        d["patch"].as_str().unwrap(),
+        &oracle(&wt, &base, &["app.txt"]),
+    );
     assert!(d["patch"].as_str().unwrap().contains("+task edit\n"));
     assert_eq!(d["binary"], false);
     assert_eq!(d["truncated"], false);
@@ -349,7 +416,10 @@ fn tracked_entries_match_git_with_base_blobs() {
     // added (staged): no base blob
     let d = env.diff(&task, "added.txt");
     assert_eq!(d["status"], "added");
-    assert_eq!(d["patch"], oracle(&wt, &base, &["added.txt"]).as_str());
+    assert_matches_oracle(
+        d["patch"].as_str().unwrap(),
+        &oracle(&wt, &base, &["added.txt"]),
+    );
     assert!(d.get("baseBlob").is_none(), "{d}");
     // deleted
     let d = env.diff(&task, "gone.txt");
@@ -358,16 +428,23 @@ fn tracked_entries_match_git_with_base_blobs() {
         d["patch"].as_str().unwrap().contains("deleted file mode"),
         "{d}"
     );
-    assert_eq!(d["patch"], oracle(&wt, &base, &["gone.txt"]).as_str());
+    assert_matches_oracle(
+        d["patch"].as_str().unwrap(),
+        &oracle(&wt, &base, &["gone.txt"]),
+    );
     assert_eq!(d["baseBlob"], blob(&wt, &base, "gone.txt").as_str());
-    // renamed: BOTH pathspecs, so git sees the rename (repo sets
-    // diff.renames=false); the base blob is the OLD path's.
+    // renamed: the rename is carried by `status` + `oldPath` (A6 C4: the
+    // display compares the OLD path's base content with the new file, so a
+    // pure rename has no hunks); the base blob is the OLD path's.
     let d = env.diff(&task, "new \"name\".txt");
     assert_eq!(d["status"], "renamed");
     assert_eq!(d["oldPath"], "old name.txt");
     let p = d["patch"].as_str().unwrap();
-    assert!(p.contains("rename from old name.txt\n"), "{p}");
-    assert_eq!(p, oracle(&wt, &base, &["new \"name\".txt", "old name.txt"]));
+    assert!(!p.contains("rename from"), "{p}");
+    assert_matches_oracle(
+        p,
+        &oracle(&wt, &base, &["new \"name\".txt", "old name.txt"]),
+    );
     assert_eq!(d["baseBlob"], blob(&wt, &base, "old name.txt").as_str());
     // binary: decided by numstat, empty patch, never --binary
     let d = env.diff(&task, "bin.dat");
@@ -386,7 +463,7 @@ fn special_character_paths_are_diffed_exactly() {
         assert_eq!(d["path"], name);
         let p = d["patch"].as_str().unwrap();
         assert!(p.ends_with(" one\n+two\n"), "{name:?}: {p}");
-        assert_eq!(p, oracle(&wt, &base, &[name]), "{name:?}");
+        assert_matches_oracle(p, &oracle(&wt, &base, &[name]));
         assert_eq!(d["baseBlob"], blob(&wt, &base, name).as_str(), "{name:?}");
     }
 }
@@ -487,9 +564,9 @@ fn truncation_cuts_at_a_line_and_max_bytes_is_clamped() {
             );
         }
     }
-    assert_eq!(
-        env.diff(&task, "big.txt")["patch"],
-        oracle(&wt, &base, &["big.txt"]).as_str()
+    assert_matches_oracle(
+        env.diff(&task, "big.txt")["patch"].as_str().unwrap(),
+        &oracle(&wt, &base, &["big.txt"]),
     );
     // 0 is clamped to 1 byte (never refused); a huge value to the maximum.
     let d = env.ok(
@@ -712,10 +789,11 @@ fn repository_diff_config_cannot_change_prefixes_or_context() {
     }
     let d = env.diff(&task, "nine.txt");
     let p = d["patch"].as_str().unwrap();
-    assert!(p.starts_with("diff --git a/nine.txt b/nine.txt\n"), "{p}");
+    // A6 C4: header names are Core temp names, still with `a/`/`b/`.
+    assert!(p.starts_with("diff --git a/base b/task\n"), "{p}");
     assert!(
         p.ends_with(
-            "\n--- a/nine.txt\n+++ b/nine.txt\n@@ -2,7 +2,7 @@\n 2\n 3\n 4\n-5\n+FIVE\n 6\n 7\n 8\n"
+            "\n--- a/base\n+++ b/task\n@@ -2,7 +2,7 @@\n 2\n 3\n 4\n-5\n+FIVE\n 6\n 7\n 8\n"
         ),
         "{p}"
     );

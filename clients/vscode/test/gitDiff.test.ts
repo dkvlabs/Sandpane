@@ -161,7 +161,8 @@ describe('A5 drift: bounds, messages and wire fields match the Rust sources', ()
     expect(rustConst(serviceLib, 'MSG_DIFF_PATH_NOT_IN_LIST')).toBe(MSG_DIFF_PATH_NOT_IN_LIST);
     expect(rustConst(serviceLib, 'MSG_DIFF_PATH_LISTED_TWICE')).toBe(MSG_DIFF_PATH_LISTED_TWICE);
     expect(rustConst(serviceLib, 'MSG_DIFF_PATH_NOT_EXACT')).toBe(MSG_DIFF_PATH_NOT_EXACT);
-    expect(serviceLib).toContain(`"${MSG_NO_GIT_CONTEXT}".to_string()`);
+    // A6 moved the literal into a constant (shared with git.apply's refusal).
+    expect(rustConst(serviceLib, 'MSG_NO_GIT_CONTEXT')).toBe(MSG_NO_GIT_CONTEXT);
     // git_context (git.review / git.diff) answers an unknown task with this exact text.
     expect(serviceLib).toMatch(new RegExp(`fn git_context[\\s\\S]{0,1500}\\(ErrorCode::NotFound, "${MSG_TASK_NOT_FOUND}"\\.to_string\\(\\)\\)`));
     expect(serviceLib.replace(/\\\n\s*/g, '')).toContain(`"${MSG_WORKTREE_REMOVED}"`);

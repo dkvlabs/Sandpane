@@ -1239,6 +1239,40 @@ button.chip {
   gap: var(--space-2);
 }
 
+/* A6 apply confirmation: wider, the full file list scrolls inside the body. */
+.dialog--apply {
+  width: min(720px, 100%);
+}
+
+.dialog--apply .dialog__body {
+  max-height: 60vh;
+}
+
+.apply-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.apply-confirm__heading {
+  font-size: 13px;
+  color: var(--text-strong);
+}
+
+.apply-confirm__list {
+  margin: 0;
+  padding-left: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  overflow-wrap: anywhere;
+}
+
+.apply-confirm__list--all {
+  max-height: 28vh;
+  overflow: auto;
+}
+
 /* ------------------------------------------------------- render failure */
 
 .fatal {

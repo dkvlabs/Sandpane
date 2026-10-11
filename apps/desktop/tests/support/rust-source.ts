@@ -245,7 +245,35 @@ export function rustStrConst(relative: string, name: string): string {
   if (raw !== null) return raw[1];
   const head = new RegExp(`pub const ${name}: &str =\\s*"`).exec(source);
   if (head === null) throw new Error(`${relative} has no "pub const ${name}: &str = \\"…\\";"`);
-  let i = head.index + head[0].length;
+  return scanRustString(source, head.index + head[0].length, name);
+}
+
+/**
+ * The FIRST `format!("…")` template inside `pub fn NAME(` in `relative`,
+ * decoded like `rustStrConst` (placeholders such as `{}` / `{repo}` stay as
+ * written). `{NOTHING_WRITTEN}` is resolved from the file's own
+ * `const NOTHING_WRITTEN: &str = "…";` when the template names it.
+ */
+export function rustFormatTemplate(relative: string, fnName: string): string {
+  const source = read(relative);
+  const fn = new RegExp(`pub(?:\\(crate\\))? fn ${fnName}\\(`).exec(source);
+  if (fn === null) throw new Error(`${relative} has no "pub fn ${fnName}("`);
+  const fmt = source.indexOf("format!(", fn.index);
+  const nextFn = source.indexOf("\nfn ", fn.index + 1);
+  const nextPubFn = source.indexOf("\npub fn ", fn.index + 1);
+  const bound = Math.min(...[nextFn, nextPubFn].filter((n) => n > 0), source.length);
+  if (fmt < 0 || fmt > bound) throw new Error(`pub fn ${fnName} has no format!( template`);
+  const quote = source.indexOf('"', fmt);
+  const template = scanRustString(source, quote + 1, fnName);
+  if (!template.includes("{NOTHING_WRITTEN}")) return template;
+  const nothing = /const NOTHING_WRITTEN: &str = "([^"]*)";/.exec(source)?.[1];
+  if (nothing === undefined) throw new Error(`${relative} has no const NOTHING_WRITTEN`);
+  return template.split("{NOTHING_WRITTEN}").join(nothing);
+}
+
+/** Scan a (non-raw) Rust string literal body starting at `start`, decoding escapes. */
+function scanRustString(source: string, start: number, name: string): string {
+  let i = start;
   let out = "";
   for (;;) {
     const ch = source[i];

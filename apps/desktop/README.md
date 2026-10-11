@@ -20,11 +20,11 @@ an earlier revision of this README claimed that while the crate did not compile 
 
 ## Verification
 
-### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A5 git.diff pass, 2026-10-11
+### Verified on this host (macOS, Node 24.5.0, Rust 1.99.0 / Homebrew) — A6 git.apply pass, 2026-10-11
 
-Run fresh after the A5 `git.diff` + ChangeSet fields client work (protocol design 2026-10-09 §3.5),
-against the A5 Core + schema in the working tree, on top of the A4 send-mode work (§3.4), the A3b
-conversation-lifecycle work (§3.3) and
+Run fresh after the A6 `git.apply` client work (protocol design 2026-10-09 §3.6), against the A6
+Core + schema in the working tree, on top of the A5 `git.diff` work (§3.5), the A4 send-mode work
+(§3.4), the A3b conversation-lifecycle work (§3.3) and
 the A3a project-lifecycle work (§3.2), the A2 idempotency work and its review fixes
 (W1–W4, I4, I5) and the A1 sandbox-lifecycle work and its review fixes. Every row below is a command that was actually run, with its actual
 result, except where a row says it was not re-run:
@@ -32,13 +32,13 @@ result, except where a row says it was not re-run:
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` (`tsc --noEmit`) | OK — 0 errors |
-| `npm test` (`vitest run`) | OK — **20 files, 614 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
+| `npm test` (`vitest run`) | OK — **22 files, 672 tests passed**; 1 file (8 live tests) skipped without `SANDPANE_SOCKET` |
 | `npm run build` (`tsc --noEmit && vite build`) | NOT re-run in the A1 pass. Last run in the 2026-10-09 review-fix pass: OK, `dist/` emitted (338.83 kB JS, 20.65 kB CSS then) |
 | `cd src-tauri && cargo fmt --check` | OK — no diff |
-| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b / A4 / A5 passes (`clippy --all-targets` below compiles the crate) |
-| `cd src-tauri && cargo clippy --offline --all-targets -- -D warnings` | OK — no warnings |
-| `cd src-tauri && cargo test --offline` | OK — **33 passed; 0 failed** (frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 28; the six A3a project methods, the five A3b conversation methods and A5's `git.diff` are allowlisted and never replay-safe; the A3a and A3b methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s, and `git.review` / `git.diff` are at 43 s; a lost answer to an `is_read_only` method — `git.diff` and `conversation.export` included — is never marked maybe-applied) |
-| `make desktop-check` (repo root) | NOT re-run in the A3b / A4 / A5 passes (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
+| `cd src-tauri && cargo check --offline` | NOT re-run separately in the A3b / A4 / A5 / A6 passes (`clippy --all-targets` below compiles the crate) |
+| `cd src-tauri && cargo clippy --all-targets -- -D warnings` | OK — no warnings |
+| `cd src-tauri && cargo test` | OK — **34 passed; 0 failed** (A6: `git.apply` is on a 43 s budget, is neither `is_read_only` nor `replay_safe`, and a lost answer to it keeps the maybe-applied suffix for TIMEOUT / CONNECTION_CLOSED / MALFORMED_FRAME / FRAME_TOO_LARGE; earlier: frame validation and wire-length cap, CR/LF smuggling, response-id match, Core's connection-level refusal, per-method budgets, socket path policy, socket trust check, and fake-Core round trips on a real socket: retry-once for reads on early EOF / connect refused, no retry after a timeout or for a mutation, a part-way write of a mutation flagged as maybe-applied, `sandbox.stop` / `sandbox.remove` never re-sent after an early EOF; `Method::ALL` is 28; the six A3a project methods, the five A3b conversation methods and A5's `git.diff` are allowlisted and never replay-safe; the A3a and A3b methods are on the default 12 s budget except `project.create` / `project.add_repository` at 43 s, and `git.review` / `git.diff` are at 43 s; a lost answer to an `is_read_only` method — `git.diff` and `conversation.export` included — is never marked maybe-applied) |
+| `make desktop-check` (repo root) | NOT re-run in the A3b / A4 / A5 / A6 passes (the orchestrator runs `make check`); it runs all of the above except `npm run build` |
 | `npm run lint --if-present` | No `lint` script in this package — nothing ran |
 
 **Correction of an earlier claim.** A previous revision of this table reported `cargo check` OK
@@ -227,6 +227,118 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
 | `ChatPanel` wiring (settings section, disabled Send on an archived chat) | Not SSR-renderable in this suite (external-store hooks); the pieces it composes are tested, the panel itself is **UNVERIFIED** |
 | `tests/live-core.test.ts` A3b pins (27 methods, `conversation-sandbox-id` advertised) | Updated, **not run** (skips without `SANDPANE_SOCKET`) |
 
+### A6 git.apply for reviewed files — what the desktop does, and status
+
+This is the first desktop action that writes into the user's own repository. Core binds the apply
+to the exact content it hashed at review; the desktop's job is to send exactly what was reviewed,
+confirm deliberately, and never claim more than Core said.
+
+- **Methods: still 28. Features: 5.** `KNOWN_FEATURES` gains `git-apply` (drift-tested against
+  Rust `FEATURES` and FakeCore's `A6_CORE_FEATURES`; the proxy pins no features). Apply is enabled
+  ONLY when Core advertises both the `git.apply` method and the `git-apply` feature; otherwise the
+  review stays read-only with "Apply is not implemented by this Core (it does not advertise the
+  git-apply feature)".
+- **Deadline and lost answers.** `git.apply` gets the git deadline: webview 45 s (Core's
+  `CLIENT_APPLY_DEADLINE`), proxy 43 s, pinned on both sides. It is NOT replay-safe and NOT in the
+  proxy's `is_read_only`, so the proxy's "may have been applied" suffix stays (Rust test
+  `git_apply_is_a_write_that_keeps_the_may_have_been_applied_suffix`). A timeout reads "Core did
+  not answer in time — the apply may have been applied; check `git status` in <repoPath> before
+  retrying"; any other lost or unreadable answer (including an `ApplyResult` that fails to decode,
+  and Core's INTERNAL "git ran, but Core could not record the outcome") also says "may have been
+  applied". "Nothing was written" is said only for a refusal Core worded that way, or for a frame
+  this desktop provably never sent — positive evidence only: a preflight refusal, the webview's
+  encode-side frame cap, the method allowlist, or a pre-write proxy code (`CORE_UNREACHABLE`,
+  `SOCKET_UNTRUSTED`, `CORE_REFUSED_CONNECTION`, `VALIDATION_FAILED`, `FRAME_TOO_LARGE`) without
+  `mayHaveBeenApplied`. An oversized ANSWER is "may have been applied".
+- **Decoding.** `ChangeSet.reviewId` / `hostHooksPath`, `FileChange.taskBlob` / `taskMode`,
+  `GitDiffResult.taskBlob` / `taskMode` are optional open strings (never validated, trimmed or
+  case-folded). `ApplyResult` gains `appliedFiles`, `modeChanges`, `snapshotTree` and `partial`;
+  a `partial` that is present but not a boolean decodes as a possible partial.
+- **The frame.** `{taskId, expectedBase, reviewId, entries}` and nothing else. Each entry carries
+  the five wire fields (`path`, `status`, `oldPath`, `taskBlob`, `taskMode`) of ONE `git.review`
+  answer, copied verbatim (tab, quote, newline and non-ASCII paths tested), in Core's order, at
+  most 1000. `selectedFiles` is not part of the type, is never sent, and a source scan pins that no
+  `src/` file builds it (the desktop never had an A5 `selectedFiles` validator; `planApply` and the
+  whole-set default are removed). An empty `reviewId`, an empty list or more than 1000 entries are
+  refused before any frame, exactly as Core refuses them.
+- **Review surface (`ReviewPanel`).** Per-entry checkboxes and "Select all applicable (N of M)".
+  The selection is keyed by entry index AND the answer's `reviewId`, so a new answer (Review again,
+  or the re-read after an apply) starts with nothing selected; the review query never refetches on
+  window focus. An entry is selectable only when it is `deleted` or has `taskBlob` + `taskMode`,
+  and never mode `120000`; otherwise it is disabled with "symlinks are never applied", "too large or
+  unreadable to apply (over 32 MiB)" or "no reviewed content id". An answer with no `reviewId`
+  (non-`host_worktree`) is never applicable. An unrecognised status, and a recognised twin of its
+  path, stay unselectable. A rename is one entry (Core brings its `oldPath`).
+- **Confirmation (§3.6 item 9).** An in-app modal `role="alertdialog"` with focus on Cancel. It
+  opens ONLY from the Apply button's `onClick`, and only for a trusted (browser-generated) click
+  (`openApplyConfirmation`); a source pin checks that this is the panel's only opener and that no
+  effect or timer sets it. It shows a snapshot frozen at the click, which is exactly what Confirm
+  sends: the repository (`repoPath`, revealed, capped), the base commit, every file with its status
+  (`oldPath → path` for renames, each path revealed and capped, the list scrolls), and separately
+  (a) content never fully shown — binary, truncated, never opened in the Diff view this session,
+  or a diff that did not name the reviewed content; (b) executable files (`taskMode` 100755);
+  (c) paths that run automatically — any path component (any case, any depth, `oldPath` too)
+  `.husky/`, `.githooks/`, `.github/workflows/`, `.envrc`, `.vscode/`, `.idea/`, `.gitattributes`,
+  `.gitmodules`, or under `hostHooksPath`. It states "Writes these files into your working tree and
+  stages them. Nothing is committed. The content is the version Core hashed when you reviewed."
+  Buttons: Cancel and "Apply N files". All of it is React text (SSR-tested with `<script>`, `<img>`,
+  U+202E and U+200B in paths); no `dangerouslySetInnerHTML` on any apply surface.
+- **Diff mismatch.** Every opened `git.diff` records its `taskBlob` / `taskMode` / binary /
+  truncated (never the patch), only when BOTH its `path` and `status` are the opened entry's. If a
+  selected entry's diff returned a different `taskBlob` or `taskMode` (or found a file for a
+  `deleted` entry), Apply is disabled with "<path> changed after you reviewed it — review again"
+  and a Review again button; the check runs again at Confirm, and no frame is written.
+- **Review again** (it replaces the A5 "Re-read" button) discards the selection, the diff records,
+  the cached diffs and the open modal, then reads a fresh `git.review`. A last result that may
+  have written files (success, partial, lost answer) stays on screen; only a clean refusal is
+  cleared. It is offered after "entries do not match a
+  review", "changed since it was reviewed", "snapshot differs", "listed more than once" and
+  Core's `needs reviewId` refusal.
+- **Results.** Success: "Applied N files to <repoPath> (staged, not committed)" with staged files
+  and mode changes. Partial: a danger warning "Apply did not finish cleanly — some files may have
+  been written or staged", Core's reason verbatim, "check `git status` in <repo>", and the
+  `.git/index.lock` advice when Core gave it — never success, never "nothing written" (the review
+  summary says "Apply incomplete"; the review summary no longer claims "Not applied to your
+  working tree", which this view cannot know, and shows a last abort reason revealed). Aborts: copy keyed on Core's exact constants and `format!`
+  fragments (no Git context, direct_mount, not reviewed, changed, snapshot differs, does not apply
+  cleanly, could not check — never worded as a conflict, too large / too slow, not started, dirty,
+  hidden index entries, under a symlink, symlink, base symlink, gitlink, filter attribute, HEAD /
+  base, unborn, work tree redirected); an unknown reason is shown verbatim, revealed. CONFLICT,
+  writer lock: "the repository is busy; nothing was written … after it finishes" (not an
+  idempotency conflict). CONFLICT, direct mount: "Stop or remove that sandbox … first" (never "try
+  again shortly"). CONFLICT, direct-mount sandbox being created (`msg_mount_being_created`): "a
+  direct-mount sandbox is being created for this repository; nothing was written" — once it
+  exists every apply is refused until it is stopped or removed. `MSG_WRITE_TOO_LATE` reads like
+  `MSG_WRITE_NOT_RUN` (not started, nothing written). `sandbox.create`'s two repository-busy
+  CONFLICTs (`msg_create_repo_busy`, `msg_create_mount_in_progress`) read "Repository busy —
+  nothing was created; try again when it finishes", with Core's text shown. The review is re-read after every outcome.
+- **Single flight, across task switches (review W2).** The apply mutation is keyed
+  `["core","git","apply",taskId]` and kept in the client's mutation cache (`gcTime: Infinity`), so
+  `useIsMutating` disables Apply while an apply started from an earlier mount is still pending,
+  and `useMutationState` shows the newest outcome for the task after switching away and back (a
+  partial or lost answer is never dropped). A ref guards a double confirm, `retry: false`, and
+  there is no keyed "Retry safely" for `git.apply`.
+- **Never deferred to an `online` event (review D-C1).** Core is local IPC, so the browser's
+  online state means nothing: the QueryClient defaults (`src/lib/query-client.ts`) set
+  `networkMode: "always"` for every query and mutation, and the apply mutation sets it too. A
+  confirmed apply is sent at the click (or fails then); it is never paused and sent later by
+  TanStack. Tested with TanStack's own `MutationObserver` and `onlineManager.setOnline(false)`.
+- **Events.** `git.apply.started`, `git.applied`, `git.apply.failed` and `git.apply.reconciled`
+  are timeline entries with open payloads (file counts, Core's reason revealed, the reconcile
+  outcome; `entries` / `expected` / `before` never rendered). A failed event whose `partial` is not
+  exactly `false` reads as a possible partial. They never change the task status.
+- **A5 display note.** For `host_worktree`, a pure rename's empty patch reads "renamed, content
+  unchanged"; a diff discloses its `task blob` / `task mode`.
+
+| Item | Status |
+| --- | --- |
+| Frames, gating, selectability, flags, gesture opener, mismatch refusal, copy, decode, events, drift, SSR of the dialog and the outcome | Functional headless: `tests/git-apply.test.ts` (46 tests) and `tests/git-apply-fixes.test.ts` (13 tests, the review fixes) against a scripted transport and TanStack's `MutationObserver`. **UNVERIFIED live** — never run against a real A6 Core, never in the running desktop app |
+| Core answers used in the tests (`ApplyResult` shapes, CONFLICT texts) | **Illustrative**, written from `apply.rs` / `git_apply.rs` (their message templates are drift-tested), **not captured**; FakeCore does not model `git.apply` (feature pin only) |
+| A real apply | **UNVERIFIED and not reachable over the wire today**: no wire-created task has Git context until A4b, so a real Core answers "task has no Git context …; nothing was written" (its copy is tested) |
+| `ReviewPanel` wiring (checkboxes, select all, Review again, the modal's open/close, focus on Cancel, Escape, focus trap, `isTrusted` in WKWebView) | `ReviewPanel` is not SSR-rendered and there is no DOM in this suite; the dialog markup, the pure helpers and a source pin on the opener are tested, the live behaviour is **UNVERIFIED** |
+| Tauri native build / signing | Deferred (not run on this host in this pass) |
+| `tests/live-core.test.ts` A6 pins (`git-apply` advertised, 5 features) | Updated, **not run** |
+
 ### A5 git.diff — what the desktop does, and status
 
 - **Methods: 28.** `git.diff` sits between `git.review` and `git.apply` (drift-tested against Rust
@@ -258,7 +370,8 @@ now compiles, and `make desktop-check` builds and tests it, so the same regressi
   for Core's exact untracked symlink shape (status `untracked`, not binary or truncated, line 2
   exactly `new file mode 120000`, hunk header exactly `@@ -0,0 +1 @@`, exactly one `+` line —
   the JetBrains rule), otherwise no symlink line (a target containing a newline, a typechange); `baseBlob` as a short id; an
-  empty non-binary patch as "Core returned an empty patch …". Never "no changes".
+  empty non-binary patch as "Core returned an empty patch …" (since A6, a renamed entry's empty
+  patch reads "renamed, content unchanged"). Never "no changes".
 - **Honest copy.** Core's exact refusals (path not in the change list, listed twice, not valid
   UTF-8, work tree redirected, no Git context, worktree removed, submodules, and the untracked
   read refusals ending "; nothing was read") map to "Nothing was read — …" (drift-tested against
@@ -621,8 +734,10 @@ a non-compiling shell can no longer hide behind a green `make check`.
   deferred: capability-gated advanced wizard options, and project↔sandbox binding beyond
   `sandbox.create`.
 - **DT3:** read-only per-file diff text is implemented (A5 `git.diff`; see "A5 git.diff" under
-  Verification). Still deferred: a side-by-side viewer, selective apply UX, verification
-  history, "open in IDE", approval responses (no approval RPC exists).
+  Verification), and so is selective apply of reviewed files with a confirmation (A6 `git.apply`;
+  see "A6 git.apply" under Verification — UNVERIFIED live until A4b). Still deferred: a
+  side-by-side viewer, verification history, "open in IDE", approval responses (no approval RPC
+  exists).
 - **DT4:** network policy, port publishing (loopback by default), templates, MCP, secret
   presence, redacted diagnostics export, native-app/SSH wizard.
 - **DT5:** multi-window consistency, signing/notarization, installer paths per OS,

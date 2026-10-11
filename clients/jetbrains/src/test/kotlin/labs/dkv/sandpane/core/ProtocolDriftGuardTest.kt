@@ -864,7 +864,8 @@ class ProtocolDriftGuardTest {
         assertEquals(rustStringConst(service, "MSG_DIFF_PATH_NOT_IN_LIST"), GitDiffs.MSG_PATH_NOT_IN_LIST)
         assertEquals(rustStringConst(service, "MSG_DIFF_PATH_LISTED_TWICE"), GitDiffs.MSG_PATH_LISTED_TWICE)
         assertEquals(rustStringConst(service, "MSG_DIFF_PATH_NOT_EXACT"), GitDiffs.MSG_PATH_NOT_EXACT)
-        assertTrue(service.contains("\"${GitDiffs.MSG_NO_GIT_CONTEXT}\".to_string()"), "no-Git-context text changed")
+        // A6 turned the literal into a `pub const` (git.apply reuses it for its no-Git-context abort).
+        assertEquals(rustStringConst(service, "MSG_NO_GIT_CONTEXT"), GitDiffs.MSG_NO_GIT_CONTEXT, "no-Git-context text changed")
         assertTrue(service.contains("(ErrorCode::NotFound, \"${GitDiffs.MSG_TASK_NOT_FOUND}\".to_string())"))
         val removed = Regex(""""(the task's worktree was removed[^"]*)"""").find(service)?.groupValues?.get(1)
             ?.replace(Regex("""\\\n\s*"""), "") ?: fail("worktree-removed message not found")
@@ -881,7 +882,7 @@ class ProtocolDriftGuardTest {
         assertTrue(params.contains("pub status: Option<FileChangeStatus>"))
         val result = Regex("""pub struct GitDiffResult \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1) ?: fail("GitDiffResult not found")
         assertEquals(
-            listOf("path", "old_path", "status", "patch", "binary", "truncated", "lossy", "base_blob"),
+            listOf("path", "old_path", "status", "patch", "binary", "truncated", "lossy", "base_blob", "task_blob", "task_mode"),
             Regex("""pub ([a-z_]+):""").findAll(result).map { it.groupValues[1] }.toList(),
         )
         assertTrue(Regex("""#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\s*pub uninspected: Option<Vec<String>>""").containsMatchIn(rust))
@@ -889,6 +890,128 @@ class ProtocolDriftGuardTest {
         // git.diff stays out of every replay/retry path: this plugin keeps no replay-safe list, and
         // Core's own replay-safe set does not name it.
         assertFalse(Regex("""replay_safe[\s\S]{0,400}GitDiff""").containsMatchIn(rust + service), "git.diff became replay-safe")
+    }
+
+    // ------------------------------------------------------------------
+    // A6: git.apply for reviewed files (design 2026-10-09 \u00A73.6)
+    // ------------------------------------------------------------------
+
+    private val applyRs by lazy { read("core/crates/sandpane-core/src/apply.rs") }
+    private val gitApplyRs by lazy { read("core/crates/sandpane-service/src/git_apply.rs") }
+
+    /** The `format!` template of a Rust `pub fn NAME(...) -> String`, `\`-newline continuations joined. */
+    private fun rustFormat(source: String, fn: String): String {
+        val m = Regex("""pub fn $fn\([^)]*\) -> String \{\s*format!\(\s*"((?:[^"\\]|\\[\s\S])*)"""").find(source)
+            ?: fail("no `pub fn $fn(...) -> String { format!(\"...\"` found")
+        return m.groupValues[1].replace(Regex("""\\\n\s*"""), "")
+    }
+
+    /** Every Core message this client's apply copy keys on is Core's constant, byte for byte. */
+    @Test
+    fun gitApplyMessagesTheCopyKeysOnMatchCore() {
+        val pairs = listOf(
+            "MSG_NEEDS_REVIEW" to GitApplies.MSG_NEEDS_REVIEW,
+            "MSG_SELECTED_FILES" to GitApplies.MSG_SELECTED_FILES,
+            "MSG_TOO_MANY_ENTRIES" to GitApplies.MSG_TOO_MANY_ENTRIES,
+            "MSG_ENTRIES_NOT_REVIEWED" to GitApplies.MSG_ENTRIES_NOT_REVIEWED,
+            "MSG_CHECK_FAILED" to GitApplies.MSG_CHECK_FAILED,
+            "MSG_CHECK_UNAVAILABLE" to GitApplies.MSG_CHECK_UNAVAILABLE,
+            "MSG_WRITE_NOT_RUN" to GitApplies.MSG_WRITE_NOT_RUN,
+            "MSG_WRITE_TOO_LATE" to GitApplies.MSG_WRITE_TOO_LATE,
+        )
+        for ((name, kotlin) in pairs) assertEquals(rustStringConst(applyRs, name), kotlin, name)
+        assertTrue(applyRs.contains("const NOTHING_WRITTEN: &str = \"${GitApplies.NOTHING_WRITTEN}\";"), "NOTHING_WRITTEN changed")
+        // msg_changed: "{q(path)} changed since it was reviewed; review it again{NOTHING_WRITTEN}".
+        assertEquals("{} changed since it was reviewed; review it again{NOTHING_WRITTEN}", rustFormat(applyRs, "msg_changed"))
+        assertEquals(" changed since it was reviewed; review it again" + GitApplies.NOTHING_WRITTEN, GitApplies.CHANGED_SUFFIX)
+        // The two CONFLICT kinds.
+        assertEquals(
+            "{what}: a sandbox mounts this repository directly and can change it while Core writes; stop or remove it first{NOTHING_WRITTEN}",
+            rustFormat(applyRs, "msg_mounted"),
+        )
+        assertEquals(
+            ": a sandbox mounts this repository directly and can change it while Core writes; stop or remove it first" +
+                GitApplies.NOTHING_WRITTEN,
+            GitApplies.MOUNTED_SUFFIX,
+        )
+        val locked = rustFormat(gitApplyRs, "msg_locked")
+        assertEquals("{repo}" + GitApplies.LOCKED_INFIX + "{holder}" + GitApplies.LOCKED_SUFFIX, locked)
+        assertEquals(
+            "{repo}" + GitApplies.LOCKED_INFIX + "sandbox {sandbox:?}" + GitApplies.MOUNT_BEING_CREATED_SUFFIX.removeSuffix(GitApplies.NOTHING_WRITTEN) +
+                "; nothing was written",
+            rustFormat(gitApplyRs, "msg_mount_being_created"),
+        )
+        // W-N1 (review J-I4): the two direct_mount sandbox.create CONFLICT texts the create copy keys on.
+        val createBusy = rustFormat(gitApplyRs, "msg_create_repo_busy")
+        assertTrue(createBusy.startsWith("{repo}" + GitApplies.LOCKED_INFIX + "{holder} holds its writer lock"), createBusy)
+        assertTrue(createBusy.endsWith(KeyedWrites.CREATE_REPO_BUSY_SUFFIX), createBusy)
+        assertEquals(
+            "{repo}" + GitApplies.LOCKED_INFIX + "sandbox {sandbox:?}" + KeyedWrites.CREATE_MOUNT_IN_PROGRESS_SUFFIX,
+            rustFormat(gitApplyRs, "msg_create_mount_in_progress"),
+        )
+        val creator = Regex("""fn create_locked\([\s\S]*?\n\}""").find(gitApplyRs)?.value ?: fail("create_locked not found")
+        assertTrue(creator.contains("msg_create_repo_busy(") && creator.contains("msg_create_mount_in_progress("), creator)
+        assertTrue(creator.contains("ErrorCode::Conflict"), "a busy direct_mount create is no longer CONFLICT")
+        // Both writer-lock texts are CONFLICT (W6, W-N1), chosen by the holder in `apply_locked`.
+        val locker = Regex("""fn apply_locked\([\s\S]*?\n\}""").find(gitApplyRs)?.value ?: fail("apply_locked not found")
+        assertTrue(locker.contains("msg_mount_being_created(") && locker.contains("msg_locked("), locker)
+        assertTrue(locker.contains("ErrorCode::Conflict"), "the writer lock is no longer CONFLICT")
+        assertTrue(gitApplyRs.contains(".map_err(|holder| apply_locked("), "apply no longer maps the lock holder through apply_locked")
+        assertTrue(Regex("""ErrorCode::Conflict,\s*apply::msg_mounted\(""").containsMatchIn(gitApplyRs), "direct mounts are no longer CONFLICT")
+        // The partial texts name `git status` (and index.lock) — the copy shows them verbatim.
+        assertTrue(rustFormat(applyRs, "msg_write_failed").contains("check `git status` in {repo}"))
+        assertTrue(applyRs.contains("`.git/index.lock` may remain"))
+        assertTrue(rustFormat(applyRs, "msg_verify_unavailable").startsWith("could not verify the staged content"))
+        assertTrue(rustFormat(applyRs, "msg_verify_failed").contains("check `git status` in {repo}"))
+        // MSG_CHECK_UNAVAILABLE is distinct from "does not apply cleanly" (I3).
+        assertFalse(GitApplies.MSG_CHECK_UNAVAILABLE.contains("does not apply cleanly"))
+    }
+
+    /** Feature, limits, deadline, wire shapes and event kinds of A6. */
+    @Test
+    fun gitApplyShapesLimitsDeadlineAndEventsMatchCore() {
+        assertTrue(labs.dkv.sandpane.model.CoreFeatures.KNOWN.contains("git-apply"))
+        assertEquals(labs.dkv.sandpane.model.CoreFeatures.GIT_APPLY, "git-apply")
+        assertEquals(28, CoreMethods.ALL.size, "A6 adds no method")
+        val max = Regex("""pub const MAX_APPLY_ENTRIES: usize = (\d+);""").find(applyRs)?.groupValues?.get(1)?.toInt()
+            ?: fail("apply.rs has no MAX_APPLY_ENTRIES")
+        assertEquals(max, GitApplies.MAX_ENTRIES)
+        fun secs(name: String) = Regex("""pub const $name: Duration = Duration::from_secs\((\d+)\);""").find(applyRs)
+            ?.groupValues?.get(1)?.toInt() ?: fail("apply.rs has no $name")
+        assertEquals(secs("CLIENT_APPLY_DEADLINE") * 1000, MethodDeadlines.GIT_APPLY_MS)
+        val verify = Regex("""verify_budget: Duration::from_secs\((\d+)\)""").find(applyRs)?.groupValues?.get(1)?.toInt()
+            ?: fail("apply.rs has no default verify_budget")
+        val coreTotal = (secs("APPLY_PREPARE_BUDGET") + secs("APPLY_WRITE_TIMEOUT") + verify) * 1000
+        assertTrue(coreTotal < MethodDeadlines.GIT_APPLY_MS, "Core's apply budget ($coreTotal ms) no longer fits the client deadline")
+        assertEquals(MethodDeadlines.GIT_APPLY_MS, MethodDeadlines.forMethod(CoreMethods.GIT_APPLY, 15_000))
+        // Wire shapes.
+        fun fields(struct: String) = (Regex("""pub struct $struct \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1)
+            ?: fail("$struct not found")).let { body -> Regex("""pub ([a-z_]+):""").findAll(body).map { it.groupValues[1] }.toList() }
+        assertEquals(listOf("task_id", "selected_files", "expected_base", "review_id", "entries"), fields("GitApplyParams"))
+        assertEquals(listOf("path", "status", "old_path", "task_blob", "task_mode"), fields("FileChange"))
+        assertEquals(
+            listOf("applied", "abort_reason", "conflicted_files", "applied_files", "mode_changes", "snapshot_tree", "partial"),
+            fields("ApplyResult"),
+        )
+        assertEquals(listOf("path", "from", "to"), fields("ModeChange"))
+        val changeSet = fields("ChangeSet")
+        assertTrue(changeSet.containsAll(listOf("review_id", "host_hooks_path")), changeSet.toString())
+        for (f in listOf("taskBlob", "taskMode", "reviewId", "hostHooksPath", "appliedFiles", "modeChanges", "snapshotTree")) {
+            assertTrue(kotlinMirror.contains("@SerialName(\"$f\")"), "Kotlin mirror lacks $f")
+        }
+        assertFalse(kotlinMirror.contains("@SerialName(\"selectedFiles\")"), "selectedFiles must not be sendable")
+        // Durable event kinds, appended through constants the old `log.append(…"kind")` probe cannot see.
+        for ((name, kind) in listOf(
+            "EVENT_APPLY_STARTED" to labs.dkv.sandpane.model.CoreEventKinds.GIT_APPLY_STARTED,
+            "EVENT_APPLIED" to labs.dkv.sandpane.model.CoreEventKinds.GIT_APPLIED,
+            "EVENT_APPLY_FAILED" to labs.dkv.sandpane.model.CoreEventKinds.GIT_APPLY_FAILED,
+            "EVENT_APPLY_RECONCILED" to labs.dkv.sandpane.model.CoreEventKinds.GIT_APPLY_RECONCILED,
+        )) {
+            assertEquals(rustStringConst(gitApplyRs, name), kind, name)
+            assertTrue(labs.dkv.sandpane.model.CoreEventKinds.ALL.contains(kind))
+        }
+        // git.apply is never replay-safe: Core's replay-safe set does not name it.
+        assertFalse(Regex("""replay_safe[\s\S]{0,400}GitApply""").containsMatchIn(rust + service), "git.apply became replay-safe")
     }
 
     /** A4 (\u00A73.4): the mode values, the normalisation and the exact refusal are Core's. */

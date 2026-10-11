@@ -87,6 +87,10 @@ describe("constants match the Rust side", () => {
       "message.user",
       "adapter.unavailable",
       "scheduler.deferred",
+      "git.apply.started",
+      "git.applied",
+      "git.apply.failed",
+      "git.apply.reconciled",
     ]);
   });
 });

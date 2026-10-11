@@ -70,6 +70,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::objects::ObjectFormat;
 use crate::process::{run_bounded, RunLimits};
 use crate::validation::{ValidationError, Validator};
 
@@ -175,6 +176,10 @@ pub struct GitRunner {
     /// acceptable (a repository registered later contains it). One-way: from
     /// then on every call uses `/dev/null` until Core restarts and re-vets.
     excludes_revoked: AtomicBool,
+    /// A6 W-B: when set, EVERY call's timeout is also bounded by what is
+    /// left until this instant (an expired deadline fails the call). Set
+    /// only on a copy made by [`Self::with_deadline`].
+    deadline: Option<std::time::Instant>,
 }
 
 impl Default for GitRunner {
@@ -184,6 +189,7 @@ impl Default for GitRunner {
             limits: RunLimits::QUERY,
             excludes_file: PathBuf::from("/dev/null"),
             excludes_revoked: AtomicBool::new(false),
+            deadline: None,
         }
     }
 }
@@ -228,7 +234,8 @@ pub fn user_excludes_candidate(
         Some(x) => cmd.env("XDG_CONFIG_HOME", x),
         None => cmd.env_remove("XDG_CONFIG_HOME"),
     };
-    let out = run_bounded(cmd, &runner.limits).map_err(|e| GitError::Exec(e.to_string()))?;
+    let out = run_bounded(cmd, &runner.bounded(&runner.limits))
+        .map_err(|e| GitError::Exec(e.to_string()))?;
     match out.status.code() {
         Some(0) if !out.stdout_truncated => {
             let value = out.stdout_lossy();
@@ -344,6 +351,54 @@ impl GitRunner {
         }
     }
 
+    /// A6 W-B: a copy whose every call is bounded by `deadline` as well as
+    /// by its own limits (the earlier of an existing and the new deadline
+    /// wins). Excludes state is copied, including a revocation.
+    pub fn with_deadline(&self, deadline: std::time::Instant) -> Self {
+        let mut copy = self.copy_with(self.limits);
+        copy.deadline = Some(self.deadline.map_or(deadline, |d| d.min(deadline)));
+        copy
+    }
+
+    /// A6 W-B: a copy with other default limits (keeps any deadline).
+    pub fn with_limits(&self, limits: RunLimits) -> Self {
+        self.copy_with(limits)
+    }
+
+    fn copy_with(&self, limits: RunLimits) -> Self {
+        Self {
+            program: self.program.clone(),
+            limits,
+            excludes_file: self.excludes_file.clone(),
+            excludes_revoked: AtomicBool::new(self.excludes_revoked.load(Ordering::SeqCst)),
+            deadline: self.deadline,
+        }
+    }
+
+    /// The deadline every call of this runner is bounded by, if any.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
+    /// `true` once this runner's deadline (if any) has passed.
+    pub fn deadline_passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
+    }
+
+    /// `limits` with the timeout cut to what is left of the deadline.
+    fn bounded(&self, limits: &RunLimits) -> RunLimits {
+        match self.deadline {
+            None => *limits,
+            Some(d) => RunLimits {
+                timeout: limits
+                    .timeout
+                    .min(d.saturating_duration_since(std::time::Instant::now())),
+                ..*limits
+            },
+        }
+    }
+
     /// Build the hardened command (pure; no I/O). `ambient_env_keys` is the
     /// set of variable names in Core's own environment — every `GIT_*` one is
     /// explicitly removed. `extra_config` carries per-repo overrides such as
@@ -364,6 +419,7 @@ impl GitRunner {
         self.command(
             cwd,
             WorkTree::Pin,
+            &GitDirPin::NONE,
             extra_config,
             attr_source,
             args,
@@ -371,12 +427,15 @@ impl GitRunner {
         )
     }
 
-    /// [`Self::hardened_command`] with an explicit work-tree policy. Only
-    /// [`Self::show_toplevel`] uses [`WorkTree::Discover`].
+    /// [`Self::hardened_command`] with an explicit work-tree policy and an
+    /// optional git-dir pin. Only [`Self::show_toplevel`] uses
+    /// [`WorkTree::Discover`]; only [`GitDirSession`] pins a git dir.
+    #[allow(clippy::too_many_arguments)]
     fn command<I>(
         &self,
         cwd: &Path,
         work_tree: WorkTree,
+        pin: &GitDirPin<'_>,
         extra_config: &[String],
         attr_source: Option<&str>,
         args: &[String],
@@ -392,9 +451,16 @@ impl GitRunner {
             // the work tree away from `cwd` — neither to hide the user's
             // uncommitted work nor to read files outside the repository.
             // (`-c core.worktree=` does not override it; `--work-tree` does.)
-            let mut pin = OsString::from("--work-tree=");
-            pin.push(cwd.as_os_str());
-            cmd.arg(pin);
+            let mut wt = OsString::from("--work-tree=");
+            wt.push(cwd.as_os_str());
+            cmd.arg(wt);
+        }
+        if let Some(git_dir) = pin.git_dir {
+            // A6 C3: the repository is named explicitly, so no `.git` file
+            // in (or above) `cwd` is ever consulted.
+            let mut gd = OsString::from("--git-dir=");
+            gd.push(git_dir.as_os_str());
+            cmd.arg(gd);
         }
         for key in ambient_env_keys {
             if key.to_string_lossy().starts_with("GIT_") {
@@ -406,6 +472,21 @@ impl GitRunner {
         }
         if let Some(tree) = attr_source {
             cmd.env("GIT_ATTR_SOURCE", tree);
+        }
+        if let Some(index) = pin.index_file {
+            // A6 item 4: a Core-owned temporary index, set AFTER the scrub.
+            cmd.env("GIT_INDEX_FILE", index);
+        }
+        if let (Some(objects), Some(git_dir)) = (pin.objects, pin.git_dir) {
+            // A6 W-N2 quarantine, set AFTER the scrub: new objects go to
+            // Core's directory; the host's are read through an alternate.
+            // An unquotable host path (refused when the session opened)
+            // would leave no alternate: reads fail, nothing is written.
+            cmd.env("GIT_OBJECT_DIRECTORY", objects);
+            cmd.env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                quoted_alternate(&git_dir.join("objects")).unwrap_or_default(),
+            );
         }
         for c in HARDENING_CONFIG
             .iter()
@@ -535,24 +616,58 @@ impl GitRunner {
         pathspecs: &[LiteralPathspec],
         limits: &RunLimits,
     ) -> Result<crate::process::BoundedOutput, GitError> {
-        let mut argv: Vec<String> = args.to_vec();
-        argv.extend(pathspecs.iter().map(|p| p.as_str().to_string()));
-        let cmd = self.command(
+        self.exec_call(&Call {
             cwd,
             work_tree,
+            pin: GitDirPin::NONE,
             extra,
             attr_source,
+            args,
+            tail: Tail::Pathspecs(pathspecs),
+            limits,
+            ok_exit: &[0],
+        })
+        .map_err(|e| match e {
+            CallError::Git(g) => g,
+            CallError::TimedOut(m) => GitError::Exec(m),
+        })
+    }
+
+    /// Spawn one hardened git described by `call`. An exit code outside
+    /// `call.ok_exit` is an error; a deadline kill is reported separately
+    /// ([`CallError::TimedOut`]) so the apply write can tell "killed" from
+    /// "failed" (A6 W1/R6). Output may be truncated: every caller decides.
+    fn exec_call(&self, call: &Call<'_>) -> Result<crate::process::BoundedOutput, CallError> {
+        let mut argv: Vec<String> = call.args.to_vec();
+        match call.tail {
+            Tail::Pathspecs(specs) => argv.extend(specs.iter().map(|p| p.as_str().to_string())),
+            Tail::Raw(raw) => argv.extend(raw.0.iter().cloned()),
+        }
+        let cmd = self.command(
+            call.cwd,
+            call.work_tree,
+            &call.pin,
+            call.extra,
+            call.attr_source,
             &argv,
             std::env::vars_os().map(|(k, _)| k),
         );
-        let out = run_bounded(cmd, limits).map_err(|e| GitError::Exec(e.to_string()))?;
-        if !out.status.success() {
-            let sub = args.first().map(String::as_str).unwrap_or("?");
-            return Err(GitError::Exec(format!(
+        let sub = call.args.first().map(String::as_str).unwrap_or("?");
+        let out = match run_bounded(cmd, &self.bounded(call.limits)) {
+            Ok(out) => out,
+            Err(crate::process::ProcessError::TimedOut(d)) => {
+                return Err(CallError::TimedOut(format!(
+                    "git {sub} exceeded its {d:?} deadline and was killed"
+                )))
+            }
+            Err(e) => return Err(CallError::Git(GitError::Exec(e.to_string()))),
+        };
+        if !out.status.code().is_some_and(|c| call.ok_exit.contains(&c)) {
+            return Err(CallError::Git(GitError::Exec(format!(
                 "git {sub} exited {}: {}",
                 out.status,
                 out.stderr_lossy().trim()
-            )));
+            ))));
         }
         Ok(out)
     }
@@ -594,6 +709,17 @@ impl GitRunner {
     /// `required=false`) and the object format (for the empty-tree attribute
     /// source). Unsafe driver names / unknown formats fail CLOSED.
     fn repo_overrides(&self, cwd: &Path) -> Result<RepoOverrides, GitError> {
+        self.repo_overrides_in(cwd, &GitDirPin::NONE)
+    }
+
+    /// [`Self::repo_overrides`] for a call pinned by `pin` (A6 C3: the
+    /// enumeration itself runs with `--git-dir=<common>` from Core's temp
+    /// dir, never in a task worktree).
+    fn repo_overrides_in(
+        &self,
+        cwd: &Path,
+        pin: &GitDirPin<'_>,
+    ) -> Result<RepoOverrides, GitError> {
         // Every repository call passes through here first: the work-tree
         // pin is only meaningful for an absolute cwd.
         if !cwd.is_absolute() {
@@ -608,13 +734,25 @@ impl GitRunner {
             "--get-regexp".into(),
             "^(filter\\.|extensions\\.objectformat$)".into(),
         ];
-        let cmd =
-            self.hardened_command(cwd, &[], None, &query, std::env::vars_os().map(|(k, _)| k));
-        let out = run_bounded(cmd, &self.limits).map_err(|e| GitError::Exec(e.to_string()))?;
-        // `git config --get-regexp` exits 1 when nothing matches.
+        let cmd = self.command(
+            cwd,
+            WorkTree::Pin,
+            pin,
+            &[],
+            None,
+            &query,
+            std::env::vars_os().map(|(k, _)| k),
+        );
+        let out = run_bounded(cmd, &self.bounded(&self.limits))
+            .map_err(|e| GitError::Exec(e.to_string()))?;
+        // `git config --get-regexp` exits 1 when nothing matches — QUIETLY
+        // (A6 I1: an exit 1 with any stderr is a failure, never "no
+        // overrides").
         match out.status.code() {
             Some(0) => {}
-            Some(1) if out.stdout.is_empty() => return repo_overrides_from_config(""),
+            Some(1) if out.stdout.is_empty() && out.stderr.is_empty() => {
+                return repo_overrides_from_config("")
+            }
             _ => {
                 return Err(GitError::Exec(format!(
                     "git config (filter enumeration) exited {}: {}",
@@ -702,7 +840,8 @@ impl GitRunner {
             args,
             std::env::vars_os().map(|(k, _)| k),
         );
-        let out = run_bounded(cmd, &self.limits).map_err(|e| GitError::Exec(e.to_string()))?;
+        let out = run_bounded(cmd, &self.bounded(&self.limits))
+            .map_err(|e| GitError::Exec(e.to_string()))?;
         let sub = args.first().map(String::as_str).unwrap_or("?");
         match out.status.code() {
             Some(0) if !out.stdout_truncated => Ok(Some(out.stdout_lossy())),
@@ -904,6 +1043,9 @@ impl GitRunner {
 pub struct RepoOverrides {
     pub config: Vec<String>,
     pub empty_tree: &'static str,
+    /// The repository's object format (`extensions.objectFormat`), read in
+    /// the same single config call (A6 R3).
+    pub format: ObjectFormat,
 }
 
 /// Parse `git config --null --get-regexp` output (`key\nvalue\0` entries, or
@@ -911,12 +1053,13 @@ pub struct RepoOverrides {
 pub fn repo_overrides_from_config(out: &str) -> Result<RepoOverrides, GitError> {
     let mut names = String::new();
     let mut empty_tree = EMPTY_TREE_SHA1;
+    let mut format = ObjectFormat::Sha1;
     for entry in out.split('\0').filter(|e| !e.is_empty()) {
         let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
         if key.eq_ignore_ascii_case("extensions.objectformat") {
-            empty_tree = match value.trim().to_ascii_lowercase().as_str() {
-                "sha1" => EMPTY_TREE_SHA1,
-                "sha256" => EMPTY_TREE_SHA256,
+            (empty_tree, format) = match value.trim().to_ascii_lowercase().as_str() {
+                "sha1" => (EMPTY_TREE_SHA1, ObjectFormat::Sha1),
+                "sha256" => (EMPTY_TREE_SHA256, ObjectFormat::Sha256),
                 other => {
                     return Err(GitError::Exec(format!(
                         "refusing to run git: unknown object format {other:?}"
@@ -931,6 +1074,7 @@ pub fn repo_overrides_from_config(out: &str) -> Result<RepoOverrides, GitError> 
     Ok(RepoOverrides {
         config: filter_overrides_from_names(&names)?,
         empty_tree,
+        format,
     })
 }
 
@@ -1616,16 +1760,1189 @@ fn absolute_path_arg(path: &Path) -> Result<String, GitError> {
     Ok(path_str.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// A6: `git.apply` plumbing (design 2026-10-09 §3.6)
+// ---------------------------------------------------------------------------
+
+/// A git-dir pin for one call (A6 C3). [`GitDirPin::NONE`] = ordinary
+/// discovery from `cwd` (every pre-A6 call).
+#[derive(Debug, Clone, Copy)]
+struct GitDirPin<'a> {
+    git_dir: Option<&'a Path>,
+    index_file: Option<&'a Path>,
+    /// A6 W-N2: a Core-owned object directory every NEW object goes to
+    /// (`GIT_OBJECT_DIRECTORY`); the git dir's own `objects/` is only read,
+    /// as an alternate. Only meaningful with `git_dir`.
+    objects: Option<&'a Path>,
+}
+
+impl GitDirPin<'_> {
+    const NONE: GitDirPin<'static> = GitDirPin {
+        git_dir: None,
+        index_file: None,
+        objects: None,
+    };
+}
+
+/// One entry of `GIT_ALTERNATE_OBJECT_DIRECTORIES`, C-quoted (git reads an
+/// entry that starts with `"` as a C-style quoted path), so a `:` in the
+/// path can never split it. `None` for a non-UTF-8 path or one with a
+/// control character (never quoted, never passed).
+fn quoted_alternate(path: &Path) -> Option<String> {
+    let s = path.to_str()?;
+    if s.chars().any(char::is_control) {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    Some(out)
+}
+
+/// What follows the tripwire-checked arguments of one call.
+#[derive(Debug, Clone, Copy)]
+enum Tail<'a> {
+    /// `:(literal)` pathspecs (A5).
+    Pathspecs(&'a [LiteralPathspec]),
+    /// Raw repository paths / cacheinfo triples (A6).
+    Raw(&'a RawTail),
+}
+
+/// Everything one hardened invocation needs.
+struct Call<'a> {
+    cwd: &'a Path,
+    work_tree: WorkTree,
+    pin: GitDirPin<'a>,
+    extra: &'a [String],
+    attr_source: Option<&'a str>,
+    args: &'a [String],
+    tail: Tail<'a>,
+    limits: &'a RunLimits,
+    /// Exit codes that mean success (`diff --no-index`: 0 or 1).
+    ok_exit: &'a [i32],
+}
+
+enum CallError {
+    Git(GitError),
+    TimedOut(String),
+}
+
+impl From<CallError> for GitError {
+    fn from(e: CallError) -> Self {
+        match e {
+            CallError::Git(g) => g,
+            CallError::TimedOut(m) => GitError::Exec(m),
+        }
+    }
+}
+
+/// W4 pins for EVERY host-side call on the apply path (status gate,
+/// `apply --check`, the write, post-write verification), as global `-c`
+/// options before the subcommand: repository or user config can neither
+/// convert content (`autocrlf`, `whitespace=fix`), change what "clean"
+/// means (`checkStat`, `trustctime`), weaken path protection, nor make git
+/// write split or sparse index files into the user's repository.
+pub const APPLY_PINS: &[&str] = &[
+    "core.autocrlf=false",
+    "core.safecrlf=false",
+    "core.symlinks=true",
+    "core.fileMode=true",
+    "core.protectHFS=true",
+    "core.protectNTFS=true",
+    "core.checkStat=default",
+    "core.trustctime=true",
+    "core.splitIndex=false",
+    "core.sparseCheckout=false",
+    "index.sparse=false",
+    "apply.whitespace=nowarn",
+    "apply.ignoreWhitespace=no",
+];
+
+/// R1: the apply patch's only config pin. A GLOBAL `-c` (before
+/// `diff-tree`); after the subcommand `-c` is diff-tree's combined-diff
+/// flag.
+pub const DIFF_TREE_PATCH_CONFIG: &[&str] = &["diff.suppressBlankEmpty=false"];
+
+/// A repository-relative path in the RAW argument channel (A6 §3.6 item 3):
+/// `update-index --cacheinfo/--force-remove` and `check-attr` take raw
+/// paths, not pathspecs. Like [`LiteralPathspec`], raw paths are exempt from
+/// the shell-metacharacter tripwire (a real filename may hold `\n`, `$(`,
+/// a backtick, `&&` or `||`; no shell is involved) and are built only from a
+/// validated entry: non-empty, no NUL, relative, no empty / `.` / `..`
+/// component, no trailing `/`. The constructor is crate-private; the apply
+/// module builds them only from reviewed entries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RawPath(String);
+
+impl RawPath {
+    pub(crate) fn new(path: &str) -> Result<Self, GitError> {
+        let invalid = |reason: &str| {
+            GitError::Validation(ValidationError::InvalidShape {
+                reason: format!("repository path {path:?} {reason}"),
+            })
+        };
+        if path.is_empty() {
+            return Err(GitError::Validation(ValidationError::Empty));
+        }
+        if path.contains('\0') {
+            return Err(GitError::Validation(ValidationError::DisallowedChar {
+                found: '\0',
+            }));
+        }
+        if path.starts_with('/') {
+            return Err(invalid("is absolute"));
+        }
+        if path
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(invalid("has an empty, '.' or '..' component"));
+        }
+        Ok(Self(path.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The same path as a `:(literal)` pathspec.
+    pub fn literal(&self) -> LiteralPathspec {
+        LiteralPathspec(format!(":(literal){}", self.0))
+    }
+}
+
+/// A git index mode Core writes (A6). Symlinks and gitlinks are never
+/// applied, so they have no variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitMode {
+    Regular,
+    Executable,
+}
+
+impl GitMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitMode::Regular => "100644",
+            GitMode::Executable => "100755",
+        }
+    }
+}
+
+/// One `--cacheinfo <mode>,<oid>,<path>` (A6 item 4): mode and oid are
+/// validated, the path is a [`RawPath`] (git splits on the first two
+/// commas, so commas in the path are fine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntry {
+    mode: GitMode,
+    oid: String,
+    path: RawPath,
+}
+
+impl CacheEntry {
+    pub fn new(mode: GitMode, oid: &str, path: RawPath) -> Result<Self, GitError> {
+        Validator::full_object_id(oid)?;
+        Ok(Self {
+            mode,
+            oid: oid.to_ascii_lowercase(),
+            path,
+        })
+    }
+}
+
+/// The raw-channel arguments of one call, built only by the typed
+/// constructors below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTail(Vec<String>);
+
+impl RawTail {
+    /// Raw paths (after a builder's trailing `--`).
+    pub fn paths(paths: &[RawPath]) -> Self {
+        Self(paths.iter().map(|p| p.0.clone()).collect())
+    }
+
+    /// `--cacheinfo <mode>,<oid>,<path>` per entry.
+    pub fn cacheinfo(entries: &[CacheEntry]) -> Self {
+        let mut v = Vec::with_capacity(entries.len() * 2);
+        for e in entries {
+            v.push("--cacheinfo".to_string());
+            v.push(format!("{},{},{}", e.mode.as_str(), e.oid, e.path.0));
+        }
+        Self(v)
+    }
+
+    pub fn args(&self) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
+/// A6 I3: the outcome of `git apply --check`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyCheck {
+    Applies,
+    /// git ran and reported that the patch does not apply (its stderr).
+    DoesNotApply(String),
+    /// git could not answer: killed at its deadline, failed to start, or
+    /// exited with anything but 0 / 1-with-errors.
+    CouldNotCheck(String),
+}
+
+/// A6 I3: exit 0 applies; exit 1 WITH `error:` lines (git 2.56: "error:
+/// patch failed: a:1", "error: a: patch does not apply") does not apply;
+/// everything else (exit 128 "No valid patches", 129 usage, a signal) is
+/// "could not check".
+pub fn classify_apply_check(code: Option<i32>, stderr: &str) -> ApplyCheck {
+    match code {
+        Some(0) => ApplyCheck::Applies,
+        Some(1) if stderr.lines().any(|l| l.starts_with("error: ")) => {
+            ApplyCheck::DoesNotApply(stderr.to_string())
+        }
+        other => ApplyCheck::CouldNotCheck(format!(
+            "git apply --check exited {other:?}: {}",
+            stderr.trim()
+        )),
+    }
+}
+
+/// Outcome of the apply WRITE (§3.6 item 6): written, git failed after its
+/// checks passed (W1), or the write's own limit killed it (W1 + R6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyWrite {
+    Written,
+    Failed(String),
+    Killed,
+    /// `git apply` was never started: the read-only steps before it (the
+    /// tripwire, the configuration read) failed or ran out of time (W-B).
+    NotRun(String),
+    /// `git apply` was never started: less than the floor was left of the
+    /// phase deadline, too little to finish it safely (I-N1).
+    TooLittleTime,
+}
+
+/// I-N1: `true` when less than `floor` is left before `deadline` (no
+/// deadline: never).
+pub fn too_little_time(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+    floor: std::time::Duration,
+) -> bool {
+    deadline.is_some_and(|d| d.saturating_duration_since(now) < floor)
+}
+
+/// One `ls-tree -r` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub mode: String,
+    /// `blob`, `commit` (gitlink) or `tree`.
+    pub kind: String,
+    pub oid: String,
+}
+
+/// One `diff-tree -r -z --raw` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDiffEntry {
+    pub old_mode: String,
+    pub new_mode: String,
+    pub old_oid: String,
+    pub new_oid: String,
+    /// `A`, `M`, `D`, `T`, ...
+    pub status: char,
+    pub path: String,
+    /// `false` when git reported a non-UTF-8 path (never equal to an entry).
+    pub exact: bool,
+}
+
+/// One `ls-files -s -z` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub mode: String,
+    pub oid: String,
+    pub stage: u8,
+    pub path: String,
+}
+
+/// git pinned to a repository's COMMON dir, run from a Core-owned
+/// directory (A6 §3.6 item 2, C3). The task worktree's agent-writable `.git`
+/// file can name an agent-owned gitdir whose `commondir` points back at the
+/// host, so every task-side call names the host's common dir explicitly
+/// (`--git-dir=<common>`) and runs with cwd = Core's temp dir (also pinned
+/// as the work tree), never in the task worktree. The per-repository
+/// overrides — and the object format (R3) — are read ONCE, by the same kind
+/// of pinned call, when the session opens.
+pub struct GitDirSession<'r> {
+    runner: &'r GitRunner,
+    git_dir: PathBuf,
+    cwd: PathBuf,
+    overrides: RepoOverrides,
+    /// A6 W-N2: the quarantine object directory, when the session has one.
+    objects: Option<PathBuf>,
+}
+
+impl GitRunner {
+    /// Open a [`GitDirSession`]. `git_dir` must be the canonical common dir
+    /// of the REGISTERED host repository (derived from the registered
+    /// repository, never from a worktree); `cwd` a Core-owned directory.
+    pub fn git_dir_session(
+        &self,
+        git_dir: &Path,
+        cwd: &Path,
+    ) -> Result<GitDirSession<'_>, GitError> {
+        absolute_path_arg(git_dir)?;
+        absolute_path_arg(cwd)?;
+        let pin = GitDirPin {
+            git_dir: Some(git_dir),
+            index_file: None,
+            objects: None,
+        };
+        let overrides = self.repo_overrides_in(cwd, &pin)?;
+        Ok(GitDirSession {
+            runner: self,
+            git_dir: git_dir.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            overrides,
+            objects: None,
+        })
+    }
+
+    /// A6 W-N2: a [`GitDirSession`] whose every NEW object (`hash-object
+    /// -w`, `update-index`, `write-tree`) is written to `objects` — a
+    /// Core-owned directory the caller removes — never into the host's
+    /// store, which it reads through an alternate. A host path that cannot
+    /// be passed as an alternate is refused.
+    pub fn git_dir_session_quarantined(
+        &self,
+        git_dir: &Path,
+        cwd: &Path,
+        objects: &Path,
+    ) -> Result<GitDirSession<'_>, GitError> {
+        absolute_path_arg(objects)?;
+        if quoted_alternate(&git_dir.join("objects")).is_none() {
+            return Err(GitError::Exec(format!(
+                "the repository's object directory {} cannot be used as an alternate",
+                git_dir.join("objects").display()
+            )));
+        }
+        let mut session = self.git_dir_session(git_dir, cwd)?;
+        session.objects = Some(objects.to_path_buf());
+        Ok(session)
+    }
+}
+
+impl GitDirSession<'_> {
+    /// The repository's object format, read once when the session opened.
+    pub fn format(&self) -> ObjectFormat {
+        self.overrides.format
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call(
+        &self,
+        index: Option<&Path>,
+        extra: &[String],
+        args: &[String],
+        tail: Tail<'_>,
+        limits: &RunLimits,
+        ok_exit: &[i32],
+    ) -> Result<crate::process::BoundedOutput, GitError> {
+        let non_paths: Vec<String> = args
+            .iter()
+            .filter(|a| !Path::new(a.as_str()).is_absolute())
+            .cloned()
+            .collect();
+        Validator::assert_no_shell_metachars(&non_paths).map_err(GitError::Validation)?;
+        let mut config = self.overrides.config.clone();
+        // W4 for the task side too: the host's index-format settings (e.g.
+        // `core.splitIndex`) must not make Core's TEMP index write
+        // `sharedindex.*` files into the host git dir, and no conversion
+        // setting may touch the bytes Core hashes or displays.
+        config.extend(APPLY_PINS.iter().map(|c| c.to_string()));
+        config.extend(extra.iter().cloned());
+        Ok(self.runner.exec_call(&Call {
+            cwd: &self.cwd,
+            work_tree: WorkTree::Pin,
+            pin: GitDirPin {
+                git_dir: Some(&self.git_dir),
+                index_file: index,
+                objects: self.objects.as_deref(),
+            },
+            extra: &config,
+            attr_source: Some(self.overrides.empty_tree),
+            args,
+            tail,
+            limits,
+            ok_exit,
+        })?)
+    }
+
+    /// [`Self::call`] whose stdout must be complete.
+    fn bytes(
+        &self,
+        index: Option<&Path>,
+        args: &[String],
+        tail: Tail<'_>,
+        limits: &RunLimits,
+    ) -> Result<Vec<u8>, GitError> {
+        let out = self.call(index, &[], args, tail, limits, &[0])?;
+        if out.stdout_truncated {
+            let sub = args.first().map(String::as_str).unwrap_or("?");
+            return Err(GitError::Exec(format!(
+                "git {sub} output exceeded {} bytes; refusing truncated output",
+                limits.max_stdout
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    fn scan_limits(&self) -> RunLimits {
+        RunLimits {
+            max_stdout: SUBMODULE_SCAN_MAX_STDOUT.max(self.runner.limits.max_stdout),
+            ..self.runner.limits
+        }
+    }
+
+    /// Every entry of `base`'s tree, recursively, keyed by exact path
+    /// (`ls-tree -r -z --full-tree`, NO pathspec: exact lookups, never a
+    /// prefix match). Non-UTF-8 paths are skipped: no entry can name them.
+    pub fn ls_tree_full(
+        &self,
+        base: &str,
+    ) -> Result<std::collections::BTreeMap<String, TreeEntry>, GitError> {
+        Validator::full_object_id(base)?;
+        let out = self.bytes(
+            None,
+            &GitArgs::ls_tree_full(base),
+            Tail::Pathspecs(&[]),
+            &self.scan_limits(),
+        )?;
+        parse_ls_tree_full_z(&out)
+    }
+
+    /// The content of blob `oid`, refused when larger than `cap` bytes.
+    pub fn cat_blob(&self, oid: &str, cap: usize) -> Result<Vec<u8>, GitError> {
+        Validator::full_object_id(oid)?;
+        let args: Vec<String> = vec![
+            "cat-file".into(),
+            "blob".into(),
+            "--end-of-options".into(),
+            oid.into(),
+        ];
+        let limits = RunLimits {
+            max_stdout: cap,
+            ..self.runner.limits
+        };
+        self.bytes(None, &args, Tail::Pathspecs(&[]), &limits)
+    }
+
+    /// DISPLAY-ONLY: [`Self::cat_blob`] that returns at most `cap` bytes and
+    /// whether the blob was larger (instead of refusing), so `git.diff` can
+    /// say "truncated" honestly for a base side over the apply cap.
+    pub fn cat_blob_capped(&self, oid: &str, cap: usize) -> Result<(Vec<u8>, bool), GitError> {
+        Validator::full_object_id(oid)?;
+        let args: Vec<String> = vec![
+            "cat-file".into(),
+            "blob".into(),
+            "--end-of-options".into(),
+            oid.into(),
+        ];
+        let limits = RunLimits {
+            max_stdout: cap,
+            ..self.runner.limits
+        };
+        let out = self.call(None, &[], &args, Tail::Pathspecs(&[]), &limits, &[0])?;
+        Ok((out.stdout, out.stdout_truncated))
+    }
+
+    /// `hash-object -w --no-filters -- <files…>` (Core-owned temp files):
+    /// one id per file, in order.
+    pub fn hash_object_write(&self, files: &[PathBuf]) -> Result<Vec<String>, GitError> {
+        let mut args: Vec<String> = vec![
+            "hash-object".into(),
+            "-w".into(),
+            "--no-filters".into(),
+            "--".into(),
+        ];
+        for f in files {
+            args.push(absolute_path_arg(f)?);
+        }
+        let out = self.bytes(None, &args, Tail::Pathspecs(&[]), &self.runner.limits)?;
+        let text = String::from_utf8(out)
+            .map_err(|_| GitError::Exec("hash-object printed non-UTF-8 output".into()))?;
+        let oids: Vec<String> = text.lines().map(str::to_string).collect();
+        if oids.len() != files.len()
+            || oids.iter().any(|o| {
+                o.len() != self.format().hex_len() || Validator::full_object_id(o).is_err()
+            })
+        {
+            return Err(GitError::Exec(format!(
+                "unexpected hash-object output {}",
+                excerpt(text.as_bytes())
+            )));
+        }
+        Ok(oids)
+    }
+
+    /// `read-tree <base>` into the temporary index `index`.
+    pub fn read_tree(&self, index: &Path, base: &str) -> Result<(), GitError> {
+        Validator::full_object_id(base)?;
+        let args: Vec<String> = vec!["read-tree".into(), "--end-of-options".into(), base.into()];
+        self.bytes(
+            Some(index),
+            &args,
+            Tail::Pathspecs(&[]),
+            &self.runner.limits,
+        )
+        .map(|_| ())
+    }
+
+    /// `update-index --force-remove -- <paths…>` on the temporary index.
+    pub fn update_index_remove(&self, index: &Path, paths: &[RawPath]) -> Result<(), GitError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let tail = RawTail::paths(paths);
+        self.bytes(
+            Some(index),
+            &GitArgs::update_index_remove(),
+            Tail::Raw(&tail),
+            &self.runner.limits,
+        )
+        .map(|_| ())
+    }
+
+    /// `update-index --add --cacheinfo <m,o,p>…` (never `--replace`, R8).
+    pub fn update_index_add(&self, index: &Path, entries: &[CacheEntry]) -> Result<(), GitError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tail = RawTail::cacheinfo(entries);
+        self.bytes(
+            Some(index),
+            &GitArgs::update_index_add(),
+            Tail::Raw(&tail),
+            &self.runner.limits,
+        )
+        .map(|_| ())
+    }
+
+    /// `write-tree` of the temporary index.
+    pub fn write_tree(&self, index: &Path) -> Result<String, GitError> {
+        let args: Vec<String> = vec!["write-tree".into()];
+        let out = self.bytes(
+            Some(index),
+            &args,
+            Tail::Pathspecs(&[]),
+            &self.runner.limits,
+        )?;
+        let oid = String::from_utf8_lossy(&out).trim().to_string();
+        Validator::full_object_id(&oid).map_err(|_| {
+            GitError::Exec(format!("unexpected write-tree output {}", excerpt(&out)))
+        })?;
+        Ok(oid)
+    }
+
+    /// C1 exact-set input: `diff-tree -r -z --raw --no-renames <base>
+    /// <tree>`, WITHOUT a pathspec.
+    pub fn diff_tree_raw(&self, base: &str, tree: &str) -> Result<Vec<RawDiffEntry>, GitError> {
+        Validator::full_object_id(base)?;
+        Validator::full_object_id(tree)?;
+        let out = self.bytes(
+            None,
+            &GitArgs::diff_tree_raw(base, tree),
+            Tail::Pathspecs(&[]),
+            &self.scan_limits(),
+        )?;
+        parse_diff_tree_raw_z(&out)
+    }
+
+    /// The apply patch (§3.6 item 4): `-c diff.suppressBlankEmpty=false
+    /// diff-tree -r --binary --full-index --no-renames …` WITHOUT a pathspec.
+    /// `None` when it exceeds `cap` bytes (the apply budget). Never built
+    /// with the `git.diff` builders or the display-capped runner.
+    pub fn diff_tree_patch(
+        &self,
+        base: &str,
+        tree: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<u8>>, GitError> {
+        Validator::full_object_id(base)?;
+        Validator::full_object_id(tree)?;
+        let limits = RunLimits {
+            max_stdout: cap,
+            ..self.runner.limits
+        };
+        let pins: Vec<String> = DIFF_TREE_PATCH_CONFIG
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let out = self.call(
+            None,
+            &pins,
+            &GitArgs::diff_tree_patch(base, tree),
+            Tail::Pathspecs(&[]),
+            &limits,
+            &[0],
+        )?;
+        Ok(if out.stdout_truncated {
+            None
+        } else {
+            Some(out.stdout)
+        })
+    }
+
+    /// DISPLAY-ONLY (A6 C4): `diff --no-index` between two Core-owned files
+    /// named relative to the session cwd (or `/dev/null`), so headers show
+    /// those temp names. Exit 1 ("differences") is success. Returns the
+    /// first `cap` bytes and whether more existed.
+    pub fn diff_no_index_display(
+        &self,
+        a: &str,
+        b: &str,
+        cap: usize,
+    ) -> Result<(Vec<u8>, bool), GitError> {
+        for name in [a, b] {
+            let ok = name == "/dev/null"
+                || (!name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')));
+            if !ok || name == "." || name == ".." {
+                return Err(GitError::Validation(ValidationError::InvalidShape {
+                    reason: format!("{name:?} is not a Core temp file name"),
+                }));
+            }
+        }
+        let args: Vec<String> = vec![
+            "diff".into(),
+            "--no-index".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+            "--no-color".into(),
+            "--src-prefix=a/".into(),
+            "--dst-prefix=b/".into(),
+            "-U3".into(),
+            "--".into(),
+            a.into(),
+            b.into(),
+        ];
+        let limits = RunLimits {
+            max_stdout: cap,
+            ..self.runner.limits
+        };
+        let out = self.call(None, &[], &args, Tail::Pathspecs(&[]), &limits, &[0, 1])?;
+        Ok((out.stdout, out.stdout_truncated))
+    }
+}
+
+impl GitRunner {
+    /// One HOST call on the apply path: hardened, work tree pinned to the
+    /// repository root, [`APPLY_PINS`] added, the per-repository overrides
+    /// applied. `attr_source: false` drops the `GIT_ATTR_SOURCE` override
+    /// (R5: `check-attr` must see the host's own `.gitattributes`).
+    #[allow(clippy::too_many_arguments)]
+    fn host_call(
+        &self,
+        repo: &Path,
+        args: &[String],
+        tail: Tail<'_>,
+        attr_source: bool,
+        limits: &RunLimits,
+        ok_exit: &[i32],
+    ) -> Result<crate::process::BoundedOutput, CallError> {
+        let repo_o = self.prepare_run(repo, args).map_err(CallError::Git)?;
+        self.host_call_with(repo, &repo_o, args, tail, attr_source, limits, ok_exit)
+    }
+
+    /// [`Self::host_call`] with the per-repository overrides already read.
+    #[allow(clippy::too_many_arguments)]
+    fn host_call_with(
+        &self,
+        repo: &Path,
+        repo_o: &RepoOverrides,
+        args: &[String],
+        tail: Tail<'_>,
+        attr_source: bool,
+        limits: &RunLimits,
+        ok_exit: &[i32],
+    ) -> Result<crate::process::BoundedOutput, CallError> {
+        let mut config = repo_o.config.clone();
+        config.extend(APPLY_PINS.iter().map(|c| c.to_string()));
+        self.exec_call(&Call {
+            cwd: repo,
+            work_tree: WorkTree::Pin,
+            pin: GitDirPin::NONE,
+            extra: &config,
+            attr_source: attr_source.then_some(repo_o.empty_tree),
+            args,
+            tail,
+            limits,
+            ok_exit,
+        })
+    }
+
+    fn host_bytes(
+        &self,
+        repo: &Path,
+        args: &[String],
+        tail: Tail<'_>,
+        attr_source: bool,
+    ) -> Result<Vec<u8>, GitError> {
+        let out = self.host_call(repo, args, tail, attr_source, &self.limits, &[0])?;
+        if out.stdout_truncated {
+            let sub = args.first().map(String::as_str).unwrap_or("?");
+            return Err(GitError::Exec(format!(
+                "git {sub} output exceeded {} bytes; refusing truncated output",
+                self.limits.max_stdout
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    /// The touched-path dirty gate (§3.6 item 5): the paths `git status`
+    /// lists among `specs` — modified, staged, untracked AND ignored.
+    pub fn status_touched(
+        &self,
+        repo: &Path,
+        specs: &[LiteralPathspec],
+    ) -> Result<Vec<String>, GitError> {
+        let out = self.host_bytes(
+            repo,
+            &GitArgs::status_touched(),
+            Tail::Pathspecs(specs),
+            true,
+        )?;
+        Ok(parse_status_paths_z(&out))
+    }
+
+    /// R5: `check-attr -z filter -- <raw paths>` in the host repository
+    /// WITHOUT the attribute-source override (the host's `.gitattributes`
+    /// are the user's; `check-attr` executes nothing). `(path, value)`.
+    pub fn check_attr_filter(
+        &self,
+        repo: &Path,
+        paths: &[RawPath],
+    ) -> Result<Vec<(String, String)>, GitError> {
+        let tail = RawTail::paths(paths);
+        let out = self.host_bytes(repo, &GitArgs::check_attr_filter(), Tail::Raw(&tail), false)?;
+        parse_check_attr_z(&out)
+    }
+
+    /// `git apply --check --index --whitespace=nowarn <patch>`: `Err` with
+    /// git's stderr when the patch does not apply cleanly.
+    pub fn apply_check(&self, repo: &Path, patch: &Path, limits: &RunLimits) -> ApplyCheck {
+        let args = match GitArgs::apply_index(patch, true) {
+            Ok(a) => a,
+            Err(e) => return ApplyCheck::CouldNotCheck(e.to_string()),
+        };
+        match self.host_call(repo, &args, Tail::Pathspecs(&[]), true, limits, &[0, 1]) {
+            Ok(out) => classify_apply_check(out.status.code(), &out.stderr_lossy()),
+            Err(CallError::TimedOut(m)) => ApplyCheck::CouldNotCheck(m),
+            Err(CallError::Git(e)) => ApplyCheck::CouldNotCheck(e.to_string()),
+        }
+    }
+
+    /// The write: `git apply --index --whitespace=nowarn <patch>` under its
+    /// OWN `limits` (not the QUERY kill). Distinguishes a failure from a
+    /// deadline kill (W1 / R6).
+    pub fn apply_write(
+        &self,
+        repo: &Path,
+        patch: &Path,
+        limits: &RunLimits,
+        floor: std::time::Duration,
+    ) -> Result<ApplyWrite, GitError> {
+        let args = GitArgs::apply_index(patch, false)?;
+        // W-B: the read-only steps first; if they fail or run out of the
+        // phase deadline, `git apply` is never spawned.
+        let repo_o = match self.prepare_run(repo, &args) {
+            Ok(o) => o,
+            Err(e) => return Ok(ApplyWrite::NotRun(e.to_string())),
+        };
+        // I-N1: never spawn `git apply` with too little time left to finish
+        // it (a deadline kill mid-write is a partial with a stale lock).
+        if too_little_time(self.deadline, std::time::Instant::now(), floor) {
+            return Ok(ApplyWrite::TooLittleTime);
+        }
+        match self.host_call_with(
+            repo,
+            &repo_o,
+            &args,
+            Tail::Pathspecs(&[]),
+            true,
+            limits,
+            &[0],
+        ) {
+            Ok(_) => Ok(ApplyWrite::Written),
+            Err(CallError::TimedOut(_)) => Ok(ApplyWrite::Killed),
+            Err(CallError::Git(GitError::Exec(m))) => Ok(ApplyWrite::Failed(m)),
+            Err(CallError::Git(other)) => Err(other),
+        }
+    }
+
+    /// Host index entries among `specs` (`ls-files -s -z`). Literal specs
+    /// prefix-match directories: callers filter to exact paths.
+    pub fn ls_files_stage(
+        &self,
+        repo: &Path,
+        specs: &[LiteralPathspec],
+    ) -> Result<Vec<IndexEntry>, GitError> {
+        let args: Vec<String> = vec!["ls-files".into(), "-s".into(), "-z".into(), "--".into()];
+        let out = self.host_bytes(repo, &args, Tail::Pathspecs(specs), true)?;
+        parse_ls_files_stage_z(&out)
+    }
+
+    /// Paths whose work-tree file differs from the index among `specs`
+    /// (`diff-files -z --name-only`).
+    pub fn diff_files_names(
+        &self,
+        repo: &Path,
+        specs: &[LiteralPathspec],
+    ) -> Result<Vec<String>, GitError> {
+        let args: Vec<String> = vec![
+            "diff-files".into(),
+            "-z".into(),
+            "--name-only".into(),
+            "--ignore-submodules=dirty".into(),
+            "--".into(),
+        ];
+        let out = self.host_bytes(repo, &args, Tail::Pathspecs(specs), true)?;
+        Ok(nul_fields(&out)
+            .into_iter()
+            .map(|f| String::from_utf8_lossy(f).into_owned())
+            .collect())
+    }
+
+    /// The host's EFFECTIVE `core.hooksPath` value as configured (not
+    /// Core's own `-c core.hooksPath=/dev/null`): the last value from a
+    /// non-command scope of `config --show-scope -z --get-all`. `None` when
+    /// unset. System config is not read (`GIT_CONFIG_NOSYSTEM`).
+    pub fn effective_hooks_path(&self, repo: &Path) -> Result<Option<String>, GitError> {
+        let args: Vec<String> = vec![
+            "config".into(),
+            "--show-scope".into(),
+            "-z".into(),
+            "--get-all".into(),
+            "core.hooksPath".into(),
+        ];
+        let repo_o = self.prepare_run(repo, &args)?;
+        let out = self
+            .exec_call(&Call {
+                cwd: repo,
+                work_tree: WorkTree::Pin,
+                pin: GitDirPin::NONE,
+                extra: &repo_o.config,
+                attr_source: Some(repo_o.empty_tree),
+                args: &args,
+                tail: Tail::Pathspecs(&[]),
+                limits: &self.limits,
+                ok_exit: &[0, 1],
+            })
+            .map_err(GitError::from)?;
+        if out.stdout_truncated {
+            return Err(GitError::Exec("config output truncated".into()));
+        }
+        Ok(effective_non_command_value(&parse_show_scope_z(
+            &out.stdout,
+        )?))
+    }
+}
+
+impl GitArgs {
+    /// C1: the raw base→snapshot difference, no pathspec, renames off.
+    pub fn diff_tree_raw(base: &str, tree: &str) -> Vec<String> {
+        vec![
+            "diff-tree".into(),
+            "-r".into(),
+            "-z".into(),
+            "--raw".into(),
+            "--no-renames".into(),
+            "--end-of-options".into(),
+            base.into(),
+            tree.into(),
+        ]
+    }
+
+    /// The apply patch (`--binary` implies `--patch`); see
+    /// [`GitDirSession::diff_tree_patch`].
+    pub fn diff_tree_patch(base: &str, tree: &str) -> Vec<String> {
+        vec![
+            "diff-tree".into(),
+            "-r".into(),
+            "--binary".into(),
+            "--full-index".into(),
+            "--no-renames".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+            "--src-prefix=a/".into(),
+            "--dst-prefix=b/".into(),
+            "--end-of-options".into(),
+            base.into(),
+            tree.into(),
+        ]
+    }
+
+    /// Every entry of a tree, recursively, no pathspec.
+    pub fn ls_tree_full(base: &str) -> Vec<String> {
+        vec![
+            "ls-tree".into(),
+            "-r".into(),
+            "-z".into(),
+            "--full-tree".into(),
+            "--end-of-options".into(),
+            base.into(),
+        ]
+    }
+
+    /// The touched-path dirty gate; literal pathspecs follow `--`.
+    pub fn status_touched() -> Vec<String> {
+        vec![
+            "status".into(),
+            "--porcelain=v1".into(),
+            "-z".into(),
+            "--untracked-files=all".into(),
+            "--ignored=matching".into(),
+            "--ignore-submodules=dirty".into(),
+            "--".into(),
+        ]
+    }
+
+    /// R5; raw paths follow `--`.
+    pub fn check_attr_filter() -> Vec<String> {
+        vec![
+            "check-attr".into(),
+            "-z".into(),
+            "filter".into(),
+            "--".into(),
+        ]
+    }
+
+    /// `git apply [--check] --index --whitespace=nowarn <patch>`; the patch
+    /// is a Core-owned absolute path.
+    pub fn apply_index(patch: &Path, check: bool) -> Result<Vec<String>, GitError> {
+        let patch = absolute_path_arg(patch)?;
+        let mut v: Vec<String> = vec!["apply".into()];
+        if check {
+            v.push("--check".into());
+        }
+        v.extend([
+            "--index".to_string(),
+            "--whitespace=nowarn".to_string(),
+            patch,
+        ]);
+        Ok(v)
+    }
+
+    /// Never `--replace` (C1/R8); `--cacheinfo` triples follow.
+    pub fn update_index_add() -> Vec<String> {
+        vec!["update-index".into(), "--add".into()]
+    }
+
+    /// Raw paths follow `--`.
+    pub fn update_index_remove() -> Vec<String> {
+        vec!["update-index".into(), "--force-remove".into(), "--".into()]
+    }
+}
+
+/// Parse `ls-tree -r -z` (`<mode> SP <type> SP <oid> TAB <path>` NUL). A
+/// malformed record fails CLOSED; non-UTF-8 paths are skipped.
+pub fn parse_ls_tree_full_z(
+    out: &[u8],
+) -> Result<std::collections::BTreeMap<String, TreeEntry>, GitError> {
+    let malformed = || GitError::Exec(format!("unexpected ls-tree -r -z output {}", excerpt(out)));
+    let mut map = std::collections::BTreeMap::new();
+    for rec in nul_fields(out) {
+        let tab = rec.iter().position(|b| *b == b'\t').ok_or_else(malformed)?;
+        let meta = std::str::from_utf8(&rec[..tab]).map_err(|_| malformed())?;
+        let mut m = meta.split(' ');
+        let (Some(mode), Some(kind), Some(oid), None) = (m.next(), m.next(), m.next(), m.next())
+        else {
+            return Err(malformed());
+        };
+        Validator::full_object_id(oid).map_err(|_| malformed())?;
+        if mode.is_empty() || !mode.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(malformed());
+        }
+        let path = &rec[tab + 1..];
+        if path.is_empty() {
+            return Err(malformed());
+        }
+        if let Ok(p) = std::str::from_utf8(path) {
+            map.insert(
+                p.to_string(),
+                TreeEntry {
+                    mode: mode.to_string(),
+                    kind: kind.to_string(),
+                    oid: oid.to_ascii_lowercase(),
+                },
+            );
+        }
+    }
+    Ok(map)
+}
+
+/// Parse `diff-tree -r -z --raw` (`:<om> <nm> <oo> <no> <status>\0<path>\0`;
+/// `--no-renames`, so never two paths). Anything else fails CLOSED.
+pub fn parse_diff_tree_raw_z(out: &[u8]) -> Result<Vec<RawDiffEntry>, GitError> {
+    let malformed = || {
+        GitError::Exec(format!(
+            "unexpected diff-tree --raw -z output {}",
+            excerpt(out)
+        ))
+    };
+    let fields = nul_fields(out);
+    if !fields.len().is_multiple_of(2) {
+        return Err(malformed());
+    }
+    let mut v = Vec::new();
+    for pair in fields.chunks(2) {
+        let meta = std::str::from_utf8(pair[0]).map_err(|_| malformed())?;
+        let meta = meta.strip_prefix(':').ok_or_else(malformed)?;
+        let mut m = meta.split(' ');
+        let (Some(om), Some(nm), Some(oo), Some(no), Some(st), None) =
+            (m.next(), m.next(), m.next(), m.next(), m.next(), m.next())
+        else {
+            return Err(malformed());
+        };
+        for oid in [oo, no] {
+            Validator::full_object_id(oid).map_err(|_| malformed())?;
+        }
+        let mut chars = st.chars();
+        let (Some(status), None) = (chars.next(), chars.next()) else {
+            return Err(malformed());
+        };
+        if pair[1].is_empty() {
+            return Err(malformed());
+        }
+        let (path, exact) = decode_exact(pair[1]);
+        v.push(RawDiffEntry {
+            old_mode: om.to_string(),
+            new_mode: nm.to_string(),
+            old_oid: oo.to_ascii_lowercase(),
+            new_oid: no.to_ascii_lowercase(),
+            status,
+            path,
+            exact,
+        });
+    }
+    Ok(v)
+}
+
+/// Parse `check-attr -z` (`<path>\0<attr>\0<value>\0`) into `(path, value)`.
+pub fn parse_check_attr_z(out: &[u8]) -> Result<Vec<(String, String)>, GitError> {
+    let fields = nul_fields(out);
+    if !fields.len().is_multiple_of(3) {
+        return Err(GitError::Exec(format!(
+            "unexpected check-attr -z output {}",
+            excerpt(out)
+        )));
+    }
+    Ok(fields
+        .chunks(3)
+        .map(|c| {
+            (
+                String::from_utf8_lossy(c[0]).into_owned(),
+                String::from_utf8_lossy(c[2]).into_owned(),
+            )
+        })
+        .collect())
+}
+
+/// Parse `ls-files -s -z` (`<mode> SP <oid> SP <stage> TAB <path>` NUL).
+pub fn parse_ls_files_stage_z(out: &[u8]) -> Result<Vec<IndexEntry>, GitError> {
+    let malformed = || GitError::Exec(format!("unexpected ls-files -s -z output {}", excerpt(out)));
+    let mut v = Vec::new();
+    for rec in nul_fields(out) {
+        let tab = rec.iter().position(|b| *b == b'\t').ok_or_else(malformed)?;
+        let meta = std::str::from_utf8(&rec[..tab]).map_err(|_| malformed())?;
+        let mut m = meta.split(' ');
+        let (Some(mode), Some(oid), Some(stage), None) = (m.next(), m.next(), m.next(), m.next())
+        else {
+            return Err(malformed());
+        };
+        Validator::full_object_id(oid).map_err(|_| malformed())?;
+        let stage: u8 = stage.parse().map_err(|_| malformed())?;
+        v.push(IndexEntry {
+            mode: mode.to_string(),
+            oid: oid.to_ascii_lowercase(),
+            stage,
+            path: String::from_utf8_lossy(&rec[tab + 1..]).into_owned(),
+        });
+    }
+    Ok(v)
+}
+
+/// Parse `config --show-scope -z --get-all <key>` (`<scope>\0<value>\0`).
+pub fn parse_show_scope_z(out: &[u8]) -> Result<Vec<(String, String)>, GitError> {
+    let fields = nul_fields(out);
+    if !fields.len().is_multiple_of(2) {
+        return Err(GitError::Exec(format!(
+            "unexpected config --show-scope -z output {}",
+            excerpt(out)
+        )));
+    }
+    Ok(fields
+        .chunks(2)
+        .map(|c| {
+            (
+                String::from_utf8_lossy(c[0]).into_owned(),
+                String::from_utf8_lossy(c[1]).into_owned(),
+            )
+        })
+        .collect())
+}
+
+/// The effective value among `(scope, value)` pairs, ignoring Core's own
+/// command-line overrides (`command` scope): the LAST other value.
+pub fn effective_non_command_value(pairs: &[(String, String)]) -> Option<String> {
+    pairs
+        .iter()
+        .rev()
+        .find(|(scope, _)| scope != "command")
+        .map(|(_, v)| v.clone())
+}
+
+/// Paths named by `status --porcelain=v1 -z` (`XY SP <path>\0`, plus the
+/// source `\0<path>` for a rename or copy). Best effort, for MESSAGES only:
+/// callers refuse on ANY output, whatever this returns.
+pub fn parse_status_paths_z(out: &[u8]) -> Vec<String> {
+    let fields = nul_fields(out);
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let f = fields[i];
+        if f.len() > 3 {
+            paths.push(String::from_utf8_lossy(&f[3..]).into_owned());
+        }
+        let renamed = f.len() >= 2 && (matches!(f[0], b'R' | b'C') || matches!(f[1], b'R' | b'C'));
+        if renamed {
+            if let Some(src) = fields.get(i + 1) {
+                paths.push(String::from_utf8_lossy(src).into_owned());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    paths
+}
+
 /// Pre-integration safety gate (specs/06 §6 "Before integrating changes"):
 /// verify the host tree is clean and HEAD still matches the recorded base.
 /// `expected_base` must be the FULL object id Core recorded (40 or 64 hex);
 /// the comparison is exact — never a prefix match (security W3).
 ///
-/// KNOWN SCOPE LIMIT (P4 work, review 0004 #8): the clean-tree gate is
-/// correct for `sbx_clone`/`host_worktree` but structurally blocks apply for
-/// `direct_mount`, whose host tree is dirty BY DESIGN (specs/02 §7). P4 must
-/// scope the dirty gate to the paths a patch touches — do not "fix" this by
-/// weakening the review/change side.
+/// Repo-wide gate, kept for callers that integrate a WHOLE tree. `git.apply`
+/// (A6, design 2026-10-09 §3.6) no longer uses it: it applies only
+/// `host_worktree` entries, refuses `direct_mount` (whose changes are
+/// already in the user's tree), and gates exactly the touched paths
+/// (`crate::apply`: HEAD == base, touched-path status incl. untracked and
+/// ignored, hidden index flags, leading paths, filters) — the scope limit
+/// recorded at review 0004 #8 is resolved there without weakening this gate
+/// or the review side.
 pub fn preconditions_for_apply(
     runner: &GitRunner,
     repo: &Path,
@@ -2548,6 +3865,7 @@ mod tests {
         let detector = runner.command(
             Path::new("/some repo"),
             WorkTree::Discover,
+            &GitDirPin::NONE,
             &[],
             None,
             &GitArgs::show_toplevel(),
@@ -3340,6 +4658,849 @@ mod tests {
         assert_eq!(
             user_excludes_candidate(&runner, &ExcludesEnv::default()).unwrap(),
             None
+        );
+    }
+
+    // --- A6: git.apply plumbing (design 2026-10-09 §3.6) -------------------
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Raw paths travel in their own channel, exempt from the tripwire, and
+    /// are built only from validated plain relative paths.
+    #[test]
+    fn raw_paths_are_validated_and_exempt_from_the_tripwire() {
+        for ok in ["a.txt", "dir/x\n$(y) `z` a&&b.txt", "-dash", "we,ird"] {
+            assert_eq!(RawPath::new(ok).unwrap().as_str(), ok);
+        }
+        for bad in [
+            "", "a\0b", "/abs", "a//b", "a/./b", "../x", "a/", ".", "a/..",
+        ] {
+            assert!(RawPath::new(bad).is_err(), "{bad:?}");
+        }
+        let p = RawPath::new("x\ny").unwrap();
+        assert_eq!(p.literal().as_str(), ":(literal)x\ny");
+        let oid = "a".repeat(40);
+        let c = CacheEntry::new(GitMode::Executable, &oid, p.clone()).unwrap();
+        assert_eq!(
+            RawTail::cacheinfo(std::slice::from_ref(&c)).args(),
+            vec!["--cacheinfo".to_string(), format!("100755,{oid},x\ny")]
+        );
+        assert!(CacheEntry::new(GitMode::Regular, "abc", p.clone()).is_err());
+        assert_eq!(
+            RawTail::paths(std::slice::from_ref(&p)).args(),
+            vec!["x\ny".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_pins_cover_every_w4_key() {
+        for key in [
+            "core.autocrlf=false",
+            "core.safecrlf=false",
+            "core.symlinks=true",
+            "core.fileMode=true",
+            "core.protectHFS=true",
+            "core.protectNTFS=true",
+            "core.checkStat=default",
+            "core.trustctime=true",
+            "core.splitIndex=false",
+            "core.sparseCheckout=false",
+            "index.sparse=false",
+            "apply.whitespace=nowarn",
+            "apply.ignoreWhitespace=no",
+        ] {
+            assert!(APPLY_PINS.contains(&key), "{key}");
+        }
+        assert_eq!(APPLY_PINS.len(), 13);
+    }
+
+    #[test]
+    fn a6_arg_builders_are_exact() {
+        let base = "b".repeat(40);
+        let tree = "c".repeat(40);
+        assert_eq!(
+            GitArgs::diff_tree_raw(&base, &tree),
+            vec![
+                "diff-tree",
+                "-r",
+                "-z",
+                "--raw",
+                "--no-renames",
+                "--end-of-options",
+                &base,
+                &tree
+            ]
+        );
+        // R1: no pathspec; the `-c` travels in the config channel, before
+        // the subcommand (see `GitDirSession::diff_tree_patch`).
+        assert_eq!(
+            GitArgs::diff_tree_patch(&base, &tree),
+            vec![
+                "diff-tree",
+                "-r",
+                "--binary",
+                "--full-index",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "--end-of-options",
+                &base,
+                &tree
+            ]
+        );
+        assert_eq!(DIFF_TREE_PATCH_CONFIG, &["diff.suppressBlankEmpty=false"]);
+        assert_eq!(
+            GitArgs::status_touched(),
+            vec![
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--ignore-submodules=dirty",
+                "--"
+            ]
+        );
+        assert_eq!(
+            GitArgs::check_attr_filter(),
+            vec!["check-attr", "-z", "filter", "--"]
+        );
+        let patch = Path::new("/core tmp/p.patch");
+        assert_eq!(
+            GitArgs::apply_index(patch, true).unwrap(),
+            vec![
+                "apply",
+                "--check",
+                "--index",
+                "--whitespace=nowarn",
+                "/core tmp/p.patch"
+            ]
+        );
+        assert_eq!(
+            GitArgs::apply_index(patch, false).unwrap(),
+            vec![
+                "apply",
+                "--index",
+                "--whitespace=nowarn",
+                "/core tmp/p.patch"
+            ]
+        );
+        assert!(GitArgs::apply_index(Path::new("rel.patch"), false).is_err());
+        assert_eq!(
+            GitArgs::ls_tree_full(&base),
+            vec![
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                "--end-of-options",
+                &base
+            ]
+        );
+        // Never --replace (C1/R8): a dir/file conflict must fail, not
+        // silently drop unselected entries.
+        assert_eq!(GitArgs::update_index_add(), vec!["update-index", "--add"]);
+        assert_eq!(
+            GitArgs::update_index_remove(),
+            vec!["update-index", "--force-remove", "--"]
+        );
+    }
+
+    #[test]
+    fn a6_parsers_are_exact_and_fail_closed() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let z = "0".repeat(40);
+        let raw = format!(
+            ":100644 100755 {a} {a} M\0run.sh\0:000000 100644 {z} {b} A\0new\nline\0\
+             :100644 000000 {a} {z} D\0gone.txt\0"
+        );
+        let entries = parse_diff_tree_raw_z(raw.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            (
+                entries[0].status,
+                entries[0].old_mode.as_str(),
+                entries[0].new_mode.as_str()
+            ),
+            ('M', "100644", "100755")
+        );
+        assert_eq!(entries[1].path, "new\nline");
+        assert_eq!(entries[1].new_oid, b);
+        assert_eq!(entries[2].status, 'D');
+        assert!(parse_diff_tree_raw_z(b":100644 100644 x y M\0p\0").is_err());
+        assert!(parse_diff_tree_raw_z(format!(":100644 100644 {a} {a} M\0").as_bytes()).is_err());
+
+        let tree = parse_ls_tree_full_z(
+            format!("100644 blob {a}\tdir/x\0120000 blob {b}\tlink\0160000 commit {a}\tsub\0")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(tree["dir/x"].mode, "100644");
+        assert_eq!(tree["link"].mode, "120000");
+        assert_eq!(tree["sub"].kind, "commit");
+        assert!(parse_ls_tree_full_z(b"100644 blob nothex\tx\0").is_err());
+
+        let attrs = parse_check_attr_z(b"a.txt\0filter\0unset\0x.bin\0filter\0lfs\0").unwrap();
+        assert_eq!(
+            attrs,
+            vec![
+                ("a.txt".into(), "unset".into()),
+                ("x.bin".into(), "lfs".into())
+            ]
+        );
+        assert!(parse_check_attr_z(b"a.txt\0filter\0").is_err());
+
+        let idx = parse_ls_files_stage_z(format!("100755 {a} 0\tr un.sh\0").as_bytes()).unwrap();
+        assert_eq!(idx[0].path, "r un.sh");
+        assert_eq!((idx[0].mode.as_str(), idx[0].stage), ("100755", 0));
+        assert!(parse_ls_files_stage_z(b"garbage\0").is_err());
+
+        let scopes =
+            parse_show_scope_z(b"global\0/abs/hooks\0local\0.husky\0command\0/dev/null\0").unwrap();
+        assert_eq!(
+            effective_non_command_value(&scopes),
+            Some(".husky".to_string())
+        );
+        assert_eq!(
+            effective_non_command_value(&[("command".into(), "/dev/null".into())]),
+            None
+        );
+
+        assert_eq!(
+            parse_status_paths_z(b" M a.txt\0R  new.txt\0old.txt\0?? un\ttracked\0!! ign.log\0"),
+            vec!["a.txt", "new.txt", "old.txt", "un\ttracked", "ign.log"]
+        );
+    }
+
+    /// W-B: a runner with a deadline bounds EVERY call path (plain runs,
+    /// quiet runs, the per-repository override query, sessions, host calls)
+    /// by what is left of it; an expired deadline fails the call.
+    #[test]
+    fn a_deadline_runner_bounds_every_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base_dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let cwd = base_dir.join("core-tmp");
+        std::fs::create_dir(&cwd).unwrap();
+        let plain = GitRunner::default();
+        let common = plain.common_dir(&repo).unwrap();
+        let live =
+            plain.with_deadline(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert!(!live.deadline_passed());
+        assert!(live.rev_parse_head(&repo).is_ok());
+        assert!(live.head_oid(&repo).unwrap().is_some());
+        assert!(live.git_dir_session(&common, &cwd).is_ok());
+        assert!(live.status_touched(&repo, &[]).is_ok());
+        let spent = plain.with_deadline(std::time::Instant::now());
+        assert!(spent.deadline_passed());
+        assert!(spent.rev_parse_head(&repo).is_err());
+        assert!(spent.head_oid(&repo).is_err());
+        assert!(spent.git_dir_session(&common, &cwd).is_err());
+        assert!(spent.status_touched(&repo, &[]).is_err());
+        // The copy keeps the runner's own settings.
+        assert_eq!(spent.limits, plain.limits);
+        assert_eq!(spent.program, plain.program);
+    }
+
+    /// W-B: the write phase's one deadline also covers the configuration
+    /// read that precedes `git apply`; cut off there, `git apply` never ran
+    /// (`NotRun`, distinct from a failed or killed write).
+    #[test]
+    fn a_write_cut_off_before_git_apply_reports_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let patch = repo.parent().unwrap().join("p.patch");
+        std::fs::write(
+            &patch,
+            "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-base\n+next\n",
+        )
+        .unwrap();
+        let spent = GitRunner::default().with_deadline(std::time::Instant::now());
+        assert!(matches!(
+            spent.apply_write(&repo, &patch, &RunLimits::QUERY, std::time::Duration::ZERO),
+            Ok(ApplyWrite::NotRun(_))
+        ));
+        assert_eq!(std::fs::read(repo.join("file.txt")).unwrap(), b"base\n");
+        // The same patch under a live runner is written.
+        assert_eq!(
+            GitRunner::default()
+                .apply_write(&repo, &patch, &RunLimits::QUERY, std::time::Duration::ZERO)
+                .unwrap(),
+            ApplyWrite::Written
+        );
+        assert_eq!(std::fs::read(repo.join("file.txt")).unwrap(), b"next\n");
+    }
+
+    /// I-N1: `git apply` is never spawned with less than the floor left of
+    /// the phase deadline (it could be killed mid-write); no deadline, no
+    /// floor.
+    #[test]
+    fn the_write_floor_is_measured_against_the_phase_deadline() {
+        let now = std::time::Instant::now();
+        let floor = std::time::Duration::from_secs(5);
+        let s = std::time::Duration::from_secs;
+        assert!(too_little_time(Some(now + s(4)), now, floor));
+        assert!(too_little_time(Some(now), now, floor));
+        assert!(!too_little_time(Some(now + s(5)), now, floor));
+        assert!(!too_little_time(Some(now + s(15)), now, floor));
+        assert!(!too_little_time(None, now, floor));
+    }
+
+    /// I-N1: with less than the floor left after the configuration read,
+    /// `git apply` is not started and nothing is written.
+    #[test]
+    fn a_write_with_less_than_the_floor_left_is_not_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let patch = repo.parent().unwrap().join("p.patch");
+        std::fs::write(
+            &patch,
+            "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-base\n+next\n",
+        )
+        .unwrap();
+        let floor = std::time::Duration::from_secs(5);
+        let short = GitRunner::default()
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        assert_eq!(
+            short
+                .apply_write(&repo, &patch, &RunLimits::QUERY, floor)
+                .unwrap(),
+            ApplyWrite::TooLittleTime
+        );
+        assert_eq!(std::fs::read(repo.join("file.txt")).unwrap(), b"base\n");
+        let long = GitRunner::default()
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert_eq!(
+            long.apply_write(&repo, &patch, &RunLimits::QUERY, floor)
+                .unwrap(),
+            ApplyWrite::Written
+        );
+    }
+
+    /// I3: only git's exit 1 with `error:` lines means "does not apply";
+    /// anything else (exit 128, a kill, no exit code) is "could not check".
+    #[test]
+    fn apply_check_outcomes_are_classified() {
+        assert_eq!(classify_apply_check(Some(0), ""), ApplyCheck::Applies);
+        assert!(matches!(
+            classify_apply_check(
+                Some(1),
+                "error: patch failed: a:1\nerror: a: patch does not apply\n"
+            ),
+            ApplyCheck::DoesNotApply(m) if m.contains("patch does not apply")
+        ));
+        for (code, err) in [
+            (Some(1), ""),
+            (Some(1), "warning: something\n"),
+            (Some(128), "error: No valid patches in input\n"),
+            (Some(129), "usage: git apply"),
+            (None, ""),
+        ] {
+            assert!(
+                matches!(
+                    classify_apply_check(code, err),
+                    ApplyCheck::CouldNotCheck(_)
+                ),
+                "{code:?} {err:?}"
+            );
+        }
+    }
+
+    /// W4 on the TASK side: Core's temp-index session must not honor the
+    /// host's `core.splitIndex` — `update-index` would otherwise write
+    /// `sharedindex.*` files into the HOST git dir (probe: git 2.56).
+    #[test]
+    fn git_dir_session_never_writes_a_split_index_into_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base_dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        git_plain(&repo, &["config", "core.splitIndex", "true"]);
+        let runner = GitRunner::default();
+        let base = runner.rev_parse_head(&repo).unwrap();
+        let common = runner.common_dir(&repo).unwrap();
+        let cwd = base_dir.join("core-tmp");
+        std::fs::create_dir(&cwd).unwrap();
+        let s = runner.git_dir_session(&common, &cwd).unwrap();
+        let blob = cwd.join("blob-0");
+        std::fs::write(&blob, b"new\n").unwrap();
+        let oids = s.hash_object_write(std::slice::from_ref(&blob)).unwrap();
+        let index = cwd.join("index");
+        s.read_tree(&index, &base).unwrap();
+        s.update_index_remove(&index, &[RawPath::new("file.txt").unwrap()])
+            .unwrap();
+        let add = CacheEntry::new(GitMode::Regular, &oids[0], RawPath::new("n").unwrap()).unwrap();
+        s.update_index_add(&index, &[add]).unwrap();
+        s.write_tree(&index).unwrap();
+        let shared: Vec<String> = std::fs::read_dir(&common)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("sharedindex."))
+            .collect();
+        assert!(shared.is_empty(), "{shared:?}");
+    }
+
+    /// Every file under `objects/` with its size (what a write would change).
+    fn object_files(objects: &Path) -> std::collections::BTreeMap<String, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![objects.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                let meta = e.metadata().unwrap();
+                if meta.is_dir() {
+                    stack.push(e.path());
+                } else {
+                    let rel = e
+                        .path()
+                        .strip_prefix(objects)
+                        .unwrap()
+                        .display()
+                        .to_string();
+                    out.insert(rel, meta.len());
+                }
+            }
+        }
+        out
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> Vec<u8> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    /// A6 W-N2: a QUARANTINED session writes every snapshot object (blobs,
+    /// trees) into Core's own object dir, reads the host's through an
+    /// alternate (a C-quoted one: the path holds `:` and a space), and the
+    /// `--binary --full-index` patch alone applies on the host: text,
+    /// binary literal, binary delta, mode-only, add and delete.
+    #[test]
+    fn a_quarantined_session_keeps_snapshot_objects_out_of_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base_dir.join("re:po \"x\"");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        git_ok(&repo, &["config", "gc.auto", "0"]);
+        git_ok(&repo, &["config", "maintenance.auto", "false"]);
+        let mut big: Vec<u8> = Vec::with_capacity(8192);
+        let mut x: u32 = 12345;
+        for _ in 0..8192 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            big.push((x >> 16) as u8);
+        }
+        std::fs::write(repo.join("small.bin"), b"a\0b").unwrap();
+        std::fs::write(repo.join("big.bin"), &big).unwrap();
+        std::fs::write(repo.join("tool.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(repo.join("gone.txt"), b"bye\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "more"]);
+        let runner = GitRunner::default();
+        let base = runner.rev_parse_head(&repo).unwrap();
+        let common = runner.common_dir(&repo).unwrap();
+        let cwd = base_dir.join("core-tmp");
+        let quarantine = base_dir.join("core-objects");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        let host_objects = before_objects(&common);
+
+        let s = runner
+            .git_dir_session_quarantined(&common, &cwd, &quarantine)
+            .unwrap();
+        // Host objects are readable through the alternate.
+        let tree = s.ls_tree_full(&base).unwrap();
+        let tool_oid = tree["tool.sh"].oid.clone();
+        assert_eq!(s.cat_blob(&tool_oid, 100).unwrap(), b"#!/bin/sh\n");
+        let mut big2 = big.clone();
+        big2[4000] ^= 0xff;
+        let news: Vec<(&str, Vec<u8>)> = vec![
+            ("file.txt", b"changed\n".to_vec()),
+            ("small.bin", b"c\0d".to_vec()),
+            ("big.bin", big2.clone()),
+            ("added.txt", b"added\n".to_vec()),
+        ];
+        let mut files = Vec::new();
+        for (i, (_, bytes)) in news.iter().enumerate() {
+            let f = cwd.join(format!("blob-{i}"));
+            std::fs::write(&f, bytes).unwrap();
+            files.push(f);
+        }
+        let oids = s.hash_object_write(&files).unwrap();
+        let index = cwd.join("index");
+        s.read_tree(&index, &base).unwrap();
+        s.update_index_remove(&index, &[RawPath::new("gone.txt").unwrap()])
+            .unwrap();
+        let mut adds: Vec<CacheEntry> = news
+            .iter()
+            .zip(&oids)
+            .map(|((p, _), oid)| {
+                CacheEntry::new(GitMode::Regular, oid, RawPath::new(p).unwrap()).unwrap()
+            })
+            .collect();
+        adds.push(
+            CacheEntry::new(
+                GitMode::Executable,
+                &tool_oid,
+                RawPath::new("tool.sh").unwrap(),
+            )
+            .unwrap(),
+        );
+        s.update_index_add(&index, &adds).unwrap();
+        let snapshot = s.write_tree(&index).unwrap();
+        assert_eq!(s.diff_tree_raw(&base, &snapshot).unwrap().len(), 6);
+        let patch = s
+            .diff_tree_patch(&base, &snapshot, 1 << 20)
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&patch).to_string();
+        assert!(text.contains("\nliteral "), "binary literal covered");
+        assert!(text.contains("\ndelta "), "binary delta covered");
+        assert!(text.contains("old mode 100644\nnew mode 100755"));
+
+        // Nothing reached the host store; the snapshot lives in quarantine.
+        assert_eq!(before_objects(&common), host_objects);
+        assert!(!object_files(&quarantine).is_empty());
+        let has = |oid: &str| {
+            Command::new("git")
+                .args(["cat-file", "-e", oid])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(!has(&snapshot), "the snapshot tree is not in the host");
+
+        // The patch alone applies on the host (check, then write).
+        let patch_file = base_dir.join("apply.patch");
+        std::fs::write(&patch_file, &patch).unwrap();
+        assert_eq!(
+            runner.apply_check(&repo, &patch_file, &RunLimits::QUERY),
+            ApplyCheck::Applies
+        );
+        assert_eq!(
+            runner
+                .apply_write(
+                    &repo,
+                    &patch_file,
+                    &RunLimits::QUERY,
+                    std::time::Duration::ZERO
+                )
+                .unwrap(),
+            ApplyWrite::Written
+        );
+        for (p, bytes) in &news {
+            assert_eq!(&std::fs::read(repo.join(p)).unwrap(), bytes, "{p}");
+        }
+        assert!(!repo.join("gone.txt").exists());
+        let staged =
+            String::from_utf8(git_ok(&repo, &["ls-files", "-s", "--", "tool.sh"])).unwrap();
+        assert!(staged.starts_with("100755 "), "{staged}");
+        // The host index now matches the snapshot exactly.
+        let written = String::from_utf8(git_ok(&repo, &["write-tree"])).unwrap();
+        assert_eq!(written.trim(), snapshot);
+    }
+
+    /// A fake `git` (a test-only script in a temp dir) whose `config` call
+    /// exits 1, with or without stderr.
+    fn fake_git(dir: &Path, name: &str, stderr: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let noise = if stderr {
+            "echo 'error: simulated config failure' >&2; "
+        } else {
+            ""
+        };
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    config) {noise}exit 1;;\n  \
+                 esac\ndone\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A6 I1 / N14: `git config --get-regexp` exiting 1 means "no match"
+    /// ONLY when it is quiet; exit 1 with anything on stderr is a failure.
+    #[test]
+    fn a_config_probe_exiting_1_with_stderr_is_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let noisy = GitRunner {
+            program: fake_git(&base, "noisy-git", true),
+            ..GitRunner::default()
+        };
+        match noisy.repo_overrides(&base) {
+            Err(GitError::Exec(m)) => assert!(m.contains("simulated config failure"), "{m}"),
+            other => panic!("expected a failure, got {:?}", other.map(|o| o.config)),
+        }
+        let quiet = GitRunner {
+            program: fake_git(&base, "quiet-git", false),
+            ..GitRunner::default()
+        };
+        let o = quiet
+            .repo_overrides(&base)
+            .expect("a quiet exit 1 is no match");
+        assert!(o.config.is_empty(), "{:?}", o.config);
+    }
+
+    #[test]
+    fn alternates_are_c_quoted_or_refused() {
+        assert_eq!(
+            quoted_alternate(Path::new("/a:b/c \"d\" \\e/objects")).as_deref(),
+            Some("\"/a:b/c \\\"d\\\" \\\\e/objects\"")
+        );
+        assert_eq!(quoted_alternate(Path::new("/a\nb/objects")), None);
+        assert_eq!(quoted_alternate(Path::new("/a\tb/objects")), None);
+    }
+
+    fn before_objects(common: &Path) -> std::collections::BTreeMap<String, u64> {
+        object_files(&common.join("objects"))
+    }
+
+    /// C3: a `--git-dir`-pinned session never runs git in (or reads) the
+    /// task worktree: cwd is a Core directory, the git dir is the HOST's
+    /// common dir, and the object format is read once from that config.
+    #[test]
+    fn git_dir_session_builds_a_snapshot_from_objects_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base_dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::create_dir(repo.join("d")).unwrap();
+        std::fs::write(repo.join("d/x"), "x\n").unwrap();
+        std::fs::write(repo.join("d/y"), "y\n").unwrap();
+        git_plain(&repo, &["add", "-A"]);
+        git_plain(&repo, &["commit", "-qm", "dir"]);
+        let runner = GitRunner::default();
+        let base = runner.rev_parse_head(&repo).unwrap();
+        let common = runner.common_dir(&repo).unwrap();
+        let cwd = base_dir.join("core-tmp");
+        std::fs::create_dir(&cwd).unwrap();
+        let s = runner.git_dir_session(&common, &cwd).unwrap();
+        assert_eq!(s.format(), crate::objects::ObjectFormat::Sha1);
+        let tree = s.ls_tree_full(&base).unwrap();
+        assert!(tree.contains_key("file.txt") && tree.contains_key("d/x"));
+
+        let blob = cwd.join("blob-0");
+        std::fs::write(&blob, b"new\n").unwrap();
+        let oids = s.hash_object_write(std::slice::from_ref(&blob)).unwrap();
+        assert_eq!(
+            oids,
+            vec![crate::objects::blob_id(s.format(), b"new\n").unwrap()]
+        );
+        assert_eq!(s.cat_blob(&oids[0], 100).unwrap(), b"new\n");
+        assert!(s.cat_blob(&oids[0], 2).is_err(), "over the cap is refused");
+
+        let index = cwd.join("index");
+        // dir -> file swap with ONE deletion unselected: update-index (no
+        // --replace) refuses instead of silently dropping d/y.
+        s.read_tree(&index, &base).unwrap();
+        s.update_index_remove(&index, &[RawPath::new("d/x").unwrap()])
+            .unwrap();
+        let swap = CacheEntry::new(GitMode::Regular, &oids[0], RawPath::new("d").unwrap()).unwrap();
+        assert!(s
+            .update_index_add(&index, std::slice::from_ref(&swap))
+            .is_err());
+        // Both deletions selected: the swap succeeds, and the raw diff names
+        // exactly the three changes.
+        s.read_tree(&index, &base).unwrap();
+        s.update_index_remove(
+            &index,
+            &[RawPath::new("d/x").unwrap(), RawPath::new("d/y").unwrap()],
+        )
+        .unwrap();
+        s.update_index_add(&index, &[swap]).unwrap();
+        let snapshot = s.write_tree(&index).unwrap();
+        let raw = s.diff_tree_raw(&base, &snapshot).unwrap();
+        let mut names: Vec<(char, String)> =
+            raw.iter().map(|e| (e.status, e.path.clone())).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ('A', "d".to_string()),
+                ('D', "d/x".to_string()),
+                ('D', "d/y".to_string())
+            ]
+        );
+        let patch = s
+            .diff_tree_patch(&base, &snapshot, 1 << 20)
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(patch).unwrap();
+        assert!(
+            text.contains("diff --git a/d b/d\nnew file mode 100644\n"),
+            "{text}"
+        );
+        assert!(
+            s.diff_tree_patch(&base, &snapshot, 10).unwrap().is_none(),
+            "over cap"
+        );
+        // The host's own index and work tree were never touched.
+        assert_eq!(git_out(&repo, &["status", "--porcelain"]), "");
+        assert!(std::fs::read_dir(&cwd).unwrap().all(|e| {
+            let n = e.unwrap().file_name();
+            n == "blob-0" || n == "index"
+        }));
+    }
+
+    /// R2: `diff --no-index` needs a repository under `GIT_ATTR_SOURCE`, so
+    /// it runs with `--git-dir=<common>`; exit 1 ("differences") is success.
+    #[test]
+    fn no_index_display_diff_runs_under_the_host_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base_dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let runner = GitRunner::default();
+        let common = runner.common_dir(&repo).unwrap();
+        let cwd = base_dir.join("core-tmp");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("base"), "a\n").unwrap();
+        std::fs::write(cwd.join("task"), "a\nb\n").unwrap();
+        let s = runner.git_dir_session(&common, &cwd).unwrap();
+        let (patch, truncated) = s.diff_no_index_display("base", "task", 1 << 20).unwrap();
+        let text = String::from_utf8(patch).unwrap();
+        assert!(!truncated);
+        assert!(
+            text.contains("--- a/base\n+++ b/task\n@@ -1 +1,2 @@\n a\n+b\n"),
+            "{text}"
+        );
+        let (same, _) = s.diff_no_index_display("base", "base", 100).unwrap();
+        assert!(same.is_empty());
+        let (cut, truncated) = s.diff_no_index_display("base", "task", 10).unwrap();
+        assert!(truncated && cut.len() <= 10);
+    }
+
+    /// W4 + host calls: the hostile repo config is overridden on the apply
+    /// write; `check-attr` sees the HOST's `.gitattributes` (no attribute
+    /// source override); the effective hooks path ignores Core's own `-c`.
+    #[test]
+    fn host_apply_calls_pin_config_and_read_host_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+        git_plain(&repo, &["add", "-A"]);
+        git_plain(&repo, &["commit", "-qm", "attrs"]);
+        let runner = GitRunner::default();
+        let attrs = runner
+            .check_attr_filter(
+                &repo,
+                &[
+                    RawPath::new("x.bin").unwrap(),
+                    RawPath::new("a.txt").unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            attrs,
+            vec![
+                ("x.bin".into(), "lfs".into()),
+                ("a.txt".into(), "unspecified".into())
+            ]
+        );
+        assert_eq!(runner.effective_hooks_path(&repo).unwrap(), None);
+        git_plain(&repo, &["config", "core.hooksPath", ".husky"]);
+        assert_eq!(
+            runner.effective_hooks_path(&repo).unwrap(),
+            Some(".husky".to_string())
+        );
+
+        // A patch with trailing whitespace, applied under hostile config.
+        let base = runner.rev_parse_head(&repo).unwrap();
+        for (k, v) in [("apply.whitespace", "error"), ("core.autocrlf", "true")] {
+            git_plain(&repo, &["config", k, v]);
+        }
+        let patch = repo.parent().unwrap().join("p.patch");
+        std::fs::write(
+            &patch,
+            "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-base\n+base \n",
+        )
+        .unwrap();
+        assert!(runner
+            .status_touched(&repo, &[RawPath::new("file.txt").unwrap().literal()])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            runner.apply_check(&repo, &patch, &RunLimits::QUERY),
+            ApplyCheck::Applies
+        );
+        assert_eq!(
+            runner
+                .apply_write(&repo, &patch, &RunLimits::QUERY, std::time::Duration::ZERO)
+                .unwrap(),
+            ApplyWrite::Written
+        );
+        assert_eq!(
+            std::fs::read(repo.join("file.txt")).unwrap(),
+            b"base \n",
+            "no CRLF, no whitespace fix"
+        );
+        assert_eq!(
+            runner
+                .status_touched(&repo, &[RawPath::new("file.txt").unwrap().literal()])
+                .unwrap(),
+            vec!["file.txt"]
+        );
+        let staged = runner
+            .ls_files_stage(&repo, &[RawPath::new("file.txt").unwrap().literal()])
+            .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert!(runner
+            .diff_files_names(&repo, &[RawPath::new("file.txt").unwrap().literal()])
+            .unwrap()
+            .is_empty());
+        let _ = base;
+        // A write killed by its limit is reported as such (R6).
+        git_plain(&repo, &["reset", "-q", "--hard"]);
+        let tiny = RunLimits {
+            timeout: std::time::Duration::from_nanos(1),
+            ..RunLimits::QUERY
+        };
+        assert_eq!(
+            runner
+                .apply_write(&repo, &patch, &tiny, std::time::Duration::ZERO)
+                .unwrap(),
+            ApplyWrite::Killed
         );
     }
 }

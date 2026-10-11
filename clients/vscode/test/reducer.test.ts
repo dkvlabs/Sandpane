@@ -353,3 +353,57 @@ describe('batch ordering across tasks (review 12c)', () => {
     expect(selectTask(state, 'a')?.status).toBe('queued');
   });
 });
+
+describe('A6 apply events are shown honestly and never move the status', () => {
+  const line = (kind: string, payload: unknown) => {
+    let state = reduceTaskView(EMPTY_STATE, { kind: 'taskEvent', event: ev('t1', 1, 'status.changed', { to: 'awaiting_review' }) });
+    state = reduceTaskView(state, { kind: 'taskEvent', event: ev('t1', 2, kind, payload) });
+    const task = selectTask(state, 't1');
+    expect(task?.status).toBe('awaiting_review');
+    expect(task?.unknownKinds).toEqual([]);
+    return task?.lines.at(-1)?.text ?? '';
+  };
+
+  it('git.apply.started: counts and the repository only — never the entries or index states', () => {
+    const text = line('git.apply.started', {
+      files: ['a.ts', 'b.ts'],
+      baseCommit: 'b71995fc1e0f4a3c8f0d7b1a2e3c4d5e6f708192',
+      snapshotTree: 'abc',
+      repoPath: '/repo/at\u202elas',
+      entries: [{ path: 'SECRET-ENTRY', status: 'added' }],
+      expected: [{ path: 'SECRET-STATE' }],
+    });
+    expect(text).toContain('Core started applying 2 file(s) to /repo/at\\u202Elas');
+    expect(text).not.toContain('SECRET');
+  });
+
+  it('git.applied: staged, not committed', () => {
+    expect(line('git.applied', { startedSequence: 1, files: ['a.ts'], modeChanges: [{ path: 'a.ts', from: '100644', to: '100755' }] })).toBe(
+      'Core applied 1 file(s) (staged, not committed); 1 mode change(s)',
+    );
+  });
+
+  it('git.apply.failed: partial is "may have been written", never success; otherwise Core’s reason', () => {
+    const partial = line('git.apply.failed', { startedSequence: 1, partial: true, reason: 'could not verify the staged content — check `git status` in /r' });
+    expect(partial).toMatch(/^Core's apply did not complete — some files may have been written or staged/);
+    expect(partial).toContain('check `git status` in /r');
+    const failed = line('git.apply.failed', { startedSequence: 1, partial: false, reason: 'git apply was not started; nothing was written' });
+    expect(failed).toBe('Core did not apply: git apply was not started; nothing was written');
+  });
+
+  it('git.apply.reconciled: Core restarted mid-apply — check `git status` (whatever it concluded)', () => {
+    for (const outcome of ['applied', 'partial', 'not_applied', 'unknown', 42, undefined]) {
+      const text = line('git.apply.reconciled', { outcome, reconciledAfterRestart: true, startedSequence: 1 });
+      expect(text, String(outcome)).toMatch(/^Core restarted during an apply/);
+      expect(text, String(outcome)).toContain('check `git status`');
+    }
+    expect(line('git.apply.reconciled', { outcome: 'unknown' })).toContain('cannot know what was written');
+  });
+
+  it('malformed payloads degrade to an honest line, never a crash', () => {
+    for (const kind of ['git.apply.started', 'git.applied', 'git.apply.failed', 'git.apply.reconciled']) {
+      expect(line(kind, 'not an object').length, kind).toBeGreaterThan(0);
+      expect(line(kind, null).length, kind).toBeGreaterThan(0);
+    }
+  });
+});

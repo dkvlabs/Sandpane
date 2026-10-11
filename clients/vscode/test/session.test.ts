@@ -9,7 +9,7 @@
  * 9 (background reconnect loads data), 10 (live polling), 12d (single load).
  */
 
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -101,6 +101,10 @@ class ScriptedCore {
   reviewExtra: Record<string, unknown> = {};
   /** A5: when set, `git.diff` answers this instead of a generated patch. */
   diffAnswer: unknown = null;
+  /** A6: what `git.apply` answers (null = success naming every entry path). */
+  applyAnswer: unknown = null;
+  /** `system.probe` instanceId (a Core restart changes it). */
+  instanceId = 'inst-1';
   /** A5: a marker inside the generated patch (must never reach the log). */
   diffSecret = 'PATCH-CONTENT-MARKER';
   /** Future-Core shape: task.list rows carry `sandboxName`. Today's Core never sets it. */
@@ -221,7 +225,7 @@ class ScriptedCore {
           ok: {
             protocolVersion: 1,
             coreVersion: '0.1.0-test',
-            instanceId: 'inst-1',
+            instanceId: this.instanceId,
             platform: 'darwin',
             sbx: { installed: true },
             agents: [{ id: 'codex', verified: this.agentVerified, supportsStreaming: false, supportsCancel: false, supportsResume: false }],
@@ -447,6 +451,20 @@ class ScriptedCore {
             binary: false,
             truncated: false,
             lossy: false,
+          },
+        };
+      }
+      case 'git.apply': {
+        const forced = this.takeForced('git.apply');
+        if (forced) return forced;
+        const entries = (p['entries'] ?? []) as { path: string }[];
+        return {
+          ok: this.applyAnswer ?? {
+            applied: true,
+            conflictedFiles: [],
+            appliedFiles: entries.map((e) => e.path),
+            modeChanges: [],
+            snapshotTree: '4b825dc642cb6eb9a060e54bf8d69288fbee4904',
           },
         };
       }
@@ -2782,20 +2800,6 @@ describe('A5 git.diff: per-file patch view', () => {
     expect(core.calls('git.diff')).toHaveLength(1);
     session.dispose();
   });
-
-  it('apply listing reveals exact paths and discloses uninspected paths (never "complete")', async () => {
-    const core = new ScriptedCore();
-    core.reviewChanges = [{ path: 'evil\nline.txt', status: 'added' }];
-    core.reviewExtra = { repoPath: '/repo/atlas', uninspected: ['sub'] };
-    const { session } = await online(core);
-    await session.applyTask('task-a');
-    const call = stub.warningCalls.find((c) => c.items.includes('Apply via Core'));
-    expect(call?.message).toContain('evil\\nline.txt');
-    expect(call?.message).not.toContain('evil\nline.txt');
-    expect(call?.message).toContain('1 paths were not inspected');
-    expect(call?.message).toContain('repository (from Core): /repo/atlas');
-    session.dispose();
-  });
 });
 
 describe('A5 review uses Core\'s repoPath and exact paths', () => {
@@ -2823,5 +2827,502 @@ describe('A5 review uses Core\'s repoPath and exact paths', () => {
     expect(title).not.toMatch(/[\n\t]/);
     expect(session.snapshot().status?.text).toContain('repository (from Core): /repo/nova');
     session.dispose();
+  });
+});
+
+describe('A6 git.apply: reviewed files, gesture-only confirmation', () => {
+  const BASE = 'b71995fc1e0f4a3c8f0d7b1a2e3c4d5e6f708192';
+  const BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391';
+  const BLOB2 = '0123456789abcdef0123456789abcdef01234567';
+  const A6_FEATURES = ['idempotency-keys', 'sandbox-create-agent', 'conversation-sandbox-id', 'conversation-send-mode', 'git-apply'];
+  const WEIRD = 'dir/weırd\t"q"\nline é.sh';
+
+  function a6Core(): ScriptedCore {
+    const core = new ScriptedCore();
+    core.features = A6_FEATURES;
+    core.reviewChanges = [
+      { path: WEIRD, status: 'added', taskBlob: BLOB, taskMode: '100755' },
+      { path: 'new.ts', status: 'renamed', oldPath: 'old.ts', taskBlob: BLOB2, taskMode: '100644' },
+      { path: 'gone.txt', status: 'deleted' },
+      { path: 'link', status: 'added', taskBlob: BLOB, taskMode: '120000' },
+      { path: 'huge.bin', status: 'added' },
+      { path: 'src/a.ts', status: 'modified', taskBlob: BLOB, taskMode: '100644' },
+    ];
+    core.reviewExtra = { repoPath: '/repo/atlas', reviewId: 'rev-1', hostHooksPath: 'tools/hooks' };
+    return core;
+  }
+
+  async function online(core = a6Core()) {
+    const made = makeSession(core);
+    const logged: string[] = [];
+    made.session.setOutputChannel({ appendLine: (line: string) => logged.push(line) } as unknown as vscode.OutputChannel);
+    await made.session.attach();
+    await settle();
+    return { core, logged, ...made };
+  }
+
+  function expire(timers: FakeTimers, ms: number): void {
+    const timer = timers.pending.find((t) => t.ms === ms);
+    if (!timer) throw new Error(`no pending ${ms} ms timer`);
+    timers.clear(timer.id);
+    timer.fn();
+  }
+
+  const modals = () => stub.warningCalls.filter((c) => c.options?.modal === true);
+
+  it('not advertised (no "git-apply" feature): refused visibly — no git.review / git.apply frame, no picker, no modal; Apply disabled', async () => {
+    const core = a6Core();
+    core.features = ['idempotency-keys', 'sandbox-create-agent', 'conversation-sandbox-id', 'conversation-send-mode'];
+    const { session } = await online(core);
+    expect(session.snapshot().gitApplySupported).toBe(false);
+    stub.pickIndexes = [0];
+    await session.applyTask('task-a');
+    expect(core.calls('git.review')).toHaveLength(0);
+    expect(core.calls('git.apply')).toHaveLength(0);
+    expect(stub.quickPickCalls).toHaveLength(0);
+    expect(modals()).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toBe(
+      'Apply is not implemented by the attached Sandpane Core (it does not advertise "git-apply"); nothing was sent.',
+    );
+    // A Core without the method at all is refused before the feature check.
+    core.methods = ALL_METHODS.filter((m) => m !== 'git.apply');
+    await session.applyTask('task-a');
+    expect(stub.warnings.at(-1)).toMatch(/"git\.apply"/);
+    expect(core.calls('git.review')).toHaveLength(0);
+    session.dispose();
+  });
+
+  it('one review → only applicable entries pickable → modal lists every file → git.apply with reviewId and the entries VERBATIM; never selectedFiles', async () => {
+    const { core, session, logged } = await online();
+    expect(session.snapshot().gitApplySupported).toBe(true);
+    stub.pickIndexes = [0, 1, 2, 3, 4, 5, 6]; // every row: the header cannot be checked, the 2 inert rows are not sent
+    stub.answers.set('Apply 4 files', 'Apply 4 files');
+    stub.inputs.push('4'); // V-W1: the typed second step
+    await session.applyTask('task-a');
+    await settle();
+
+    const pick = stub.quickPickCalls[0];
+    expect((pick?.options as { canPickMany?: boolean }).canPickMany).toBe(true);
+    expect(pick?.items.map((i) => [i.label, i.kind ?? 0])).toEqual([
+      ['dir/weırd\\t"q"\\nline é.sh', 0],
+      ['old.ts → new.ts', 0],
+      ['gone.txt', 0],
+      ['src/a.ts', 0],
+      ['cannot be applied — checking these has no effect; nothing of them is sent', -1],
+      ['(cannot be applied) link', 0],
+      ['(cannot be applied) huge.bin', 0],
+    ]);
+    expect(pick?.items[5]?.description).toBe('added · not selectable: symlinks are never applied');
+    expect(pick?.items.every((i) => i.picked !== true)).toBe(true);
+    for (const item of pick?.items ?? []) expect(item.label).not.toMatch(/[\n\t]/);
+
+    const modal = modals()[0];
+    expect(modal?.items).toEqual(['Apply 4 files']);
+    const text = `${modal?.message}\n${modal?.options?.detail}`;
+    expect(text).toContain('/repo/atlas');
+    expect(text).toContain('added dir/weırd\\t"q"\\nline é.sh');
+    expect(text).toContain('renamed old.ts → new.ts');
+    expect(text).toContain('deleted gone.txt');
+    expect(text).toContain('modified src/a.ts');
+    expect(text).toContain('Writes these files into your working tree and stages them. Nothing is committed.');
+    expect(text).toMatch(/\(a\) Content you have not fully seen \(4\)/);
+    expect(text).toMatch(/\(b\) Executable \(1\)/);
+    expect(text).toContain('Checked but NOT sent \u2014 these cannot be applied (2):');
+    expect(text).toContain('\u00b7 link \u2014 symlinks are never applied');
+
+    const frames = core.calls('git.apply');
+    expect(frames).toHaveLength(1);
+    const review = core.reviewChanges;
+    expect(frames[0]?.params).toEqual({
+      taskId: 'task-a',
+      expectedBase: BASE,
+      reviewId: 'rev-1',
+      entries: [review[0], review[1], review[2], review[5]],
+    });
+    expect(frames[0]?.params).not.toHaveProperty('selectedFiles');
+    expect(stub.infos.at(-1)).toContain('Applied 4 files to /repo/atlas (staged, not committed).');
+    // The review is refreshed after the answer (read-only).
+    expect(core.calls('git.review')).toHaveLength(2);
+    expect(session.snapshot().status?.text).toMatch(/review refreshed: Core now lists 6 changed file\(s\)/);
+    // Paths and patch content are never logged.
+    expect(logged.join('\n')).not.toContain('gone.txt');
+    session.dispose();
+  });
+
+  it('"$(" in Core text is broken in the picker title, placeholder, labels and descriptions (A5 W2)', async () => {
+    const core = a6Core();
+    core.reviewChanges = [{ path: '$(pass-filled) ok.ts', status: 'modified', taskBlob: BLOB, taskMode: '100644' }];
+    core.reviewExtra = { repoPath: '/repo/$(check)atlas', reviewId: '$(x)rev' };
+    const { session } = await online(core);
+    stub.pickIndexes = [0];
+    await session.applyTask('task-a');
+    const pick = stub.quickPickCalls[0];
+    const options = pick?.options as { title?: string; placeHolder?: string };
+    for (const text of [options.title, options.placeHolder, ...(pick?.items ?? []).flatMap((i) => [i.label, i.description])]) {
+      expect(text ?? '').not.toContain('$(');
+    }
+    expect(options.placeHolder).toContain('/repo/$ (check)atlas');
+    // The modal is not a QuickPick: it shows the path as Core named it (revealed).
+    expect(modals()[0]?.options?.detail).toContain('modified $(pass-filled) ok.ts');
+    session.dispose();
+  });
+
+  it('Cancel / Escape sends nothing; a dismissed picker or an empty selection shows no modal and sends nothing', async () => {
+    const { core, session } = await online();
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    await session.applyTask('task-a');
+    expect(modals()).toHaveLength(1);
+    expect(core.calls('git.apply')).toHaveLength(0);
+    expect(session.snapshot().status?.text).toBe('Apply not confirmed; nothing was sent.');
+
+    stub.pickIndexes = undefined;
+    await session.applyTask('task-a');
+    expect(session.snapshot().status?.text).toBe('No file selected; nothing was sent.');
+    stub.pickIndexes = [4, 5, 6]; // the header and the two rows that cannot be applied
+    await session.applyTask('task-a');
+    expect(modals()).toHaveLength(1);
+    expect(core.calls('git.apply')).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toBe(
+      'None of the checked entries can be applied: link (symlinks are never applied); huge.bin (too large or unreadable to apply (over 32 MiB)). Nothing was sent.',
+    );
+    session.dispose();
+  });
+
+  it('no reviewId (not a host_worktree task): no picker, nothing sent', async () => {
+    const core = a6Core();
+    core.reviewExtra = { repoPath: '/repo/atlas' };
+    const { session } = await online(core);
+    stub.pickIndexes = [0];
+    await session.applyTask('task-a');
+    expect(stub.quickPickCalls).toHaveLength(0);
+    expect(core.calls('git.apply')).toHaveLength(0);
+    expect(stub.warnings.at(-1)).toMatch(/did not issue a review id/);
+    session.dispose();
+  });
+
+  it('a diff the user opened shows other content: NO frame, "changed after you reviewed it — review again"; Review again re-reviews and flags it as not shown', async () => {
+    const core = a6Core();
+    core.diffAnswer = { path: 'src/a.ts', status: 'modified', patch: '', binary: false, truncated: false, lossy: false, taskBlob: BLOB2, taskMode: '100644' };
+    const { session } = await online(core);
+    stub.pickIndex = 5;
+    expect(await session.showTaskPatch('task-a')).toBe(true);
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    stub.answers.set('Review again', 'Review again');
+    await session.applyTask('task-a');
+    await settle(30);
+    expect(core.calls('git.apply')).toHaveLength(0);
+    const refusal = stub.errorCalls.find((c) => c.message.includes('changed after you reviewed it'));
+    expect(refusal?.message).toBe('src/a.ts changed after you reviewed it — review again. Nothing was sent.');
+    expect(refusal?.items).toEqual(['Review again']);
+    // "Review again" ran a FRESH review (the selection was discarded and picked again) …
+    expect(core.calls('git.review').length).toBeGreaterThanOrEqual(3);
+    expect(stub.quickPickCalls.filter((c) => (c.options as { canPickMany?: boolean }).canPickMany)).toHaveLength(2);
+    // … and the stale diff no longer blocks: the entry is flagged as not shown instead.
+    const modal = modals()[0];
+    expect(modal?.options?.detail).toContain('src/a.ts — never opened in the Diff view this session');
+    expect(core.calls('git.apply')).toHaveLength(0);
+    session.dispose();
+  });
+
+  it('a matching diff the user opened clears flag (a) for that entry', async () => {
+    const core = a6Core();
+    core.diffAnswer = { path: 'src/a.ts', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n', binary: false, truncated: false, lossy: false, taskBlob: BLOB, taskMode: '100644' };
+    const { session } = await online(core);
+    stub.pickIndex = 5;
+    await session.showTaskPatch('task-a');
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    await session.applyTask('task-a');
+    expect(modals()[0]?.options?.detail).toMatch(/\(a\) Content you have not fully seen: none/);
+    session.dispose();
+  });
+
+  it('partial: a warning naming git status / index.lock exactly as Core said — never success', async () => {
+    const core = a6Core();
+    const reason =
+      "the write failed after git's checks passed; some files may have been written or staged — check `git status` in /repo/atlas; " +
+      '`.git/index.lock` may remain — remove it only after checking that no git process is running';
+    core.applyAnswer = { applied: false, partial: true, abortReason: reason, conflictedFiles: [], appliedFiles: ['src/a.ts'] };
+    const { session } = await online(core);
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    stub.answers.set('Apply 1 file', 'Apply 1 file');
+    stub.inputs.push('1'); // V-W1: the typed second step
+    await session.applyTask('task-a');
+    await settle();
+    const warning = stub.warnings.at(-1) ?? '';
+    expect(warning).toMatch(/^Apply INCOMPLETE/);
+    expect(warning).toContain('`.git/index.lock` may remain');
+    expect(warning).not.toMatch(/nothing (was )?(written|changed|sent)/i);
+    expect(stub.infos.some((i) => i.startsWith('Applied'))).toBe(false);
+    session.dispose();
+  });
+
+  it('an abort keyed on "changed since it was reviewed" offers Review again; the reason is shown revealed', async () => {
+    const core = a6Core();
+    core.applyAnswer = { applied: false, abortReason: '"src/a\\u202e.ts" changed since it was reviewed; review it again; nothing was written', conflictedFiles: [] };
+    const { session } = await online(core);
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    stub.answers.set('Apply 1 file', 'Apply 1 file');
+    stub.inputs.push('1'); // V-W1: the typed second step
+    await session.applyTask('task-a');
+    await settle();
+    const shown = stub.errorCalls.at(-1);
+    expect(shown?.message).toMatch(/^Not applied — A selected file changed in the task worktree after you reviewed it/);
+    expect(shown?.items).toEqual(['Review again']);
+    session.dispose();
+  });
+
+  it('CONFLICT: writer lock ("try again after it finishes") vs direct mount ("stop or remove it first")', async () => {
+    const core = a6Core();
+    core.forced.set('git.apply', {
+      code: 'CONFLICT',
+      message: '/repo/atlas is busy: git.apply:task-b holds its writer lock (a running writer task, another apply or a worktree discard); nothing was written',
+    });
+    const { session } = await online(core);
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    stub.answers.set('Apply 1 file', 'Apply 1 file');
+    stub.inputs.push('1'); // V-W1: the typed second step
+    await session.applyTask('task-a');
+    await settle();
+    expect(stub.errors.at(-1)).toMatch(/repository is busy[\s\S]*Try again after it finishes/);
+    core.forced.set('git.apply', {
+      code: 'CONFLICT',
+      message: 'sandbox "atlas-live": a sandbox mounts this repository directly and can change it while Core writes; stop or remove it first; nothing was written',
+    });
+    stub.inputs.push('1');
+    await session.applyTask('task-a');
+    await settle();
+    expect(stub.errors.at(-1)).toMatch(/Stop or remove that sandbox or task first/);
+    expect(stub.errors.at(-1)).toContain('sandbox "atlas-live"');
+    expect(stub.errors.at(-1)).not.toMatch(/try again|shortly/i);
+    expect(stub.errors.at(-1)).not.toMatch(/task.s current state/);
+    session.dispose();
+  });
+
+  it('V-W1: after "Apply N files" a typed number is required — Enter on an empty box, a wrong number and Escape never send; the exact number sends once', async () => {
+    const { core, session } = await online();
+    stub.answers.set('Apply 1 file', 'Apply 1 file');
+    for (const typed of ['', '2', ' 1', undefined]) {
+      stub.pickIndexes = [3];
+      stub.inputs.push(typed);
+      await session.applyTask('task-a');
+      await settle();
+      expect(core.calls('git.apply'), JSON.stringify(typed)).toHaveLength(0);
+      expect(session.snapshot().status?.text).toBe('Apply not confirmed (the number was not typed); nothing was sent.');
+    }
+    const call = stub.inputCalls[0];
+    expect(call).not.toHaveProperty('value');
+    expect(call?.title).toBe('Apply 1 file to /repo/atlas');
+    expect(call?.prompt).toBe('Type 1 to write and stage these files. Nothing is committed.');
+    expect((call as { ignoreFocusOut?: boolean }).ignoreFocusOut).toBe(true);
+    expect(call?.validateInput?.('')).toBe('Type 1 to apply, or press Escape to cancel');
+    expect(call?.validateInput?.('1')).toBeNull();
+    // The typed box opens only AFTER the modal's button.
+    expect(stub.inputCalls).toHaveLength(4);
+    expect(modals()).toHaveLength(4);
+    stub.pickIndexes = [3];
+    stub.inputs.push('1');
+    await session.applyTask('task-a');
+    await settle();
+    expect(core.calls('git.apply')).toHaveLength(1);
+    // Cancel in the modal never opens the typed box.
+    stub.answers.clear();
+    stub.pickIndexes = [3];
+    await session.applyTask('task-a');
+    expect(stub.inputCalls).toHaveLength(5);
+    session.dispose();
+  });
+
+  it('V-W1: more than 50 files — the full list opens read-only (sandpane-apply:) BEFORE the modal, which lists 50 + "and K more"', async () => {
+    const core = a6Core();
+    core.reviewChanges = Array.from({ length: 60 }, (_, i) => ({ path: `many/f${i}.ts`, status: 'modified', taskBlob: BLOB, taskMode: '100644' }));
+    const { session } = await online(core);
+    stub.pickIndexes = Array.from({ length: 60 }, (_, i) => i);
+    stub.manual.add('Apply 60 files');
+    const run = session.applyTask('task-a');
+    await settle();
+    // The document is open while the modal is still waiting for the click.
+    expect(modals()).toHaveLength(1);
+    const opened = stub.openedDocuments[0];
+    expect(opened?.uri.scheme).toBe('sandpane-apply');
+    expect(stub.shownDocuments).toHaveLength(1);
+    const text = session.applyListDocuments.provideTextDocumentContent(opened!.uri);
+    for (let i = 0; i < 60; i += 1) expect(text).toContain(`modified many/f${i}.ts`);
+    expect(modals()[0]?.options?.detail).toContain('… and 10 more — the full list is open in the editor');
+    expect(stub.fileWrites).toHaveLength(0);
+    stub.inputs.push('60');
+    stub.clicks.shift()?.('Apply 60 files');
+    await run;
+    await settle();
+    expect(core.calls('git.apply')).toHaveLength(1);
+    expect((core.calls('git.apply')[0]?.params['entries'] as unknown[]).length).toBe(60);
+    session.dispose();
+  });
+
+  it('I2: a partial result sets an error-toned status, never "info"', async () => {
+    const core = a6Core();
+    core.applyAnswer = { applied: false, partial: true, abortReason: 'could not verify the staged content — check `git status` in /repo/atlas', conflictedFiles: [] };
+    const { session } = await online(core);
+    stub.pickIndexes = [3];
+    stub.answers.set('Apply 1 file', 'Apply 1 file');
+    stub.inputs.push('1');
+    await session.applyTask('task-a');
+    await settle();
+    expect(session.snapshot().status?.tone).toBe('error');
+    session.dispose();
+  });
+
+  it('a Core error outside the mapped set (PERMISSION_DENIED) never says "nothing was sent"; the review is refreshed', async () => {
+    const core = a6Core();
+    core.forced.set('git.apply', { code: 'PERMISSION_DENIED', message: 'policy refused' });
+    const { session } = await online(core);
+    stub.pickIndexes = [3];
+    stub.answers.set('Apply 1 file', 'Apply 1 file');
+    stub.inputs.push('1'); // V-W1: the typed second step
+    await session.applyTask('task-a');
+    await settle();
+    expect(stub.errors.at(-1)).toContain('PERMISSION_DENIED');
+    expect(stub.errors.at(-1)).toContain('policy refused');
+    expect([...stub.errors, ...stub.warnings].join('\n')).not.toMatch(/nothing (was )?sent/i);
+    expect(core.calls('git.review')).toHaveLength(2);
+    session.dispose();
+  });
+
+  it('a 45 s timeout: "may have been applied … check `git status`", never "nothing changed", never retried, no Retry button', async () => {
+    const core = a6Core();
+    core.hold = (f) => f.method === 'git.apply';
+    const { session, timers } = await online(core);
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    stub.answers.set('Apply 1 file', 'Apply 1 file');
+    stub.inputs.push('1'); // V-W1: the typed second step
+    const pending = session.applyTask('task-a');
+    await settle();
+    expect(session.snapshot().applyInFlight).toBe(true);
+    expire(timers, 45_000);
+    await pending;
+    await settle();
+    expect(stub.warnings.at(-1)).toBe(
+      'Core did not answer in time — the apply may have been applied; check `git status` in /repo/atlas before retrying.',
+    );
+    const all = [...stub.warnings, ...stub.errors, ...stub.infos].join('\n');
+    expect(all).not.toMatch(/nothing (was )?(changed|written)/i);
+    expect([...stub.warningCalls, ...stub.errorCalls].flatMap((c) => c.items)).not.toContain('Retry safely');
+    expect(core.calls('git.apply')).toHaveLength(1);
+    expect(session.snapshot().applyInFlight).toBe(false);
+    expect(session.snapshot().status?.tone).toBe('error'); // I2: a lost answer is not "info"
+    session.dispose();
+  });
+
+  it('single-flight: a second Apply while the first modal is open is refused; one frame at most', async () => {
+    const { core, session } = await online();
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    stub.manual.add('Apply 1 file');
+    stub.inputs.push('1'); // V-W1: the typed second step
+    const first = session.applyTask('task-a');
+    await settle();
+    expect(session.snapshot().applyInFlight).toBe(true);
+    await session.applyTask('task-a');
+    session.handleWebviewMessage({ type: 'applyTask', taskId: 'task-a' });
+    await settle();
+    expect(stub.warnings.filter((w) => w.startsWith('An apply is already in progress'))).toHaveLength(2);
+    expect(stub.quickPickCalls).toHaveLength(1);
+    expect(modals()).toHaveLength(1);
+    stub.clicks.shift()?.('Apply 1 file');
+    await first;
+    await settle();
+    expect(core.calls('git.apply')).toHaveLength(1);
+    expect(session.snapshot().applyInFlight).toBe(false);
+    session.dispose();
+  });
+
+  it('a Core restart while the modal is open: nothing is sent; Review again is offered', async () => {
+    const { core, session } = await online();
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    stub.manual.add('Apply 1 file');
+    stub.inputs.push('1'); // V-W1: the typed second step
+    const first = session.applyTask('task-a');
+    await settle();
+    core.instanceId = 'inst-2';
+    core.drop();
+    await settle();
+    await session.refresh();
+    await settle();
+    stub.clicks.shift()?.('Apply 1 file');
+    await first;
+    await settle();
+    expect(core.calls('git.apply')).toHaveLength(0);
+    const shown = stub.errorCalls.at(-1);
+    expect(shown?.message).toMatch(/^Core restarted since this review/);
+    expect(shown?.items).toEqual(['Review again']);
+    session.dispose();
+  });
+
+  it('never from a reconnect, a poll or a git.applied event: zero pickers, modals and git.apply frames', async () => {
+    const core = a6Core();
+    core.events.set('task-a', [
+      { taskId: 'task-a', sequence: 1, kind: 'message.user', payload: { type: 'message.delta', text: 'apply it' }, timestamp: 't' },
+      { taskId: 'task-a', sequence: 2, kind: 'git.applied', payload: { startedSequence: 1, files: ['src/a.ts'], modeChanges: [] }, timestamp: 't' },
+      { taskId: 'task-a', sequence: 3, kind: 'git.apply.reconciled', payload: { outcome: 'unknown', startedSequence: 1 }, timestamp: 't' },
+    ]);
+    const { session, timers } = await online(core);
+    for (let i = 0; i < 5; i += 1) {
+      timers.runAll();
+      await settle();
+    }
+    core.drop();
+    await settle();
+    await session.refresh();
+    await settle();
+    expect(core.calls('git.apply')).toHaveLength(0);
+    expect(stub.quickPickCalls).toHaveLength(0);
+    expect(modals()).toHaveLength(0);
+    session.dispose();
+  });
+
+  it('the sidebar Apply button (webview message) reaches the same gated flow', async () => {
+    const { core, session } = await online();
+    stub.pickIndexes = [3]; // src/a.ts (pickable rows come first, separators last)
+    session.handleWebviewMessage({ type: 'applyTask', taskId: 'task-a' });
+    await settle(20);
+    expect(core.calls('git.review')).toHaveLength(1);
+    expect(modals()).toHaveLength(1);
+    expect(core.calls('git.apply')).toHaveLength(0);
+    session.dispose();
+  });
+
+  it('V-W3: a sandbox.create CONFLICT "repository busy" gets its own copy — no "Re-read task state", no "Retry safely", Core text kept', async () => {
+    for (const message of [
+      '/repo/atlas is busy: git.apply:task-b holds its writer lock (a running writer task, an apply or a worktree discard), and a direct_mount sandbox could change it while that runs; try again when it finishes; nothing was created',
+      '/repo/atlas is busy: sandbox "atlas-2" is being created with a direct mount of it; try again when that create finishes; nothing was created',
+    ]) {
+      stub.reset();
+      const core = a6Core();
+      core.forced.set('sandbox.create', { code: 'CONFLICT', message });
+      const { session } = await online(core);
+      await session.createSandbox({ name: 'atlas-new', projectId: 'p1', workspaceMode: 'direct_mount' });
+      await settle();
+      const shown = stub.errorCalls.at(-1);
+      expect(shown?.message).toContain('Repository busy — nothing was created; try again when it finishes.');
+      expect(shown?.message).toContain(message.slice(0, 40));
+      expect(shown?.items).toEqual([]);
+      expect(shown?.message).not.toMatch(/task.s current state/);
+      expect(session.snapshot().status?.text).toContain('Repository busy');
+      session.dispose();
+    }
+  });
+
+  it('applyTask is called only from user-gesture handlers (command, sidebar button, "Review again" button)', () => {
+    const root = join(process.cwd(), 'src');
+    const files = ['extension.ts', 'session.ts', 'webview/app.ts', 'webview/bridge.ts', 'state/reducer.ts', 'core-client/catchup.ts'];
+    const calls = files.flatMap((f) =>
+      readFileSync(join(root, f), 'utf8')
+        .split('\n')
+        .map((line, i) => ({ f, i, line }))
+        .filter(({ line }) => /\.applyTask\(/.test(line)),
+    );
+    expect(calls.map(({ f, line }) => `${f}: ${line.trim()}`).sort()).toEqual([
+      'extension.ts: await session.applyTask(taskId);',
+      'session.ts: if (choice === REVIEW_AGAIN) void this.applyTask(taskId);',
+      'session.ts: void this.applyTask(message.taskId);',
+    ]);
   });
 });

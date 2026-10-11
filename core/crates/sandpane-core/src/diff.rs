@@ -329,6 +329,83 @@ fn openat(dir: &OwnedFd, name: &CString, flags: libc::c_int) -> std::io::Result<
     }
 }
 
+/// The result of walking every component of a relative path but the last.
+enum Walk {
+    /// Every ancestor opened as a real directory; `dir` holds the last one.
+    Parent {
+        dir: OwnedFd,
+        leaf: CString,
+        dir_marker: bool,
+    },
+    /// An ancestor does not exist (ENOENT); every ancestor before it opened
+    /// as a real directory.
+    MissingAncestor,
+}
+
+/// Why a walk refused a path.
+enum WalkError {
+    /// Not a plain relative path, or an existing ancestor is a symlink or
+    /// not a directory (`ELOOP` / `ENOTDIR` under `O_NOFOLLOW`).
+    Escapes,
+    Io(std::io::Error),
+}
+
+/// Walk `rel` below `root` one component at a time (`O_DIRECTORY |
+/// O_NOFOLLOW` per ancestor). `.`/`..`/empty/absolute components are refused
+/// before any syscall; a trailing `/` (git's untracked-directory marker) is
+/// reported as `dir_marker`.
+fn walk_parent(root: &Path, rel: &str) -> Result<Walk, WalkError> {
+    if rel.is_empty() || rel.starts_with('/') {
+        return Err(WalkError::Escapes);
+    }
+    let (body, dir_marker) = match rel.strip_suffix('/') {
+        Some(b) => (b, true),
+        None => (rel, false),
+    };
+    let mut parts: Vec<CString> = Vec::new();
+    for part in body.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(WalkError::Escapes);
+        }
+        parts.push(CString::new(part).map_err(|_| WalkError::Escapes)?);
+    }
+    let Some(leaf) = parts.pop() else {
+        return Err(WalkError::Escapes);
+    };
+    let root_c =
+        CString::new(root.as_os_str().as_encoded_bytes()).map_err(|_| WalkError::Escapes)?;
+    // SAFETY: NUL-terminated path; the result is checked and then owned.
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(WalkError::Io(last_os_error()));
+    }
+    // SAFETY: `root_fd` was just returned by a successful `open`.
+    let mut dir = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    for part in &parts {
+        dir = match openat(&dir, part, dir_flags) {
+            Ok(fd) => fd,
+            Err(e) => {
+                return match e.raw_os_error() {
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR) => Err(WalkError::Escapes),
+                    Some(libc::ENOENT) => Ok(Walk::MissingAncestor),
+                    _ => Err(WalkError::Io(e)),
+                }
+            }
+        };
+    }
+    Ok(Walk::Parent {
+        dir,
+        leaf,
+        dir_marker,
+    })
+}
+
 /// Read the untracked entry `rel` (a path git reported, relative to `root`)
 /// WITHOUT following any symlink and without leaving `root` (see the module
 /// doc for the walk). Reads at most `cap + 1` bytes.
@@ -342,53 +419,158 @@ pub fn read_untracked(
             "{rel:?} is not a plain path inside the review target"
         ))
     };
-    if rel.is_empty() || rel.starts_with('/') {
-        return Err(escapes());
-    }
-    let (body, dir_marker) = match rel.strip_suffix('/') {
-        Some(b) => (b, true),
-        None => (rel, false),
-    };
-    let mut parts: Vec<CString> = Vec::new();
-    for part in body.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            return Err(escapes());
+    let (dir, last, dir_marker) = match walk_parent(root, rel) {
+        Ok(Walk::Parent {
+            dir,
+            leaf,
+            dir_marker,
+        }) => (dir, leaf, dir_marker),
+        Ok(Walk::MissingAncestor) => {
+            return Err(UntrackedError::Io(std::io::Error::from_raw_os_error(
+                libc::ENOENT,
+            )))
         }
-        parts.push(CString::new(part).map_err(|_| escapes())?);
-    }
-    let Some(last) = parts.pop() else {
-        return Err(escapes());
+        Err(WalkError::Escapes) => return Err(escapes()),
+        Err(WalkError::Io(e)) => return Err(UntrackedError::Io(e)),
     };
-    let root_c = CString::new(root.as_os_str().as_encoded_bytes()).map_err(|_| escapes())?;
-    // SAFETY: NUL-terminated path; the result is checked and then owned.
-    let root_fd = unsafe {
-        libc::open(
-            root_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if root_fd < 0 {
-        return Err(UntrackedError::Io(last_os_error()));
-    }
-    // SAFETY: `root_fd` was just returned by a successful `open`.
-    let mut dir = unsafe { OwnedFd::from_raw_fd(root_fd) };
-    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
-    for part in &parts {
-        dir = openat(&dir, part, dir_flags).map_err(|e| match e.raw_os_error() {
-            Some(libc::ELOOP) | Some(libc::ENOTDIR) => escapes(),
-            _ => UntrackedError::Io(e),
-        })?;
-    }
-    // A5 security I4: classify the leaf WITHOUT opening it (no open of a
-    // FIFO/device, no symlink followed), then open it and prove the
-    // descriptor is that same inode.
     let first = stat_at_nofollow(&dir, &last).map_err(UntrackedError::Io)?;
+    read_classified_leaf(&dir, &last, &first, rel, cap, dir_marker)
+}
+
+/// What [`read_task_entry`] found for a change-list path (A6 §3.6 item 3).
+#[derive(Debug, PartialEq, Eq)]
+pub enum TaskEntry {
+    /// The leaf (or an ancestor) does not exist; every EXISTING ancestor is
+    /// a real directory.
+    Absent,
+    /// A regular file: at most `cap` bytes; `over_cap` when more existed.
+    File {
+        bytes: Vec<u8>,
+        over_cap: bool,
+        executable: bool,
+    },
+    /// A symlink: its target text (never followed).
+    Symlink { target: Vec<u8> },
+}
+
+impl TaskEntry {
+    /// The git mode of a present entry (`None` when absent).
+    pub fn git_mode(&self) -> Option<NewFileMode> {
+        match self {
+            TaskEntry::Absent => None,
+            TaskEntry::File {
+                executable: true, ..
+            } => Some(NewFileMode::Executable),
+            TaskEntry::File { .. } => Some(NewFileMode::Regular),
+            TaskEntry::Symlink { .. } => Some(NewFileMode::Symlink),
+        }
+    }
+}
+
+/// Read the task-side state of `rel` below `root` for an apply or a review
+/// hash (A6 §3.6 items 2-3): the same hardened walk as [`read_untracked`]
+/// (no symlink followed, no FIFO/device opened, inode re-checked), except
+/// that absence is an answer ([`TaskEntry::Absent`]) — an ancestor that is a
+/// symlink or a file is still refused ([`UntrackedError::Escapes`]). A
+/// trailing `/` (a nested repository) is refused as [`UntrackedError::NotAFile`]. Reads at most `cap + 1` bytes.
+pub fn read_task_entry(root: &Path, rel: &str, cap: usize) -> Result<TaskEntry, UntrackedError> {
+    let escapes =
+        || UntrackedError::Escapes(format!("{rel:?} is not a plain path inside the work tree"));
+    if rel.ends_with('/') {
+        // git lists a nested repository as `dir/`: never read, like A5.
+        return Err(UntrackedError::NotAFile(format!(
+            "{rel:?} is a directory (for example a nested repository)"
+        )));
+    }
+    let (dir, leaf) = match walk_parent(root, rel) {
+        Ok(Walk::Parent { dir, leaf, .. }) => (dir, leaf),
+        Ok(Walk::MissingAncestor) => return Ok(TaskEntry::Absent),
+        Err(WalkError::Escapes) => return Err(escapes()),
+        Err(WalkError::Io(e)) => return Err(UntrackedError::Io(e)),
+    };
+    let first = match stat_at_nofollow(&dir, &leaf) {
+        Ok(st) => st,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(TaskEntry::Absent),
+        Err(e) => return Err(UntrackedError::Io(e)),
+    };
+    Ok(
+        match read_classified_leaf(&dir, &leaf, &first, rel, cap, false)? {
+            UntrackedContent::File {
+                bytes,
+                over_cap,
+                executable,
+            } => TaskEntry::File {
+                bytes,
+                over_cap,
+                executable,
+            },
+            UntrackedContent::Symlink { target } => TaskEntry::Symlink { target },
+        },
+    )
+}
+
+/// What a host leaf must be for [`check_host_path`] (A6 §3.6 item 5, C2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostLeaf {
+    /// A create target: nothing may exist at the path.
+    MustBeAbsent,
+    /// A modify or delete target: a regular file (never a symlink).
+    MustBeRegularFile,
+}
+
+/// The host leading-path check (A6 §3.6 item 5, C2). `git apply --index`
+/// consults only the INDEX for "beyond a symlink", so an untracked or
+/// ignored symlinked directory would send a write outside the repository.
+/// Core walks the host work tree itself: every EXISTING ancestor must be a
+/// real directory (`O_DIRECTORY | O_NOFOLLOW`); then the leaf must match
+/// `want` (`fstatat(AT_SYMLINK_NOFOLLOW)`). A missing ancestor is fine only
+/// for a create target. `Err` carries a short reason (never the message the
+/// client sees — the caller words that).
+pub fn check_host_path(root: &Path, rel: &str, want: HostLeaf) -> Result<(), String> {
+    if rel.ends_with('/') {
+        return Err("not a plain path".into());
+    }
+    let (dir, leaf) = match walk_parent(root, rel) {
+        Ok(Walk::Parent { dir, leaf, .. }) => (dir, leaf),
+        Ok(Walk::MissingAncestor) if want == HostLeaf::MustBeAbsent => return Ok(()),
+        Ok(Walk::MissingAncestor) => return Err("the file does not exist".into()),
+        Err(WalkError::Escapes) => return Err("an ancestor is a symlink or a file".into()),
+        Err(WalkError::Io(e)) => return Err(e.to_string()),
+    };
+    match (stat_at_nofollow(&dir, &leaf), want) {
+        (Err(e), HostLeaf::MustBeAbsent) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        (Ok(_), HostLeaf::MustBeAbsent) => Err("something already exists there".into()),
+        (Ok(st), HostLeaf::MustBeRegularFile) if st.st_mode & libc::S_IFMT == libc::S_IFREG => {
+            Ok(())
+        }
+        (Ok(_), HostLeaf::MustBeRegularFile) => Err("it is not a regular file".into()),
+        (Err(e), _) => Err(e.to_string()),
+    }
+}
+
+/// Read an already-classified leaf (`first` = its `fstatat` result).
+fn read_classified_leaf(
+    dir: &OwnedFd,
+    last: &CString,
+    first: &libc::stat,
+    rel: &str,
+    cap: usize,
+    dir_marker: bool,
+) -> Result<UntrackedContent, UntrackedError> {
+    let escapes = || {
+        UntrackedError::Escapes(format!(
+            "{rel:?} is not a plain path inside the review target"
+        ))
+    };
+    // A5 security I4: the leaf was classified WITHOUT opening it (no open of
+    // a FIFO/device, no symlink followed); now open it and prove the
+    // descriptor is that same inode.
     #[cfg(test)]
     run_before_open_hook();
     let changed = || UntrackedError::Changed(format!("{rel:?} changed while it was being read"));
     match first.st_mode & libc::S_IFMT {
         libc::S_IFLNK if !dir_marker => {
-            return match read_link_at(&dir, &last) {
+            return match read_link_at(dir, last) {
                 // Not a symlink any more (EINVAL) or gone: it changed.
                 Err(UntrackedError::Io(e))
                     if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOENT)) =>
@@ -412,7 +594,7 @@ pub fn read_untracked(
         }
     }
     let file_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-    let fd = openat(&dir, &last, file_flags).map_err(|e| match e.raw_os_error() {
+    let fd = openat(dir, last, file_flags).map_err(|e| match e.raw_os_error() {
         // A symlink (ELOOP), FIFO/socket/device quirks, or a vanished
         // entry: it was a regular file a moment ago.
         Some(libc::ELOOP) | Some(libc::ENXIO) | Some(libc::EOPNOTSUPP) | Some(libc::ENOENT) => {
@@ -421,7 +603,7 @@ pub fn read_untracked(
         _ => UntrackedError::Io(e),
     })?;
     let opened = fstat(&fd).map_err(UntrackedError::Io)?;
-    if !same_file(&first, &opened) || opened.st_mode & libc::S_IFMT != libc::S_IFREG {
+    if !same_file(first, &opened) || opened.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(changed());
     }
     let executable = opened.st_mode & libc::S_IXUSR != 0;
@@ -918,6 +1100,122 @@ mod tests {
         // Without a swap the same names read normally.
         std::fs::write(root.join("ok"), b"fine\n").unwrap();
         assert!(read_untracked(&root, "ok", 100).is_ok());
+    }
+
+    /// A6 §3.6 item 3: the task-side read tells "absent" (ENOENT, with every
+    /// existing ancestor a real directory) apart from everything else, and
+    /// reads the FULL content up to the cap.
+    #[test]
+    fn task_entry_reads_files_symlinks_and_absence_without_following() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/f.txt"), b"hello\n").unwrap();
+        assert_eq!(
+            read_task_entry(&root, "sub/f.txt", 100).unwrap(),
+            TaskEntry::File {
+                bytes: b"hello\n".to_vec(),
+                over_cap: false,
+                executable: false
+            }
+        );
+        assert_eq!(
+            read_task_entry(&root, "sub/f.txt", 2).unwrap(),
+            TaskEntry::File {
+                bytes: b"he".to_vec(),
+                over_cap: true,
+                executable: false
+            }
+        );
+        symlink("/etc/passwd", &root.join("link"));
+        assert_eq!(
+            read_task_entry(&root, "link", 100).unwrap(),
+            TaskEntry::Symlink {
+                target: b"/etc/passwd".to_vec()
+            }
+        );
+        // Absent leaf, and absent ANCESTOR (a whole directory deleted).
+        assert_eq!(
+            read_task_entry(&root, "sub/gone.txt", 100).unwrap(),
+            TaskEntry::Absent
+        );
+        assert_eq!(
+            read_task_entry(&root, "nodir/x/y.txt", 100).unwrap(),
+            TaskEntry::Absent
+        );
+        // A FILE where an ancestor directory should be (dir->file swap) is
+        // not "absent": it is refused.
+        std::fs::write(root.join("plain"), b"x").unwrap();
+        assert!(matches!(
+            read_task_entry(&root, "plain/x.txt", 100),
+            Err(UntrackedError::Escapes(_))
+        ));
+        // A symlinked ancestor is refused, never followed.
+        symlink(root.join("sub").to_str().unwrap(), &root.join("lsub"));
+        assert!(matches!(
+            read_task_entry(&root, "lsub/f.txt", 100),
+            Err(UntrackedError::Escapes(_))
+        ));
+        // Directories are not files.
+        assert!(matches!(
+            read_task_entry(&root, "sub", 100),
+            Err(UntrackedError::NotAFile(_))
+        ));
+        for bad in ["", "/abs", "a/../b", "./a", "a//b"] {
+            assert!(
+                matches!(
+                    read_task_entry(&root, bad, 100),
+                    Err(UntrackedError::Escapes(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        // git's `dir/` marker (a nested repository) is a directory, refused
+        // before any syscall, with "directory" in the message (A5 wording).
+        assert!(
+            matches!(read_task_entry(&root, "a/", 100), Err(UntrackedError::NotAFile(m)) if m.contains("directory"))
+        );
+    }
+
+    /// A6 §3.6 item 5 (C2): every existing ancestor of a host path must be a
+    /// real directory; a create target must be absent, a modify/delete
+    /// target a regular file.
+    #[test]
+    fn host_leading_path_check_refuses_symlinked_or_file_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"x").unwrap();
+        let outside = root.parent().unwrap().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        // Untracked/ignored symlinked directories (node_modules-style).
+        symlink(outside.to_str().unwrap(), &root.join("node_modules"));
+        symlink("/etc/passwd", &root.join("leaf-link"));
+        std::fs::write(root.join("afile"), b"x").unwrap();
+
+        use HostLeaf::*;
+        assert!(check_host_path(&root, "src/a.rs", MustBeRegularFile).is_ok());
+        assert!(check_host_path(&root, "src/new.rs", MustBeAbsent).is_ok());
+        assert!(check_host_path(&root, "brand/new/dir/f.rs", MustBeAbsent).is_ok());
+        for (rel, want) in [
+            ("node_modules/pkg/index.js", MustBeAbsent),
+            ("node_modules/x", MustBeRegularFile),
+            ("afile/child", MustBeAbsent),
+            ("leaf-link", MustBeRegularFile),
+            ("leaf-link", MustBeAbsent),
+            ("src/a.rs", MustBeAbsent),
+            ("src", MustBeRegularFile),
+            ("src/missing.rs", MustBeRegularFile),
+            ("missing-dir/x.rs", MustBeRegularFile),
+            ("../outside/x", MustBeAbsent),
+            ("", MustBeAbsent),
+        ] {
+            assert!(
+                check_host_path(&root, rel, want).is_err(),
+                "{rel:?} {want:?} must be refused"
+            );
+        }
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     }
 
     #[test]

@@ -543,3 +543,41 @@ describe('A5: per-task Diff button', () => {
     expect(old.byId('sp-diff-t-1').disabled).toBe(true);
   });
 });
+
+describe('A6: per-task Apply button', () => {
+  const row = { taskId: 't-1', status: 'awaiting_review', branch: null, baseCommit: null, unknownKinds: [] };
+
+  it('posts applyTask (only the task id) when Core advertises git.apply + git-apply', () => {
+    const h = boot();
+    h.push(state({ gitApplySupported: true, tasks: [row] }));
+    h.flushFrame();
+    const button = h.byId('sp-apply-t-1');
+    expect(button.textContent).toBe('Apply…');
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute('title')).toContain('confirm in a dialog');
+    h.posted.length = 0;
+    button.click();
+    expect(h.posted).toEqual([{ type: 'applyTask', taskId: 't-1' }]);
+  });
+
+  it('is disabled with "not implemented by this Core" when unsupported (or the flag is absent), and while an apply runs', () => {
+    const h = boot();
+    h.push(state({ gitApplySupported: false, tasks: [row] }));
+    h.flushFrame();
+    const button = h.byId('sp-apply-t-1');
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute('title')).toContain('not implemented by this Core');
+    h.posted.length = 0;
+    button.click();
+    expect(h.posted).toEqual([]);
+    const old = boot();
+    old.push(state({ tasks: [row] }));
+    old.flushFrame();
+    expect(old.byId('sp-apply-t-1').disabled).toBe(true);
+    const busy = boot();
+    busy.push(state({ gitApplySupported: true, applyInFlight: true, tasks: [row] }));
+    busy.flushFrame();
+    expect(busy.byId('sp-apply-t-1').disabled).toBe(true);
+    expect(busy.byId('sp-apply-t-1').getAttribute('title')).toContain('another apply is in progress');
+  });
+});

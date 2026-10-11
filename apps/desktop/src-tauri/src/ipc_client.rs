@@ -50,7 +50,8 @@ const RETRY_DELAY: Duration = Duration::from_millis(150);
 /// (identity re-check plus `rm --force`) a little longer. `project.create` and
 /// `project.add_repository` canonicalize a repository path with git, which may
 /// take up to 30 s, and so do `git.review` / `git.diff` (A5) for the change
-/// list and the diff. Everything else answers well inside the default.
+/// list and the diff. `git.apply` (A6) runs inside Core's 41 s apply budget.
+/// Everything else answers well inside the default.
 pub fn proxy_deadline_ms(method: Method) -> u64 {
     match method {
         Method::SandboxCreate => 320_000,
@@ -65,6 +66,10 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
         // (30 s) for the change list and the diff.
         Method::GitReview => 43_000,
         Method::GitDiff => 43_000,
+        // A6 (design §3.6 item 10): Core's whole apply budget is 41 s
+        // (prepare 20 + write 15 + verify 6) inside its 45 s client deadline.
+        // A write: a lost answer keeps MAY_HAVE_BEEN_APPLIED_SUFFIX.
+        Method::GitApply => 43_000,
         _ => PROXY_DEADLINE_MS,
     }
 }
@@ -941,7 +946,6 @@ mod tests {
         assert_eq!(proxy_deadline_ms(Method::SandboxList), 40_000);
         assert_eq!(proxy_deadline_ms(Method::SandboxStop), 350_000);
         assert_eq!(proxy_deadline_ms(Method::SandboxRemove), 390_000);
-        assert_eq!(proxy_deadline_ms(Method::GitApply), PROXY_DEADLINE_MS);
         assert_eq!(proxy_deadline_ms(Method::SystemProbe), PROXY_DEADLINE_MS);
         // A3a: the project-lifecycle DB writes keep the default budget …
         for m in [
@@ -967,6 +971,34 @@ mod tests {
         // A5: git.review and git.diff run git under Core's 30 s query limit.
         assert_eq!(proxy_deadline_ms(Method::GitReview), 43_000);
         assert_eq!(proxy_deadline_ms(Method::GitDiff), 43_000);
+        // A6: git.apply's whole Core budget is 41 s (45 s client deadline).
+        assert_eq!(proxy_deadline_ms(Method::GitApply), 43_000);
+    }
+
+    /// A6 (design 2026-10-09 §3.6 items 8 and 10): `git.apply` writes the
+    /// user's repository and Core gives it no idempotency, so it is neither
+    /// read-only nor replay-safe: a lost answer always keeps the "may have
+    /// been applied" suffix, whatever the transport failure, and it gets the
+    /// 43 s git budget (the webview waits 45 s).
+    #[test]
+    fn git_apply_is_a_write_that_keeps_the_may_have_been_applied_suffix() {
+        assert!(!is_read_only(Method::GitApply));
+        assert!(!replay_safe(Method::GitApply));
+        for code in [
+            "TIMEOUT",
+            "CONNECTION_CLOSED",
+            "MALFORMED_FRAME",
+            "FRAME_TOO_LARGE",
+        ] {
+            let lost = after_write(Method::GitApply, ProxyError::new(code, "Core went quiet"));
+            assert!(lost.may_have_been_applied, "{code}");
+            assert_eq!(
+                lost.message,
+                format!("Core went quiet{MAY_HAVE_BEEN_APPLIED_SUFFIX}"),
+                "{code}"
+            );
+        }
+        assert_eq!(proxy_deadline_ms(Method::GitApply), 43_000);
     }
 
     #[test]

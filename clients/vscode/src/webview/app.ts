@@ -128,6 +128,10 @@ interface SidebarState {
   sendModeSupported?: boolean;
   /** A5: Core advertises `git.diff` (absent from an older host = no). */
   gitDiffSupported?: boolean;
+  /** A6: Core advertises `git.apply` + feature `git-apply` (absent = no). */
+  gitApplySupported?: boolean;
+  /** A6: an apply flow is running in the extension host. */
+  applyInFlight?: boolean;
   lines: ChatLine[];
   transcript: { scope: 'conversation' | 'project'; label: string };
   tasks: TaskRow[];
@@ -194,6 +198,9 @@ const LIVE_WRITABLE_LABEL = 'LIVE-WRITABLE';
 const SEND_MODE_LABEL = 'Send mode';
 const CHOSEN_SANDBOX_LABEL = 'sandbox chosen by its chat \u2014 not where it runs';
 const SEND_MODE_NOTE = 'Send mode: Core records whether you asked for a Task or a Discuss. Neither mode runs an agent in this build: every send stays queued. Discuss is not a sandbox, not a dry run and not safe execution.';
+const APPLY_UNSUPPORTED =
+  'Apply: not implemented by this Core (it does not advertise "git.apply" with the feature "git-apply")';
+const APPLY_IN_FLIGHT_TITLE = 'Apply: another apply is in progress \u2014 wait for it to finish';
 const SEND_MODE_UNSUPPORTED = 'Task / Discuss: not supported by this Core (it does not advertise "conversation-send-mode"); every send is a Task.';
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -659,7 +666,12 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
   memo.lineKeys = lineKeys;
 
   // --- tasks: stable button ids keep focus across a rebuild ---
-  const tasksKey = JSON.stringify([state.tasks, state.gitDiffSupported === true]);
+  const tasksKey = JSON.stringify([
+    state.tasks,
+    state.gitDiffSupported === true,
+    state.gitApplySupported === true,
+    state.applyInFlight === true,
+  ]);
   if (tasksKey !== memo.tasks) {
     memo.tasks = tasksKey;
     const children: HTMLElement[] = [];
@@ -700,6 +712,24 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
       }
       diff.addEventListener('click', () => api.postMessage({ type: 'showTaskPatch', taskId: row.taskId }));
       children.push(diff);
+
+      // A6: Apply reviewed files — enabled only when Core advertises git.apply
+      // AND the feature git-apply; a click opens the file picker and then a
+      // native modal in the extension host (nothing is sent without it).
+      const apply = el('button', 'secondary', 'Apply\u2026');
+      apply.id = `sp-apply-${token}`;
+      apply.setAttribute('aria-label', `Apply reviewed files of task ${row.taskId} (asks for confirmation)`);
+      if (state.gitApplySupported !== true) {
+        apply.disabled = true;
+        apply.setAttribute('title', APPLY_UNSUPPORTED);
+      } else if (state.applyInFlight === true) {
+        apply.disabled = true;
+        apply.setAttribute('title', APPLY_IN_FLIGHT_TITLE);
+      } else {
+        apply.setAttribute('title', 'Pick reviewed files and confirm in a dialog; Core writes and stages them (never commits)');
+      }
+      apply.addEventListener('click', () => api.postMessage({ type: 'applyTask', taskId: row.taskId }));
+      children.push(apply);
 
       // Cancel is an explicit request; Core decides whether the state allows it.
       const cancel = el('button', 'secondary', 'Cancel');

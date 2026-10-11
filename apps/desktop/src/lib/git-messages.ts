@@ -20,9 +20,9 @@ export const MSG_DIFF_PATH_LISTED_TWICE =
   "path is listed more than once in this task's change list; pass its status; nothing was read";
 export const MSG_DIFF_PATH_NOT_EXACT =
   "this path is not valid UTF-8, so Core cannot name the file exactly; nothing was read";
-/** Not a named const in Core: the literal `git.review` / `git.diff` return. */
+/** Core's `MSG_NO_GIT_CONTEXT` (`sandpane-service/src/lib.rs`). */
 export const MSG_NO_GIT_CONTEXT = "task has no Git context (repo binding + base_commit)";
-/** Not a named const in Core: the literal for a discarded worktree. */
+/** Core's `MSG_WORKTREE_REMOVED` (`sandpane-service/src/lib.rs`). */
 export const MSG_WORKTREE_REMOVED =
   "the task's worktree was removed (discarded); there is nothing left to review";
 /** Core's submodule refusal starts with this, then names the paths. */
@@ -89,5 +89,26 @@ export function gitMessageCopy(code: string, message: string, method?: string): 
       action: "Core's reason is shown below (for example the file changed while it was being read, or it is not a regular file).",
     };
   }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// A6 (W-N1): sandbox.create refused because the repository is busy
+// ---------------------------------------------------------------------------
+
+/** `{repo} is busy: ` — the shared head of both create refusals. */
+export const CREATE_BUSY_INFIX = " is busy: ";
+/** Service `msg_create_repo_busy`: a writer (task, apply, discard) holds the repository. */
+export const CREATE_REPO_BUSY_SUFFIX =
+  " holds its writer lock (a running writer task, an apply or a worktree discard), and a direct_mount sandbox could change it while that runs; try again when it finishes; nothing was created";
+/** Service `msg_create_mount_in_progress`: another direct_mount create of it is running. */
+export const CREATE_MOUNT_IN_PROGRESS_SUFFIX =
+  " is being created with a direct mount of it; try again when that create finishes; nothing was created";
+
+/** Which `sandbox.create` repository-busy CONFLICT `message` is, or `null`. */
+export function createRepoBusyKind(message: string): "writer-lock" | "mount-in-progress" | null {
+  if (!message.includes(CREATE_BUSY_INFIX)) return null;
+  if (message.endsWith(CREATE_REPO_BUSY_SUFFIX)) return "writer-lock";
+  if (message.endsWith(CREATE_MOUNT_IN_PROGRESS_SUFFIX)) return "mount-in-progress";
   return null;
 }

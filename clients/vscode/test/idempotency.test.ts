@@ -105,7 +105,13 @@ describe('keys: format, validation, wire', () => {
 
 describe('features', () => {
   it('reads features absent-tolerantly and ignores unknown strings', () => {
-    expect(KNOWN_FEATURES).toEqual(['idempotency-keys', 'sandbox-create-agent', 'conversation-sandbox-id', 'conversation-send-mode']);
+    expect(KNOWN_FEATURES).toEqual([
+      'idempotency-keys',
+      'sandbox-create-agent',
+      'conversation-sandbox-id',
+      'conversation-send-mode',
+      'git-apply',
+    ]);
     expect(coreAdvertisesFeature({}, 'idempotency-keys')).toBe(false);
     expect(coreAdvertisesFeature(null, 'idempotency-keys')).toBe(false);
     expect(coreAdvertisesFeature({ features: ['x-future', 'idempotency-keys'] }, 'idempotency-keys')).toBe(true);

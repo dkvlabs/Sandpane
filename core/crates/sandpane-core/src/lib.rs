@@ -4,11 +4,13 @@
 //! before it can reach a subprocess argument vector; subprocesses are spawned
 //! with fixed executables + argument arrays only — never through a shell.
 
+pub mod apply;
 pub mod db;
 pub mod diff;
 pub mod events;
 pub mod git;
 pub mod idempotency;
+pub mod objects;
 pub mod process;
 pub mod redact;
 pub mod sbx;

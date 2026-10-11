@@ -7,6 +7,7 @@ import com.intellij.ui.components.JBScrollPane
 import labs.dkv.sandpane.model.FileChange
 import labs.dkv.sandpane.model.GitDiffResult
 import java.awt.BorderLayout
+import java.awt.Component
 import java.awt.Dimension
 import java.awt.Font
 import javax.swing.Action
@@ -61,15 +62,24 @@ class FileDiffChooserDialog(
  * non-editable [JTextArea] (which never interprets markup), with Core's flags disclosed above it. There
  * is no apply, copy-to-project or run action, and nothing is written anywhere (no temp file either).
  */
-class GitDiffViewerDialog(
-    project: Project,
-    private val result: GitDiffResult,
-    private val requestedMaxBytes: Int?,
-) : DialogWrapper(project, false) {
+class GitDiffViewerDialog : DialogWrapper {
+    private val result: GitDiffResult
+    private val requestedMaxBytes: Int?
 
-    init {
+    /** Non-modal, over the project frame (the review notification's "Show file diff\u2026"). */
+    constructor(project: Project, result: GitDiffResult, requestedMaxBytes: Int?) : super(project, false) {
+        this.result = result
+        this.requestedMaxBytes = requestedMaxBytes
         title = GitDiffText.title(result)
         isModal = false
+        init()
+    }
+
+    /** Modal child of [parent] (A6: opened from the apply file chooser, itself modal). */
+    constructor(parent: Component, result: GitDiffResult, requestedMaxBytes: Int?) : super(parent, false) {
+        this.result = result
+        this.requestedMaxBytes = requestedMaxBytes
+        title = GitDiffText.title(result)
         init()
     }
 

@@ -1,12 +1,10 @@
 package labs.dkv.sandpane.ui
 
 import com.intellij.util.ui.HTMLEditorKitBuilder
-import labs.dkv.sandpane.model.ChangeSet
-import labs.dkv.sandpane.model.FileChange
-import labs.dkv.sandpane.model.FileChangeStatus
-import labs.dkv.sandpane.model.Reported
-import labs.dkv.sandpane.model.reported
+import kotlinx.serialization.builtins.serializer
+import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.services.ApplyPlan
+import labs.dkv.sandpane.services.ReviewSession
 import labs.dkv.sandpane.services.SandpaneContextProvider
 import java.awt.Dimension
 import java.awt.Font
@@ -23,7 +21,8 @@ import kotlin.test.assertTrue
  * platform's word-wrap view factory, which force-breaks an over-long unbreakable run at the pane
  * width. With `<br>`-separated entries, the wrapped tail of a crafted path started at the left
  * margin — where real `[n]` markers and section headers start — so the path could render a fake
- * entry or a fake "NOT sent" header.
+ * entry or a fake section header. A6: the Apply confirmation is now a `DialogWrapper` whose
+ * `JEditorPane` uses this same kit, so the layout tested here is the one shown.
  *
  * These tests lay the REAL dialog HTML ([ApplyConfirmation]) out with the platform's own
  * `HTMLEditorKitBuilder().withWordWrapViewFactory()` and check the geometry, not strings: no
@@ -100,20 +99,28 @@ class DialogLayoutTest {
     /** WrapProbe: a path padded until its forced break lands right before a fake `[2]` entry. */
     private fun fakeEntry(fill: Int) = "src/" + "x".repeat(fill) + "  [2] $target"
 
-    /** ConcealProbe: a path that would wrap into a fake NOT-sent header plus a fake entry. */
+    /** ConcealProbe: a path that would wrap into a fake flag header plus a fake flagged entry. */
     private fun fakeHeader(fill: Int) = ".github/workflows/a.yml" + " ".repeat(fill) +
-        "NOT sent (2) — status unknown to this build:" + " ".repeat(fill) + "  [1] .github/workflows/b.yml"
+        "(c) runs automatically (2) \u2014 hooks:" + " ".repeat(fill) + "  [c1] .github/workflows/b.yml"
 
-    private fun dialogFor(paths: List<String>, unknown: List<String> = emptyList()): String {
-        val reviewed = ChangeSet(
-            taskId = "task-1",
-            baseCommit = "0123456789abcdef0123456789abcdef01234567",
-            hostDirty = false,
-            changes = paths.map { FileChange(it, FileChangeStatus.MODIFIED.reported()) } +
-                unknown.map { FileChange(it, Reported.Unknown("type_changed")) },
+    /**
+     * The REAL A6 confirmation for [paths] (every entry bound to reviewed content), plus one
+     * [unbound] entry the user could not select (so it is listed nowhere in the dialog).
+     */
+    private fun dialogFor(paths: List<String>, unbound: List<String> = emptyList()): String {
+        val blob = "a".repeat(40)
+        fun json(p: String) = CoreJson.encodeToString(String.serializer(), p)
+        val changes = paths.map { """{"path":${json(it)},"status":"modified","taskBlob":"$blob","taskMode":"100644"}""" } +
+            unbound.map { """{"path":${json(it)},"status":"untracked"}""" }
+        val session = ReviewSession.fromAnswer(
+            CoreJson.parseToJsonElement(
+                """{"taskId":"task-1","baseCommit":"0123456789abcdef0123456789abcdef01234567","hostDirty":false,""" +
+                    """"repoPath":"/repo","reviewId":"rev-1","changes":[${changes.joinToString(",")}]}""",
+            ),
+            coreInstanceId = "core-1",
         )
-        val plan = assertIs<ApplyPlan.Decision.Ready>(ApplyPlan.decide("task-1", reviewed))
-        return ApplyConfirmation.message("task-1", reviewed, plan).build()
+        val plan = assertIs<ApplyPlan.Decision.Ready>(ApplyPlan.decide(session, paths.indices.toList()))
+        return ApplyConfirmation.message(session, plan).build()
     }
 
     /** The layout this change replaces: one `<br>` line per entry (kept here as the control). */
@@ -141,7 +148,7 @@ class DialogLayoutTest {
         for (width in widths) {
             for (fill in fills) {
                 for (paths in listOf(listOf(fakeEntry(fill), target), listOf(fakeHeader(fill / 3), target))) {
-                    val result = check(layOut(dialogFor(paths, unknown = listOf("u.kt")), width))
+                    val result = check(layOut(dialogFor(paths, unbound = listOf("u.kt")), width))
                     assertTrue(result.escapes.isEmpty(), "width=$width fill=$fill: ${result.escapes}")
                     wrapped += result.wrappedCells
                 }
@@ -186,15 +193,17 @@ class DialogLayoutTest {
 
     @Test
     fun everyListedEntryIsOneRowAndHeadersStayOutsideTheTables() {
-        val pane = layOut(dialogFor(listOf(fakeEntry(40), target, "a b.kt"), unknown = listOf("u.kt")), 360)
+        val pane = layOut(dialogFor(listOf(fakeEntry(40), target, "a b.kt"), unbound = listOf("u.kt")), 360)
         val rows = rows(pane)
-        assertTrue(rows.size == 4, "3 sent rows + 1 NOT-sent row, got ${rows.size}")
         val text = pane.document.getText(0, pane.document.length)
         val markers = rows.map { (marker, _) -> text.substring(marker.startOffset, marker.endOffset).replace('\u00A0', ' ').trim() }
-        assertTrue(markers == listOf("[1]", "[2]", "[3]", "[x1]"), "markers: $markers")
+            .filter { it.startsWith("[") }
+        // 3 files, all 3 never opened in a diff (a), and the workflow file runs automatically (c).
+        assertTrue(markers == listOf("[1]", "[2]", "[3]", "[a1]", "[a2]", "[a3]", "[c1]"), "markers: $markers")
+        assertTrue(!text.contains("u.kt"), "an entry the user could not select is not in the confirmation")
         // Headers are body text, never inside a table cell.
         val inCells = rows.flatMap { (m, c) -> listOf(m.startOffset until m.endOffset, c.startOffset until c.endOffset) }
-        for (header in listOf("files (3)", "NOT sent (1)")) {
+        for (header in listOf("Files (3)", "(c) runs automatically (1)")) {
             val at = text.indexOf(header)
             assertTrue(at >= 0 && inCells.none { at in it }, "header '$header' must be outside the tables")
         }

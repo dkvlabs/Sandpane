@@ -549,6 +549,42 @@ class CoreCommands(
             ),
         )
 
+    /**
+     * `git.apply` (A6, design 2026-10-09 §3.6). Sent ONLY when Core advertises the `git-apply`
+     * feature (git.apply itself is a baseline method, so the method list proves nothing): without it
+     * this fails locally with [MethodNotSupportedException] and nothing reaches the socket.
+     * [params]'s entries are passed through untouched (no validation stricter than Core's; Core
+     * checks every entry against its review). NOT replay-safe and NOT read-only: callers never retry,
+     * and a timeout is reported as "may have been applied". The answer is never echoed if it does
+     * not decode.
+     */
+    fun gitApply(params: labs.dkv.sandpane.model.GitApplyParams): CompletableFuture<labs.dkv.sandpane.model.ApplyResult> {
+        val caps = capabilities()
+        if (caps == null || !caps.hasFeature(labs.dkv.sandpane.model.CoreFeatures.GIT_APPLY)) {
+            val why = if (caps == null) {
+                "this plugin is not connected to Core, so its features are not known yet"
+            } else {
+                "Core ${caps.coreVersion} does not advertise the git-apply feature, so its git.apply predates " +
+                    "reviewed-file apply. Nothing was sent."
+            }
+            return CompletableFuture.failedFuture(MethodNotSupportedException(CoreMethods.GIT_APPLY, why))
+        }
+        val payload = try {
+            CoreJson.encodeToJsonElement(
+                labs.dkv.sandpane.model.GitApplyParams.serializer(),
+                params.copy(taskId = CoreGuards.requireId(params.taskId, "taskId")),
+            )
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(CoreMethods.GIT_APPLY, payload)
+            .thenApply { ok ->
+                decodeOrFixed(CoreMethods.GIT_APPLY) {
+                    CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.ApplyResult.serializer(), ok)
+                }
+            }
+    }
+
     private fun conversationCall(method: String, build: () -> JsonElement): CompletableFuture<Conversation> {
         advertisementGap(method)?.let { return CompletableFuture.failedFuture(it) }
         val payload = try {

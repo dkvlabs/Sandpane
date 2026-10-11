@@ -88,7 +88,26 @@ example `deleted` and `untracked` after `git rm --cached`): `git.diff` then
 refuses (`VALIDATION_FAILED`) unless the optional `status` — one of the
 `changes[].status` values — names the entry; when given, path and status
 must both match. Client adoption pending (A5 client
-step). The
+step). A6 implements `git.apply` for reviewed `host_worktree` entries (no new
+method; the `git-apply` feature is in `core-capabilities`, gated by
+`schema-drift`). `change-set.schema.json` gains the optional `reviewId` (an
+opaque id per `host_worktree` review; Core keeps the last 8 per task in
+memory), `hostHooksPath` (the host's effective `core.hooksPath`, only when it
+is inside the repository, repo-relative) and `changes[].taskBlob` /
+`changes[].taskMode` (Core's own blob id and git mode of the task-side bytes;
+absent for `deleted` entries and files over 32 MiB), together with the Rust
+`ChangeSet` / `FileChange`. `GitDiffResult` gains the same optional
+`taskBlob` / `taskMode` (from the one read that also renders the patch; on
+`host_worktree` the patch header names are Core temp names, `a/base` /
+`b/task`). `GitApplyParams` gains `reviewId?` and `entries?` (each a
+`FileChange` copied verbatim from that review); `selectedFiles` is refused.
+`ApplyResult` gains `appliedFiles?`, `modeChanges? [{path, from, to}]`,
+`snapshotTree?` and `partial?` (true only when git may have written after its
+checks passed). The task events `git.apply.started`, `git.applied`,
+`git.apply.failed` and `git.apply.reconciled` are open `kind` strings, not
+enum values; `git.applied` / `git.apply.failed` payloads carry
+`startedSequence` (the `git.apply.started` event they close), which restart
+reconciliation matches on. Client adoption pending (A6 client step). The
 `docs/specs/02 §2` contract blocks are the
 human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7

@@ -217,6 +217,31 @@ class IdempotencyTest {
         assertFalse(t.offerRetrySafely)
     }
 
+    /**
+     * A6 W-N1 (review J-I4): a direct_mount `sandbox.create` refused because the repository is busy
+     * (an apply, a discard or a writing task holds it) or another direct_mount create of it is in
+     * flight. Nothing was created; trying again later (a new action, a new key) is the remedy, and
+     * Core's own text stays visible. The fixtures are Core's `format!` templates, filled in.
+     */
+    @Test
+    fun aBusyRepositoryRefusesADirectMountCreateAndNothingWasCreated() {
+        val busy = "/repo/atlas-demo is busy: git.apply:t-1 holds its writer lock (a running writer task, an apply or " +
+            "a worktree discard), and a direct_mount sandbox could change it while that runs" + KeyedWrites.CREATE_REPO_BUSY_SUFFIX
+        val inProgress = "/repo/atlas-demo is busy: sandbox \"atlas-demo-2\"" + KeyedWrites.CREATE_MOUNT_IN_PROGRESS_SUFFIX
+        for (message in listOf(busy, inProgress)) {
+            val failure = KeyedWrites.classify(CoreRpcException(CoreErrorCodes.CONFLICT, message))
+            assertIs<KeyedWrites.Failure.NothingRan>(failure, message)
+            val t = KeyedWrites.describe(CoreMethods.SANDBOX_CREATE, failure, keyed = true)
+            assertTrue(t.title.contains("repository busy \u2014 nothing was created"), t.title)
+            assertTrue(t.body.contains("repository busy \u2014 nothing was created; try again when it finishes"), t.body)
+            assertTrue(t.body.contains("Core said: /repo/atlas-demo is busy"), "Core's text stays visible: ${t.body}")
+            assertFalse(t.body.contains("another operation on this sandbox"), t.body)
+            assertFalse(t.offerRetrySafely, "the same key would only be refused again")
+        }
+        assertTrue(KeyedWrites.CREATE_REPO_BUSY_SUFFIX.endsWith("; nothing was created"))
+        assertTrue(KeyedWrites.CREATE_MOUNT_IN_PROGRESS_SUFFIX.endsWith("; nothing was created"))
+    }
+
     @Test
     fun conflictUnknownNeverSaysNothingWasRun() {
         val message = "the outcome of the earlier request with this idempotency key is unknown (Core restarted " +

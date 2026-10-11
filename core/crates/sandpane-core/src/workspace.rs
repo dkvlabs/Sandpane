@@ -28,6 +28,15 @@
 //! 2. discard runs only with the sandbox stopped/unmounted and the workspace
 //!    writer lock held (the scheduler lock keyed by the worktree path);
 //! 3. removal never uses `--force`.
+//! 4. (A6 C3, design 2026-10-09 §3.6 item 2 — the A4b precondition) the
+//!    `host_worktree` change list must move to the apply path's model: git
+//!    pinned to the HOST common dir (`--git-dir=<common>`, cwd = a Core
+//!    directory) with the task side read only by Core (`openat`). Today A5
+//!    `git.review` / `git.diff` on `host_worktree` still run git IN the
+//!    worktree, whose agent-writable `.git` file can name an agent-owned
+//!    gitdir (whose `commondir` points back at the host) — a raced `.git`
+//!    file could then run a clean filter on the host. `git.apply` already
+//!    runs no git in the worktree ([`verify_task_worktree_from_host`]).
 //!
 //! Removal never destroys work. Every check runs BEFORE any side effect
 //! ([`plan_worktree_removal`]): the task ref must not be SYMBOLIC (tamper
@@ -324,6 +333,43 @@ pub fn verify_task_worktree(
     Ok(())
 }
 
+/// [`verify_task_worktree`] WITHOUT running git in the worktree (A6 §3.6
+/// item 2, C3), for the apply path. The worktree's `.git` file is
+/// agent-writable and every git process run there re-reads it — it can name
+/// an agent-owned gitdir whose `commondir` points back at the host, so the
+/// top-level and common-dir checks would still pass while that gitdir's
+/// filter config runs on the host. Here only the HOST repository runs git
+/// (`worktree list`, which reads `<common>/worktrees/*/gitdir`), and the
+/// worktree itself is only `lstat`ed: an existing real directory (not a
+/// symlink), canonical, a direct child of `root`, registered in the host's
+/// worktree list. Its contents are then read only by Core (`openat`).
+pub fn verify_task_worktree_from_host(
+    runner: &GitRunner,
+    repo: &Path,
+    root: &Path,
+    worktree: &Path,
+) -> Result<(), WorkspaceError> {
+    let not_ours = |reason: &str| WorkspaceError::NotTaskWorktree {
+        path: worktree.display().to_string(),
+        reason: reason.to_string(),
+    };
+    let repo_c = canonical(repo)?;
+    let root_c = canonical(root)?;
+    under_root(&root_c, worktree).map_err(|_| not_ours("outside Sandpane's worktree root"))?;
+    let meta = std::fs::symlink_metadata(worktree).map_err(|_| not_ours("directory is missing"))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(not_ours("not a real directory"));
+    }
+    if canonical(worktree)? != worktree {
+        return Err(not_ours("path is not canonical"));
+    }
+    let listed = runner.worktree_list(&repo_c)?;
+    if !listed.iter().any(|e| Path::new(&e.path) == worktree) {
+        return Err(not_ours("not registered in the repository's worktree list"));
+    }
+    Ok(())
+}
+
 /// Every removal check, with NO side effect (see the module docs).
 pub fn plan_worktree_removal(
     runner: &GitRunner,
@@ -610,6 +656,35 @@ mod tests {
         assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), host_head);
         assert_eq!(worktree_count(&f.repo), 2);
         verify_task_worktree(&GitRunner::default(), &f.repo, &f.root, &wt.path).unwrap();
+    }
+
+    /// A6 C3: the apply path verifies the task worktree from the HOST side
+    /// only — no git process runs in it, so a planted `.git` file (pointing
+    /// at an agent-owned gitdir) is never read. Registration, location and
+    /// shape are still enforced.
+    #[test]
+    fn host_side_verification_runs_no_git_in_the_worktree() {
+        let f = fixture();
+        let runner = GitRunner::default();
+        let (_, wt) = allocate(&f);
+        verify_task_worktree_from_host(&runner, &f.repo, &f.root, &wt.path).unwrap();
+        // A planted .git file naming some other gitdir changes nothing here
+        // (the git-running verifier would follow it).
+        std::fs::write(wt.path.join(".git"), "gitdir: /nonexistent/agent-gitdir\n").unwrap();
+        verify_task_worktree_from_host(&runner, &f.repo, &f.root, &wt.path).unwrap();
+        assert!(verify_task_worktree(&runner, &f.repo, &f.root, &wt.path).is_err());
+        // Unregistered, outside the root, a symlink, or missing: refused.
+        let stray = f.root.join("not-registered");
+        std::fs::create_dir(&stray).unwrap();
+        assert!(verify_task_worktree_from_host(&runner, &f.repo, &f.root, &stray).is_err());
+        assert!(verify_task_worktree_from_host(&runner, &f.repo, &f.root, &f.repo).is_err());
+        let link = f.root.join("link");
+        std::os::unix::fs::symlink(&wt.path, &link).unwrap();
+        assert!(verify_task_worktree_from_host(&runner, &f.repo, &f.root, &link).is_err());
+        assert!(
+            verify_task_worktree_from_host(&runner, &f.repo, &f.root, &f.root.join("gone"))
+                .is_err()
+        );
     }
 
     /// The worktree starts at the RECORDED base even when the host moved on.

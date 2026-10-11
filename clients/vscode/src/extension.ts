@@ -13,6 +13,7 @@
 
 import * as vscode from 'vscode';
 import { PATCH_SCHEME } from './vscode/gitDiff';
+import { APPLY_LIST_SCHEME } from './vscode/gitApply';
 import * as fs from 'node:fs';
 import { SandpaneSession } from './session';
 import { SandpaneChatProvider } from './webview/sidebar';
@@ -103,6 +104,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.createTreeView(SandpaneTaskTreeProvider.viewId, { treeDataProvider: tree }),
     // A5: read-only virtual documents for git.diff patches (in memory, no temp files).
     vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, session.patchDocuments),
+    // A6 V-W1: the read-only full list of a large apply (in memory, never on disk).
+    vscode.workspace.registerTextDocumentContentProvider(APPLY_LIST_SCHEME, session.applyListDocuments),
     ...registrations(session, output, log),
   );
 

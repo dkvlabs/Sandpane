@@ -224,42 +224,35 @@ class UnknownEnumToleranceTest {
 
     private val base = "0123456789abcdef0123456789abcdef01234567"
 
-    private fun change(path: String, status: Reported<FileChangeStatus>) = FileChange(path, status)
+    private fun session(changes: String) = labs.dkv.sandpane.services.ReviewSession.fromAnswer(
+        CoreJson.parseToJsonElement(
+            """{"taskId":"t1","baseCommit":"$base","hostDirty":false,"reviewId":"r1","changes":[$changes]}""",
+        ),
+        coreInstanceId = "i",
+    )
+
+    private val blob = "a".repeat(40)
 
     @Test
     fun unknownFileStatusesAreListedButNeverSelected() {
-        val reviewed = ChangeSet(
-            taskId = "t1",
-            baseCommit = base,
-            hostDirty = false,
-            changes = listOf(
-                change("a.kt", FileChangeStatus.MODIFIED.reported()),
-                change("b.kt", Reported.Unknown("type_changed")),
-                change("c.kt", FileChangeStatus.RENAMED.reported()),
-                // Same path, one known and one unknown entry: excluded entirely.
-                change("d.kt", FileChangeStatus.MODIFIED.reported()),
-                change("d.kt", Reported.Unknown("copied")),
-            ),
+        val s = session(
+            """{"path":"a.kt","status":"modified","taskBlob":"$blob","taskMode":"100644"},""" +
+                """{"path":"b.kt","status":"type_changed","taskBlob":"$blob","taskMode":"100644"}""",
         )
-        val ready = assertIs<ApplyPlan.Decision.Ready>(ApplyPlan.decide("t1", reviewed))
-        assertEquals(listOf("a.kt", "c.kt"), ready.paths)
-        assertEquals(listOf("a.kt", "c.kt"), ready.params.selectedFiles, "the wire selection excludes unknown entries")
-        assertEquals(listOf("c.kt"), ready.renamedWithoutSource)
-        assertEquals(listOf("b.kt", "d.kt"), ready.notSent.map { it.path })
-        val notSent = ApplyPlan.describeNotSent(ready.notSent).replace('\u00A0', ' ')
-        assertTrue(notSent.contains("[x1] b.kt — unknown status 'type_changed'"), notSent)
-        assertTrue(notSent.contains("[x2] d.kt — unknown status 'copied'"), notSent)
+        assertIs<Reported.Unknown>(s.changeSet.changes[1].status)
+        assertNull(ApplyPlan.selectability(s.changeSet, s.changeSet.changes[0]))
+        assertEquals(ApplyPlan.REASON_UNKNOWN_STATUS, ApplyPlan.selectability(s.changeSet, s.changeSet.changes[1]))
+        val row = ApplyPlan.rowLabel(s, s.changeSet.changes[1])
+        assertTrue(row.startsWith("type_changed  b.kt"), row)
+        assertTrue(row.contains("not selectable"), row)
+        val ready = assertIs<ApplyPlan.Decision.Ready>(ApplyPlan.decide(s, listOf(0)))
+        assertEquals(listOf("a.kt"), ready.entries.map { it.path })
     }
 
     @Test
-    fun aChangeSetOfOnlyUnknownStatusesIsRefusedNotSentEmpty() {
-        val reviewed = ChangeSet(
-            taskId = "t1",
-            baseCommit = base,
-            hostDirty = false,
-            changes = listOf(change("b.kt", Reported.Unknown("type_changed"))),
-        )
-        val refused = assertIs<ApplyPlan.Decision.Refused>(ApplyPlan.decide("t1", reviewed))
-        assertTrue(refused.reason.contains("type_changed") && refused.reason.contains("nothing is sent"), refused.reason)
+    fun anUnknownStatusEntryIsRefusedNotSent() {
+        val s = session("""{"path":"b.kt","status":"type_changed","taskBlob":"$blob","taskMode":"100644"}""")
+        val refused = assertIs<ApplyPlan.Decision.Refused>(ApplyPlan.decide(s, listOf(0)))
+        assertTrue(refused.reason.contains(ApplyPlan.REASON_UNKNOWN_STATUS), refused.reason)
     }
 }

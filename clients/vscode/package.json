@@ -106,7 +106,7 @@
       },
       {
         "command": "sandpane.applyTask",
-        "title": "Sandpane: Apply Task Changes (Git)"
+        "title": "Sandpane: Apply Reviewed Task Files (git.apply, asks for confirmation)"
       },
       {
         "command": "sandpane.stopSandbox",

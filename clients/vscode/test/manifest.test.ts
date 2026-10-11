@@ -58,4 +58,12 @@ describe('A5 patch view wiring', () => {
     expect(extension).toContain('vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, session.patchDocuments)');
     expect(extension).toContain("import { PATCH_SCHEME } from './vscode/gitDiff';");
   });
+
+  it('extension.ts registers the apply-list store as the sandpane-apply content provider (V-W1)', () => {
+    const extension = readFileSync(join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
+    expect(extension).toContain(
+      'vscode.workspace.registerTextDocumentContentProvider(APPLY_LIST_SCHEME, session.applyListDocuments)',
+    );
+    expect(extension).toContain("import { APPLY_LIST_SCHEME } from './vscode/gitApply';");
+  });
 });

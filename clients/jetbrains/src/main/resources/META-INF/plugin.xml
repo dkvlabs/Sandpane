@@ -119,8 +119,8 @@
 
             <action id="labs.dkv.sandpane.ApplyTask"
                     class="labs.dkv.sandpane.actions.ApplyTaskAction"
-                    text="Sandpane: Apply Task Changes…"
-                    description="Apply a reviewed change set through an explicit, base-checked Git operation in Core"/>
+                    text="Sandpane: Apply Reviewed Files…"
+                    description="Choose reviewed files and apply them through Core's content-bound git.apply (written and staged, never committed)"/>
 
             <action id="labs.dkv.sandpane.RefreshSandboxes"
                     class="labs.dkv.sandpane.actions.RefreshSandboxesAction"

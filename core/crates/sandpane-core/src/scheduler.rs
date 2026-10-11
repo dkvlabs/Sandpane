@@ -175,6 +175,27 @@ impl Scheduler {
         Self::new(Limits::default())
     }
 
+    /// Take the single writer lock on `workspace_key` for an OPERATION that
+    /// is not a running task (A6 W6: `git.apply`; worktree discard). `Err`
+    /// names the current holder — a writing task or another operation; the
+    /// caller refuses (CONFLICT), it never waits or races. Not re-entrant.
+    pub fn try_lock_writer(&mut self, workspace_key: &str, holder: &str) -> Result<(), String> {
+        if let Some(current) = self.writer_locks.get(workspace_key) {
+            return Err(current.clone());
+        }
+        self.writer_locks
+            .insert(workspace_key.to_string(), holder.to_string());
+        Ok(())
+    }
+
+    /// Release a lock taken by [`Self::try_lock_writer`]; only its holder
+    /// can (anything else is a no-op).
+    pub fn unlock_writer(&mut self, workspace_key: &str, holder: &str) {
+        if self.writer_locks.get(workspace_key).map(String::as_str) == Some(holder) {
+            self.writer_locks.remove(workspace_key);
+        }
+    }
+
     pub fn writer_lock_holder(&self, workspace_key: &str) -> Option<&str> {
         self.writer_locks.get(workspace_key).map(String::as_str)
     }
@@ -305,6 +326,42 @@ mod tests {
         s.mark_finished("t2");
         assert_eq!(s.running_in_project("pA"), 0);
         assert_eq!(s.running_count(), 0);
+    }
+
+    /// A6 W6: an apply takes the writer lock on the host repository path;
+    /// any other holder (a writing task, another apply, a discard) means
+    /// refusal, never a wait or a race. Only the holder releases it.
+    #[test]
+    fn operation_writer_lock_is_exclusive_with_tasks_and_operations() {
+        let mut s = Scheduler::new(Limits::default());
+        assert_eq!(s.try_lock_writer("/repo", "git.apply:t1"), Ok(()));
+        assert_eq!(
+            s.try_lock_writer("/repo", "git.apply:t2"),
+            Err("git.apply:t1".to_string())
+        );
+        // A writable task on the same workspace is queued behind it.
+        assert_eq!(
+            s.admit("t3", "p", Some("/repo"), WorkspaceMode::DirectMount),
+            Admission::QueuedWriterLock
+        );
+        // Another workspace is independent.
+        assert_eq!(s.try_lock_writer("/other", "git.apply:t2"), Ok(()));
+        // A non-holder cannot release it.
+        s.unlock_writer("/repo", "git.apply:t2");
+        assert_eq!(s.writer_lock_holder("/repo"), Some("git.apply:t1"));
+        s.unlock_writer("/repo", "git.apply:t1");
+        assert_eq!(s.writer_lock_holder("/repo"), None);
+        // A running writer task blocks an operation.
+        s.mark_running("t4", "p", Some("/repo"), WorkspaceMode::DirectMount)
+            .unwrap();
+        assert_eq!(
+            s.try_lock_writer("/repo", "git.apply:t1"),
+            Err("t4".to_string())
+        );
+        // The same holder re-locking is refused too (no re-entrancy).
+        s.mark_finished("t4");
+        s.try_lock_writer("/repo", "x").unwrap();
+        assert!(s.try_lock_writer("/repo", "x").is_err());
     }
 
     #[test]

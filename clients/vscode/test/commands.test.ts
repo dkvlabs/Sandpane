@@ -201,18 +201,16 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
       method: 'git.review',
       params: { taskId: 't1' },
     });
+    // A6: {taskId, expectedBase, reviewId, entries} — entries verbatim, never selectedFiles.
+    const entries = [{ path: 'src/A.ts', status: 'modified' as const, taskBlob: 'e69de29b', taskMode: '100644' }];
     expect(
-      await sentFor((c) =>
-        c.gitApply({ taskId: 't1', expectedBase: 'b71995fc', selectedFiles: ['src/A.ts'] }),
-      ),
-    ).toMatchObject({
-      method: 'git.apply',
-      params: { taskId: 't1', expectedBase: 'b71995fc', selectedFiles: ['src/A.ts'] },
-    });
-    // An empty selection is "all files", so it is omitted rather than sent as [].
-    expect(
-      await sentFor((c) => c.gitApply({ taskId: 't1', expectedBase: 'refs/heads/main' })),
-    ).toMatchObject({ params: { taskId: 't1', expectedBase: 'refs/heads/main' } });
+      await sentFor((c) => c.gitApply({ taskId: 't1', expectedBase: 'b71995fc', reviewId: 'rev-1', entries })),
+    ).toEqual(
+      expect.objectContaining({
+        method: 'git.apply',
+        params: { taskId: 't1', expectedBase: 'b71995fc', reviewId: 'rev-1', entries },
+      }),
+    );
   });
 
   it('exposes exactly the 28 allowlisted methods and nothing else', () => {
@@ -289,19 +287,19 @@ describe('client-side guards mirror sandpane_core::validation', () => {
     return { error, writes: h.transport.writes.length, frames: h.transport.sentFrames() };
   }
 
-  it('git.apply selectedFiles: exact paths (tab, CR, newline) pass; only empty or NUL is refused (I1)', async () => {
-    const exact = ['dir/new\nline\t.ts', 'a\rb.txt', 'x\u0001y', 'z\u007f', 'x'.repeat(5000)];
-    const ok = await attempt((c) => c.gitApply({ taskId: 't1', expectedBase: 'b71995fc', selectedFiles: exact }));
+  it('git.apply entries: exact paths (tab, CR, newline, controls, long) pass verbatim; only an entry without a path is refused (A6, was I1)', async () => {
+    const exact = ['dir/new\nline\t.ts', 'a\rb.txt', 'x\u0001y', 'z\u007f', 'x'.repeat(5000), ''];
+    const entries = exact.map((path) => ({ path, status: 'added' as const, taskBlob: 'e69de29b', taskMode: '100644' }));
+    const ok = await attempt((c) => c.gitApply({ taskId: 't1', expectedBase: 'b71995fc', reviewId: 'r', entries }));
     expect(ok.error).toBe(null);
     expect(ok.writes).toBe(1);
-    expect(ok.frames[0]).toMatchObject({ method: 'git.apply', params: { selectedFiles: exact } });
-    for (const bad of ['', 'a\u0000b']) {
-      const { error, writes } = await attempt((c) =>
-        c.gitApply({ taskId: 't1', expectedBase: 'b71995fc', selectedFiles: ['ok.ts', bad] }),
-      );
-      expect(error, JSON.stringify(bad)).toBeInstanceOf(CoreValidationError);
-      expect(writes).toBe(0);
-    }
+    expect(ok.frames[0]).toMatchObject({ method: 'git.apply', params: { entries } });
+    expect((ok.frames[0] as { params: object }).params).not.toHaveProperty('selectedFiles');
+    const { error, writes } = await attempt((c) =>
+      c.gitApply({ taskId: 't1', expectedBase: 'b71995fc', reviewId: 'r', entries: [{ status: 'added' }] as never }),
+    );
+    expect(error).toBeInstanceOf(CoreValidationError);
+    expect(writes).toBe(0);
   });
 
   it('rejects shell-shaped sandbox names before sending', async () => {

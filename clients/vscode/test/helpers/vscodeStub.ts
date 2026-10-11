@@ -77,8 +77,13 @@ export const stub = {
   /** When set, `workspace.fs.writeFile` rejects with it. */
   writeError: null as Error | null,
   /** Quick picks shown (items + options); `pickIndex` chooses one (undefined = dismissed). */
-  quickPickCalls: [] as { items: { label: string; description?: string; detail?: string }[]; options: unknown }[],
+  quickPickCalls: [] as {
+    items: { label: string; description?: string; detail?: string; kind?: number; picked?: boolean }[];
+    options: unknown;
+  }[],
   pickIndex: undefined as number | undefined,
+  /** For `canPickMany` pickers: the item indexes the user checks (undefined = dismissed). */
+  pickIndexes: undefined as number[] | undefined,
   /** Content providers registered per scheme. */
   contentProviders: new Map<string, { provideTextDocumentContent(uri: StubUri): string | undefined }>(),
   /** Virtual documents opened / language set / shown (A5 patch view). */
@@ -106,6 +111,7 @@ export const stub = {
     this.writeError = null;
     this.quickPickCalls.length = 0;
     this.pickIndex = undefined;
+    this.pickIndexes = undefined;
     this.contentProviders.clear();
     this.openedDocuments.length = 0;
     this.languageChanges.length = 0;
@@ -215,8 +221,17 @@ export const window = {
     stub.saveCalls.push(options);
     return Promise.resolve(stub.saveUri);
   },
-  showQuickPick: <T extends { label: string }>(items: T[], options?: unknown): Promise<T | undefined> => {
+  showQuickPick: <T extends { label: string; kind?: number }>(items: T[], options?: { canPickMany?: boolean }): Promise<T | T[] | undefined> => {
     stub.quickPickCalls.push({ items, options });
+    if (options?.canPickMany === true) {
+      if (stub.pickIndexes === undefined) return Promise.resolve(undefined);
+      // Like VS Code: a separator row can never be checked.
+      return Promise.resolve(
+        stub.pickIndexes
+          .map((i) => items[i])
+          .filter((item): item is T => item !== undefined && item.kind !== QuickPickItemKind.Separator),
+      );
+    }
     return Promise.resolve(stub.pickIndex === undefined ? undefined : items[stub.pickIndex]);
   },
   showTextDocument: (document: StubTextDocument, options?: unknown) => {
@@ -233,6 +248,9 @@ export const window = {
     return answer(items);
   },
 };
+
+/** `vscode.QuickPickItemKind` (Separator = -1, Default = 0). */
+export const QuickPickItemKind = { Separator: -1, Default: 0 } as const;
 
 export const commands = {
   executeCommand: (command: string, ...args: unknown[]) => {

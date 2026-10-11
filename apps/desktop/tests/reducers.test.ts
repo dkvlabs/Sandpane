@@ -285,7 +285,8 @@ describe("reviewSummary", () => {
   it("does not claim anything applied before Core says so", () => {
     const summary = reviewSummary(changeSet, null);
     expect(summary.headline).toBe("1 file(s) changed");
-    expect(summary.detail).toContain("Not applied to your working tree");
+    // A6: no claim about the working tree either way (this view cannot know).
+    expect(summary.detail).not.toMatch(/applied/i);
   });
 
   it("warns when the host tree is dirty", () => {

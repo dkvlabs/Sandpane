@@ -26,6 +26,7 @@ import {
   CONVERSATION_LIFECYCLE_METHODS,
   FEATURE_CONVERSATION_SANDBOX_ID,
   FEATURE_CONVERSATION_SEND_MODE,
+  FEATURE_GIT_APPLY,
   KNOWN_FEATURES,
   METHODS,
   coreAdvertisesFeature,
@@ -126,9 +127,12 @@ describeLive("real Core answers the way the mirror claims", () => {
     expect(outcome.capabilities.methods).toEqual([...METHODS]);
     expect(METHODS).toHaveLength(28);
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SANDBOX_ID)).toBe(true);
-    // A4: conversation-send-mode, and an A4 Core advertises exactly this
-    // client's known features (A4 added no method; A5 added git.diff: 28).
+    // A4: conversation-send-mode; A6: git-apply. An A6 Core advertises
+    // exactly this client's 5 known features (A4 and A6 added no method; A5
+    // added git.diff: 28).
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SEND_MODE)).toBe(true);
+    expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_GIT_APPLY)).toBe(true);
+    expect(KNOWN_FEATURES).toHaveLength(5);
     expect(outcome.capabilities.features).toEqual([...KNOWN_FEATURES]);
   });
 

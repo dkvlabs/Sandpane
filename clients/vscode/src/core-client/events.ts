@@ -208,6 +208,18 @@ export interface TaskEvent {
   timestamp: string;
 }
 
+/**
+ * A6 (§3.6 item 8) apply events (sandpane-service git_apply.rs; drift-tested).
+ * Payloads are decoded as optional / open fields; `git.apply.started` carries
+ * the entries and index states, which are never shown or logged.
+ */
+export const APPLY_EVENT_KINDS = {
+  started: 'git.apply.started',
+  applied: 'git.applied',
+  failed: 'git.apply.failed',
+  reconciled: 'git.apply.reconciled',
+} as const;
+
 /** Read the `to` status out of a `status.changed` payload; undefined if absent/invalid. */
 export function statusFromEvent(kind: string, payload: unknown): TaskStatus | undefined {
   if (kind !== 'status.changed') return undefined;

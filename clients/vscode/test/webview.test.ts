@@ -191,3 +191,15 @@ describe('A5 webview message: showTaskPatch', () => {
     expect(parseWebviewMessage({ type: 'showTaskPatch', taskId: 'x'.repeat(201) })).toBeUndefined();
   });
 });
+
+describe('A6 webview message: applyTask', () => {
+  it('parses a task id strictly and carries nothing else (no entries, paths or confirmation from the webview)', () => {
+    expect(parseWebviewMessage({ type: 'applyTask', taskId: 't1', entries: [{ path: 'x' }], confirmed: true })).toEqual({
+      type: 'applyTask',
+      taskId: 't1',
+    });
+    expect(parseWebviewMessage({ type: 'applyTask', taskId: 5 })).toBeUndefined();
+    expect(parseWebviewMessage({ type: 'applyTask', taskId: '' })).toBeUndefined();
+    expect(parseWebviewMessage({ type: 'applyTask', taskId: 'x'.repeat(201) })).toBeUndefined();
+  });
+});

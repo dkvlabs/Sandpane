@@ -40,7 +40,6 @@ import {
   foldTaskEvents,
   foldTaskIndex,
   isTaskStatus,
-  planApply,
   reviewBlockReason,
   reviewSummary,
   sandboxModeView,
@@ -48,6 +47,7 @@ import {
   taskIsolationView,
   taskStatusView,
 } from "../src/lib/reducers";
+import { planReviewedApply, reviewSelectability } from "../src/lib/git-apply";
 import { rustSnakeCaseEnumVariants } from "./support/rust-source";
 
 /** Transport whose replies the test releases by hand. */
@@ -371,40 +371,42 @@ describe("an unknown FileChange status lists the file but never applies it", () 
     );
   });
 
-  it("whole-set apply is blocked while an unknown file is in the set", () => {
-    const changeSet = decodeChangeSet(raw);
-    const plan = planApply(changeSet, new Set());
-    expect(plan.canApply).toBe(false);
-    expect(plan.unrecognized).toEqual(["src/b.bin"]);
-    expect(plan.blockedReason).toContain("type_changed");
+  // A6: apply is addressed by ENTRY of one review (reviewId), never "the
+  // whole set": an empty selection sends nothing, and an unknown entry can
+  // never be selected (formerly planApply's whole-set block).
+  const bound = (value: unknown) => ({ ...decodeChangeSet(value), reviewId: "r1", repoPath: "/r" });
+  const blobbed = {
+    ...raw,
+    changes: raw.changes.map((c) => ({ ...c, taskBlob: "a".repeat(40), taskMode: "100644" })),
+  };
+
+  it("an unknown entry is never selectable, and nothing selected sends nothing", () => {
+    const changeSet = bound(blobbed);
+    const verdicts = reviewSelectability(changeSet);
+    expect(verdicts.map((v) => v.selectable)).toEqual([true, false, true]);
+    const none = planReviewedApply({ taskId: "t1", changeSet, selected: new Set(), diffs: new Map() });
+    expect(none.ok).toBe(false);
   });
 
   it("an explicit selection never carries the unknown file to Core", () => {
-    const changeSet = decodeChangeSet(raw);
-    const plan = planApply(changeSet, new Set(["src/a.ts", "src/b.bin"]));
-    expect(plan.canApply).toBe(true);
-    expect(plan.selectedFiles).toEqual(["src/a.ts"]);
+    const changeSet = bound(blobbed);
+    const withUnknown = planReviewedApply({ taskId: "t1", changeSet, selected: new Set([0, 1]), diffs: new Map() });
+    expect(withUnknown.ok).toBe(false);
+    const plan = planReviewedApply({ taskId: "t1", changeSet, selected: new Set([0, 2]), diffs: new Map() });
+    expect(plan.ok && plan.snapshot.request.entries.map((e) => e.path)).toEqual(["src/a.ts", "src/c.ts"]);
+    expect(JSON.stringify(plan)).not.toContain("type_changed");
   });
 
-  it("a fully known set keeps the whole-set default", () => {
-    const changeSet = decodeChangeSet({ ...raw, changes: [raw.changes[0], raw.changes[2]] });
-    const plan = planApply(changeSet, new Set());
-    expect(plan).toMatchObject({ canApply: true, selectedFiles: undefined, unrecognized: [] });
-    expect(planApply({ ...changeSet, changes: [] }, new Set()).canApply).toBe(false);
-  });
-
-  it("a successful apply reports the files actually SENT, never the unappliable one", () => {
+  it("a successful apply reports the files Core applied, else the count SENT", () => {
     const changeSet = decodeChangeSet(raw);
-    const plan = planApply(changeSet, new Set(["src/a.ts", "src/c.ts"]));
     const summary = reviewSummary(
       changeSet,
-      { applied: true, conflictedFiles: [] },
-      plan.selectedFiles?.length,
+      { applied: true, conflictedFiles: [], appliedFiles: ["src/a.ts", "src/c.ts"] },
+      5,
     );
     expect(summary.headline).toBe("Applied");
     expect(summary.detail).toContain("Core applied 2 file(s)");
-    // Without a sent count, only recognised files are ever counted.
-    expect(reviewSummary(changeSet, { applied: true, conflictedFiles: [] }).detail).toContain(
+    expect(reviewSummary(changeSet, { applied: true, conflictedFiles: [] }, 2).detail).toContain(
       "Core applied 2 file(s)",
     );
   });

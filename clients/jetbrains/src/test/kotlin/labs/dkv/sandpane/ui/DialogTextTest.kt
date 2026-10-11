@@ -14,8 +14,8 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * Security finding (review of af8949b): the Apply confirmation is shown by `Messages.showDialog`,
- * which on IntelliJ 2026.2 parses its message as HTML even without an `<html>` prefix (see
+ * Security finding (review of af8949b): confirmations shown by `Messages.showDialog` (the pre-A6
+ * Apply dialog among them; A6 lays the same [DialogHtml] out in its own `DialogWrapper`), which on IntelliJ 2026.2 parses its message as HTML even without an `<html>` prefix (see
  * [DialogText]). These tests parse [DialogText.html] with the JDK's own `HTMLEditorKit` — the same
  * Swing HTML parser family the platform panes sit on, NOT the platform's `HTMLEditorKitBuilder`
  * (no IntelliJ impl class is touched here) — and assert that crafted paths render inert: no markup

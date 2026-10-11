@@ -77,6 +77,16 @@ client) implementing the JB0/JB1 surface of
 > until A4b, so the Diff action has never reached a real `git.diff` answer; the chooser and viewer were
 > never shown in an IDE.
 >
+> Re-run on 11.10.2026 after the A6 client work (`git.apply` for reviewed files: feature `git-apply`
+> (5 known features), method pin unchanged at 28, 45 s apply deadline, per-file chooser + modal
+> confirmation, verbatim review entries, honest result/lost-answer copy): `rm -rf build/test-results &&
+> ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache` passes with
+> **445 tests, 0 failures, 0 errors, 0 skipped** across 39 test classes (JUnit XML; 443 before the
+> combined-review items J-I1/J-I4), and `./gradlew
+> verifyPlugin --offline --rerun-tasks` reports **`Compatible`** against IU-262.10968.63. A6 is
+> UNVERIFIED end to end: no task created over the wire has Git context until A4b, the chooser and the
+> confirmation were never shown in an IDE, and no apply request reached a running Core.
+>
 > **Proven on this host** (exact commands and outputs in "Checks actually run" below):
 > `./gradlew test --rerun buildPlugin verifyPluginStructure` passes both online and `--offline`
 > (the offline run after `clean`, `--no-build-cache`, so `compileKotlin`/`compileTestKotlin` really
@@ -286,6 +296,11 @@ clients/jetbrains/
     │   │   ├── core/GitDiff.kt               # A5: git.diff bounds and honest refusal copy
     │   │   ├── ui/GitDiffText.kt             # A5: viewer title, disclosures, symlink line, revealed body
     │   │   ├── ui/GitDiffDialogs.kt          # A5: file chooser + read-only diff viewer (DialogWrapper)
+    │   │   ├── core/GitApply.kt              # A6: git.apply constants, result/failure/event copy, single flight
+    │   │   ├── services/ReviewSession.kt     # A6: one git.review answer (verbatim entries, reviewId, opened diffs)
+    │   │   ├── services/ApplyPlan.kt         # A6: selectability, flags (a)/(b)/(c), mismatch refusal, submit
+    │   │   ├── ui/ApplyConfirmation.kt       # A6: confirmation text (repository, every file, flags, statement)
+    │   │   ├── ui/ApplyDialogs.kt            # A6: per-file checkbox chooser + modal confirmation (DialogWrapper)
     │   │   ├── services/{SandpaneContextProvider,EditorDiffProvider,SbxService,TaskMonitorService}.kt
     │   │   ├── services/FolderMatching.kt    # folder → Core project, pure and canonicalized on both sides
     │   │   └── settings/{SandpaneSettings,SandpaneConfigurable}.kt
@@ -295,11 +310,14 @@ clients/jetbrains/
         ├── core/ProjectLifecycleTest.kt      # A3a frames, gating, delete flow, copy, validators (39 tests)
         ├── core/ConversationLifecycleTest.kt # A3b frames, gating, delete flow, copy, validator, UI state, single-flight (46 tests)
         ├── core/ConversationExportTest.kt    # A3b export paging, partial/failed, file shape, save/cancel (15 tests)
-        ├── core/GitDiffTest.kt               # A5 frames (exact path + status), gating, flags, copy, exact paths (12 tests)
+        ├── core/GitDiffTest.kt               # A5 frames (exact path + status), gating, flags, copy, exact paths (16 tests)
+        ├── core/GitApplyTest.kt              # A6 frames (verbatim entries, reviewId, no selectedFiles), gate, copy, CONFLICT kinds, lost answers, events (22 tests)
+        ├── services/ApplyPlanTest.kt         # A6 session, selectability, verbatim entries, mismatch refusal, flags (14 tests)
+        ├── ui/ApplyConfirmationTest.kt       # A6 every file listed, flags, buttons, opens only from actionPerformed (5 tests)
         ├── core/SendModeTest.kt              # A4 send frames, mode gate, keyed retry, open-string mode, copy, no echo (11 tests)
         ├── core/CoreCommandsTest.kt          # guards, gates, the three cursor shapes  (30 tests)
         ├── core/SandboxLifecycleTest.kt      # A1 frames, token flow, stop report       (27 tests)
-        ├── core/IdempotencyTest.kt           # A2 keys, features, CONFLICT copy, replay (19 tests)
+        ├── core/IdempotencyTest.kt           # A2 keys, features, CONFLICT copy, replay, A6 create-busy CONFLICT (20 tests)
         ├── core/ErrorAttributionTest.kt      # failure provenance sentences             (13 tests)
         ├── core/ProtocolDriftGuardTest.kt    # re-reads the Rust sources + schemas      (20 tests)
         ├── core/ReplayCursorSemanticsTest.kt # per-task vs shared-scalar replay         (7 tests)
@@ -361,12 +379,14 @@ addition A3a (`project.update`, `project.archive`, `project.unarchive`, `project
 `conversation.export` — in `Method::ALL` right after `conversation.history`, not at the end) and **1** is
 addition A5 (`git.diff`, right after `git.review`). All seventeen
 additive methods are gated on `system.probe`'s `methods` (`CoreMethods.REQUIRES_ADVERTISEMENT`):
-not advertised ⇒ the action is visibly disabled and nothing is sent. There is deliberately **no**
+not advertised ⇒ the action is visibly disabled and nothing is sent. A6 adds **no** method: `git.apply` is
+baseline, and its reviewed-file form is gated on the `git-apply` feature (the fifth entry of
+`CoreFeatures.KNOWN`, drift-tested against Rust `FEATURES` and the schema examples). There is deliberately **no**
 `sandbox.start` (sbx v0.47 has none); the Start Sandbox action only shows that unsupported state. The additive fields are `CoreCapabilities.methods`,
 `Project.repositories`, `SandboxSummary.workspaceMode` and the optional
 `TaskSubscribeParams.afterSequences`.
 
-This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (25 tests), which
+This is checked **mechanically on every test run** by `ProtocolDriftGuardTest` (27 tests), which
 reads the Rust sources and the schemas out of the working tree and compares them against the
 Kotlin mirror: method names **and their order**, the `Method::parse` arms, the
 `rpc-request.schema.json` `method` enum, every `pub const` numeric bound (evaluated, not copied), the
@@ -390,7 +410,7 @@ value failed the whole `task.list` / `git.review` / `sandbox.list` / `sandbox.cr
 | unknown task status | `Unknown status '<raw>' — this plugin is older than Core` | never terminal, never running; review/apply off; "nothing to review/apply" notices count such tasks |
 | unknown `status.changed` | the row takes the unknown status and gets a note | an unreadable payload keeps the last status and leaves a note — neither is dropped silently |
 | `conversation.send` reply with an unknown status | `Core accepted task …` | accepted (Core did queue it); no INTERNAL, so no duplicate-retry bait |
-| unknown file status | listed with its raw status | **not selectable**: excluded from `selectedFiles`, listed under "NOT sent" in the Apply dialog and in the result notice; a set made only of them is refused |
+| unknown file status | listed with its raw status | **not selectable** (A6): its Apply checkbox is disabled with "status unknown to this plugin build", so it can never be among the sent entries |
 | unknown workspace mode | `UNKNOWN — TREAT AS LIVE-WRITABLE` | the existing worst-case view; never isolated |
 
 Truly malformed values still fail the frame: non-strings, `null` for a required field, and any
@@ -686,6 +706,70 @@ discovery revision this client is now synced to**):
   project" and resolves nothing (no fallback to another root or `basePath`); a Core that sends no
   `repoPath` likewise resolves nothing and says so. The Diff action is unaffected (Core reads by task
   and path, never an IDE root).
+- **Apply reviewed files (A6, design 2026-10-09 §3.6).** Enabled only when Core advertises the
+  `git-apply` feature (`git.apply` itself is a baseline method, so the method list proves nothing);
+  otherwise the action is disabled with "Apply is not implemented by this Core (it does not advertise
+  the git-apply feature); nothing is sent", and `CoreCommands.gitApply` refuses locally as well.
+  Flow, all on one user gesture: **Sandpane: Apply Reviewed Files…** (`ApplyTaskAction.actionPerformed`,
+  EDT) → a modal per-file chooser over the entries of ONE `git.review` answer (checkboxes, "Select
+  all", nothing pre-ticked, a "Diff…" button per row when `git.diff` is advertised) → the mandatory
+  modal confirmation → `git.apply` on ConnectionManager's io pool with the 45 s git deadline. The
+  review notification only says how to apply; nothing opens from chat, agent or tool text, a timer or
+  a reconnect (a source-scan test pins that both dialogs are constructed only inside
+  `actionPerformed`).
+  - **What is sent:** `{taskId, expectedBase, reviewId, entries}` where `entries` are the review
+    answer's OWN JSON objects for the ticked rows (kept by `ReviewSession`, never rebuilt from the
+    typed view, so key order and fields this build does not model survive) and `expectedBase` is the
+    review's full base. `selectedFiles` no longer exists in `GitApplyParams`, so it cannot be sent.
+  - **Selectable rows:** a known status and either `taskBlob` + `taskMode` or `deleted`, never mode
+    `120000`. Disabled rows say why: "symlinks are never applied"; "too large or unreadable to apply
+    (over 32 MiB)" (a reviewed entry with neither field); "no reviewed content id" (only one of the
+    two fields, or a review without `reviewId` — not a `host_worktree` task); "status unknown to this
+    plugin build". A rename is one row (`oldPath → path`). The only count limit is Core's 1000.
+  - **Confirmation** (`ApplyConfirmationDialog`, a `DialogWrapper` laid out by the platform's
+    word-wrapping HTML kit in a scroll pane): names the repository (`repoPath`, revealed and capped),
+    lists EVERY selected file with its status (no "… and N more"; a CR shows as `\r`), and separately
+    flags (a) content never fully shown — binary, truncated, or never opened in a Diff view in this
+    review; (b) executable entries (`taskMode` 100755); (c) paths that run automatically —
+    `.husky/`, `.githooks/`, `.vscode/`, `.idea/` (any depth), `.github/workflows/` (root), `.envrc`
+    and `.gitattributes` (any depth), `.gitmodules` (root) and anything under Core's repo-relative
+    `hostHooksPath`, matched on path components, case-folded, on `path` and a rename's `oldPath`.
+    It states "Writes these files into your working tree and stages them. Nothing is committed. The
+    content is the version Core hashed when you reviewed." A dirty host is disclosed, not refused
+    (Core's gate covers the touched paths only). The OK button reads "Apply N files"; **Cancel is the
+    default button and has the initial focus**.
+  - **Mismatch rule:** if a `git.diff` opened in this review (from the review notification or the
+    chooser) returned a `taskBlob` different from that entry's — or none for an entry that has one —
+    nothing is sent: "<path> changed after you reviewed it — review again", with a **Review again**
+    action. A review from another Core instance (Core restarted; reviews live in Core memory) is
+    discarded with the same offer.
+  - **Results:** success "Applied N files to <repoPath> (staged, not committed)" plus mode changes;
+    `partial` is a WARNING ("Not a success: some files may have been written or staged") quoting
+    Core's reason uncut (it names `git status` / `.git/index.lock`); aborts keyed on Core's exact
+    constants — entries not matching a review and "changed since it was reviewed" offer Review again,
+    "does not apply cleanly" lists git's paths, "git could not check the patch" is never worded as a
+    conflict, both "git apply was not started" texts (`MSG_WRITE_NOT_RUN`, `MSG_WRITE_TOO_LATE`) say
+    git apply was never started and nothing was written, anything else is shown verbatim (revealed, capped at 2 000 code points). CONFLICT is
+    keyed on Core's texts: the writer lock ("busy … apply again after that operation finishes"), a
+    direct mount ("stop or remove that sandbox or task first" — never "try again") and, since Core's
+    W-N1 change, a direct-mount sandbox being created ("once it exists, Core refuses every apply
+    until you stop or remove it"). The matching `sandbox.create` CONFLICTs for a direct_mount create
+    (`msg_create_repo_busy`, `msg_create_mount_in_progress`, ending "; nothing was created") read
+    "repository busy — nothing was created; try again when it finishes", with Core's text shown and
+    no "Retry safely". A timeout reads "Core
+    did not answer in time — the apply may have been applied; check `git status` in <repoPath>
+    before retrying"; a dropped connection or an unreadable answer is the same lost answer, never
+    "nothing was sent". Only this plugin's own pre-socket refusals say nothing was sent.
+  - **Afterwards:** single-flight per task (`ApplyInFlight`), never retried (no "Retry safely" for
+    git.apply). When files may have changed it marks the VCS view dirty
+    (`VcsDirtyScopeManager.markEverythingDirty`) and asks the VFS to re-read the repository root —
+    both read-only; this plugin writes no project file. Any answer that reached Core discards the
+    used review (selection and diff evidence) and runs a fresh `git.review`.
+  - **Events:** `git.apply.started`, `git.applied`, `git.apply.failed` and `git.apply.reconciled`
+    are Core lifecycle kinds with honest notes (files count; "may have been written" for a partial;
+    "Core restarted during an apply and cannot know for sure what was written … check `git status`"
+    for reconciled). Payloads are read as optional/open and never echoed when unreadable.
+  - **Display:** a host_worktree pure rename's empty patch reads "renamed, content unchanged".
 - **Allowlisted methods.** `CoreClient.request()` refuses anything outside the **28** protocol
   method names before writing a byte; there is no free-form RPC. The refusal is a
   `CoreValidationException` — this client's own word — and not a `CoreRpcException`, because Core
@@ -713,15 +797,15 @@ discovery revision this client is now synced to**):
   `nowrap` column of its own, the path in the next column, and section headers (bold) outside the
   tables. The dialog word-wraps and force-breaks an over-long path at its width; with the table, a
   wrapped tail always starts inside the path column, to the right of every real marker, so a
-  crafted path cannot render a fake entry or a fake "NOT sent" header (an earlier `<br>`-per-line
+  crafted path cannot render a fake entry or a fake flag header (an earlier `<br>`-per-line
   layout could; `DialogLayoutTest` lays the real dialog HTML out in a `JEditorPane` with the
   platform's `HTMLEditorKitBuilder().withWordWrapViewFactory()` at fixed widths and a SansSerif 13
   font, searches for such a path, and keeps the old layout as a control that does fail). The
-  AlertDialog's own pane — its width, CSS and font — was not built in a test: UNVERIFIED. NOT-sent entries carry their own `[x<n>]` markers. The
+  AlertDialog's own pane — its width, CSS and font — was not built in a test: UNVERIFIED. A6 flag rows carry their own `[a<n>]` / `[b<n>]` / `[c<n>]` markers. The
   dialog also flags any path that had hidden characters or literally contains an escape-looking
-  sequence such as `\n` (also counting them past the 20 listed), elides absurdly long paths
-  visibly, and points out selected paths that differ only in case or Unicode normalization (NFC +
-  lower case: an approximation of APFS/NTFS folding). `MessageDialog`/`InputDialog` panes were not
+  sequence such as `\n`, and elides absurdly long paths visibly. (The A6 confirmation is a
+  `DialogWrapper` with a `JEditorPane` built by the same `HTMLEditorKitBuilder().withWordWrapViewFactory()`
+  the layout test uses, so the tested layout is the shown one — still never shown in an IDE.) `MessageDialog`/`InputDialog` panes were not
   laid out in a test either (UNVERIFIED). Labels, list rows, tooltips, action descriptions, notifications and the chat
   detail pane apply the same treatment (`PlainText`, `notify`).
 - **No secrets in logs.** The unsolicited-frame log line is truncated to 240 chars, `system.err`
@@ -768,6 +852,7 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
 | Gate after the A4 client work (send mode, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 15s`; **389 tests, 0 failures, 0 errors, 0 skipped**, 35 result files (SendModeTest 11, ProtocolDriftGuardTest 24, RemoveConfirmationDialogTest 7, IdempotencyTest 19, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 79 source files (47 main, 32 test); zip 1 644 556 bytes; the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A4 files) |
 | Gate after the A5 client work (git.diff, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL in 15s`; **402 tests, 0 failures, 0 errors, 0 skipped**, 36 result files (GitDiffTest 12, ProtocolDriftGuardTest 25, CoreClientFramingTest 29); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 83 source files (50 main, 33 test); zip 1 676 534 bytes; the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A5 files) |
 | Gate after the A5 review fixes (W3 CR reveal, I3 VCS root, 11.10.2026) | same two commands | `BUILD SUCCESSFUL`; **410 tests, 0 failures, 0 errors, 0 skipped**, 37 result files (GitDiffTest 15, ReviewRootTest 5); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` |
+| Gate after the A6 client work (git.apply for reviewed files, 11.10.2026) | `rm -rf build/test-results && ./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`; `./gradlew verifyPlugin --offline --rerun-tasks` | `BUILD SUCCESSFUL`; **445 tests, 0 failures, 0 errors, 0 skipped**, 39 result files after the combined-review items J-I1/J-I4 (443 before; GitApplyTest 22, IdempotencyTest 20, ApplyPlanTest 14, ApplyConfirmationTest 5, GitDiffTest 16, ProtocolDriftGuardTest 27); verifier `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible` (no deprecated/experimental/internal usage files); 90 source files (54 main, 36 test); the same 7 Kotlin `w:` on the full recompile, all in pre-existing code (none in A6 files). RED evidence: 18 deliberate mutations of the A6 code (gate, mismatch check, timeout/partial/CONFLICT copy, symlink rule, flag (a)/(c), default button, rename copy, event notes, full listing, deadline, Core-message drift, dialog outside `actionPerformed`, lost connection, typed re-encoding of entries) each turned the named test red, and were reverted |
 | Plugin Verifier | `./gradlew verifyPlugin` (verifier-cli 1.410, `ides { current() }`) | `Plugin labs.dkv.sandpane:0.1.0-scaffold against IU-262.10968.63: Compatible`; reused the cached IDE (no second IDE download); `verification-verdict.txt` → `Compatible` |
 | Project configuration | `./gradlew verifyPluginProjectConfiguration` | one finding, deliberately not followed: `until-build property should be removed` (see "until-build is kept on purpose"). The Java-25 finding is resolved. |
 | Bytecode target | class-file major of every class in `sandpane-jetbrains-0.1.0-scaffold.jar` | 241/241 at **69** (Java 25) |
@@ -832,6 +917,15 @@ All Gradle rows were run on 09.10.2026 after the U4 upgrade; `build/test-results
   Diff action has never received a real `git.diff` answer; the chooser, the viewer and the review
   notification action were never shown in an IDE. Frames, gating, disclosures and copy are tested
   against fabricated answers shaped like Core's output.
+- **A6 git.apply** (11.10.2026): UNVERIFIED end to end. No task created over the wire has Git
+  context until A4b, so over the wire Apply can only receive Core's "task has no Git context (repo
+  binding + base_commit); nothing was written" abort; a real apply is reachable only for tasks Core
+  seeds internally, and no apply request from this plugin has reached a running Core. The chooser,
+  the confirmation (its focus and default-button behaviour included), the VCS refresh and the
+  "Review again" action were never shown or run in an IDE. Frames, gating, selectability, flags,
+  the mismatch refusal and every result kind are tested against fabricated answers shaped like
+  Core's output. With a split-mode/remote backend, the VFS refresh looks up Core's `repoPath` on
+  the backend's file system (skipped when it is not found) — UNVERIFIED there.
 - **Older/newer Core compatibility** (testing this client against an older and a newer Core within
   the compatibility policy) has not been done; advertisement gating is tested against fabricated
   capability lists only.

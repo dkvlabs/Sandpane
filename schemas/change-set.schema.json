@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://sandpane.dkvlabs.invalid/schemas/change-set.schema.json",
   "title": "SandpaneChangeSet",
-  "description": "git.review result: the ACTUAL change set versus the task's recorded base revision, including untracked files (specs/06 §6, specs/08 T15). Never a mocked-up diff. A5 adds the optional repoPath, uninspected and changes[].oldPath (design 2026-10-09 §3.5 item 2).",
+  "description": "git.review result: the ACTUAL change set versus the task's recorded base revision, including untracked files (specs/06 §6, specs/08 T15). Never a mocked-up diff. A5 adds the optional repoPath, uninspected and changes[].oldPath (design 2026-10-09 §3.5 item 2). A6 adds the optional reviewId, hostHooksPath and changes[].taskBlob/taskMode (§3.6 items 3 and 9); git.apply entries are changes[] items copied verbatim.",
   "type": "object",
   "required": ["taskId", "baseCommit", "hostDirty", "changes"],
   "additionalProperties": false,
@@ -12,6 +12,8 @@
     "hostDirty": { "type": "boolean", "description": "True when the host working tree has uncommitted changes at review time." },
     "repoPath": { "type": "string", "description": "A5 (additive, optional): the canonical host repository root of the task - the integration target hostDirty describes." },
     "uninspected": { "type": "array", "items": { "type": "string" }, "description": "A5 (additive, optional): paths Core could not inspect. Defined but never produced in A5: a repository with submodules is still refused with VALIDATION_FAILED, never returned as a partial list." },
+    "reviewId": { "type": "string", "description": "A6 (additive, optional; design 2026-10-09 §3.6 item 3, R4): an opaque id for this answer, set only for host_worktree tasks. Core keeps the last 8 per task in memory (a Core restart means review again). git.apply accepts only entries copied verbatim from a review Core produced. Not a human-presence token." },
+    "hostHooksPath": { "type": "string", "description": "A6 (additive, optional; §3.6 item 9): the host repository's effective core.hooksPath, reported only when it is repo-relative (in repo-relative form). Clients flag applied paths under it as running automatically." },
     "changes": {
       "type": "array",
       "items": {
@@ -21,6 +23,8 @@
         "properties": {
           "path": { "type": "string", "description": "Exactly as git reports it (NUL-separated since A5, never C-quoted). git.diff accepts only this exact string." },
           "oldPath": { "type": "string", "description": "A5 (additive, optional): the pre-rename path; set only for status renamed." },
+          "taskBlob": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$", "description": "A6 (additive, optional; §3.6 item 3): git blob id of the task-side bytes Core itself read (SHA-1 with collision detection, or SHA-256, per the repository's object format). host_worktree only; absent for deleted entries, files over the 32 MiB apply cap (too large to apply) and entries Core could not read as a file or symlink." },
+          "taskMode": { "type": "string", "description": "A6 (additive, optional): 100644, 100755 or 120000 from lstat of the task-side entry; present exactly when taskBlob is. An open string, not an enum." },
           "status": {
             "type": "string",
             "enum": ["added", "modified", "deleted", "renamed", "untracked"]

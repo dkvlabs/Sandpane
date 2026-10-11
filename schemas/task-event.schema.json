@@ -11,7 +11,7 @@
     "sequence": { "type": "integer", "minimum": 1 },
     "kind": {
       "type": "string",
-      "description": "Event kind. Core-emitted kinds include: task.created, status.changed, message.user, adapter.unavailable, scheduler.deferred. Agent-normalized kinds follow agent-event.schema.json type values."
+      "description": "Event kind. Core-emitted kinds include: task.created, status.changed, message.user, adapter.unavailable, scheduler.deferred, workspace.removing, workspace.removed, workspace.removal_failed, and (A6, design 2026-10-09 §3.6 item 8) git.apply.started (appended durably before the first host write), git.applied, git.apply.failed and git.apply.reconciled (restart reconciliation of an unterminated start: outcome applied, partial, not_applied or unknown, never assumed). Kinds are an open string set, not an enum. Agent-normalized kinds follow agent-event.schema.json type values."
     },
     "payload": { "description": "Kind-specific payload; for normalized agent events matches agent-event.schema.json." },
     "timestamp": { "type": "string", "format": "date-time", "description": "RFC3339 UTC, assigned by Core (stable replays)." }

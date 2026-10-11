@@ -136,6 +136,16 @@ object KeyedWrites {
     const val NAME_LOCK_PREFIX: String = "another operation on sandbox "
     const val NAME_LOCK_SUFFIX: String = " is in progress; nothing was run"
 
+    /**
+     * A6 W-N1: a direct_mount `sandbox.create` refused with CONFLICT because the repository is busy.
+     * `msg_create_repo_busy(repo, holder)` ends with [CREATE_REPO_BUSY_SUFFIX] (an apply, a discard
+     * or a writing task holds it); `msg_create_mount_in_progress(repo, sandbox)` is
+     * `<repo> is busy: sandbox "<name>"` + [CREATE_MOUNT_IN_PROGRESS_SUFFIX]. Nothing was created.
+     */
+    const val CREATE_REPO_BUSY_SUFFIX: String = "; try again when it finishes; nothing was created"
+    const val CREATE_MOUNT_IN_PROGRESS_SUFFIX: String =
+        " is being created with a direct mount of it; try again when that create finishes; nothing was created"
+
     /** The one user action that reuses a key (exact shared label). */
     const val RETRY_SAFELY_LABEL: String = "Retry safely"
 
@@ -176,9 +186,15 @@ object KeyedWrites {
     private fun classifyConflict(message: String): Failure = when {
         message.startsWith(CONFLICT_MISMATCH) || message.startsWith(CONFLICT_PENDING) -> Failure.NothingRan(message)
         message.startsWith(NAME_LOCK_PREFIX) && message.endsWith(NAME_LOCK_SUFFIX) -> Failure.NothingRan(message)
+        isCreateRepoBusy(message) -> Failure.NothingRan(message)
         message.startsWith(CONFLICT_UNKNOWN_PREFIX) -> Failure.EarlierOutcomeUnknown(message)
         else -> Failure.CoreRefused(CoreErrorCodes.CONFLICT, message)
     }
+
+    /** A6 W-N1: one of the two "repository busy; nothing was created" CONFLICT texts. */
+    private fun isCreateRepoBusy(message: String): Boolean =
+        message.contains(GitApplies.LOCKED_INFIX) &&
+            (message.endsWith(CREATE_REPO_BUSY_SUFFIX) || message.endsWith(CREATE_MOUNT_IN_PROGRESS_SUFFIX))
 
     /** The user-facing text, and whether "Retry safely" may be offered for it. */
     data class Text(val title: String, val body: String, val severity: OutcomeSeverity, val offerRetrySafely: Boolean)
@@ -196,10 +212,18 @@ object KeyedWrites {
                 OutcomeSeverity.WARNING,
                 false,
             )
+        } else if (isCreateRepoBusy(failure.coreMessage!!)) {
+            Text(
+                "Sandpane: $method \u2014 repository busy \u2014 nothing was created",
+                "Core refused CONFLICT \u2014 repository busy \u2014 nothing was created; try again when it finishes. " +
+                    "Core said: ${coreText(failure.coreMessage)}",
+                OutcomeSeverity.WARNING,
+                false,
+            )
         } else {
             val core = coreText(failure.coreMessage)
             val why = when {
-                failure.coreMessage!!.startsWith(CONFLICT_MISMATCH) ->
+                failure.coreMessage.startsWith(CONFLICT_MISMATCH) ->
                     "this request's key was already used for a different request"
                 failure.coreMessage.startsWith(CONFLICT_PENDING) ->
                     "the earlier request with this key is still in progress in Core"

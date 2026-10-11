@@ -153,6 +153,14 @@ function TimelineRow({ entry }: { entry: TimelineEntry }) {
           <Seq entry={entry} />
         </li>
       );
+    case "git-apply":
+      return (
+        <li className="timeline__row">
+          <Badge tone={entry.tone}>git apply</Badge>
+          <span className="timeline__text">{entry.text}</span>
+          <Seq entry={entry} />
+        </li>
+      );
     case "unmodelled":
       return (
         <li className="timeline__row timeline__row--unknown">

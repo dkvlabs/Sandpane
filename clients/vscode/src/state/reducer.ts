@@ -9,7 +9,8 @@
  */
 
 import type { AgentEvent, TaskEvent, TaskStatus } from '../core-client/events';
-import { isTaskStatus, normalizeAgentEvent, statusFromEvent } from '../core-client/events';
+import { APPLY_EVENT_KINDS, isTaskStatus, normalizeAgentEvent, statusFromEvent } from '../core-client/events';
+import { plainText } from '../text/visibleText';
 import type { TaskSummary } from '../core-client/protocol';
 
 export type TranscriptRole = 'user' | 'agent' | 'tool' | 'system';
@@ -272,6 +273,12 @@ function applyTaskEvent(state: TaskViewState, event: TaskEvent): TaskViewState {
         }),
       );
     }
+    case APPLY_EVENT_KINDS.started:
+    case APPLY_EVENT_KINDS.applied:
+    case APPLY_EVENT_KINDS.failed:
+    case APPLY_EVENT_KINDS.reconciled:
+      // A6: display only — an apply never moves the task status (Core owns it).
+      return withTask(state, pushLine(task, { role: 'system', text: applyEventText(event.kind, payload), sequence: event.sequence }));
     case 'adapter.unavailable':
     case 'message.agent': {
       // `adapter.unavailable` carries a normalized AgentEvent; so may a future
@@ -298,6 +305,43 @@ function applyTaskEvent(state: TaskViewState, event: TaskEvent): TaskViewState {
           },
         ),
       );
+    }
+  }
+}
+
+/**
+ * A6 apply events, decoded as optional / open fields. Core text is revealed
+ * and capped; `git.apply.started` carries the entries and index states,
+ * which are never shown (counts and the repository only).
+ */
+function applyEventText(kind: string, payload: Record<string, unknown> | undefined): string {
+  const files = Array.isArray(payload?.['files']) ? (payload['files'] as unknown[]).length : null;
+  const count = files === null ? 'the selected' : String(files);
+  const reason = typeof payload?.['reason'] === 'string' ? plainText(payload['reason'], 500) : null;
+  switch (kind) {
+    case APPLY_EVENT_KINDS.started: {
+      const repo = typeof payload?.['repoPath'] === 'string' ? ` to ${plainText(payload['repoPath'], 300)}` : '';
+      return `Core started applying ${count} file(s)${repo}`;
+    }
+    case APPLY_EVENT_KINDS.applied: {
+      const modes = Array.isArray(payload?.['modeChanges']) ? (payload['modeChanges'] as unknown[]).length : 0;
+      return `Core applied ${count} file(s) (staged, not committed)${modes > 0 ? `; ${modes} mode change(s)` : ''}`;
+    }
+    case APPLY_EVENT_KINDS.failed:
+      return payload?.['partial'] === true
+        ? `Core's apply did not complete \u2014 some files may have been written or staged: ${reason ?? 'no reason recorded; check `git status`'}`
+        : `Core did not apply: ${reason ?? 'no reason recorded'}`;
+    default: {
+      const outcome = payload?.['outcome'];
+      const found =
+        outcome === 'applied'
+          ? 'Core found the files applied (staged)'
+          : outcome === 'partial'
+            ? 'Core found it partial \u2014 some files may have been written or staged'
+            : outcome === 'not_applied'
+              ? 'Core found nothing applied'
+              : 'Core cannot know what was written';
+      return `Core restarted during an apply; ${found} \u2014 check \`git status\` in the repository.`;
     }
   }
 }

@@ -39,10 +39,15 @@ export const BINARY_DISCLOSURE =
 export const LOSSY_DISCLOSURE =
   "contains bytes that are not valid UTF-8; shown with replacement characters";
 export const EMPTY_PATCH_DISCLOSURE =
-  "Core returned an empty patch for this entry (for example a mode-only change or a pure rename)";
+  "Core returned an empty patch for this entry (for example a mode-only change)";
+/**
+ * A6 display note: for a host_worktree task a pure rename has an EMPTY patch
+ * (the rename travels in `status` / `oldPath`), so it never reads "no changes".
+ */
+export const RENAME_UNCHANGED_DISCLOSURE = "renamed, content unchanged";
 /** Always shown with a diff: what this view is, and is not. */
 export const DIFF_DISPLAY_ONLY_NOTE =
-  "Display only: this patch is shown as text and is never applied from here. Apply uses the change set and its confirmation.";
+  "Display only: this patch is shown as text and is never applied from here. Apply sends the reviewed entries (Core's content ids), never this text, after a confirmation.";
 
 /** The Diff action's gate on `system.probe` `methods`. */
 export function diffGate(capabilities: Pick<CoreCapabilities, "methods"> | null): FeatureGate {
@@ -96,8 +101,13 @@ export function diffDisclosures(result: GitDiffResult, maxBytesSent: number | un
   if (target !== null) out.push(`symlink → ${name(target)}`);
   if (result.truncated) out.push(`diff truncated at ${maxBytesSent ?? GIT_DIFF_DEFAULT_BYTES} bytes`);
   if (result.lossy) out.push(LOSSY_DISCLOSURE);
-  if (!result.binary && result.patch.length === 0) out.push(EMPTY_PATCH_DISCLOSURE);
+  if (!result.binary && result.patch.length === 0) {
+    out.push(result.status === "renamed" ? RENAME_UNCHANGED_DISCLOSURE : EMPTY_PATCH_DISCLOSURE);
+  }
   if (result.baseBlob !== undefined) out.push(`base blob ${name(result.baseBlob).slice(0, 12)}`);
+  // A6: the task-side content id this patch was rendered from (host_worktree).
+  if (result.taskBlob !== undefined) out.push(`task blob ${name(result.taskBlob).slice(0, 12)}`);
+  if (result.taskMode !== undefined) out.push(`task mode ${name(result.taskMode)}`);
   return out;
 }
 

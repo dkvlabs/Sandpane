@@ -653,6 +653,10 @@ export function decodeChangeSet(value: unknown): ChangeSet {
       ...("raw" in status ? { unrecognizedStatus: status.raw } : {}),
       // A5: exact pre-rename path; absent stays absent.
       ...optField("oldPath", optStr(f, "oldPath", "FileChange")),
+      // A6: open strings, kept byte for byte (never validated, trimmed or
+      // case-folded): they are sent back verbatim in a `git.apply` entry.
+      ...optField("taskBlob", optStr(f, "taskBlob", "FileChange")),
+      ...optField("taskMode", optStr(f, "taskMode", "FileChange")),
     };
   });
   const uninspected = optStrArray(c, "uninspected", "ChangeSet");
@@ -663,6 +667,9 @@ export function decodeChangeSet(value: unknown): ChangeSet {
     changes,
     ...optField("repoPath", optStr(c, "repoPath", "ChangeSet")),
     ...(uninspected === undefined ? {} : { uninspected }),
+    // A6: opaque; absent on a pre-A6 Core and on non-host_worktree tasks.
+    ...optField("reviewId", optStr(c, "reviewId", "ChangeSet")),
+    ...optField("hostHooksPath", optStr(c, "hostHooksPath", "ChangeSet")),
   };
 }
 
@@ -683,11 +690,38 @@ export function decodeGitDiffResult(value: unknown): GitDiffResult {
     truncated: bool(r, "truncated", "GitDiffResult"),
     lossy: bool(r, "lossy", "GitDiffResult"),
     ...optField("baseBlob", optStr(r, "baseBlob", "GitDiffResult")),
+    // A6 (host_worktree): the task-side blob/mode of the ONE read the patch
+    // was rendered from.
+    ...optField("taskBlob", optStr(r, "taskBlob", "GitDiffResult")),
+    ...optField("taskMode", optStr(r, "taskMode", "GitDiffResult")),
   };
 }
 
+/**
+ * `git.apply` result. The A6 fields are additive and tolerant:
+ * - `partial`: absent / `null` / `false` = no partial; `true` = partial; any
+ *   OTHER value is treated as a possible partial (`true`) — a garbled flag must
+ *   never turn "some files may have been written" into "nothing was written".
+ * - `appliedFiles` / `modeChanges` / `snapshotTree`: dropped when malformed
+ *   (they only ever add detail to the copy, never change its verdict).
+ * Error messages never echo payload values.
+ */
 export function decodeApplyResult(value: unknown): ApplyResult {
   const a = asRecord(value, "ApplyResult");
+  const appliedFiles = Array.isArray(a.appliedFiles)
+    ? a.appliedFiles.filter((p): p is string => typeof p === "string")
+    : undefined;
+  const modeChanges = Array.isArray(a.modeChanges)
+    ? a.modeChanges.flatMap((m) => {
+        if (typeof m !== "object" || m === null) return [];
+        const r = m as Rec;
+        return typeof r.path === "string" && typeof r.from === "string" && typeof r.to === "string"
+          ? [{ path: r.path, from: r.from, to: r.to }]
+          : [];
+      })
+    : undefined;
+  const partial =
+    a.partial === undefined || a.partial === null || a.partial === false ? undefined : true;
   return {
     applied: bool(a, "applied", "ApplyResult"),
     abortReason: optStr(a, "abortReason", "ApplyResult"),
@@ -697,6 +731,10 @@ export function decodeApplyResult(value: unknown): ApplyResult {
       }
       return p;
     }),
+    ...(appliedFiles === undefined ? {} : { appliedFiles }),
+    ...(modeChanges === undefined ? {} : { modeChanges }),
+    ...(typeof a.snapshotTree === "string" ? { snapshotTree: a.snapshotTree } : {}),
+    ...(partial === undefined ? {} : { partial }),
   };
 }
 

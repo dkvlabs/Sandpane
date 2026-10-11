@@ -24,6 +24,16 @@ sha2 = { version = "=0.11.0", default-features = false }
 # aho-corasick, "Unlicense OR MIT") is not built; every other perf feature
 # only enables code in regex-automata. New crates: regex, regex-automata,
 # regex-syntax — all MIT OR Apache-2.0.
+# A6 (design 2026-10-09 §3.6 item 3): git blob ids of task-side content
+# Core read itself. COLLISION-DETECTING SHA-1 (a Rust port of the sha1dc code
+# git links), so a detected attack is refused like git refuses it. MIT
+# (Sequoia-PGP). Pinned exactly like sha2. Default features are OFF: no
+# `digest` 0.10 / `std` (the inherent API is enough), leaving one new crate,
+# generic-array 1.4.5 (MIT), whose typenum and rustversion are already in the
+# tree. NOTE: the design names it "RustCrypto"; it is Sequoia-PGP's crate (the
+# RustCrypto equivalent, sha1-checked, was not chosen). cargo-deny and
+# cargo-audit were not installed when it was added.
+sha1collisiondetection = { version = "=0.3.4", default-features = false }
 regex = { version = "=1.13.1", default-features = false, features = ["std", "unicode", "perf-cache", "perf-dfa", "perf-onepass", "perf-backtrack", "perf-inline"] }
 
 [target.'cfg(unix)'.dependencies]

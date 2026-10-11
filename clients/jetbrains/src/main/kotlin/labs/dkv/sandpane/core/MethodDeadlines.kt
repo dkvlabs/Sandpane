@@ -43,6 +43,13 @@ object MethodDeadlines {
     const val GIT_REVIEW_MS: Int = 45_000
     const val GIT_DIFF_MS: Int = 45_000
 
+    /**
+     * `git.apply` (A6, \u00A73.6 item 10): the 45 s git deadline. Core bounds its own work at 41 s
+     * (prepare 20 + write 15 + verify 6), inside it. NOT read-only and NOT replay-safe: a timeout is
+     * a lost answer — "the apply may have been applied" — never "nothing changed", and never retried.
+     */
+    const val GIT_APPLY_MS: Int = 45_000
+
     /** The deadline for [method] given the user's [configuredMs]; never shorter than [configuredMs]. */
     fun forMethod(method: String, configuredMs: Int): Int = when (method) {
         CoreMethods.SANDBOX_STOP -> maxOf(configuredMs, SANDBOX_STOP_MS)
@@ -50,6 +57,7 @@ object MethodDeadlines {
         CoreMethods.PROJECT_ADD_REPOSITORY -> maxOf(configuredMs, PROJECT_ADD_REPOSITORY_MS)
         CoreMethods.GIT_REVIEW -> maxOf(configuredMs, GIT_REVIEW_MS)
         CoreMethods.GIT_DIFF -> maxOf(configuredMs, GIT_DIFF_MS)
+        CoreMethods.GIT_APPLY -> maxOf(configuredMs, GIT_APPLY_MS)
         else -> configuredMs
     }
 }

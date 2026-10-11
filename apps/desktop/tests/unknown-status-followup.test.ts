@@ -23,13 +23,13 @@ import {
   emptyProjection,
   foldTaskIndex,
   indexRowEventsRead,
-  planApply,
   reviewBlockReason,
   sanitizeHint,
   taskActionGate,
   taskBucket,
   type TaskProjection,
 } from "../src/lib/reducers";
+import { REASON_UNKNOWN_TWIN, planReviewedApply, reviewSelectability } from "../src/lib/git-apply";
 
 function projection(
   taskId: string,
@@ -139,38 +139,44 @@ describe("taskActionGate combines Core's task row and its event log", () => {
 // S1 — a duplicated path never applies its unrecognised twin
 // ---------------------------------------------------------------------------
 
-describe("planApply with a path Core listed twice", () => {
+describe("A6 apply with a path Core listed twice", () => {
+  const blob = { taskBlob: "c".repeat(40), taskMode: "100644" };
   const changeSet: ChangeSet = {
     taskId: "t1",
     baseCommit: "0123456789abcdef0123456789abcdef01234567",
     hostDirty: false,
+    reviewId: "r1",
+    repoPath: "/repo",
     changes: [
-      { path: "src/a.ts", status: "modified" },
+      { path: "src/a.ts", status: "modified", ...blob },
       { path: "src/a.ts", status: "unknown", unrecognizedStatus: "type_changed" },
-      { path: "src/b.ts", status: "added" },
-      { path: "src/b.ts", status: "added" },
+      { path: "src/b.ts", status: "added", ...blob },
+      { path: "src/b.ts", status: "added", ...blob },
     ],
   };
 
-  it("selecting the recognised entry does not carry the unrecognised change", () => {
-    const plan = planApply(changeSet, new Set(["src/a.ts"]));
-    expect(plan.selectedFiles ?? []).not.toContain("src/a.ts");
-    expect(plan.canApply).toBe(false);
-    expect(plan.unrecognized).toEqual(["src/a.ts"]);
+  it("the recognised twin of an unrecognised entry is not selectable", () => {
+    const verdicts = reviewSelectability(changeSet);
+    expect(verdicts[0]).toEqual({ selectable: false, reason: REASON_UNKNOWN_TWIN });
+    expect(verdicts[1]?.selectable).toBe(false);
+    const plan = planReviewedApply({ taskId: "t1", changeSet, selected: new Set([0]), diffs: new Map() });
+    expect(plan.ok).toBe(false);
   });
 
-  it("other files still apply, each sent once", () => {
-    const plan = planApply(changeSet, new Set(["src/a.ts", "src/b.ts"]));
-    expect(plan).toMatchObject({ canApply: true, selectedFiles: ["src/b.ts"] });
+  it("other entries still apply, addressed by index (each one once)", () => {
+    const plan = planReviewedApply({ taskId: "t1", changeSet, selected: new Set([2]), diffs: new Map() });
+    expect(plan.ok && plan.snapshot.request.entries).toEqual([{ path: "src/b.ts", status: "added", ...blob }]);
   });
 
   it("the plan always carries Core's raw path, never a display form", () => {
     const raw = "src/\u202Eevil.ts";
-    const plan = planApply(
-      { ...changeSet, changes: [{ path: raw, status: "modified" }] },
-      new Set([raw]),
-    );
-    expect(plan.selectedFiles).toEqual([raw]);
+    const plan = planReviewedApply({
+      taskId: "t1",
+      changeSet: { ...changeSet, changes: [{ path: raw, status: "modified", ...blob }] },
+      selected: new Set([0]),
+      diffs: new Map(),
+    });
+    expect(plan.ok && plan.snapshot.request.entries[0]?.path).toBe(raw);
   });
 
   it("the review list keys entries by index, not by path alone", () => {
@@ -252,17 +258,22 @@ describe("displayPath escapes hidden characters visibly instead of removing them
     expect(shown.text).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
   });
 
-  it("the apply-blocked reason shows the path escaped, not cleaned", () => {
-    const plan = planApply(
-      {
+  it("a diff-mismatch refusal shows the path escaped, not cleaned", () => {
+    const plan = planReviewedApply({
+      taskId: "t1",
+      changeSet: {
         taskId: "t1",
         baseCommit: "b",
         hostDirty: false,
-        changes: [{ path: "a\u202Eb", status: "unknown", unrecognizedStatus: "x" }],
+        reviewId: "r1",
+        repoPath: "/repo",
+        changes: [{ path: "a\u202Eb", status: "modified", taskBlob: "1".repeat(40), taskMode: "100644" }],
       },
-      new Set(),
-    );
-    expect(plan.blockedReason).toContain("a\\u202Eb");
+      selected: new Set([0]),
+      diffs: new Map([[`modified\u0000a\u202Eb`, { taskBlob: "2".repeat(40), binary: false, truncated: false }]]),
+    });
+    expect(plan.ok).toBe(false);
+    expect(!plan.ok && plan.reason).toContain("a\\u202Eb");
   });
 });
 

@@ -229,6 +229,9 @@ export const KNOWN_FEATURES = [
   // A4 (§3.4): `conversation.send` honours `mode`. Send it ONLY when this is
   // advertised: a pre-A4 Core drops the field and records a discussion as a task.
   'conversation-send-mode',
+  // A6 (§3.6): `git.apply` applies reviewed host_worktree entries (reviewId +
+  // entries). Without it Apply stays in its "not implemented" state.
+  'git-apply',
 ] as const;
 
 export type CoreFeature = (typeof KNOWN_FEATURES)[number];
@@ -692,6 +695,14 @@ export interface FileChange {
   status: FileChangeStatus;
   /** A5: the pre-rename path; present only for `renamed`. */
   oldPath?: string | null;
+  /**
+   * A6 (host_worktree only): the git blob id of the task-side content Core
+   * read itself (40 or 64 hex). Absent for `deleted` entries and for files
+   * over the 32 MiB apply cap. An open string: decode tolerantly.
+   */
+  taskBlob?: string | null;
+  /** A6 (host_worktree only): `"100644" | "100755" | "120000"` — an open string. */
+  taskMode?: string | null;
 }
 
 export interface ChangeSet {
@@ -706,6 +717,14 @@ export interface ChangeSet {
    * the change set is incomplete and must never be presented as complete.
    */
   uninspected?: string[] | null;
+  /**
+   * A6 (host_worktree only): an opaque id for THIS answer. `git.apply` takes
+   * entries copied verbatim from the review that produced it; Core keeps it in
+   * memory only, so after a Core restart the user reviews again.
+   */
+  reviewId?: string | null;
+  /** A6: the host's effective `core.hooksPath`, only when repo-relative. */
+  hostHooksPath?: string | null;
 }
 
 /** A5: `git.diff` byte bounds (sandpane_core::diff). Core clamps to 1..=MAX. */
@@ -739,17 +758,51 @@ export interface GitDiffResult {
   truncated: boolean;
   lossy: boolean;
   baseBlob?: string | null;
+  /**
+   * A6 (host_worktree only): the blob id of the task-side bytes this patch was
+   * rendered from (ONE read). A client MUST NOT send an apply whose entry
+   * `taskBlob` differs.
+   */
+  taskBlob?: string | null;
+  /** A6: the task-side mode of that same read. */
+  taskMode?: string | null;
 }
 
-/** `git.apply` params — explicit Git operation with a base check (specs/06 §6). */
+/**
+ * A6 `git.apply` params (§3.6). `entries` are the FileChange objects of ONE
+ * `git.review` answer, copied VERBATIM (never rebuilt or normalized), and
+ * `reviewId` is that answer's id. The pre-A6 `selectedFiles` is gone: an A6
+ * Core refuses it, and this client never sends it.
+ */
 export interface GitApplyParams {
   taskId: string;
-  selectedFiles?: string[] | null;
+  /** The task's full recorded base oid (a mismatch aborts, specs/06 §6). */
   expectedBase: string;
+  reviewId: string;
+  entries: readonly FileChange[];
+}
+
+/** A6: an executable-bit change made by an apply (open strings). */
+export interface ModeChange {
+  path: string;
+  from: string;
+  to: string;
 }
 
 export interface ApplyResult {
   applied: boolean;
   abortReason?: string | null;
   conflictedFiles: string[];
+  /** A6: the entry paths written into the working tree and staged (never committed). */
+  appliedFiles?: string[] | null;
+  /** A6: executable-bit changes among the applied entries. */
+  modeChanges?: ModeChange[] | null;
+  /** A6: the tree Core built from the reviewed objects. */
+  snapshotTree?: string | null;
+  /**
+   * A6: `true` ONLY when files MAY have been written although `applied` is
+   * false (the write failed or was killed after git's checks, or the staged
+   * content could not be verified). Never success, never "nothing written".
+   */
+  partial?: boolean | null;
 }

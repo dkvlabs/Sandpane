@@ -307,11 +307,18 @@ impl Method {
 ///   (`"task"` | `"discuss"`) and new tasks carry `TaskSummary.mode` (A4,
 ///   §3.4 item 1). A pre-A4 Core silently drops `mode` and would treat a
 ///   discussion as a task, so clients send it only when advertised.
-pub const FEATURES: [&str; 4] = [
+/// * `git-apply` — `git.apply` applies reviewed `host_worktree` entries
+///   (A6, design 2026-10-09 §3.6): `git.review` answers carry `reviewId`,
+///   `hostHooksPath` and per-entry `taskBlob` / `taskMode`, `git.diff`
+///   carries `taskBlob` / `taskMode`, and `git.apply` takes `reviewId` +
+///   `entries` and answers the additive `ApplyResult` fields. Without it a
+///   client keeps Apply in its "not implemented" state (§3.6 item 10).
+pub const FEATURES: [&str; 5] = [
     "idempotency-keys",
     "sandbox-create-agent",
     "conversation-sandbox-id",
     "conversation-send-mode",
+    "git-apply",
 ];
 
 /// [`FEATURES`] as owned strings — the one derivation `system.probe` uses.
@@ -1070,6 +1077,19 @@ pub struct ChangeSet {
     /// with `VALIDATION_FAILED`, never returned as a partial list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uninspected: Option<Vec<String>>,
+    /// A6 (additive, §3.6 item 3, R4): an opaque id for this answer, set
+    /// only for `host_worktree` tasks. Core keeps the last 8 per task in
+    /// memory (a Core restart means review again); `git.apply` accepts only
+    /// entries copied verbatim from a review Core produced. Not a
+    /// human-presence token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    /// A6 (additive, §3.6 item 9): the host repository's effective
+    /// `core.hooksPath`, reported ONLY when it is repo-relative (a path under
+    /// the repository root, in repo-relative form). Clients flag applied
+    /// paths under it as "runs automatically".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_hooks_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1082,6 +1102,19 @@ pub struct FileChange {
     /// `renamed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
+    /// A6 (additive, §3.6 item 3): the git blob id of the task-side content
+    /// Core itself read (`H("blob <len>\0" + bytes)`, SHA-1 with collision
+    /// detection or SHA-256 per the repository's object format). Only for
+    /// `host_worktree` tasks; absent for `deleted` entries, for files over
+    /// the 32 MiB apply cap ("too large to apply") and for entries Core
+    /// could not read as a file or symlink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_blob: Option<String>,
+    /// A6 (additive, §3.6 item 3): `"100644"`, `"100755"` or `"120000"`,
+    /// from `lstat` of the task-side entry; present exactly when
+    /// `task_blob` is. An open string, not an enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_mode: Option<String>,
 }
 
 /// `git.diff` params (A5, §3.5 item 3). Read-only.
@@ -1125,6 +1158,14 @@ pub struct GitDiffResult {
     /// The base-side blob id; absent for `added` and `untracked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_blob: Option<String>,
+    /// A6 (additive, §3.6 item 3, C4): for `host_worktree` tasks, the blob
+    /// id of the task-side bytes this patch was rendered from (ONE read).
+    /// A client MUST NOT send an apply whose entry `taskBlob` differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_blob: Option<String>,
+    /// A6 (additive): the task-side mode for that same read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1142,10 +1183,32 @@ pub enum FileChangeStatus {
 #[serde(rename_all = "camelCase")]
 pub struct GitApplyParams {
     pub task_id: String,
+    /// Pre-A6 field. REFUSED by an A6 Core (`VALIDATION_FAILED`), alone or
+    /// together with `entries`: a list of bare paths binds no content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_files: Option<Vec<String>>,
     /// Client's recorded base; a mismatch aborts (specs/06 §6).
     pub expected_base: String,
+    /// A6 (additive, §3.6 item 3): the `reviewId` of the `git.review`
+    /// answer the entries were copied from. Required by an A6 Core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    /// A6 (additive, §3.6 item 3): the entries to apply, copied VERBATIM
+    /// from that review (`path`, `status`, `oldPath`, `taskBlob`,
+    /// `taskMode`). Required and non-empty; an empty list never means "all".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Vec<FileChange>>,
+}
+
+/// A6 (§3.6 item 7): an executable-bit change made by an apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeChange {
+    pub path: String,
+    /// Git mode before (`"100644"`), as an open string.
+    pub from: String,
+    /// Git mode after (`"100755"`), as an open string.
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1157,6 +1220,22 @@ pub struct ApplyResult {
     pub abort_reason: Option<String>,
     #[serde(default)]
     pub conflicted_files: Vec<String>,
+    /// A6 (additive): the entry paths written into the working tree and
+    /// staged (nothing is committed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_files: Option<Vec<String>>,
+    /// A6 (additive): executable-bit changes among the applied entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_changes: Option<Vec<ModeChange>>,
+    /// A6 (additive): the tree Core built from the reviewed objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_tree: Option<String>,
+    /// A6 (additive): `true` ONLY when files may have been written although
+    /// `applied` is false — the write failed or was killed after git's
+    /// checks passed (W1), or post-write verification found staged content
+    /// that differs from the reviewed content (W2). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1351,7 +1430,8 @@ mod tests {
                 "idempotency-keys",
                 "sandbox-create-agent",
                 "conversation-sandbox-id",
-                "conversation-send-mode"
+                "conversation-send-mode",
+                "git-apply"
             ]
         );
         assert_eq!(
@@ -1360,7 +1440,8 @@ mod tests {
                 "idempotency-keys".to_string(),
                 "sandbox-create-agent".to_string(),
                 "conversation-sandbox-id".to_string(),
-                "conversation-send-mode".to_string()
+                "conversation-send-mode".to_string(),
+                "git-apply".to_string()
             ]
         );
         // A pre-A2 Core omits `features`: still parses, as "nothing advertised".
@@ -1377,7 +1458,8 @@ mod tests {
                 "idempotency-keys",
                 "sandbox-create-agent",
                 "conversation-sandbox-id",
-                "conversation-send-mode"
+                "conversation-send-mode",
+                "git-apply"
             ])
         );
     }
@@ -1569,6 +1651,8 @@ mod tests {
                 path: "new".into(),
                 status: FileChangeStatus::Renamed,
                 old_path: Some("old".into()),
+                task_blob: None,
+                task_mode: None,
             }],
             ..old
         };
@@ -1606,6 +1690,8 @@ mod tests {
             truncated: false,
             lossy: false,
             base_blob: None,
+            task_blob: None,
+            task_mode: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
@@ -1623,6 +1709,129 @@ mod tests {
         assert_eq!(v["oldPath"], "o");
         assert_eq!(v["baseBlob"], "b".repeat(40));
         assert_eq!(Method::parse("git.diff"), Some(Method::GitDiff));
+    }
+
+    /// A6 §3.6 items 3, 7, 9: every new field is additive — absent when
+    /// unset, tolerated when missing (pre-A6 wire), round-trips when set.
+    #[test]
+    fn a6_git_apply_fields_are_additive() {
+        // Pre-A6 frames still parse; nothing new is serialized when unset.
+        let old: ChangeSet = serde_json::from_str(
+            r#"{"taskId":"t","baseCommit":"b","hostDirty":false,
+                "changes":[{"path":"p","status":"modified"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (old.review_id.as_deref(), old.host_hooks_path.as_deref()),
+            (None, None)
+        );
+        assert_eq!(old.changes[0].task_blob, None);
+        assert_eq!(old.changes[0].task_mode, None);
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(
+            v.get("reviewId").is_none() && v.get("hostHooksPath").is_none(),
+            "{v}"
+        );
+        assert!(
+            v["changes"][0].get("taskBlob").is_none() && v["changes"][0].get("taskMode").is_none(),
+            "{v}"
+        );
+        let new = ChangeSet {
+            review_id: Some("r-1".into()),
+            host_hooks_path: Some(".husky".into()),
+            changes: vec![FileChange {
+                path: "run.sh".into(),
+                status: FileChangeStatus::Untracked,
+                old_path: None,
+                task_blob: Some("a".repeat(40)),
+                task_mode: Some("100755".into()),
+            }],
+            ..old
+        };
+        let v = serde_json::to_value(&new).unwrap();
+        assert_eq!(v["reviewId"], "r-1");
+        assert_eq!(v["hostHooksPath"], ".husky");
+        assert_eq!(v["changes"][0]["taskBlob"], "a".repeat(40));
+        assert_eq!(v["changes"][0]["taskMode"], "100755");
+
+        // git.apply params: the pre-A6 shape still parses (Core then refuses
+        // it as malformed for A6); entries reuse the reviewed FileChange.
+        let p: GitApplyParams = serde_json::from_str(&format!(
+            r#"{{"taskId":"t","expectedBase":"{}"}}"#,
+            "b".repeat(40)
+        ))
+        .unwrap();
+        assert_eq!((p.review_id.as_deref(), p.entries.is_none()), (None, true));
+        assert!(serde_json::to_value(&p).unwrap().get("entries").is_none());
+        let p: GitApplyParams = serde_json::from_value(serde_json::json!({
+            "taskId": "t", "expectedBase": "b".repeat(40), "reviewId": "r-1",
+            "entries": [{"path": "n", "status": "renamed", "oldPath": "o",
+                         "taskBlob": "c".repeat(40), "taskMode": "100644"}]
+        }))
+        .unwrap();
+        assert_eq!(p.review_id.as_deref(), Some("r-1"));
+        let e = &p.entries.as_ref().unwrap()[0];
+        assert_eq!(
+            (e.old_path.as_deref(), e.task_mode.as_deref()),
+            (Some("o"), Some("100644"))
+        );
+
+        // ApplyResult: pre-A6 shape unchanged; new fields only when set.
+        let r = ApplyResult {
+            applied: false,
+            abort_reason: Some("x".into()),
+            conflicted_files: vec![],
+            applied_files: None,
+            mode_changes: None,
+            snapshot_tree: None,
+            partial: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            serde_json::json!({"applied": false, "abortReason": "x", "conflictedFiles": []})
+        );
+        let old: ApplyResult = serde_json::from_str(r#"{"applied":true}"#).unwrap();
+        assert_eq!((old.partial, old.snapshot_tree), (None, None));
+        let r = ApplyResult {
+            applied: true,
+            abort_reason: None,
+            applied_files: Some(vec!["run.sh".into()]),
+            mode_changes: Some(vec![ModeChange {
+                path: "run.sh".into(),
+                from: "100644".into(),
+                to: "100755".into(),
+            }]),
+            snapshot_tree: Some("d".repeat(40)),
+            partial: Some(true),
+            ..r
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["appliedFiles"][0], "run.sh");
+        assert_eq!(
+            v["modeChanges"][0],
+            serde_json::json!({"path": "run.sh", "from": "100644", "to": "100755"})
+        );
+        assert_eq!(v["snapshotTree"], "d".repeat(40));
+        assert_eq!(v["partial"], true);
+
+        // git.diff: taskBlob/taskMode are additive.
+        let d: GitDiffResult = serde_json::from_str(
+            r#"{"path":"p","status":"modified","patch":"","binary":false,"truncated":false,"lossy":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (d.task_blob.as_deref(), d.task_mode.as_deref()),
+            (None, None)
+        );
+        assert!(serde_json::to_value(&d).unwrap().get("taskBlob").is_none());
+        let d = GitDiffResult {
+            task_blob: Some("e".repeat(64)),
+            task_mode: Some("100644".into()),
+            ..d
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["taskBlob"], "e".repeat(64));
+        assert_eq!(v["taskMode"], "100644");
     }
 
     /// A2 review W1: a replay is marked, the first response never is.

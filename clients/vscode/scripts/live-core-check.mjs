@@ -196,7 +196,7 @@ async function main() {
   // A2: advertisement only. This harness never sends a keyed sandbox.create
   // (it would drive the real sbx); keyed sends are not exercised here either.
   check(
-    'A2/A3b/A4: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent, conversation-sandbox-id, conversation-send-mode)',
+    'A2/A3b/A4/A6: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent, conversation-sandbox-id, conversation-send-mode, git-apply)',
     Array.isArray(caps.features) &&
       KNOWN_FEATURES.every((f) => caps.features.includes(f)) &&
       KNOWN_FEATURES.every((f) => coreAdvertisesFeature(caps, f)),
@@ -354,10 +354,19 @@ async function main() {
     `${diffError?.code}: ${diffError?.message}`,
   );
 
+  // A6: git.apply needs reviewId + entries copied from a git.review answer.
+  // A wire-created task has no Git context, so Core refuses BEFORE any review
+  // lookup with its exact "no Git context …; nothing was written" abort. The
+  // made-up review id and entry never reach a repository.
   let applyError = null;
   let applyResult = null;
   await commands
-    .gitApply({ taskId: summary.id, expectedBase: 'b71995fc1e0f4a3c8f0d7b1a2e3c4d5e6f708192' })
+    .gitApply({
+      taskId: summary.id,
+      expectedBase: 'b71995fc1e0f4a3c8f0d7b1a2e3c4d5e6f708192',
+      reviewId: 'live-check-unreviewed',
+      entries: [{ path: 'README.md', status: 'deleted' }],
+    })
     .then((r) => {
       applyResult = r;
     })
@@ -366,9 +375,11 @@ async function main() {
     });
   const abortReason = applyResult?.abortReason ?? applyError?.message ?? '';
   check(
-    'git.apply does not write host files (honest abort: P4 deliverable)',
-    (applyResult && applyResult.applied === false) || applyError !== null,
-    JSON.stringify(applyResult ?? { code: applyError?.code, message: abortReason.slice(0, 120) }),
+    'A6: git.apply on a wire-created task aborts with "task has no Git context …; nothing was written"',
+    applyResult?.applied === false &&
+      abortReason === 'task has no Git context (repo binding + base_commit); nothing was written' &&
+      applyResult?.partial !== true,
+    JSON.stringify(applyResult ?? { code: applyError?.code, message: abortReason.slice(0, 160) }),
   );
 
   // ---- unknown method: the client blocks it, and so does Core ----------

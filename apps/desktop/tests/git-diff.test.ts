@@ -163,10 +163,10 @@ describe("A5 drift against the Rust sources", () => {
     ] as const) {
       expect(rustStrConst(SERVICE_RUST, name), name).toBe(value);
     }
+    // A6 made both of these named consts in Core.
+    expect(rustStrConst(SERVICE_RUST, "MSG_NO_GIT_CONTEXT")).toBe(MSG_NO_GIT_CONTEXT);
+    expect(rustStrConst(SERVICE_RUST, "MSG_WORKTREE_REMOVED")).toBe(MSG_WORKTREE_REMOVED);
     const service = serviceRustSource();
-    expect(service).toContain(`"${MSG_NO_GIT_CONTEXT}".to_string()`);
-    const removed = /"(the task's worktree was removed[^"]*)"/.exec(service)?.[1] ?? "";
-    expect(removed.replace(/\\\n\s*/g, "")).toBe(MSG_WORKTREE_REMOVED);
     expect(service).toContain('format!("{m}; nothing was read")');
     const git = repoFile(GIT_RUST);
     expect(git).toContain(`"${SUBMODULE_REFUSAL_PREFIX}{}{extra}`);

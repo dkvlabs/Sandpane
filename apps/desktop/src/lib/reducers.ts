@@ -7,7 +7,7 @@
  */
 
 import { conversationMessageCopy } from "./conversation-messages";
-import { gitMessageCopy } from "./git-messages";
+import { createRepoBusyKind, gitMessageCopy } from "./git-messages";
 import { projectMessageCopy } from "./project-messages";
 import { MAX_HISTORY_BYTES, MAX_LIST_LIMIT, TASK_STATUSES } from "./protocol";
 import type {
@@ -749,6 +749,19 @@ export type TimelineEntry =
       timestamp: string;
       eventKind: string;
       detail: string;
+    }
+  | {
+      /**
+       * A6 durable apply record (`git.apply.started` / `git.applied` /
+       * `git.apply.failed` / `git.apply.reconciled`). Display only: it never
+       * changes the task's status. `text` is revealed and capped.
+       */
+      kind: "git-apply";
+      sequence: number;
+      timestamp: string;
+      phase: "started" | "applied" | "failed" | "reconciled";
+      tone: StatusTone;
+      text: string;
     };
 
 export interface TaskProjection {
@@ -879,6 +892,12 @@ function applyEvent(p: TaskProjection, event: TaskEvent): TaskProjection {
         { kind: "user-message", sequence, timestamp, text },
       );
     }
+    case "git.apply.started":
+    case "git.applied":
+    case "git.apply.failed":
+    case "git.apply.reconciled":
+      // A6: shown honestly, never folded into the task status.
+      return withSequence(p, event, {}, gitApplyEntry(kind, payload, sequence, timestamp));
     case "adapter.unavailable":
     case "scheduler.deferred": {
       const detail =
@@ -895,6 +914,87 @@ function applyEvent(p: TaskProjection, event: TaskEvent): TaskProjection {
     }
     default:
       return applyPayloadEvent(p, event);
+  }
+}
+
+/** Display cap for Core's reason inside an apply timeline entry. */
+const GIT_APPLY_REASON_CHARS = 300;
+
+function fileCount(payload: Record<string, unknown>): number | null {
+  const files = payload.files;
+  return Array.isArray(files) ? files.length : null;
+}
+
+function filesText(n: number | null): string {
+  return n === null ? "files (list not readable)" : `${n} file(s)`;
+}
+
+/**
+ * A6 apply events, decoded as OPEN payloads (every field optional). The
+ * `entries` / `expected` / `before` fields are never rendered; a `partial`
+ * that is not exactly `false` is treated as a possible partial.
+ */
+function gitApplyEntry(
+  kind: "git.apply.started" | "git.applied" | "git.apply.failed" | "git.apply.reconciled",
+  rawPayload: unknown,
+  sequence: number,
+  timestamp: string,
+): TimelineEntry {
+  const payload =
+    typeof rawPayload === "object" && rawPayload !== null ? (rawPayload as Record<string, unknown>) : {};
+  const files = filesText(fileCount(payload));
+  const at = { kind: "git-apply" as const, sequence, timestamp };
+  switch (kind) {
+    case "git.apply.started":
+      return {
+        ...at,
+        phase: "started",
+        tone: "info",
+        text: `Apply started for ${files} (Core recorded the start before writing)`,
+      };
+    case "git.applied":
+      return {
+        ...at,
+        phase: "applied",
+        tone: "success",
+        text: `Applied ${files} to the repository (staged, not committed)`,
+      };
+    case "git.apply.failed": {
+      const reason =
+        typeof payload.reason === "string"
+          ? `: ${displayRevealed(payload.reason, GIT_APPLY_REASON_CHARS).text}`
+          : "";
+      // Core always sends a boolean; anything but `false` (absent, garbled) is
+      // a POSSIBLE partial, never "nothing written".
+      const partial = payload.partial !== false;
+      return partial
+        ? {
+            ...at,
+            phase: "failed",
+            tone: "danger",
+            text: `Apply did not finish cleanly — some files may have been written or staged; check git status${reason}`,
+          }
+        : { ...at, phase: "failed", tone: "attention", text: `Apply aborted, no partial write reported${reason}` };
+    }
+    case "git.apply.reconciled": {
+      const outcome = typeof payload.outcome === "string" ? payload.outcome : null;
+      const found =
+        outcome === "applied"
+          ? "it found the files applied"
+          : outcome === "partial"
+            ? "it found a PARTIAL apply"
+            : outcome === "not_applied"
+              ? "it found nothing written"
+              : `it cannot know what was written (outcome: ${
+                  outcome === null ? "not reported" : displayRevealed(outcome, 64).text
+                })`;
+      return {
+        ...at,
+        phase: "reconciled",
+        tone: outcome === "not_applied" ? "attention" : "danger",
+        text: `Core restarted during an apply; ${found} — check git status in the repository`,
+      };
+    }
   }
 }
 
@@ -1516,62 +1616,6 @@ export function fileChangeLabel(
 }
 
 /**
- * What an apply would actually send, given the user's selection.
- *
- * A file whose status this build does not recognise is never sent: it is
- * dropped from an explicit selection, and while one is in the change set a
- * whole-set apply (no `selectedFiles`, which Core reads as "everything") is
- * blocked, because it would carry that file along implicitly.
- */
-export interface ApplyPlan {
-  canApply: boolean;
-  /** `undefined` = whole change set (only when every file is recognised). */
-  selectedFiles: string[] | undefined;
-  /** Paths whose status this build cannot read. */
-  unrecognized: string[];
-  blockedReason: string | null;
-}
-
-export function planApply(changeSet: ChangeSet, selected: ReadonlySet<string>): ApplyPlan {
-  const unknownChanges = changeSet.changes.filter((c) => c.status === "unknown");
-  // Apply is addressed BY PATH, so a path is unappliable as soon as ANY entry
-  // for it is unrecognised: selecting a recognised twin of that path would ask
-  // Core to apply the unrecognised change along with it.
-  const unrecognized = [...new Set(unknownChanges.map((c) => c.path))];
-  const unknownPaths = new Set(unrecognized);
-  const known = new Set(
-    changeSet.changes
-      .filter((c) => c.status !== "unknown" && !unknownPaths.has(c.path))
-      .map((c) => c.path),
-  );
-  // Each path is sent once, in Core's order, even when Core listed it twice.
-  const selectedFiles = [...new Set(changeSet.changes.map((c) => c.path))].filter(
-    (path) => known.has(path) && selected.has(path),
-  );
-  if (changeSet.changes.length === 0) {
-    return { canApply: false, selectedFiles: undefined, unrecognized, blockedReason: null };
-  }
-  if (selectedFiles.length > 0) {
-    return { canApply: true, selectedFiles, unrecognized, blockedReason: null };
-  }
-  if (unrecognized.length > 0) {
-    const raws = unknownChanges
-      .map((c) => `${displayPath(c.path).text} (${displayRaw(c.unrecognizedStatus ?? "unknown")})`)
-      .join(", ");
-    return {
-      canApply: false,
-      selectedFiles: undefined,
-      unrecognized,
-      blockedReason:
-        `${unrecognized.length} file(s) have a status this Sandpane build does not recognise: ` +
-        `${raws}. Applying the whole change set would include them, so select the recognised ` +
-        "files to apply explicitly.",
-    };
-  }
-  return { canApply: true, selectedFiles: undefined, unrecognized, blockedReason: null };
-}
-
-/**
  * Review panel copy for a `git.review` / `git.apply` pair. Every claim is
  * conditioned on data Core actually returned — "not yet applied" is only said
  * when the change set exists and apply has not succeeded.
@@ -1580,11 +1624,12 @@ export function reviewSummary(
   changeSet: ChangeSet | null,
   apply: ApplyResult | null,
   /**
-   * How many files the apply actually SENT (`selectedFiles.length`); omitted
-   * for a whole-set apply. Never the full change-set length when a selection
-   * or an unrecognised file narrowed what went to Core.
+   * How many entries the apply actually SENT; used only when Core's success
+   * answer omits `appliedFiles`. Never the full change-set length.
    */
   sentFileCount?: number,
+  /** The last apply's answer was lost: its outcome is UNKNOWN (may have been applied). */
+  applyOutcomeUnknown = false,
 ): { headline: string; detail: string; tone: StatusTone } {
   if (changeSet === null) {
     return {
@@ -1594,21 +1639,27 @@ export function reviewSummary(
       tone: "neutral",
     };
   }
+  if (apply?.partial === true) {
+    // A6 W1/W2: some files MAY have been written or staged — never "applied",
+    // never "not applied".
+    return {
+      headline: "Apply incomplete",
+      detail: "Some files may have been written or staged — check git status in the repository before retrying.",
+      tone: "danger",
+    };
+  }
   if (apply?.applied) {
-    // A whole-set apply is only ever sent when every file is recognised
-    // (`planApply`), so the recognised count is what Core was asked to apply.
-    const applied =
-      sentFileCount ?? changeSet.changes.filter((c) => c.status !== "unknown").length;
+    const applied = apply.appliedFiles?.length ?? sentFileCount ?? 0;
     return {
       headline: "Applied",
       detail: `Core applied ${applied} file(s) from ${shortHash(
         changeSet.baseCommit,
-      )}.`,
+      )} (staged, not committed).`,
       tone: "success",
     };
   }
   const dirtyWarning = changeSet.hostDirty
-    ? " Your host tree is dirty, so apply is blocked until you resolve it."
+    ? " Your host tree is dirty; Core refuses an apply that touches any path that is not clean."
     : "";
   if (changeSet.changes.length === 0) {
     return {
@@ -1622,12 +1673,18 @@ export function reviewSummary(
     unrecognized > 0
       ? ` ${unrecognized} file(s) have a status this build does not recognise and cannot be applied from here.`
       : "";
+  // No claim about the working tree unless Core made one: this view cannot
+  // know what was applied before it mounted.
+  const applyNote = applyOutcomeUnknown
+    ? " The last apply's outcome is unknown (Core's answer was lost) — check git status in the repository."
+    : "";
+  const aborted = apply?.abortReason
+    ? ` Last apply aborted: ${displayRevealed(apply.abortReason, MAX_REASON_CHARS).text}.`
+    : "";
   return {
     headline: `${changeSet.changes.length} file(s) changed`,
-    detail: `Base ${shortHash(changeSet.baseCommit)}. Not applied to your working tree.${dirtyWarning}${unrecognizedNote}${
-      apply?.abortReason ? ` Last apply aborted: ${apply.abortReason}.` : ""
-    }`,
-    tone: changeSet.hostDirty ? "attention" : "info",
+    detail: `Base ${shortHash(changeSet.baseCommit)} — changes in the task's workspace.${applyNote}${dirtyWarning}${unrecognizedNote}${aborted}`,
+    tone: applyOutcomeUnknown ? "danger" : changeSet.hostDirty ? "attention" : "info",
   };
 }
 
@@ -1907,6 +1964,20 @@ function describeCoreErrorUnrevealed(err: CoreRequestError): ErrorCopy {
         title: "Nothing was run — another operation on this sandbox is in progress",
         reason: err.message,
         action: "Wait for it to finish, then re-read state before trying again.",
+        tone: "attention",
+        ...coreHints(err),
+      };
+    }
+    // A6 (W-N1): sandbox.create refused because the repository it would
+    // direct-mount is busy. Core says "nothing was created"; its text stays.
+    if (err.code === "CONFLICT" && createRepoBusyKind(err.message) !== null) {
+      return {
+        title: "Repository busy — nothing was created; try again when it finishes",
+        reason: err.message,
+        action:
+          createRepoBusyKind(err.message) === "writer-lock"
+            ? "A writer task, an apply or a worktree discard holds the repository. Create the sandbox after it finishes."
+            : "Another direct-mount sandbox of this repository is being created. Try again when that create finishes.",
         tone: "attention",
         ...coreHints(err),
       };

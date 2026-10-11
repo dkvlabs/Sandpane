@@ -43,6 +43,10 @@ export const UNTRACKED_REFUSAL_SUFFIXES = [
 // --- disclosures ---
 export const BINARY_DISCLOSURE = 'treated as binary (possibly by repository attributes) \u2014 no text diff shown';
 export const LOSSY_DISCLOSURE = 'contains bytes that are not valid UTF-8; shown with replacement characters';
+/** A6 display note: on host_worktree a pure rename has an EMPTY patch. */
+export const RENAME_UNCHANGED_DISCLOSURE = 'renamed, content unchanged';
+export const EMPTY_PATCH_DISCLOSURE =
+  'Core returned an empty patch for this entry \u2014 no line difference is shown (a mode-only change, for example, has none)';
 export function truncatedDisclosure(maxBytes: number): string {
   return `diff truncated at ${maxBytes} bytes \u2014 the last hunk header may promise more lines than are shown`;
 }
@@ -130,6 +134,8 @@ export function parseGitDiffResult(raw: unknown): GitDiffResult | null {
   if (!(FILE_CHANGE_STATUSES as readonly unknown[]).includes(r['status'])) return null;
   if (typeof r['binary'] !== 'boolean' || typeof r['truncated'] !== 'boolean' || typeof r['lossy'] !== 'boolean') return null;
   if (!optionalString(r['oldPath']) || !optionalString(r['baseBlob'])) return null;
+  // A6 (host_worktree): the content id / mode of the bytes this patch shows.
+  if (!optionalString(r['taskBlob']) || !optionalString(r['taskMode'])) return null;
   return {
     path: r['path'],
     status: r['status'] as GitDiffResult['status'],
@@ -139,6 +145,8 @@ export function parseGitDiffResult(raw: unknown): GitDiffResult | null {
     lossy: r['lossy'],
     ...(typeof r['oldPath'] === 'string' ? { oldPath: r['oldPath'] } : {}),
     ...(typeof r['baseBlob'] === 'string' ? { baseBlob: r['baseBlob'] } : {}),
+    ...(typeof r['taskBlob'] === 'string' ? { taskBlob: r['taskBlob'] } : {}),
+    ...(typeof r['taskMode'] === 'string' ? { taskMode: r['taskMode'] } : {}),
   };
 }
 
@@ -147,7 +155,7 @@ export function parseGitDiffResult(raw: unknown): GitDiffResult | null {
  * visible space — a QuickPick label renders `$(name)` as a theme icon, so a
  * file named `$(pass-filled) README.md` would otherwise show a fake check.
  */
-function labelText(value: string): string {
+export function labelText(value: string): string {
   return plainText(value, MAX_PATH_CHARS).replace(/\$\(/g, '$ (');
 }
 
@@ -248,7 +256,16 @@ export function renderPatchDocument(input: PatchDocumentInput): { text: string; 
       ? [`# base blob: ${plainText(result.baseBlob, 200).slice(0, 12)}`]
       : []),
     ...(target !== null ? [`# symlink \u2192 ${plainText(target, MAX_TARGET_CHARS)} (the link text, not the target's content)`] : []),
+    ...(typeof result.taskBlob === 'string' && result.taskBlob.length > 0
+      ? [
+          `# task content id: ${plainText(result.taskBlob, 200).slice(0, 12)}` +
+            (typeof result.taskMode === 'string' ? ` (mode ${plainText(result.taskMode, 20)})` : ''),
+        ]
+      : []),
     ...(result.binary ? [`# ${BINARY_DISCLOSURE}`] : []),
+    ...(!result.binary && result.patch.length === 0
+      ? [`# ${result.status === 'renamed' ? RENAME_UNCHANGED_DISCLOSURE : EMPTY_PATCH_DISCLOSURE}`]
+      : []),
     ...(result.truncated ? [`# ${truncatedDisclosure(input.maxBytes)}`] : []),
     ...(result.lossy ? [`# ${LOSSY_DISCLOSURE}`] : []),
     ...(hiddenLines > 0
@@ -277,10 +294,16 @@ export class PatchDocumentStore {
   private counter = 0;
   private readonly docs = new Map<string, string>();
 
+  /** A6 reuses the store for the `sandpane-apply:` list (own gone text and extension). */
+  constructor(
+    private readonly goneText: string = PATCH_GONE_TEXT,
+    private readonly extension: string = '.diff',
+  ) {}
+
   put(label: string, text: string): { path: string } {
     this.counter += 1;
     const base = (label.split('/').pop() ?? 'patch').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) || 'patch';
-    const path = `/${this.counter}/${base}.diff`;
+    const path = `/${this.counter}/${base}${this.extension}`;
     this.docs.set(path, text);
     while (this.docs.size > MAX_PATCH_DOCUMENTS) {
       const oldest = this.docs.keys().next().value;
@@ -291,6 +314,6 @@ export class PatchDocumentStore {
   }
 
   provideTextDocumentContent(uri: { path: string }): string {
-    return this.docs.get(uri.path) ?? PATCH_GONE_TEXT;
+    return this.docs.get(uri.path) ?? this.goneText;
   }
 }
