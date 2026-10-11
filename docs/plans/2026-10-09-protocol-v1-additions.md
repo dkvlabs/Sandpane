@@ -77,7 +77,7 @@ Each row is one commit, plus its `docs(audit)` log entry. Status is tracked in t
 | A5 | `ChangeSet.repoPath?`, `ChangeSet.uninspected?: string[]`, `FileChange.oldPath?` | response fields | `oldPath` comes from `--name-status -M`. `uninspected` lets a future review return a flagged partial list for submodules instead of refusing; today it is always refused. |
 | A5 | `git.diff` | `{ taskId, path, maxBytes? }` → `{ path, oldPath?, patch, binary, truncated, baseBlob?, taskBlob? }` | Read-only. Hardened runner; the path must be in the task's change list. Patch capped (default 256 KiB). |
 | A6 | `git.apply` (existing) implemented for reviewed entries | additive: `entries`, `FileChange.taskBlob`/`taskMode`, `ApplyResult.appliedFiles` | **Superseded by §3.6** (originally `--3way` / `cherry-pick`): `host_worktree` only; content bound to the reviewed blob ids; no git process reads the task worktree; exact-set snapshot from objects; host leading-path and dirty gates; `git apply --index` with post-write verification; durable start/finish events. |
-| A7 | `verification.list`, `verification.approve` (user-entered argv + label), `verification.revoke`, `verification.run` | `VerificationCommand { id, label, argv: string[], approvedAt }`, `VerificationResult { exitCode, stdout, stderr, truncated, elapsedMs }` | Runs **only** inside the task's sandbox via `sbx exec` with an argv vector (no shell). Output is bounded and redacted. Never runs on the host. |
+| A7 | `verification.list`, `verification.approve` (user-entered argv + label), `verification.revoke`, `verification.run` | `VerificationCommand { id, label, argv: string[], approvedAt }`, `VerificationResult { exitCode, stdout, stderr, truncated, elapsedMs }` | **Superseded by §3.7**: runs **only** inside the task's sandbox via `sbx exec -- <name> <argv>` (no shell), asynchronously, with output read through the added `verification.result`; approvals refuse secrets; spawning is version-gated on captured proof. Never runs on the host. |
 | A7 | `project.context` | `{ detected: [{ manifest, suggestedCommands: string[][] }], approved: VerificationCommand[] }` | Bounded, read-only manifest parsing. Suggestions are never auto-approved. |
 | A8 | `sbx.status` (read-only diagnostics) | `{ path, version, daemon: { running }, policyInitialized?, captured: boolean }` | From `version` and `daemon status --json`. |
 | A8 | `sandbox.ports.list`, `sandbox.ports.publish` (loopback only) / `unpublish` | — | Each is advertised only if captured `--help` proves the flags. Otherwise it is not advertised. |
@@ -510,6 +510,206 @@ The design-level `security-reviewer` pass on the first draft returned **BLOCK**.
       - a lost-answer retry, a concurrent apply, writer-lock contention and restart reconciliation.
     - Mutation runs cover the gates.
     - Over the wire, the live checks can confirm only the advertisement and the "no Git context" refusal (UNVERIFIED until A4b).
+
+### 3.7 A7 decisions (verification commands + `project.context`), fixed before implementation
+
+A7 is the first addition that **executes** something. It runs user-approved argv vectors inside a task's sandbox through `sbx exec`. Nothing ever runs on the host (specs/06; AGENTS.md rules 1–2). The real `sbx` is never run while Sandpane is being built. Every `sbx exec` fact below that a capture has not proven is marked **UNVERIFIED**, and item 12 lists the captures that would prove it.
+
+The design-level `security-reviewer` pass on the first draft returned **BLOCK**. The block was one Critical: approved argv and labels were stored and replayed unredacted. The same pass raised Warnings W1–W9 and Info I1–I7. A cobra v1.10.2 / pflag v1.0.10 probe showed that the `sbx exec -- NAME argv…` shape never turns an argv element into an `sbx` flag, under both interspersed and non-interspersed parsing. Every finding is folded in below and tagged with its id. A re-review returned PASS-WITH-WARNINGS. Its R1–R4 and Info I-a–I-h are folded in as well.
+
+1. **Wire (additive; 28 → 34 methods; features 5 → 6).**
+   - **`verification.list {projectId}`** → `{commands: VerificationCommand[]}`, ordered by `approvedAt`, with revoked commands excluded.
+     - `VerificationCommand {id, projectId, label, argv: string[], approvedAt}`.
+   - **`verification.approve {projectId, label, argv}`** → `{command: VerificationCommand}`.
+     - Approving the same `argv` again (byte-equal, not revoked) returns the existing command, with its label unchanged.
+     - A project holds at most 50 live commands; revoked ones do not count. More is `VALIDATION_FAILED`.
+   - **`verification.revoke {commandId}`** → `{revoked: true}`.
+     - The row is tombstoned (`revoked_at`), never deleted, so older events' `commandId` still resolves.
+     - A run that is already in flight is not stopped. Run start checks revocation inside its transaction (item 5).
+   - **`verification.run {taskId, commandId, expectedSandboxName, expectedWorkspaceMode, idempotencyKey?}`** → `{runId, startedSequence}`. It is **asynchronous** (item 5).
+     - It never takes argv or a path, so only approved commands can ever run.
+     - The two `expected*` values are what the run dialog showed the user (`TaskSummary.sandboxName` / workspace mode). Core compares them with the binding and the live listing (W5), following the A6 `expectedBase` pattern.
+   - **`verification.result {runId}`** → `VerificationResult {runId, taskId, commandId, label, argv, sandbox, workspaceMode, outcome, exitCode?, stdout, stderr, stdoutTruncated, stderrTruncated, redactions, elapsedMs, startedAt, finishedAt?}` (W1). An unknown run is `NOT_FOUND`; a run still in flight returns `outcome: "running"`.
+   - **`project.context {projectId}`** → `{repositories: [{repoPath, detected: [{manifest, suggestedCommands: string[][], notes: string[]}], unreadable: string[]}], approved: VerificationCommand[]}` (item 9).
+   - **Methods** go in `Method::ALL` after `git.apply`, in this order: `verification.list`, `verification.approve`, `verification.revoke`, `verification.run`, `verification.result`, `project.context`. Every pinned list moves together, to **34**.
+   - **New feature `"verification"`.** Clients enable the verification UI only when it is advertised.
+   - **Archived projects (R4):** `verification.approve` and `verification.run` are refused on an archived project with the A3a message ("project is archived; unarchive it first; nothing was changed"). `verification.run` is also refused when the task's conversation is archived, with the A3b message. `verification.revoke` is always allowed, because it only narrows what can run.
+   - **Errors:**
+     - `NOT_FOUND`: unknown project, command, task or run.
+     - `VALIDATION_FAILED`: malformed input, a secret in an approve (item 2), a command from another project, or a gate refusal (item 4, text ends "nothing was run").
+     - `NOT_INSTALLED`: no `sbx`.
+     - `UNSUPPORTED_SBX_VERSION`: the version gate (item 3).
+     - `CONFLICT`: a run already in flight for the task, the sandbox or the repository, the global cap, or a bad idempotency replay (A2).
+2. **Approve validation (Core is the authority; clients are never stricter).**
+   - `label`: 1–80 characters, no control characters, no bidi or invisible format characters. Leading and trailing whitespace is trimmed.
+   - `argv`:
+     - 1–64 elements;
+     - each element at most 4096 bytes, all of them together at most 16 KiB;
+     - valid UTF-8 with no NUL;
+     - `argv[0]` is non-empty and does not start with `-` (hygiene only, I1: after `--` no element can become an `sbx` flag).
+   - **No secrets (C1).** Each argv element and the label go through `redact::redact`.
+     - Any replacement → `VALIDATION_FAILED` "argument N looks like a secret (<kind>); approved commands cannot hold secrets; nothing was approved", or "the label looks like a secret …".
+     - `RedactorUnavailable` → the approve is refused: "the secret check is unavailable, so nothing was approved".
+     - Only proven-clean argv is ever stored, put in events or returned. The approve dialog says "Do not put tokens or passwords in arguments".
+     - **False positives (I-g):** a harmless argument shaped like a secret (e.g. `--password-file=/path`) is also refused, and there is no override. That is fail-closed. The refusal names the kind and says the argument can be renamed or moved into a script.
+   - Nothing else is interpreted. There is no shell, no splitting and no globbing, and no path or allowlist check on `argv[0]`. The user approves an exact vector.
+   - Clients collect argv as a list. If a client offers a one-line field, it must show the user the resulting list before approving. Clients never pass a string through a shell-like splitter silently.
+3. **What runs (one fixed spawn).**
+   - **Argv:** `sbx exec -- <sandbox name> <argv…>`. Core passes no `-i`/`-t`/`-u`/`-e`/`-w`/`--privileged` and no `--cloud`.
+   - **Process:**
+     - stdin is `/dev/null`;
+     - the process runs in its own group;
+     - `current_dir` is a Core-owned empty 0700 directory, so sbx cannot derive anything from Core's working directory (W6).
+   - **Environment (W4):** cleared, then an allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG` and `LC_*`. Host tokens in Core's environment never reach `sbx`.
+   - **Same context for the gates (R2):** the identity gate's `sbx ls --json` and the version probe run with exactly the same environment allowlist and the same Core-owned working directory as the exec, so they cannot consult a different daemon or context. A test asserts the identical environment and working directory across all three invocations.
+   - **Flag safety:** the `--` comes **before** the sandbox name. The probe proved that, under stock cobra/pflag, no later element is ever read as an `sbx` flag, in either parsing mode. Other shapes fail: without `--`, interspersed parsing injects `-u root --privileged --cloud`; with `NAME --`, non-interspersed parsing passes the `--` into the command.
+   - **UNVERIFIED (C-1, W6):**
+     - sbx's own argument handling after parsing (e.g. resolving a default sandbox when `ArgsLenAtDash() == 0`);
+     - whether sandboxd joins argv into a shell string;
+     - the cobra/pflag version sbx actually links.
+   - **Version gate (W6; sbx-cli rule 4).**
+     - Core spawns `sbx exec` only for sbx versions in `VERIFIED_EXEC_VERSIONS`, a list that holds a version only after C-1, C-2, C-5 and C-7 are captured for it (item 11).
+     - The list is **empty** in A7. Any other version returns `UNSUPPORTED_SBX_VERSION` "sbx exec argument passing has not been verified for sbx <version>; nothing was run".
+     - Integration tests add the fake `sbx` version through a test seam.
+     - This is honest: the feature, approvals, `project.context` and results are real, and running is gated on proof.
+   - **The sandbox name** comes from the task's **binding** (`sandbox_bindings`, the same source as `TaskSummary.sandboxName`). It is never taken from `chosenSandboxName` or from the client, and it is re-validated with `sandpane_core::validation` before it becomes an argument.
+   - **No working directory is passed.** The command runs in sbx's default working directory (C-5), and every client says so.
+4. **Pre-run gates (nothing runs if any fails).**
+   - **Binding:** the task exists and has a live binding. Otherwise: "this task is not bound to a sandbox; nothing was run". Over the wire no task has a binding until A4b, so a real run is reachable only for tasks seeded internally, recorded UNVERIFIED.
+   - **Command:** it exists, is not revoked, and belongs to the task's project.
+   - **What the user saw:** `expectedSandboxName` and `expectedWorkspaceMode` equal the binding. Otherwise: "the task's sandbox changed since you confirmed; nothing was run".
+   - **Identity (W5):**
+     - The binding must carry `sbx_id`. A fresh `sbx ls --json` must list the name with exactly that `id`.
+     - Its `workspaces` (now parsed) must equal the binding's mount, compared as canonicalized paths (I-d: `/tmp` vs `/private/tmp` on macOS). That is the repository path for `direct_mount`, the task worktree path for `host_worktree`, the clone source for `sbx_clone`, and empty for `mountless`. Only the `direct_mount` shape is captured; the `host_worktree` and `sbx_clone` shapes are UNVERIFIED, and a mismatch fails closed.
+     - Its `status` must be exactly `"running"`. `sbx exec` starts a stopped sandbox (captured help), so a stopped one is refused: "sandbox \"<name>\" is not running; sbx exec would start it; start it with `sbx run` in a terminal; nothing was run".
+     - A NULL `sbx_id`, a missing or different id, a workspace mismatch, or an unknown status → "Core cannot confirm the sandbox's identity; nothing was run".
+     - Disclosed residual (as A1): `exec` acts on a name, so a same-named sandbox swapped in between the listing and the exec would be the one used.
+   - **`direct_mount`** bindings run. The run takes the **repository writer lock** for its whole duration, so it is never concurrent with an apply, a writer task, a discard or another `direct_mount` run on that repository (W7). A run on a repository whose lock is held by a running `direct_mount` writer task gets `CONFLICT`, which is intended (I-b). Releasing the lock after a timeout or kill does not stop writes: per C-4 the in-sandbox process may continue, and the timeout copy says so. Every label says "this sandbox mounts your repository directly; the command can change your working tree, including `.git/hooks` that later run on your machine" (I7).
+   - **Concurrency (W7):** at most one run per task and one per sandbox, and at most 4 runs across Core. Exceeding any of these → `CONFLICT` "… a verification is already running …; nothing was run".
+5. **Asynchronous, durable, reconciled.**
+   - **Keyed replay first (R1).** When `idempotencyKey` is present, Core looks it up **before every other check** (A2 §3.1 item 4; A3b keyed replay). A stored result is returned as is, even while that run is still in flight or after its command was revoked. A key with different parameters is `CONFLICT`.
+   - **Lock order (I-a).** For `direct_mount`, Core first takes the repository writer lock through the scheduler (non-blocking) and releases the scheduler mutex, and only then opens the DB transaction. The scheduler mutex is never nested inside the DB guard (the A3b C1 deadlock class). The writer lock is released on every failure path and by the drop guard.
+   - **Start transaction (W7).** One DB transaction under the DB lock:
+     1. re-check that the command is not revoked and belongs to the task's project;
+     2. check and set the run concurrency, with an in-memory registry guarded by the same lock;
+     3. insert the `verification_runs` row as `running`;
+     4. record the idempotency key as **done**, with `{runId, startedSequence}` as its result, atomically with the row and the event (the `conversation.send` pattern, §3.1 item 3). A key is never left pending;
+     5. append the durable task event `verification.started {runId, commandId, label, argv, sandbox, workspaceMode}`. The argv was proven clean at approve (C1).
+
+     Commit, answer `{runId, startedSequence}`, then spawn on a worker thread. **No DB, scheduler or writer lock other than the run's own (`direct_mount` only) is held across the exec.**
+   - **Worker:**
+     - a drop guard writes the terminal state and clears the registry even on panic;
+     - it tolerates the task having been deleted (a run in flight also blocks deletes; see below).
+   - **One terminal record (R3).** Every terminal write is conditional (`UPDATE … WHERE status = 'running'`), and the terminal event is appended only when that update changed a row. The first terminal record wins: a run marked `interrupted` at shutdown is never overwritten by the `signaled` its own worker sees later. Interruption has **one** representation on both paths, `verification.finished {outcome: "interrupted"}`; there is no separate `verification.interrupted` kind.
+   - **Outcome:** the run row is updated, then the durable event `verification.finished {runId, startedSequence, outcome, exitCode?, stdoutBytes, stderrBytes, stdoutTruncated, stderrTruncated, redactions, elapsedMs}` is appended. **Output never goes into events (W1).** It lives only in the run row, read through `verification.result`.
+   - **Outcomes** are open strings, not an enum change:
+     - `exited`, with `exitCode`;
+     - `signaled`, with no code (W2);
+     - `timed_out`;
+     - `spawn_failed`;
+     - `read_failed` (W2);
+     - `possibly_sbx_error` (I3; see item 6);
+     - `interrupted`.
+   - **Idempotency:** `idempotencyKey` reuses A2 (24 h). The fingerprint is `{taskId, commandId, expectedSandboxName, expectedWorkspaceMode}`. A replay returns the same `{runId, startedSequence}` and never runs a second time. Clients always send a key, so a lost answer can be retried safely.
+   - **Limits (W2):** `RunLimits::VERIFICATION {timeout: 600 s, max_stdout: 64 KiB, max_stderr: 64 KiB}`, through a runner variant that **keeps the output captured so far** on timeout, read failure and kill. A timed-out run therefore still has its partial output.
+     - At the deadline Core kills the process group: SIGTERM, 5 s grace, then SIGKILL.
+     - **Disclosed:** killing the `sbx exec` client may not stop the process inside the sandbox (C-4). Copy: "the command may still be running inside the sandbox".
+   - **Shutdown and restart (W3):**
+     - On graceful shutdown, Core appends a terminal `verification.finished {outcome: "interrupted"}` for each in-flight run, then signals its process group (SIGTERM, grace, SIGKILL).
+     - After a crash, a `verification.started` with no matching outcome (matched on `startedSequence`, as A6 I2) gets `verification.finished {outcome: "interrupted"}` at startup, and its row becomes `interrupted`. If that reconcile fails, Core refuses to serve (A2 item 7). Stale PIDs are never signalled after a restart (specs/02 §1).
+     - **Disclosed:** after a crash, the orphaned `sbx exec` client and its in-sandbox process may keep running.
+     - Copy: "Core restarted while this verification ran; its result is unknown, and the command may still be running inside the sandbox".
+   - **Lifecycle (W7):**
+     - `project.delete`, `conversation.delete` and `sandbox.remove` refuse while a run is in flight for any of their tasks or sandboxes ("a verification is running …; wait for it to finish; nothing was deleted"). `sandbox.stop` describes in-flight runs in its impact.
+     - **Task status is never changed by a verification** (rule 3). A7 deliberately does not use the specs/02 §4 `verifying` state, and clients never show a verification as task status (I6).
+6. **Exit status and output (honest, bounded, redacted).**
+   - `exitCode` is **the exit status of `sbx exec`**. Whether sbx passes a command's non-zero exit through unchanged is UNVERIFIED (C-2). The only capture is `echo`, which exited 0, and sbx's own failures also exit 1.
+   - **I3:** when stdout is empty and stderr has the captured `error: …` shape, the outcome is `possibly_sbx_error`, which keeps its `exitCode` (I-f), labelled "possibly sbx's own error, or the command's own output".
+     - `classify_failure`'s code mapping is never applied to exec output.
+     - A `try:` hint is never relayed as Core's advice.
+   - Clients label the number "exit status (as reported by sbx exec)". They never say "tests passed" or "failed", and never colour exit 0 as a pass until C-2 is captured (I4).
+   - **Storage:**
+     - stdout and stderr are capped at 64 KiB each and redacted with the best-effort redactor **before** storage. The bytes are decoded lossily first, and that is disclosed (I5).
+     - A secret cut at the cap can survive as a partial token, also disclosed (I5).
+     - If the redactor is unavailable, the output is not stored; the result says so, and nothing raw is kept.
+     - Output is kept only in `verification_runs`. A9 retention must cover these rows.
+   - **Rendering (W9).** Output, labels, argv, notes and sandbox names are untrusted text, and clients render them revealed and capped:
+     - as plain text: never HTML, never Markdown;
+     - never in a terminal, pty or console widget (no VS Code terminal, no JetBrains `ConsoleView` with hyperlink filters);
+     - every C0/C1 character except LF and TAB, including ESC, is escaped and shown visibly, so OSC 8 links, OSC 52 clipboard writes and file-link detectors cannot act. A CR is shown as `\r` (I-e);
+     - no command links.
+7. **Storage (W7).**
+   - Migration **v8**, with the v4–v7 backup and downgrade refusal:
+     - `verification_commands (id, project_id, label, argv_json, approved_at, revoked_at)`;
+     - `verification_runs (id, task_id, command_id, sandbox_name, workspace_mode, argv_json, label, status, exit_code, outcome, stdout, stderr, stdout_truncated, stderr_truncated, redactions_json, started_sequence, started_at, finished_at)`.
+   - The unused pre-A7 `verifications` table stays as is.
+   - **Explicit delete order (A3a/A3b):** runs before tasks; commands before projects.
+8. **Gestures and confirmations (binding for every client; W9).**
+   - Approve, revoke and run each happen **only** from a direct user gesture on Sandpane's own control. They never come from chat, agent or tool text, an event, a reconnect or a timer.
+   - No entry point accepts argv or a `commandId` from `command:` URIs, `executeCommand` arguments or action parameters. Every entry point opens the dialog and fills it from Core state.
+   - **Approve** shows a confirmation that lists argv element by element (revealed, with the element count) and the label, plus "Do not put tokens or passwords in arguments". It also states:
+     - "Approval binds this exact argument list, not what it executes. Commands such as `npm run test`, `make test` or `./gradlew test` run code from the repository that the agent can change after you approve.";
+     - for a suggestion, the notes Core showed (item 9).
+   - **Run** shows:
+     - the command, the sandbox and the workspace mode, with the `direct_mount` warning (item 4);
+     - "Runs in sbx's default working directory inside the sandbox; the result is the exit status reported by sbx exec; not yet verified against a real sbx";
+     - in `host_worktree`, that the command can change files in the task's workspace, so a review taken before may no longer match. A later apply then refuses "changed since reviewed", and the client offers "Review again". A7 does not lift the W-D/A4b precondition (I7).
+   - Revoke is a plain confirmation and is not destructive. VS Code reuses the A6 pattern: a modal plus a typed or QuickPick step whose Cancel is the default.
+9. **`project.context` (read-only, bounded, no tool runs; W8).**
+   - It reads only the project's **registered** repositories. Each root is opened with `O_DIRECTORY|O_NOFOLLOW` and an identity check against the registered canonical path; each manifest goes through the A5 race-safe `openat` read (`O_NOFOLLOW` leaf, regular file only, inode check).
+   - A file is capped at 256 KiB. Anything larger, a symlink, a UTF-8 BOM, invalid JSON or an unreadable file goes into `unreadable` by name, with nothing taken from it.
+   - Core never runs `npm`, `cargo`, `make`, `gradle` or any other tool. It adds **no new dependency**: JSON goes through `serde_json::Value` with the default recursion limit, never disabled, and a duplicate key takes the last value, like `JSON.parse` (pinned in a test).
+   - **Detection** (root files only):
+
+     | Manifest | Suggestion | Notes |
+     |---|---|---|
+     | `package.json` | `["npm","run","<name>"]` for each of the `scripts` keys `test`, `check`, `lint`, `build` that is present | `"npm run <name> runs: <text>"`, plus `pre<name>` / `post<name>` text when present, which npm also runs. A root `.npmrc` adds "this repository has an .npmrc that can change how npm runs scripts". Each note is capped at 512 bytes. |
+     | `Cargo.toml` | `["cargo","test"]` | presence only |
+     | `go.mod` | `["go","test","./..."]` | presence only |
+     | `GNUmakefile`, else `makefile`, else `Makefile` (GNU make's order) | `["make","<target>"]` for `test` / `check` | the note names the file that was found. Only lines of the form `^<target>:` are matched, with a bounded line scan. |
+     | `gradlew` (file) + `build.gradle(.kts)` | `["./gradlew","test"]` | "the Gradle wrapper may download Gradle from the URL in gradle/wrapper/gradle-wrapper.properties" |
+     | `pyproject.toml` | `["python","-m","pytest"]` | presence only, "assumes pytest" |
+   - Every note set also carries "this is the file in your registered repository now; the copy that runs in the sandbox may differ, and it runs in sbx's default working directory".
+   - Suggestions and notes are **untrusted display strings**: shown revealed and capped, never auto-approved, never run. Approving one goes through the same gesture-only approve flow, with argv shown exactly. The secret check applies to it too.
+   - `approved` repeats `verification.list` for convenience.
+10. **Not in A7.**
+    - verification on the host (never);
+    - running suggestions without approval;
+    - environment variables or a working directory per command;
+    - cancelling a running verification (recorded follow-up; needs C-4);
+    - retry policies (01 §122);
+    - storing output as artifact files.
+11. **A4b preconditions (W6, recorded beside W-D).**
+    - **Capture gate (I-h):** before A4b makes `verification.run` reachable over the wire, C-1, C-2, C-5 and C-7 must be captured for the installed sbx version, and only then is that version added to `VERIFIED_EXEC_VERSIONS`. C-7 is what makes "no elevation inside the sandbox" a proven claim.
+    - **Worktree discard (I-c):** the A4b `worktree.discard` must refuse while a `host_worktree` run is in flight for that task. A7 takes no worktree lock, because a `host_worktree` run writes only the task's own worktree.
+12. **UNVERIFIED until captured.** The user can run these against a disposable provider-free `shell` sandbox; Sandpane never runs them while building.
+    - **C-1 (argument passing):** `sbx exec -- <name> printf '[%s]\n' -u --privileged -e X=y 'a b' '$(id)' '*' --`. It must print every element literally, bracketed, and must not run as root or privileged.
+    - **C-2 (exit status):** `sbx exec -- <name> sh -c 'exit 7'`. It must exit 7 and be distinguishable from an sbx error.
+    - **C-3 (stopped sandbox):** `sbx exec` on a stopped sandbox. Confirm it auto-starts, which the gate assumes.
+    - **C-4 (kill):** send SIGTERM, then separately SIGKILL, to the `sbx exec` client during `sleep 60`. Check whether the in-sandbox process survives each.
+    - **C-5 (working directory):** `sbx exec -- <name> pwd`.
+    - **C-6 (environment):** start `sbx exec -- <name> env` with a canary variable in the environment. The canary must not appear.
+    - **C-7 (user):** `sbx exec -- <name> id`. It must be the sandbox's normal user, not root.
+13. **Verification (Core).**
+    - Integration tests use a fake `sbx` script, an executable in a test temp dir found through `SANDPANE_SBX_PATH`. It records its exact argv, environment and working directory, and plays back the captured `ls --json` and `exec` shapes. The fake's version is added to `VERIFIED_EXEC_VERSIONS` through a test seam.
+    - They assert:
+      - the exact argv (`exec`, `--`, name, argv, nothing else), the cleared environment and the empty working directory;
+      - each gate's refusal, and that nothing is spawned on a refusal;
+      - the version gate with the seam off;
+      - the secret refusal at approve;
+      - one run per task, sandbox and Core cap;
+      - the `direct_mount` writer lock;
+      - an idempotent replay, including a replay while the run is still in flight and a replay after a revoke (R1);
+      - a revoke racing a run;
+      - archived-project and archived-conversation refusals, with revoke still allowed (R4);
+      - exactly one terminal record when shutdown and the worker race (R3);
+      - the timeout kill with partial output kept;
+      - `signaled` and `read_failed`;
+      - shutdown interruption and restart reconciliation;
+      - redaction before storage;
+      - output never in events;
+      - delete refusals while a run is in flight;
+      - `project.context` on real temporary repositories (a symlinked root and manifest, oversized, BOM, deeply nested and duplicate-key JSON, pre/post scripts, `.npmrc`, the make file order, hostile script text).
 
 ## 4. Client obligations per addition
 
