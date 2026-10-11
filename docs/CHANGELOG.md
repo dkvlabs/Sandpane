@@ -778,4 +778,54 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0036 — Protocol A5: git.diff and exact change lists
+
+- **date:** 2026-10-11
+- **phase:** protocol v1 addition A5 ([design §3.5](plans/2026-10-09-protocol-v1-additions.md)), with all three clients
+- **commits:**
+  - `10c5f18` (feat(protocol): git.diff and exact change lists (A5, WIP — client review fixes in progress))
+  - `394709e` (fix(clients): A5 git.diff client review fixes)
+- **details:**
+  - **Wire:**
+    - New read-only `git.diff {taskId, path, status?, maxBytes?}` → `{path, oldPath?, status, patch, binary, truncated, lossy, baseBlob?}`, placed right after `git.review`. That makes **28 methods**; features are unchanged at 4.
+    - `path` must be an exact entry of the task's change list. `status` disambiguates a path listed twice. `maxBytes` is clamped to 1..=524 288 (default 262 144).
+    - Output is display-only and never fed to apply.
+  - **Change list:**
+    - `git.review` paths are now exact: parsed with `-z --find-renames`, no longer C-quoted.
+    - New `FileChange.oldPath?` for renames, and `ChangeSet.repoPath?` / `uninspected?`.
+  - **Hardening (from the Core review):**
+    - Every git call pins `--work-tree=<cwd>`, and `confirm_work_tree` refuses a redirected work tree. Review C1: a repo-local `core.worktree` read outside the target.
+    - The patch shape is pinned (`a/`/`b/` prefixes, `-U3`), and pathspecs are built only from the change list (`LiteralPathspec::from_change`).
+    - Untracked reads use `fstatat`, then `openat(O_NOFOLLOW|O_NONBLOCK)`, then an inode check.
+    - Synthesized untracked patches carry `diff --git` and `new file mode` lines.
+  - **Clients:**
+    - per-file read-only diff views: a VS Code `sandpane-diff:` virtual document, a desktop `<pre>` as text, a JetBrains read-only dialog;
+    - a 45 s deadline for `git.review` / `git.diff` (the desktop proxy uses 43 s);
+    - disclosures for binary (possibly by repository attributes), truncated, lossy, rename and symlink patches;
+    - honest copy for every exact refusal.
+  - **Client review fixes:**
+    - the symlink line needs untracked, mode `120000` on line 2, an exact `@@ -0,0 +1 @@` and exactly one `+` line;
+    - VS Code breaks `$(` in labels;
+    - the desktop proxy has an `is_read_only` set, so reads never say "may have been applied";
+    - JetBrains shows CR as `\r` and picks the VCS root by `repoPath`.
+  - **Deviations:**
+    - The client review fixes landed one commit after the implementation commit. The user asked to commit the in-progress tree, so `10c5f18` is labelled WIP and lists the open items.
+    - JetBrains now resolves nothing (with a visible warning) when `repoPath` is absent or matches no VCS root. It no longer falls back to the first root.
+- **files:**
+  - `core/crates/**` (new `sandpane-core/src/diff.rs`, `sandpane-service/tests/git_diff.rs`)
+  - `schemas/rpc-request.schema.json`, `schemas/change-set.schema.json`, `schemas/README.md`
+  - `clients/vscode/**`, `clients/jetbrains/**`, `apps/desktop/**`
+  - `docs/plans/2026-10-09-protocol-v1-additions.md`, `docs/specs/02_ARCHITECTURE_AND_DATA.md`, `README.md`
+- **verification:**
+  - `make check` exited 0 on `394709e`: Rust 455 (Core 422 plus Tauri 33); schemas in sync (28 methods, 4 features); VS Code 641; desktop 614 + 8 opt-in skipped.
+  - JetBrains, run alone: 410 tests; `verifyPlugin` Compatible.
+  - Live checks against an isolated Core with no `sbx`: VS Code 62/62, desktop 8/8.
+  - 0 raw invisible characters; the secret gate was clean.
+  - UNVERIFIED:
+    - never run against a real `sbx` or in a real editor, app or IDE;
+    - no wire-created task has Git context until A4b, so no real patch has crossed the wire.
+- **review:** [audit/0036-protocol-a5-git-diff-review.md](audit/0036-protocol-a5-git-diff-review.md) — `security-reviewer` on Core (BLOCK: C1 `core.worktree` leak fixed and re-verified PASS; W1 and I1–I4, I7 fixed) plus one combined security/phase pass on the clients (PASS-WITH-WARNINGS: all dispatched items fixed in `394709e`); no Critical remains
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
