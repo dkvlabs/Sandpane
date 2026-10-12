@@ -954,4 +954,51 @@ Rules:
 - **model:** claude-opus-5-5 (session configuration)
 - **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
 
+## 0039 — Protocol A8a: sbx daemon status, execVerified and versionCaptured
+
+- **date:** 2026-10-12
+- **phase:** protocol v1 addition A8a ([design §3.8](plans/2026-10-09-protocol-v1-additions.md)), with all three clients; A8b/A8c deferred
+- **commits:**
+  - `391babc` (docs(plan): A8 and A9 design decisions (§3.8, §3.9))
+  - `20829f9` (feat(protocol): sbx daemon status from the text form, execVerified and versionCaptured (A8a))
+- **details:**
+  - **Wire (additive, no new method or feature; still 34 methods and 6 features):**
+    - `system.probe` reads the daemon state from the captured text form of `sbx daemon status`. The probe runs `version` and `daemon status`, never `ls`. A stopped daemon now reads `false`.
+    - The parse is strict: exit 0, untruncated output, line 1 exactly `Status: running` or `Status: stopped`, no later `Status:` line, no CR, no `Starting…` preamble. Anything else is `null`. `Socket:` and `Logs:` lines and stderr are never parsed, stored or returned.
+    - `SbxStatus` gains optional `execVerified` (the `verification.run` gate's predicate over the probe's own reading; the gate stays authoritative) and `versionCaptured` (the version number equals a captured fixture version, `CAPTURED_VERSIONS = [0.47.0]`, drift-tested; build not compared).
+  - **Review fixes in Core:**
+    - `SbxVersion` keeps the semver pre-release, so `0.47.0-rc.1` is never captured or exec-verified as `0.47.0`.
+    - The `verification.run` version gate refuses truncated `sbx version` output (a pre-existing A7 gap).
+  - **Clients:**
+    - All three show "SBX daemon running (at last check)", "SBX daemon stopped (at last check)" or "SBX daemon state unknown", plus "Verification runs are (not) enabled for this sbx version" and "Same sbx version number as Sandpane's captured fixtures (macOS; build not compared): yes/no" when Core sends them.
+    - No "ready" wording, no success tone, no daemon start/stop control.
+    - Desktop decodes the two booleans tolerantly and relabels the old "SBX ready". VS Code adds a sidebar sbx region shown only while online. JetBrains marks the sbx block as coming from the connection check, not the refresh.
+  - **Deviations and open items:**
+    - A8b (ports) and A8c (listings) are not implemented: their outputs are uncaptured (C-8 to C-13), so decoders would be written against guessed JSON.
+    - `sandbox.list` (A1) still runs `sbx ls`, which sbx 0.47.0 was captured auto-starting the daemon. Refusing it when the daemon reads stopped is carried to A8c (needs C-14).
+    - Aligning the probe's `sbx version` read context with the gate's is deferred until `VERIFIED_EXEC_VERSIONS` gets its first entry.
+- **files:**
+  - `core/crates/sandpane-core/src/sbx.rs`, `process.rs`; `sandpane-protocol/src/lib.rs`; `sandpane-service/src/lib.rs`, `verification.rs`; `tests/service_integration.rs`, `tests/verification.rs`
+  - `schemas/core-capabilities.schema.json`, `schemas/README.md`
+  - `apps/desktop/**`, `clients/vscode/**`, `clients/jetbrains/**`
+  - `docs/plans/2026-10-09-protocol-v1-additions.md`, `docs/plans/2026-10-12-status-report.md` (design commit), `docs/compatibility.md`, `README.md`
+- **verification:**
+  - Core: `cargo test` 606 passed, 0 failed; fmt and clippy clean.
+  - `make check` exited 0: schemas in sync (34 methods, 6 features); Rust 642 (606 Core + 36 Tauri shell); VS Code 850; desktop 747 + 9 opt-in skipped; JetBrains build successful.
+  - JetBrains, run alone: 493 tests, 0 failures; `verifyPlugin` Compatible (IU-262.10968.63).
+  - Live checks against an isolated Core with no `sbx`: VS Code 66/66, desktop 9/9; no Core process left.
+  - 0 raw invisible characters in 38 staged files (after replacing two raw U+202E test literals with escapes); secret gate clean.
+  - No new dependency.
+  - UNVERIFIED:
+    - never run against a real `sbx`; the parse rests on the v0.47.0 macOS arm64 captures;
+    - the running form's exit status and the stopped JSON form are uncaptured (C-14);
+    - no client display shown in a real editor, app or IDE.
+- **review:** [audit/0039-protocol-a8a-sbx-status-review.md](audit/0039-protocol-a8a-sbx-status-review.md)
+  - Design: `security-reviewer` returned BLOCK on C1 (an A9 finding; fixed and re-checked: PASS); §3.8 findings W8, I1–I4 and I10 folded in.
+  - Core: `security-reviewer` returned PASS-WITH-WARNINGS (W1–W3 and I1 fixed; I2 and I3 accepted).
+  - Clients: `security-reviewer` returned PASS-WITH-WARNINGS (W1–W3 and the Info items fixed; the `sandbox.list` auto-start follow-up deferred to A8c).
+  - No Critical remains.
+- **model:** claude-opus-5-5 (session configuration)
+- **tokens:** input: - · cached: - · output: - (session delta: -; no per-breakdown usage source exposed to this session — dash per rule)
+
 <!-- New entries are appended immediately above this line (chronological, numbers ascending). -->
