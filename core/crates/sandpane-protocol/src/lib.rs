@@ -194,6 +194,14 @@ pub enum Method {
     /// A7 (§3.7 item 9): read-only manifest detection + approved commands.
     #[serde(rename = "project.context")]
     ProjectContext,
+    /// A9 (§3.9 item 1): read-only list of Core-created state that can be
+    /// cleaned up.
+    #[serde(rename = "maintenance.inventory")]
+    MaintenanceInventory,
+    /// A9 (§3.9 item 1): §2 two-step, token-confirmed removal of inventory
+    /// items.
+    #[serde(rename = "maintenance.cleanup")]
+    MaintenanceCleanup,
 }
 
 impl Method {
@@ -202,7 +210,7 @@ impl Method {
     /// from the enum rather than hand-written, and `dispatch` must match
     /// exhaustively over the same enum, so an advertised method always really
     /// exists and a handled method is always advertised.
-    pub const ALL: [Method; 34] = [
+    pub const ALL: [Method; 36] = [
         Self::SystemProbe,
         Self::ProjectCreate,
         Self::ProjectList,
@@ -237,6 +245,8 @@ impl Method {
         Self::VerificationRun,
         Self::VerificationResult,
         Self::ProjectContext,
+        Self::MaintenanceInventory,
+        Self::MaintenanceCleanup,
     ];
 
     /// Wire names of every method in [`Method::ALL`] — derived, never a list a
@@ -281,6 +291,8 @@ impl Method {
             "verification.run" => Self::VerificationRun,
             "verification.result" => Self::VerificationResult,
             "project.context" => Self::ProjectContext,
+            "maintenance.inventory" => Self::MaintenanceInventory,
+            "maintenance.cleanup" => Self::MaintenanceCleanup,
             _ => return None,
         })
     }
@@ -321,6 +333,8 @@ impl Method {
             Self::VerificationRun => "verification.run",
             Self::VerificationResult => "verification.result",
             Self::ProjectContext => "project.context",
+            Self::MaintenanceInventory => "maintenance.inventory",
+            Self::MaintenanceCleanup => "maintenance.cleanup",
         }
     }
 }
@@ -356,13 +370,19 @@ impl Method {
 ///   `verification.run` answers `UNSUPPORTED_SBX_VERSION` for every sbx
 ///   version whose `exec` argument passing is not captured (all of them in
 ///   A7) — the feature is real, running is gated on proof.
-pub const FEATURES: [&str; 6] = [
+/// * `maintenance` — `maintenance.inventory` and the token-confirmed
+///   `maintenance.cleanup` (A9, design 2026-10-09 §3.9): Core-created temp
+///   directories, migration backups and old verification output; worktrees
+///   report-only. Clients show the Maintenance view only when it is
+///   advertised.
+pub const FEATURES: [&str; 7] = [
     "idempotency-keys",
     "sandbox-create-agent",
     "conversation-sandbox-id",
     "conversation-send-mode",
     "git-apply",
     "verification",
+    "maintenance",
 ];
 
 /// [`FEATURES`] as owned strings — the one derivation `system.probe` uses.
@@ -1457,6 +1477,13 @@ pub struct VerificationResult {
     pub finished_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_incomplete: Option<bool>,
+    /// A9 (§3.9 item 2 `verificationOutput`): `true` = this run's stored
+    /// stdout/stderr were removed by `maintenance.cleanup`; the record is
+    /// kept. Takes precedence over `stdoutTruncated` / `stderrTruncated` /
+    /// `outputIncomplete` in rendering ("output removed by maintenance
+    /// cleanup"). Absent otherwise and from a pre-A9 Core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_pruned: Option<bool>,
 }
 
 /// `project.context` params.
@@ -1492,6 +1519,151 @@ pub struct RepositoryContext {
 pub struct ProjectContextResult {
     pub repositories: Vec<RepositoryContext>,
     pub approved: Vec<VerificationCommand>,
+}
+
+// ---------------------------------------------------------------------------
+// A9 — maintenance.inventory / maintenance.cleanup (design 2026-10-09 §3.9)
+// ---------------------------------------------------------------------------
+
+/// `MaintenanceItem.kind` values A9 emits. `kind` is an OPEN string on the
+/// wire: clients render an unknown kind unchecked and show Core's `detail`.
+/// Plain consts, not an enum, on purpose (§1 rule 2: no new strict enums).
+pub const MAINTENANCE_KIND_TEMP: &str = "temp";
+pub const MAINTENANCE_KIND_DB_BACKUP: &str = "dbBackup";
+pub const MAINTENANCE_KIND_VERIFICATION_OUTPUT: &str = "verificationOutput";
+pub const MAINTENANCE_KIND_WORKTREE: &str = "worktree";
+
+/// The action string a `maintenance.cleanup` confirmation is valid for.
+pub const MAINTENANCE_CLEANUP_ACTION: &str = "maintenance.cleanup";
+
+/// `maintenance.inventory` params: none (`{}` or absent).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceInventoryParams {}
+
+impl MaintenanceInventoryParams {
+    /// Parse the wire `params`: `null` (absent) is the default.
+    pub fn from_wire(params: serde_json::Value) -> Result<Self, serde_json::Error> {
+        if params.is_null() {
+            return Ok(Self::default());
+        }
+        serde_json::from_value(params)
+    }
+}
+
+/// One inventory entry (§3.9 item 1). `id` is Core-assigned and only ever
+/// looked up in Core's own fresh inventory; ids of entries Core did not
+/// create are opaque (`foreign:<n>`) and never removable. `detail` and
+/// `reason` are Core-built, escaped (control characters and invalid UTF-8
+/// replaced) and at most 512 bytes. `reason` says why `removable` is false.
+/// `bytes` is absent when Core did not measure the size (A9 measures no
+/// `temp` or `worktree` sizes). `createdAt` is the file system's birth time
+/// where the platform reports one. `path` / `repositoryPath` (worktree items
+/// only, additive to §3.9) are display-only copyable values, never
+/// executed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceItem {
+    pub id: String,
+    pub kind: String,
+    pub removable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_incomplete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_path: Option<String>,
+}
+
+/// A kind Core could not inventory at all (additive to §3.9: item 3 says
+/// "reported as unavailable", e.g. no data directory). `kind` is an open
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceUnavailable {
+    pub kind: String,
+    pub reason: String,
+}
+
+/// `maintenance.inventory` result. Items are ordered by (kind, id), at most
+/// 2 000; `truncated: true` when entries were left out (the item cap or a
+/// directory with more than 10 000 entries).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceInventoryResult {
+    pub items: Vec<MaintenanceItem>,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<MaintenanceUnavailable>,
+}
+
+/// `maintenance.cleanup` params (§2 two-step). Without `confirmToken` Core
+/// changes nothing and answers a [`MaintenanceConfirmation`]; with it (and
+/// exactly the confirmed `items`) Core re-checks and removes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceCleanupParams {
+    pub items: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_token: Option<String>,
+}
+
+/// The confirmed item set (§3.9 item 1: `target: {items}`, not the
+/// `{name, id}` of [`ConfirmationTarget`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceTarget {
+    pub items: Vec<String>,
+}
+
+/// Step-1 answer of `maintenance.cleanup`: the §2 confirmation with an
+/// item-set target. `external` is always `false` (Core-created state only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceConfirmation {
+    pub token: String,
+    /// RFC 3339 UTC.
+    pub expires_at: String,
+    pub action: String,
+    pub target: MaintenanceTarget,
+    pub impact: Vec<String>,
+    pub external: bool,
+}
+
+/// An item step 2 did not remove, with Core's reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceSkipped {
+    pub id: String,
+    pub reason: String,
+}
+
+/// `maintenance.cleanup` result: `confirmation` at step 1; `removed` +
+/// `skipped` (+ `freedBytes`) at step 2. `freedBytes` counts file-system
+/// removals only (never `verificationOutput`) and is absent when a removed
+/// item's size was not measured. `notes` (additive to §3.9) carries the
+/// honesty statements of step 2, e.g. that pruned output may survive in
+/// older migration backups.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceCleanupResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<MaintenanceConfirmation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<Vec<MaintenanceSkipped>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1551,7 +1723,7 @@ mod tests {
     /// A3b added the five conversation lifecycle methods (§3.3 item 1).
     #[test]
     fn all_twenty_seven_methods_round_trip() {
-        const EXPECTED: [&str; 34] = [
+        const EXPECTED: [&str; 36] = [
             "system.probe",
             "project.create",
             "project.list",
@@ -1587,6 +1759,9 @@ mod tests {
             "verification.run",
             "verification.result",
             "project.context",
+            // A9 (§3.9 item 1), after project.context.
+            "maintenance.inventory",
+            "maintenance.cleanup",
         ];
         assert_eq!(Method::ALL.len(), EXPECTED.len());
         assert_eq!(Method::wire_names(), EXPECTED.to_vec());
@@ -1682,6 +1857,105 @@ mod tests {
             serde_json::from_value(serde_json::json!({"projectId": "p"})).unwrap();
     }
 
+    /// A9 (§3.9 item 1): `maintenance.inventory` takes `{}` (or no params)
+    /// and answers `{items, truncated}`; `kind` is an OPEN string; the
+    /// optional fields are absent when unset.
+    #[test]
+    fn maintenance_inventory_shapes() {
+        let _: MaintenanceInventoryParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        let item = MaintenanceItem {
+            id: "temp:3f9a1c22-0000-4000-8000-abcdef012345".into(),
+            kind: MAINTENANCE_KIND_TEMP.into(),
+            removable: true,
+            bytes: None,
+            size_incomplete: None,
+            created_at: None,
+            detail: "d".into(),
+            reason: None,
+            path: None,
+            repository_path: None,
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"id": "temp:3f9a1c22-0000-4000-8000-abcdef012345",
+                "kind": "temp", "removable": true, "detail": "d"})
+        );
+        let future: MaintenanceItem = serde_json::from_value(serde_json::json!({
+            "id": "x:1", "kind": "someFutureKind", "removable": false, "bytes": 7,
+            "sizeIncomplete": true, "createdAt": "2026-10-12T00:00:00Z", "detail": "d",
+            "reason": "r", "path": "/w", "repositoryPath": "/r"
+        }))
+        .unwrap();
+        assert_eq!(future.kind, "someFutureKind");
+        assert_eq!(future.bytes, Some(7));
+        assert_eq!(future.size_incomplete, Some(true));
+        let result = MaintenanceInventoryResult {
+            items: vec![item],
+            truncated: false,
+            unavailable: Vec::new(),
+        };
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["truncated"], false);
+        assert!(v.get("unavailable").is_none(), "{v}");
+        assert_eq!(
+            [
+                MAINTENANCE_KIND_TEMP,
+                MAINTENANCE_KIND_DB_BACKUP,
+                MAINTENANCE_KIND_VERIFICATION_OUTPUT,
+                MAINTENANCE_KIND_WORKTREE
+            ],
+            ["temp", "dbBackup", "verificationOutput", "worktree"]
+        );
+    }
+
+    /// A9 (§3.9 item 1, §2): step 1 answers `{confirmation: {token,
+    /// expiresAt, action, target: {items}, impact, external}}`; step 2
+    /// answers `{removed, skipped: [{id, reason}], freedBytes?}`.
+    #[test]
+    fn maintenance_cleanup_shapes() {
+        let p: MaintenanceCleanupParams =
+            serde_json::from_value(serde_json::json!({"items": ["temp:a"]})).unwrap();
+        assert_eq!((p.items.len(), p.confirm_token), (1, None));
+        let step1 = MaintenanceCleanupResult {
+            confirmation: Some(MaintenanceConfirmation {
+                token: "t".into(),
+                expires_at: "e".into(),
+                action: "maintenance.cleanup".into(),
+                target: MaintenanceTarget {
+                    items: vec!["temp:a".into()],
+                },
+                impact: vec!["i".into()],
+                external: false,
+            }),
+            removed: None,
+            skipped: None,
+            freed_bytes: None,
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&step1).unwrap(),
+            serde_json::json!({"confirmation": {"token": "t", "expiresAt": "e",
+                "action": "maintenance.cleanup", "target": {"items": ["temp:a"]},
+                "impact": ["i"], "external": false}})
+        );
+        let step2 = MaintenanceCleanupResult {
+            confirmation: None,
+            removed: Some(vec!["temp:a".into()]),
+            skipped: Some(vec![MaintenanceSkipped {
+                id: "dbBackup:x".into(),
+                reason: "r".into(),
+            }]),
+            freed_bytes: None,
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&step2).unwrap(),
+            serde_json::json!({"removed": ["temp:a"],
+                "skipped": [{"id": "dbBackup:x", "reason": "r"}]})
+        );
+    }
+
     /// A2: the single source of `CoreCapabilities.features`. Pinned here and,
     /// as a value set, against `core-capabilities.schema.json` by the drift
     /// gate. Additive only: a feature string is never renamed or reused.
@@ -1695,7 +1969,8 @@ mod tests {
                 "conversation-sandbox-id",
                 "conversation-send-mode",
                 "git-apply",
-                "verification"
+                "verification",
+                "maintenance"
             ]
         );
         assert_eq!(
@@ -1706,7 +1981,8 @@ mod tests {
                 "conversation-sandbox-id".to_string(),
                 "conversation-send-mode".to_string(),
                 "git-apply".to_string(),
-                "verification".to_string()
+                "verification".to_string(),
+                "maintenance".to_string()
             ]
         );
         // A pre-A2 Core omits `features`: still parses, as "nothing advertised".
@@ -1725,7 +2001,8 @@ mod tests {
                 "conversation-sandbox-id",
                 "conversation-send-mode",
                 "git-apply",
-                "verification"
+                "verification",
+                "maintenance"
             ])
         );
     }
@@ -1894,8 +2171,10 @@ mod tests {
             started_at: "s".into(),
             finished_at: None,
             output_incomplete: None,
+            output_pruned: None,
         };
         let v = serde_json::to_value(&running).unwrap();
+        assert!(v.get("outputPruned").is_none(), "{v}");
         assert!(
             v.get("exitCode").is_none() && v.get("finishedAt").is_none(),
             "{v}"
@@ -1918,7 +2197,13 @@ mod tests {
         .unwrap();
         assert_eq!(done.outcome, "some_future_outcome");
         assert_eq!(done.output_incomplete, Some(true));
+        assert_eq!(done.output_pruned, None, "absent from a pre-A9 Core");
         assert_eq!(done.redactions.output_withheld, Some(true));
+        let pruned = VerificationResult {
+            output_pruned: Some(true),
+            ..done
+        };
+        assert_eq!(serde_json::to_value(&pruned).unwrap()["outputPruned"], true);
         // project.context
         let ctx = ProjectContextResult {
             repositories: vec![RepositoryContext {

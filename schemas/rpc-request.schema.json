@@ -19,7 +19,7 @@
       "maxLength": 128
     },
     "method": {
-      "description": "Allowlisted dotted method name. There is deliberately no free-form execution method. The set is additive for protocol v1: discovery revision 1 adds conversation.list, conversation.history and task.list; addition A1 adds sandbox.stop and sandbox.remove (two-step server-side confirmation token). Addition A3a adds project.update, project.archive, project.unarchive, project.delete (two-step confirmation token bound to the project id), project.add_repository and project.remove_repository; method segments are lowercase snake_case. Addition A3b adds conversation.rename, conversation.archive, conversation.unarchive, conversation.delete (two-step confirmation token bound to the conversation id) and conversation.export (redacted, paged, bounded; read-only). Addition A5 adds git.diff (read-only). Addition A7 adds verification.list, verification.approve (an exact user-entered argv + label; secret-shaped values refused), verification.revoke (tombstone), verification.run (asynchronous; runs ONLY an approved command inside the task's sandbox through sbx exec, never on the host; spawning is gated on a captured-proof sbx version, so every current sbx answers UNSUPPORTED_SBX_VERSION), verification.result and project.context (read-only, bounded manifest detection). There is deliberately no sandbox.start: sbx v0.47 has none. A Core advertises exactly what it handles via core-capabilities.methods.",
+      "description": "Allowlisted dotted method name. There is deliberately no free-form execution method. The set is additive for protocol v1: discovery revision 1 adds conversation.list, conversation.history and task.list; addition A1 adds sandbox.stop and sandbox.remove (two-step server-side confirmation token). Addition A3a adds project.update, project.archive, project.unarchive, project.delete (two-step confirmation token bound to the project id), project.add_repository and project.remove_repository; method segments are lowercase snake_case. Addition A3b adds conversation.rename, conversation.archive, conversation.unarchive, conversation.delete (two-step confirmation token bound to the conversation id) and conversation.export (redacted, paged, bounded; read-only). Addition A5 adds git.diff (read-only). Addition A7 adds verification.list, verification.approve (an exact user-entered argv + label; secret-shaped values refused), verification.revoke (tombstone), verification.run (asynchronous; runs ONLY an approved command inside the task's sandbox through sbx exec, never on the host; spawning is gated on a captured-proof sbx version, so every current sbx answers UNSUPPORTED_SBX_VERSION), verification.result and project.context (read-only, bounded manifest detection). Addition A9 adds maintenance.inventory (read-only) and maintenance.cleanup (two-step server-side confirmation token bound to the exact item set; Core-created temp directories, migration backups and old verification output only; it never spawns a process). There is deliberately no sandbox.start: sbx v0.47 has none. A Core advertises exactly what it handles via core-capabilities.methods.",
       "type": "string",
       "enum": [
         "system.probe",
@@ -55,7 +55,9 @@
         "verification.revoke",
         "verification.run",
         "verification.result",
-        "project.context"
+        "project.context",
+        "maintenance.inventory",
+        "maintenance.cleanup"
       ]
     },
     "params": {

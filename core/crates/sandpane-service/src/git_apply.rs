@@ -35,14 +35,38 @@ pub const EVENT_APPLY_RECONCILED: &str = "git.apply.reconciled";
 /// Longest `reviewId` accepted (Core issues 36-char UUIDs).
 pub const MAX_REVIEW_ID_LEN: usize = 128;
 
+/// How many fresh UUIDs [`CoreTemp::new`] tries when its lock file is
+/// unlinked or replaced between create and `flock` (§3.9 item 2 `temp`).
+const MAX_TEMP_ATTEMPTS: usize = 8;
+
 /// A Core-owned `0700` temporary directory under `<data>/tmp`, removed on
 /// drop. Never in the task worktree or the user's repository.
-pub(crate) struct CoreTemp {
+///
+/// A9 liveness (design 2026-10-09 §3.9 item 2 `temp`, review C1): every
+/// Core of this user shares `<data>/tmp`, so liveness is proven ACROSS
+/// processes. Before the directory exists, Core creates the sibling lock
+/// file `<data>/tmp/<uuid>.live` (`O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`,
+/// 0600), takes an exclusive `flock` on it, and checks that the path still
+/// names its descriptor (`(dev, ino)`); on a mismatch or `ENOENT` (a cleaner
+/// unlinked it in between) it retries with a fresh UUID. Only then does it
+/// `mkdir <uuid>`. The lock is held for the whole lifetime; `Drop` removes
+/// the directory, unlinks the lock file, then releases the lock. A crash
+/// releases the lock with the process. The UUID is in this Core's in-process
+/// registry from before the lock file exists until after the directory is
+/// removed. The lock file sits BESIDE the directory: the directory is the
+/// pinned `--work-tree` of some git calls and the cwd of A7 exec, so nothing
+/// new appears inside it.
+#[doc(hidden)]
+pub struct CoreTemp {
     path: PathBuf,
+    #[cfg(unix)]
+    lock: Option<(PathBuf, std::fs::File)>,
+    uuid: uuid::Uuid,
+    registry: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
 }
 
 impl CoreTemp {
-    pub(crate) fn new(inner: &ServerInner) -> Result<Self, String> {
+    pub fn new(inner: &ServerInner) -> Result<Self, String> {
         let root = inner
             .worktrees_root
             .as_deref()
@@ -51,28 +75,145 @@ impl CoreTemp {
             .join("tmp");
         #[cfg(unix)]
         crate::runtime::ensure_private_data_dir(&root).map_err(|e| e.to_string())?;
-        let dir = root.join(uuid::Uuid::new_v4().to_string());
-        let mut b = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            b.mode(0o700);
+        let registry = inner.temp_registry.clone();
+        for _ in 0..MAX_TEMP_ATTEMPTS {
+            let uuid = uuid::Uuid::new_v4();
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(uuid);
+            let forget = || {
+                registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&uuid);
+            };
+            #[cfg(unix)]
+            let lock = match Self::lock_file(inner, &root, uuid) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    forget();
+                    continue;
+                }
+                Err(e) => {
+                    forget();
+                    return Err(e);
+                }
+            };
+            let dir = root.join(uuid.to_string());
+            let mut b = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                b.mode(0o700);
+            }
+            if let Err(e) = b.create(&dir) {
+                // Not ours (never remove it): unlink our lock file, release
+                // the lock, forget the UUID.
+                #[cfg(unix)]
+                if let Some((path, file)) = lock {
+                    unlink_if_ours(&path, &file);
+                    drop(file);
+                }
+                forget();
+                return Err(format!("cannot create {}: {e}", dir.display()));
+            }
+            let mut temp = Self {
+                path: dir.clone(),
+                #[cfg(unix)]
+                lock,
+                uuid,
+                registry: registry.clone(),
+            };
+            // On failure, Drop removes the directory we just made, unlinks
+            // the lock file, releases the lock and forgets the UUID.
+            temp.path = std::fs::canonicalize(&dir)
+                .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
+            return Ok(temp);
         }
-        b.create(&dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        let path = std::fs::canonicalize(&dir)
-            .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
-        Ok(Self { path })
+        Err(format!(
+            "cannot create a Core temporary directory: its lock file was replaced {MAX_TEMP_ATTEMPTS} \
+             times in a row"
+        ))
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    /// Create and lock `<root>/<uuid>.live`. `Ok(None)` = the path no
+    /// longer names the locked descriptor (retry with a fresh UUID).
+    #[cfg(unix)]
+    fn lock_file(
+        inner: &ServerInner,
+        root: &Path,
+        uuid: uuid::Uuid,
+    ) -> Result<Option<(PathBuf, std::fs::File)>, String> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let path = root.join(format!("{uuid}.live"));
+        // std always adds O_CLOEXEC; create_new = O_CREAT|O_EXCL.
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(e) => return Err(format!("cannot create {}: {e}", path.display())),
+        };
+        if let Some(hook) = &inner.test_temp_after_lock_create {
+            (hook.0)(&path);
+        }
+        if let Err(e) = crate::maintenance::flock(&file, libc::LOCK_EX) {
+            unlink_if_ours(&path, &file);
+            return Err(format!("cannot lock {}: {e}", path.display()));
+        }
+        let mine = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                // Never leak our own lock file on an error path (review I4).
+                unlink_if_ours(&path, &file);
+                return Err(format!("cannot stat {}: {e}", path.display()));
+            }
+        };
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.dev() == mine.dev() && m.ino() == mine.ino() => Ok(Some((path, file))),
+            // Unlinked (ENOENT) or replaced between create and flock: the
+            // path is not ours any more — never unlink it; drop the
+            // descriptor (releasing the lock) and retry.
+            _ => Ok(None),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Unlink `path` only while it still names `file` (`(dev, ino)`): a lock
+/// file replaced by someone else is never removed.
+#[cfg(unix)]
+fn unlink_if_ours(path: &Path, file: &std::fs::File) {
+    use std::os::unix::fs::MetadataExt;
+    if let (Ok(m), Ok(mine)) = (std::fs::symlink_metadata(path), file.metadata()) {
+        if m.dev() == mine.dev() && m.ino() == mine.ino() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
 impl Drop for CoreTemp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+        #[cfg(unix)]
+        if let Some((path, file)) = self.lock.take() {
+            // Unlink while still holding the lock, then release (the
+            // descriptor closes after the unlink).
+            unlink_if_ours(&path, &file);
+            drop(file);
+        }
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.uuid);
     }
 }
 

@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandpane.dkvlabs.invalid/schemas/maintenance.schema.json",
+  "title": "SandpaneMaintenance",
+  "description": "A9 maintenance methods (design 2026-10-09 §3.9): params and results of maintenance.inventory and maintenance.cleanup. Hand-synced with sandpane_protocol::{MaintenanceInventoryParams, MaintenanceItem, MaintenanceUnavailable, MaintenanceInventoryResult, MaintenanceCleanupParams, MaintenanceTarget, MaintenanceConfirmation, MaintenanceSkipped, MaintenanceCleanupResult}. Only syntax-checked by `make schema-lint`; the value-set drift gate does not read this file. Core cleans up only state it created itself (temp directories under <data>/tmp, migration backups beside the database, old verification output); worktrees are report-only. Neither method spawns a process. Ids are only ever looked up in Core's own fresh inventory; no path is built from a client-supplied id.",
+  "$defs": {
+    "MaintenanceInventoryParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "description": "No parameters: `{}` or absent."
+    },
+    "MaintenanceItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "removable",
+        "detail"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Core-assigned. Grammar: `temp:<lowercase UUID v4>`, `dbBackup:<exact backup file name>`, `verificationOutput:<YYYY-MM-DDTHH:MM:SSZ cutoff>`, `worktree:<task id>`, or the opaque `foreign:<n>` for entries Core did not create (never removable)."
+        },
+        "kind": {
+          "type": "string",
+          "examples": [
+            "temp",
+            "dbBackup",
+            "verificationOutput",
+            "worktree"
+          ],
+          "description": "An OPEN string, deliberately not an enum: clients render an unknown kind unchecked and show `detail`."
+        },
+        "removable": {
+          "type": "boolean"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Absent when Core did not measure the size. A9 measures dbBackup file sizes and verificationOutput byte counts (stdout + stderr as stored); it measures no temp or worktree sizes."
+        },
+        "sizeIncomplete": {
+          "const": true
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The file system's birth time, where the platform reports one."
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Core-built, escaped (control characters and invalid UTF-8 replaced), at most 512 bytes. UNTRUSTED display text: foreign names are arbitrary bytes."
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Why `removable` is false. Escaped and bounded like `detail`."
+        },
+        "path": {
+          "type": "string",
+          "description": "Worktree items only (additive to §3.9): the worktree directory, a display-only copyable value. Never executed."
+        },
+        "repositoryPath": {
+          "type": "string",
+          "description": "Tracked worktree items only (additive to §3.9): the repository the worktree belongs to, a display-only copyable value."
+        }
+      }
+    },
+    "MaintenanceUnavailable": {
+      "type": "object",
+      "required": [
+        "kind",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "description": "A kind Core could not inventory at all, for example temp and worktree when Core runs without a data directory (additive to §3.9)."
+    },
+    "MaintenanceInventoryResult": {
+      "type": "object",
+      "required": [
+        "items",
+        "truncated"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "maxItems": 2000,
+          "items": {
+            "$ref": "#/$defs/MaintenanceItem"
+          },
+          "description": "Ordered by (kind, id), so `truncated` is stable between scans."
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "True when entries were left out: more than 2000 items, or a directory with more than 10000 entries."
+        },
+        "unavailable": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MaintenanceUnavailable"
+          }
+        }
+      }
+    },
+    "MaintenanceCleanupParams": {
+      "type": "object",
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 500,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          },
+          "description": "Inventory ids. Duplicates, ids outside the grammar, more than 500 ids, unknown or not-removable ids are VALIDATION_FAILED at step 1 (nothing issued). Step 2 must present exactly the confirmed set (order does not matter)."
+        },
+        "confirmToken": {
+          "type": "string",
+          "description": "Absent at step 1. Step 2: the token from step 1's confirmation (256-bit, single-use, 120 s)."
+        }
+      }
+    },
+    "MaintenanceTarget": {
+      "type": "object",
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "MaintenanceConfirmation": {
+      "type": "object",
+      "required": [
+        "token",
+        "expiresAt",
+        "action",
+        "target",
+        "impact",
+        "external"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "token": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "action": {
+          "const": "maintenance.cleanup"
+        },
+        "target": {
+          "$ref": "#/$defs/MaintenanceTarget"
+        },
+        "impact": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Shown in the gesture-only confirmation; dbBackup items are listed on their own lines."
+        },
+        "external": {
+          "const": false
+        }
+      },
+      "description": "The §2 confirmation with an item-set target (not the {name, id} ConfirmationTarget of the other two-step methods)."
+    },
+    "MaintenanceSkipped": {
+      "type": "object",
+      "required": [
+        "id",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "MaintenanceCleanupResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "confirmation": {
+          "$ref": "#/$defs/MaintenanceConfirmation"
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skipped": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MaintenanceSkipped"
+          }
+        },
+        "freedBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "File-system removals only, never verificationOutput. Absent when a removed item's size was not measured (every removed temp item)."
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Step 2 honesty statements (additive to §3.9), e.g. that pruned verification output is removed from Sandpane's records while the database file does not shrink and older migration backups may still contain it."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "confirmation"
+          ]
+        },
+        {
+          "required": [
+            "removed",
+            "skipped"
+          ]
+        }
+      ],
+      "description": "Step 1 answers {confirmation}; step 2 answers {removed, skipped, freedBytes?, notes?}. A partial failure is never reported as cleaned: every requested id is in exactly one of removed or skipped."
+    }
+  }
+}

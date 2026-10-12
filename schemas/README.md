@@ -15,6 +15,7 @@ formats — never Docker SBX / Codex / Claude wire formats.
 | [change-set.schema.json](change-set.schema.json) | `git.review` result | `sandpane_protocol::ChangeSet` |
 | [verification.schema.json](verification.schema.json) | A7 `verification.*` params and results (`$defs`) | `sandpane_protocol::Verification*`, `OutputRedaction` |
 | [project-context.schema.json](project-context.schema.json) | A7 `project.context` params and result | `sandpane_protocol::ProjectContext*`, `RepositoryContext`, `DetectedManifest` |
+| [maintenance.schema.json](maintenance.schema.json) | A9 `maintenance.inventory` / `maintenance.cleanup` params and results (`$defs`) | `sandpane_protocol::Maintenance*` |
 
 ## Sync status
 
@@ -152,7 +153,20 @@ version), both absent when the version is unknown, and `daemonRunning` now
 comes from the captured text form of `sbx daemon status`. `schema-drift`
 compares value sets, so these field names are pinned by the protocol test
 `a8a_sbx_status_wire_shape` instead. Client adoption pending (A8a client
-step). The
+step). A9 (design 2026-10-09 §3.9) adds `maintenance.inventory` (read-only)
+and `maintenance.cleanup` (the §2 two-step token flow, bound to the exact
+item set) right after `project.context` in `rpc-request`'s enum (36 methods),
+and the `maintenance` feature in `core-capabilities` (7 features); both sets
+are gated by `schema-drift`. Their shapes live in `maintenance.schema.json`
+(syntax-linted only, like the A7 files; pinned by the protocol tests
+`maintenance_inventory_shapes` / `maintenance_cleanup_shapes`).
+`MaintenanceItem.kind` is an OPEN string (`temp`, `dbBackup`,
+`verificationOutput`, `worktree` today), never an enum. The step-1
+confirmation is `MaintenanceConfirmation` with `target: {items}` — not the
+shared `ConfirmationRequest`, whose `target` stays `{name, id}`.
+`verification.schema.json`'s `VerificationResult` gains the optional
+`outputPruned` (present, true, only when maintenance cleanup removed the
+run's stored output). Client adoption pending (A9 client step). The
 `docs/specs/02 §2` contract blocks are the
 human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7

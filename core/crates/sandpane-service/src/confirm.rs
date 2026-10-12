@@ -47,9 +47,22 @@ pub const TOKEN_REJECTED_MESSAGE: &str =
     "confirmation token is invalid, expired, already used, or not for this action and target; \
      request a new confirmation";
 
+/// A9 (§3.9 item 1, W2): the step-1 file-system identity of one confirmed
+/// maintenance item, kept in the token's in-memory binding so step 2 can
+/// skip an item that changed in between ("changed since you confirmed").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemIdentity {
+    pub id: String,
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_ns: i128,
+}
+
 #[derive(Debug)]
 struct Pending {
     binding: ConfirmationBinding,
+    identities: Vec<ItemIdentity>,
     issued: Instant,
     expires: Instant,
 }
@@ -94,6 +107,18 @@ impl ConfirmationStore {
         now: Instant,
         ttl: Duration,
     ) -> Result<String, getrandom::Error> {
+        self.issue_with_identities(binding, Vec::new(), now, ttl)
+    }
+
+    /// [`Self::issue`] carrying the step-1 identities of the confirmed items
+    /// (A9 `maintenance.cleanup`). Same token rules.
+    pub fn issue_with_identities(
+        &mut self,
+        binding: ConfirmationBinding,
+        identities: Vec<ItemIdentity>,
+        now: Instant,
+        ttl: Duration,
+    ) -> Result<String, getrandom::Error> {
         let mut raw = [0u8; 32];
         getrandom::fill(&mut raw)?;
         let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
@@ -114,6 +139,7 @@ impl ConfirmationStore {
             token.clone(),
             Pending {
                 binding,
+                identities,
                 issued: now,
                 expires: now + ttl.min(CONFIRMATION_TTL),
             },
@@ -158,6 +184,19 @@ impl ConfirmationStore {
         id: &str,
         now: Instant,
     ) -> Result<ConfirmationBinding, TokenRejected> {
+        self.consume_with_identities(token, action, id, now)
+            .map(|(binding, _)| binding)
+    }
+
+    /// [`Self::consume_by_id`] that also returns the identities the token was
+    /// issued with (A9: `id` is the digest of the exact confirmed item set).
+    pub fn consume_with_identities(
+        &mut self,
+        token: &str,
+        action: &str,
+        id: &str,
+        now: Instant,
+    ) -> Result<(ConfirmationBinding, Vec<ItemIdentity>), TokenRejected> {
         let Some(p) = self.pending.remove(token) else {
             return Err(TokenRejected);
         };
@@ -165,7 +204,7 @@ impl ConfirmationStore {
         let same_action = p.binding.action == action;
         let same_id = p.binding.id == id;
         if in_time & same_action & same_id {
-            Ok(p.binding)
+            Ok((p.binding, p.identities))
         } else {
             Err(TokenRejected)
         }
@@ -364,6 +403,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.len(), 1);
+    }
+
+    /// A9 (§3.9 item 1, W2): a maintenance token carries the step-1
+    /// file-system identities; consuming it returns them exactly once, under
+    /// the same burn-before-judge rules as every other token.
+    #[test]
+    fn identities_travel_with_the_token_and_burn_with_it() {
+        let mut s = ConfirmationStore::new();
+        let now = Instant::now();
+        let ids = vec![ItemIdentity {
+            id: "temp:x".into(),
+            dev: 1,
+            ino: 2,
+            size: 3,
+            mtime_ns: 4,
+        }];
+        let t = s
+            .issue_with_identities(
+                binding("maintenance.cleanup", "", "digest"),
+                ids.clone(),
+                now,
+                CONFIRMATION_TTL,
+            )
+            .unwrap();
+        let (b, got) = s
+            .consume_with_identities(&t, "maintenance.cleanup", "digest", now)
+            .unwrap();
+        assert_eq!((b.id.as_str(), got), ("digest", ids.clone()));
+        assert_eq!(
+            s.consume_with_identities(&t, "maintenance.cleanup", "digest", now),
+            Err(TokenRejected),
+            "single use"
+        );
+        // Wrong digest, wrong action, expired: uniform rejection, burned.
+        for (action, id, at) in [
+            ("maintenance.cleanup", "other", now),
+            ("project.delete", "digest", now),
+            ("maintenance.cleanup", "digest", now + CONFIRMATION_TTL),
+        ] {
+            let t = s
+                .issue_with_identities(
+                    binding("maintenance.cleanup", "", "digest"),
+                    ids.clone(),
+                    now,
+                    CONFIRMATION_TTL,
+                )
+                .unwrap();
+            assert_eq!(
+                s.consume_with_identities(&t, action, id, at),
+                Err(TokenRejected)
+            );
+            assert_eq!(
+                s.consume_with_identities(&t, "maintenance.cleanup", "digest", now),
+                Err(TokenRejected),
+                "burned by the failed attempt"
+            );
+        }
+        // A plain token carries no identities.
+        let t = s
+            .issue(
+                binding("maintenance.cleanup", "", "d2"),
+                now,
+                CONFIRMATION_TTL,
+            )
+            .unwrap();
+        let (_, got) = s
+            .consume_with_identities(&t, "maintenance.cleanup", "d2", now)
+            .unwrap();
+        assert!(got.is_empty());
     }
 
     /// A3a: `project.delete` binds the project ID; the name is display only,

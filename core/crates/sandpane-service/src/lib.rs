@@ -16,12 +16,20 @@ pub use conversation_lifecycle::{
     MSG_CONVERSATION_NOT_FOUND, MSG_TITLE_BLANK, UNTITLED_CONVERSATION,
 };
 mod git_apply;
+#[doc(hidden)]
+pub use git_apply::CoreTemp;
 pub use git_apply::{
     msg_create_mount_in_progress, msg_create_repo_busy, msg_locked, msg_mount_being_created,
     reconcile_applies_after_restart, EVENT_APPLIED, EVENT_APPLY_FAILED, EVENT_APPLY_RECONCILED,
     EVENT_APPLY_STARTED, MAX_REVIEW_ID_LEN,
 };
 pub mod inflight;
+mod maintenance;
+pub use maintenance::{
+    msg_not_removable as msg_maintenance_not_removable, msg_unknown as msg_maintenance_unknown,
+    MaintenanceLimits, MaintenanceState, DEFAULT_VERIFICATION_OUTPUT_RETENTION,
+    MAX_VERIFICATION_OUTPUT_RETENTION, MIN_VERIFICATION_OUTPUT_RETENTION,
+};
 mod project_lifecycle;
 pub use project_lifecycle::{
     MSG_PROJECT_ARCHIVED, MSG_PROJECT_CREATE_IN_FLIGHT, MSG_PROJECT_HAS_SANDBOXES,
@@ -68,10 +76,11 @@ use sandpane_protocol::{
     ConversationHistoryParams, ConversationHistoryResult, ConversationIdParams,
     ConversationListParams, ConversationRenameParams, ConversationSendParams, CoreCapabilities,
     ErrorCode, FileChange, FileChangeStatus, GitApplyParams, GitDiffParams, GitDiffResult,
-    MessageRecord, Method, Project, ProjectCreateParams, ProjectDeleteParams, ProjectIdParams,
-    ProjectRepositoryParams, ProjectUpdateParams, RpcRequest, RpcResponse, SandboxCreateSpec,
-    SandboxRemoveParams, SandboxRemoveResult, SandboxStopParams, SandboxStopResult, SandboxSummary,
-    SbxStatus, TaskEvent, TaskListParams, TaskStatus, TaskSubscribeParams, TaskSummary,
+    MaintenanceCleanupParams, MaintenanceInventoryParams, MessageRecord, Method, Project,
+    ProjectCreateParams, ProjectDeleteParams, ProjectIdParams, ProjectRepositoryParams,
+    ProjectUpdateParams, RpcRequest, RpcResponse, SandboxCreateSpec, SandboxRemoveParams,
+    SandboxRemoveResult, SandboxStopParams, SandboxStopResult, SandboxSummary, SbxStatus,
+    TaskEvent, TaskListParams, TaskStatus, TaskSubscribeParams, TaskSummary,
     VerificationApproveParams, VerificationListParams, VerificationResultParams,
     VerificationRevokeParams, VerificationRunParams, WorkspaceMode, CORE_VERSION, PROTOCOL_VERSION,
 };
@@ -166,6 +175,18 @@ impl std::fmt::Debug for TestHook {
     }
 }
 
+/// TEST SEAM for the A9 temp lock-file paths: called with the lock file's
+/// path (`CoreConfig::test_temp_after_lock_create`,
+/// `CoreConfig::test_cleanup_after_unlink`). Production never sets one.
+#[derive(Clone)]
+pub struct PathHook(pub Arc<dyn Fn(&Path) + Send + Sync>);
+
+impl std::fmt::Debug for PathHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PathHook(..)")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CoreConfig {
     pub sbx_limits: SbxLimits,
@@ -187,6 +208,35 @@ pub struct CoreConfig {
     /// most that, so configuration can only shorten it (tests use zero to
     /// prove expiry without sleeping out the full window).
     pub confirmation_ttl: Option<std::time::Duration>,
+    /// A9 (§3.9 item 2 `verificationOutput`): how long finished runs keep
+    /// their stored output before `maintenance.inventory` offers it for
+    /// pruning. `None` = 30 days; a value is CLAMPED to 1..=3650 days.
+    pub verification_output_retention: Option<std::time::Duration>,
+    /// Test seam only (A9): called by `CoreTemp::new` with the lock file's
+    /// path right after creating it and BEFORE `flock` (the forced
+    /// interleaving of §3.9 item 8). `None` in production.
+    #[doc(hidden)]
+    pub test_temp_after_lock_create: Option<PathHook>,
+    /// Test seam only (A9): called by `maintenance.cleanup` step 2 after a
+    /// temp lock file was unlinked and BEFORE its lock is released. `None`
+    /// in production.
+    #[doc(hidden)]
+    pub test_cleanup_after_unlink: Option<PathHook>,
+    /// Test seam only (A9 review W2): called by `maintenance.cleanup` step 2
+    /// with the temp item's lock-file path right after its directory was
+    /// removed and BEFORE the lock file is re-checked and unlinked. `None`
+    /// in production.
+    #[doc(hidden)]
+    pub test_cleanup_after_dir_removed: Option<PathHook>,
+    /// Test seam only (A9): called by `maintenance.inventory` and both
+    /// `maintenance.cleanup` steps right after their single-flight flag is
+    /// taken, with no Core lock held. `None` in production.
+    #[doc(hidden)]
+    pub test_maintenance_in_flight: Option<TestHook>,
+    /// Test seam only (A9): smaller inventory / prune bounds. `None` in
+    /// production.
+    #[doc(hidden)]
+    pub test_maintenance_limits: Option<MaintenanceLimits>,
     /// Test seam only — see [`CreateClaimHook`]. `None` in production.
     #[doc(hidden)]
     pub test_after_create_claim: Option<CreateClaimHook>,
@@ -287,6 +337,20 @@ pub struct ServerInner {
     pub(crate) test_verification_limits: Option<(RunLimits, std::time::Duration)>,
     pub(crate) test_verification_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     pub(crate) test_verification_before_start: Option<TestHook>,
+    /// A9: UUIDs of this Core's live `CoreTemp`s (filled before the lock
+    /// file exists, emptied after the directory is removed).
+    pub(crate) temp_registry: Arc<Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// A9: when this Core started (lock-absent temp entries must be older).
+    pub(crate) started_at: std::time::SystemTime,
+    /// A9: single-flight flags of `maintenance.inventory` / `cleanup`.
+    pub(crate) maintenance: MaintenanceState,
+    /// A9: clamped `CoreConfig::verification_output_retention`.
+    pub(crate) verification_output_retention: std::time::Duration,
+    pub(crate) test_temp_after_lock_create: Option<PathHook>,
+    pub(crate) test_cleanup_after_unlink: Option<PathHook>,
+    pub(crate) test_cleanup_after_dir_removed: Option<PathHook>,
+    pub(crate) test_maintenance_in_flight: Option<TestHook>,
+    pub(crate) test_maintenance_limits: Option<MaintenanceLimits>,
 }
 
 impl ServerInner {
@@ -379,6 +443,17 @@ impl ServerInner {
             test_verification_limits: config.test_verification_limits,
             test_verification_env: config.test_verification_env,
             test_verification_before_start: config.test_verification_before_start,
+            temp_registry: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            started_at: std::time::SystemTime::now(),
+            maintenance: MaintenanceState::default(),
+            verification_output_retention: maintenance::retention_from_config(
+                config.verification_output_retention,
+            ),
+            test_temp_after_lock_create: config.test_temp_after_lock_create,
+            test_cleanup_after_unlink: config.test_cleanup_after_unlink,
+            test_cleanup_after_dir_removed: config.test_cleanup_after_dir_removed,
+            test_maintenance_in_flight: config.test_maintenance_in_flight,
+            test_maintenance_limits: config.test_maintenance_limits,
             confirmation_ttl: config
                 .confirmation_ttl
                 .unwrap_or(confirm::CONFIRMATION_TTL)
@@ -1076,6 +1151,14 @@ fn dispatch(
         Method::ProjectContext => parse_params::<ProjectContextParams>(params)
             .map_err(SvcFailure::from)
             .and_then(|p| verification::project_context(inner, p)),
+        Method::MaintenanceInventory => MaintenanceInventoryParams::from_wire(params)
+            .map_err(|e| {
+                SvcFailure::from((ErrorCode::ValidationFailed, format!("invalid params: {e}")))
+            })
+            .and_then(|p| maintenance::maintenance_inventory(inner, p)),
+        Method::MaintenanceCleanup => parse_params::<MaintenanceCleanupParams>(params)
+            .map_err(SvcFailure::from)
+            .and_then(|p| maintenance::maintenance_cleanup(inner, p)),
     };
     match result {
         Ok(value) => RpcResponse::ok(id, value),
