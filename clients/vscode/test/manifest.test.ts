@@ -33,9 +33,9 @@ describe('contributed commands match the registered ones', () => {
   const extension = readFileSync(join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
   const registered = [...extension.matchAll(/registerCommand\('(sandpane\.[A-Za-z]+)'/g)].map((m) => m[1]);
 
-  it('every contributed command is registered and vice versa (26, incl. the 8 A3a project commands, A5 Show Task Patch and the 5 A7 verification commands)', () => {
+  it('every contributed command is registered and vice versa (27, incl. the 8 A3a project commands, A5 Show Task Patch, the 5 A7 verification commands and A9 Clean Up Core State)', () => {
     expect([...contributed].sort()).toEqual([...registered].sort());
-    expect(contributed).toHaveLength(26);
+    expect(contributed).toHaveLength(27);
     for (const id of [
       'sandpane.showTaskPatch',
       'sandpane.renameProject',

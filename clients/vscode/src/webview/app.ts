@@ -82,6 +82,12 @@ interface TaskRow {
   verification?: { runEnabled: boolean; runReason: string | null; runs: string[] };
 }
 
+/** A9: the Maintenance section (a click opens the native flow). */
+interface MaintenancePanelView {
+  supported: boolean;
+  inFlight: boolean;
+}
+
 /** A7: the per-project Verification section (every string already plain text). */
 interface VerificationPanelView {
   supported: boolean;
@@ -148,6 +154,7 @@ interface SidebarState {
   applyInFlight?: boolean;
   /** A7: absent from an older host = unsupported. */
   verification?: VerificationPanelView;
+  maintenance?: MaintenancePanelView;
   lines: ChatLine[];
   transcript: { scope: 'conversation' | 'project'; label: string };
   tasks: TaskRow[];
@@ -184,6 +191,7 @@ interface SidebarRefs {
   notices: HTMLElement;
   conversations: HTMLElement;
   verification: HTMLElement;
+  maintenance: HTMLElement;
   stream: HTMLElement;
   tasks: HTMLElement;
   plan: HTMLElement;
@@ -205,6 +213,7 @@ interface PaintMemo {
   notices: string;
   conversations: string;
   verification: string;
+  maintenance: string;
   composerNote: string;
   sendModeNote: string;
   lineKeys: string[];
@@ -338,6 +347,12 @@ function buildSkeleton(
   verification.id = 'sp-verification';
   verification.setAttribute('aria-label', 'Verification commands Core lists for this project');
   root.appendChild(verification);
+
+  // --- A9: Maintenance (a click opens the native flow; no ids cross here) ---
+  const maintenance = el('div', 'sp-conversations');
+  maintenance.id = 'sp-maintenance';
+  maintenance.setAttribute('aria-label', 'Clean up state Core itself created');
+  root.appendChild(maintenance);
 
   // --- message stream ---
   const stream = el('div', 'sp-stream');
@@ -480,6 +495,7 @@ function buildSkeleton(
     notices,
     conversations,
     verification,
+    maintenance,
     stream,
     tasks,
     plan,
@@ -650,6 +666,39 @@ function verificationChildren(view: VerificationPanelView, api: VsCodeApi): HTML
   return children;
 }
 
+const MAINTENANCE_UNSUPPORTED_NOTE =
+  'Maintenance: not supported by the attached Sandpane Core (it does not advertise "maintenance").';
+
+/**
+ * The Maintenance section (A9). The button posts ONLY `{type}`; the extension
+ * opens the native flow filled from a fresh Core read, and nothing is removed
+ * without its modal.
+ */
+function maintenanceChildren(view: MaintenancePanelView, api: VsCodeApi): HTMLElement[] {
+  const children: HTMLElement[] = [];
+  const head = el('div', 'sp-picker');
+  head.appendChild(el('strong', undefined, 'Maintenance'));
+  const button = el('button', 'secondary', 'Clean up…');
+  button.id = 'sp-maintenance-scan';
+  if (view.supported && !view.inFlight) {
+    button.setAttribute('title', 'Scan what Core itself created (temporary directories, migration backups, stored verification output) and confirm a cleanup');
+  } else {
+    button.disabled = true;
+    button.setAttribute('title', view.inFlight && view.supported ? 'A maintenance dialog is already open' : MAINTENANCE_UNSUPPORTED_NOTE);
+  }
+  button.addEventListener('click', () => api.postMessage({ type: 'maintenanceScan' }));
+  head.appendChild(button);
+  children.push(head);
+  if (!view.supported) {
+    children.push(el('div', 'sp-empty', MAINTENANCE_UNSUPPORTED_NOTE));
+    return children;
+  }
+  children.push(
+    el('div', 'sp-empty', 'Cleans up only state Core itself created; worktrees are report-only. Nothing runs automatically.'),
+  );
+  return children;
+}
+
 function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsCodeApi): void {
   // --- header ---
   const headerKey = JSON.stringify([state.connection, state.capabilities?.coreVersion ?? '', state.header]);
@@ -769,6 +818,14 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
   if (verificationKey !== memo.verification) {
     memo.verification = verificationKey;
     rebuildRegion(refs.verification, verificationChildren(verificationView, api));
+  }
+
+  // --- A9 maintenance section: rebuilt only when it changed ---
+  const maintenanceView: MaintenancePanelView = state.maintenance ?? { supported: false, inFlight: false };
+  const maintenanceKey = JSON.stringify(maintenanceView);
+  if (maintenanceKey !== memo.maintenance) {
+    memo.maintenance = maintenanceKey;
+    rebuildRegion(refs.maintenance, maintenanceChildren(maintenanceView, api));
   }
 
   // --- message stream: append when the transcript only grew ---
@@ -992,6 +1049,7 @@ function bootSandpaneSidebar(): void {
     notices: '',
     conversations: '',
     verification: '',
+    maintenance: '',
     composerNote: '',
     sendModeNote: '',
     lineKeys: [],

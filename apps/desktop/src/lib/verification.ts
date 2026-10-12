@@ -509,14 +509,21 @@ export { exitStatusText, outcomeView, type OutcomeView } from "./reducers";
 export {
   DISCLOSURE_BEST_EFFORT,
   DISCLOSURE_OUTPUT_INCOMPLETE,
+  DISCLOSURE_OUTPUT_PRUNED,
   DISCLOSURE_OUTPUT_WITHHELD,
   redactedCountText,
 } from "./reducers";
+import { DISCLOSURE_OUTPUT_PRUNED } from "./reducers";
 
 /** Every disclosure flag of a stored result, in a fixed order. */
 export function resultDisclosures(
-  result: Pick<VerificationResult, "stdoutTruncated" | "stderrTruncated" | "outputIncomplete" | "redactions">,
+  result: Pick<
+    VerificationResult,
+    "stdoutTruncated" | "stderrTruncated" | "outputIncomplete" | "outputPruned" | "redactions"
+  >,
 ): string[] {
+  // A9 precedence (§3.9 item 2): pruned output is not truncated output.
+  if (result.outputPruned === true) return [DISCLOSURE_OUTPUT_PRUNED];
   const out: string[] = [];
   if (result.stdoutTruncated) out.push("stdout was cut at Core's 64 KiB cap");
   if (result.stderrTruncated) out.push("stderr was cut at Core's 64 KiB cap");

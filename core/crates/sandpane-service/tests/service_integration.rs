@@ -3595,7 +3595,8 @@ fn features_are_advertised_from_the_single_const_list() {
             "conversation-sandbox-id",
             "conversation-send-mode",
             "git-apply",
-            "verification"
+            "verification",
+            "maintenance"
         ])
     );
 }

@@ -172,6 +172,16 @@ import {
   type VerificationOperation,
 } from './vscode/verification';
 import {
+  LOST_STEP2_TITLE,
+  MAINTENANCE_CONFLICT_TITLE,
+  defaultChecked,
+  itemPickLine,
+  maintenanceAdvertised,
+  maintenanceOutcomeCopy,
+  parseMaintenanceCleanup,
+  parseMaintenanceInventory,
+} from './vscode/maintenance';
+import {
   MALFORMED_DIFF_COPY,
   PATCH_SCHEME,
   PatchDocumentStore,
@@ -232,6 +242,7 @@ import {
   type SidebarState,
   type TaskVerificationRow,
   type VerificationAction,
+  type MaintenancePanelView,
   type VerificationPanelView,
   type WebviewToExtension,
 } from './webview/bridge';
@@ -2674,6 +2685,8 @@ export class SandpaneSession {
   private readonly verificationRunsStartedHere = new Map<string, string>();
   /** One approve / revoke dialog at a time. */
   private verificationEditOpen = false;
+  /** A9: one Maintenance flow at a time (a second gesture is refused). */
+  private maintenanceOpen = false;
   /** Only the newest hydration may write the section (loads can overlap). */
   private verificationGeneration = 0;
   /** `project.context` is due: a project load, an explicit refresh or a reconnect (never the timer). */
@@ -3580,6 +3593,205 @@ export class SandpaneSession {
     if (projectChanged && options.reload !== false) void this.reloadScope();
   }
 
+  // -----------------------------------------------------------------------
+  // A9 maintenance (design 2026-10-09 §3.9): scan → pick → step 1 → modal →
+  // step 2 → re-scan. Runs ONLY from a user gesture (the command or the
+  // sidebar button); step 2 is never retried and never sent without the
+  // modal, and the flow always re-scans after it settles.
+  // -----------------------------------------------------------------------
+
+  /** Click-time gate: fresh probe; both methods and the `maintenance` feature. */
+  private async ensureMaintenance(action: string): Promise<boolean> {
+    if (!(await this.ensureAdvertised('maintenance.inventory', action))) return false;
+    if (maintenanceAdvertised(this.capabilities) !== true) {
+      const text = 'This Core does not advertise maintenance, so cleanup is not supported by this Core.';
+      void vscode.window.showWarningMessage(text);
+      this.setStatus('error', text);
+      this.emit();
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * The whole Maintenance flow, one gesture at a time: fresh inventory →
+   * multi-select (removable items only; dbBackup and unknown kinds unchecked
+   * by default) → step 1 → modal with Core's impact → step 2 → re-scan.
+   */
+  async runMaintenanceCleanup(): Promise<void> {
+    if (this.maintenanceOpen) {
+      this.setStatus('info', 'A maintenance dialog is already open; finish it first. Nothing was sent.');
+      this.emit();
+      return;
+    }
+    this.maintenanceOpen = true;
+    try {
+      if (!(await this.ensureMaintenance('Clean up Core state'))) return;
+      let raw: unknown;
+      try {
+        raw = await this.commands.maintenanceInventory();
+      } catch (error) {
+        this.reportMaintenanceFailure(error, 'maintenance.inventory');
+        return;
+      }
+      const inventory = parseMaintenanceInventory(raw);
+      if (inventory === null) {
+        this.setStatus('error', 'maintenance.inventory: Core answered a shape this client cannot read. Nothing was sent.');
+        this.emit();
+        return;
+      }
+      if (inventory.items.length === 0) {
+        this.setStatus('ok', 'Core found nothing to clean up.');
+        this.emit();
+        return;
+      }
+      const removable = inventory.items.filter((item) => item.removable);
+      const reportOnly = inventory.items.filter((item) => !item.removable);
+      if (inventory.truncated) {
+        void vscode.window.showInformationMessage(
+          'The maintenance scan was cut short: Core left items out (too many entries). Clean up what is listed, then scan again.',
+        );
+      }
+      if (removable.length === 0) {
+        this.setStatus(
+          'info',
+          `Nothing is removable by Sandpane (${reportOnly.length} report-only item${reportOnly.length === 1 ? '' : 's'}; run the command for the paths).`,
+        );
+        this.emit();
+        return;
+      }
+      // Multi-select: every removable item is listed; the pre-picked set is
+      // Core's default (temp + verificationOutput; dbBackup and unknown kinds
+      // stay UNchecked until the user opts in).
+      const picked = await vscode.window.showQuickPick(
+        removable.map((item) => ({
+          label: labelText(itemPickLine(item)),
+          description: labelText(plainText(item.detail, 300)),
+          picked: defaultChecked(item),
+          item,
+        })),
+        {
+          title: labelText(
+            `Clean up which items? (Core's fresh scan${reportOnly.length > 0 ? `; ${reportOnly.length} report-only item${reportOnly.length === 1 ? ' is' : 's are'} not offered` : ''})`,
+          ),
+          canPickMany: true,
+          ignoreFocusOut: true,
+        },
+      );
+      if (picked === undefined || picked.length === 0) {
+        this.notConfirmedMaintenance();
+        return;
+      }
+      const items = picked.map((p) => p.item.id);
+      // Step 1: Core re-inventories, refuses what changed, mints the token.
+      let step1: unknown;
+      try {
+        step1 = await this.commands.maintenanceCleanupRequest(items);
+      } catch (error) {
+        this.reportMaintenanceFailure(error, 'maintenance.cleanup (step 1)');
+        return;
+      }
+      const request = parseMaintenanceCleanup(step1);
+      if (request === null || request.confirmation === undefined) {
+        this.setStatus(
+          'error',
+          'maintenance.cleanup: Core answered a shape this client cannot read. Nothing was sent.',
+        );
+        this.emit();
+        return;
+      }
+      const confirmation = request.confirmation;
+      const impact = confirmation.impact.map((line) => plainText(line, 500)).join('\n');
+      const answer = await vscode.window.showWarningMessage(
+        `Remove ${items.length} confirmed item${items.length === 1 ? '' : 's'}? This cannot be undone.`,
+        { modal: true, detail: labelText(`${impact}\n\nValid until ${plainText(confirmation.expiresAt, 64)}. Items that changed since the scan are skipped and reported, not removed silently.`) },
+        'Remove them',
+      );
+      if (answer !== 'Remove them') {
+        this.notConfirmedMaintenance();
+        return;
+      }
+      // Step 2: the token is spent exactly once, from this gesture only.
+      let step2: unknown;
+      try {
+        step2 = await this.commands.maintenanceCleanupConfirm(items, confirmation.token);
+      } catch (error) {
+        this.reportMaintenanceFailure(error, 'maintenance.cleanup (step 2)');
+        await this.maintenanceRescan();
+        return;
+      }
+      const outcome = parseMaintenanceCleanup(step2);
+      if (outcome === null || outcome.confirmation !== undefined || outcome.removed === undefined) {
+        this.setStatus(
+          'error',
+          'maintenance.cleanup: Core answered a shape this client cannot read. Some items may have been removed — scan again.',
+        );
+        this.emit();
+        await this.maintenanceRescan();
+        return;
+      }
+      const copy = maintenanceOutcomeCopy(outcome, items.length);
+      this.setStatus(
+        outcome.skipped !== undefined && outcome.skipped.length > 0 ? 'info' : 'ok',
+        copy.headline,
+      );
+      void vscode.window.showInformationMessage(
+        labelText(
+          [
+            copy.headline,
+            ...copy.skippedLines.slice(0, 10),
+            ...(copy.skippedLines.length > 10 ? [`…and ${copy.skippedLines.length - 10} more`] : []),
+            ...copy.noteLines,
+          ].join('\n'),
+        ),
+      );
+      this.emit();
+      // §3.9 item 7.5: always re-scan after step 2.
+      await this.maintenanceRescan();
+    } finally {
+      this.maintenanceOpen = false;
+    }
+  }
+
+  /** A silent re-scan after step 2: failures surface as a status line only. */
+  private async maintenanceRescan(): Promise<void> {
+    try {
+      await this.commands.maintenanceInventory();
+    } catch (error) {
+      this.setStatus('info', 'The post-cleanup re-scan failed; run the command again to see what remains.');
+      this.log(`maintenance.inventory re-scan failed: ${errorCodeOf(error) ?? 'no Core error code'}`);
+      this.emit();
+    }
+  }
+
+  private notConfirmedMaintenance(): void {
+    this.setStatus('info', 'Not confirmed; nothing was sent.');
+    this.emit();
+  }
+
+  /** Honesty copy for a maintenance failure (client brief, §9 step 2). */
+  private reportMaintenanceFailure(error: unknown, what: string): void {
+    const code = errorCodeOf(error);
+    this.log(`${what} failed: ${code ?? 'no Core error code'}`);
+    if (code === 'CONFLICT') {
+      const text = MAINTENANCE_CONFLICT_TITLE;
+      void vscode.window.showWarningMessage(text);
+      this.setStatus('info', text);
+      this.emit();
+      return;
+    }
+    if (what.includes('step 2')) {
+      // A lost answer or a token refusal: the client cannot tell "expired"
+      // from "consumed by a lost earlier attempt" — never "nothing was removed".
+      const text = `${LOST_STEP2_TITLE}. ${plainText(error instanceof Error ? error.message : String(error), 300)}`;
+      void vscode.window.showWarningMessage(labelText(text));
+      this.setStatus('error', LOST_STEP2_TITLE);
+      this.emit();
+      return;
+    }
+    this.reportError(error, what, 'The cleanup was not started; nothing was changed.');
+  }
+
   handleWebviewMessage(message: WebviewToExtension): void {
     switch (message.type) {
       case 'ready':
@@ -3628,6 +3840,11 @@ export class SandpaneSession {
         break;
       case 'showVerificationResults':
         void this.showVerificationResults(message.taskId);
+        break;
+      case 'maintenanceScan':
+        // A9: a click opens the native Maintenance flow; nothing is sent
+        // without its modal.
+        void this.runMaintenanceCleanup();
         break;
       default: {
         const _exhaustive: never = message;
@@ -3720,6 +3937,10 @@ export class SandpaneSession {
       gitApplySupported: this.coreAdvertises('git.apply') && this.coreHasFeature(GIT_APPLY_FEATURE),
       applyInFlight: this.applyInFlight,
       verification: this.verificationPanel(),
+      maintenance: {
+        supported: maintenanceAdvertised(this.capabilities) === true,
+        inFlight: this.maintenanceOpen,
+      },
       lines: transcript.lines.map((line) => ({
         role: line.role,
         text: line.text,

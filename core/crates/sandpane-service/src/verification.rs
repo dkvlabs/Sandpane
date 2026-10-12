@@ -556,6 +556,7 @@ pub(crate) fn verification_result(
         Option<String>,
         Option<i64>,
         bool,
+        bool,
     );
     let row: Option<Row> = {
         let db = inner.lock_db();
@@ -564,7 +565,7 @@ pub(crate) fn verification_result(
                 "SELECT task_id, command_id, label, argv_json, sandbox_name, workspace_mode,
                         status, exit_code, outcome, stdout, stderr, stdout_truncated,
                         stderr_truncated, redactions_json, started_at, finished_at, elapsed_ms,
-                        output_incomplete
+                        output_incomplete, output_pruned
                  FROM verification_runs WHERE id = ?1",
                 params![p.run_id],
                 |r| {
@@ -587,6 +588,7 @@ pub(crate) fn verification_result(
                         r.get(15)?,
                         r.get(16)?,
                         r.get(17)?,
+                        r.get(18)?,
                     ))
                 },
             )
@@ -612,6 +614,7 @@ pub(crate) fn verification_result(
         finished_at,
         elapsed_ms,
         output_incomplete,
+        output_pruned,
     )) = row
     else {
         return Err(not_found(MSG_RUN_NOT_FOUND));
@@ -644,6 +647,8 @@ pub(crate) fn verification_result(
         started_at,
         finished_at,
         output_incomplete: output_incomplete.then_some(true),
+        // A9: the stored output was removed by maintenance cleanup.
+        output_pruned: output_pruned.then_some(true),
     };
     let bytes = json_len(&result);
     if bytes > MAX_RESPONSE_BYTES {

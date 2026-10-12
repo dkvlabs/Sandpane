@@ -30,6 +30,7 @@ import { MalformedFrameError } from "../src/lib/framing";
 import {
   DEFAULT_SBX_AGENT,
   METHODS,
+  MAINTENANCE_METHODS,
   PROTOCOL_VERSION,
   SBX_AGENTS,
   type ConfirmationRequest,
@@ -166,7 +167,7 @@ describe("A1 pinned lists", () => {
     ]);
     expect(rustMethodAll().names).toEqual([...METHODS]);
     expect(schemaMethodEnum()).toEqual([...METHODS]);
-    expect(METHODS).toHaveLength(34);
+    expect(METHODS).toHaveLength(36);
     // The A1 Core's set is today's minus the six A3a project methods, the
     // five A3b conversation methods, A5's git.diff and the six A7 methods.
     expect(A1_CORE_METHODS).toEqual(
@@ -175,6 +176,7 @@ describe("A1 pinned lists", () => {
           !(PROJECT_LIFECYCLE_METHODS as readonly string[]).includes(m) &&
           !(CONVERSATION_LIFECYCLE_METHODS as readonly string[]).includes(m) &&
           !(VERIFICATION_METHODS as readonly string[]).includes(m) &&
+          !(MAINTENANCE_METHODS as readonly string[]).includes(m) &&
           m !== "git.diff",
       ),
     );

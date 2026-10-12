@@ -139,8 +139,8 @@ async function main() {
 
   // ---- method advertisement (the discovery revision) --------------------
   check(
-    'system.probe advertises exactly the 34 methods the client allowlists',
-    Array.isArray(caps.methods) && caps.methods.length === 34 && caps.methods.join(',') === CORE_METHODS.join(','),
+    'system.probe advertises exactly the 36 methods the client allowlists',
+    Array.isArray(caps.methods) && caps.methods.length === 36 && caps.methods.join(',') === CORE_METHODS.join(','),
     (caps.methods ?? []).join(','),
   );
   const schemaMethods = JSON.parse(
@@ -196,10 +196,11 @@ async function main() {
   // A2: advertisement only. This harness never sends a keyed sandbox.create
   // (it would drive the real sbx); keyed sends are not exercised here either.
   check(
-    'A2/A3b/A4/A6/A7: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent, conversation-sandbox-id, conversation-send-mode, git-apply, verification)',
+    'A2/A3b/A4/A6/A7/A9: Core advertises every feature this client knows (idempotency-keys, sandbox-create-agent, conversation-sandbox-id, conversation-send-mode, git-apply, verification, maintenance)',
     Array.isArray(caps.features) &&
-      KNOWN_FEATURES.length === 6 &&
+      KNOWN_FEATURES.length === 7 &&
       KNOWN_FEATURES.includes('verification') &&
+      KNOWN_FEATURES.includes('maintenance') &&
       KNOWN_FEATURES.every((f) => caps.features.includes(f)) &&
       KNOWN_FEATURES.every((f) => coreAdvertisesFeature(caps, f)),
     JSON.stringify(caps.features ?? null),
@@ -439,6 +440,49 @@ async function main() {
     'A7: the refused approve left the list empty',
     Array.isArray(afterApprove?.commands) && afterApprove.commands.length === 0,
     JSON.stringify(afterApprove === null ? null : { commands: afterApprove.commands.length }),
+  );
+
+  // A9: the maintenance surface — advertisement, a read-only inventory, and a
+  // step 1 that Core must refuse for an unknown id (nothing is ever removed
+  // here; a real cleanup needs a real Core-created item and a human).
+  check(
+    'A9: Core advertises the two maintenance methods at the end, and the feature "maintenance"',
+    (caps.methods ?? []).slice(-2).join(',') === 'maintenance.inventory,maintenance.cleanup' &&
+      coreAdvertisesFeature(caps, 'maintenance'),
+    (caps.methods ?? []).slice(-4).join(','),
+  );
+  let inventoryResult = null;
+  let inventoryError = null;
+  await commands
+    .maintenanceInventory()
+    .then((r) => {
+      inventoryResult = r;
+    })
+    .catch((e) => {
+      inventoryError = e;
+    });
+  check(
+    'A9: maintenance.inventory answers {items, truncated} (an empty items list is fine)',
+    inventoryResult !== null &&
+      Array.isArray(inventoryResult.items) &&
+      typeof inventoryResult.truncated === 'boolean',
+    JSON.stringify(
+      inventoryResult === null
+        ? { code: inventoryError?.code, message: inventoryError?.message }
+        : { items: inventoryResult.items.length, truncated: inventoryResult.truncated },
+    ),
+  );
+  let cleanupRefusal = null;
+  await commands
+    .maintenanceCleanupRequest(['temp:00000000-0000-4000-8000-000000000000'])
+    .then(() => {})
+    .catch((e) => {
+      cleanupRefusal = e;
+    });
+  check(
+    'A9: maintenance.cleanup step 1 with an unknown id answers VALIDATION_FAILED (nothing issued)',
+    cleanupRefusal?.code === 'VALIDATION_FAILED',
+    cleanupRefusal ? `${cleanupRefusal.code}: ${String(cleanupRefusal.message).slice(0, 120)}` : 'Core issued a token',
   );
 
   // ---- unknown method: the client blocks it, and so does Core ----------

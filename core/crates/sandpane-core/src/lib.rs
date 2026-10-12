@@ -11,6 +11,7 @@ pub mod diff;
 pub mod events;
 pub mod git;
 pub mod idempotency;
+pub mod maintenance;
 pub mod objects;
 pub mod process;
 pub mod redact;

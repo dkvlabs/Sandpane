@@ -53,6 +53,7 @@ import {
   A4_CORE_FEATURES,
   A6_CORE_FEATURES,
   A7_CORE_FEATURES,
+  A9_CORE_FEATURES,
   FakeCore,
 } from "./support/fake-core";
 import { SERVICE_RUST, protocolRustSource, rustStrConst, serviceRustSource } from "./support/rust-source";
@@ -96,7 +97,8 @@ describe("A4 drift against the Rust sources", () => {
     // the A7 double all of it (each plus one unknown string clients ignore).
     expect(A4_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names.slice(0, 4));
     expect(A6_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names.slice(0, 5));
-    expect(A7_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names);
+    expect(A7_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names.slice(0, 6));
+    expect(A9_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names);
   });
 
   it("the mode values and the refusal message are Core's", () => {

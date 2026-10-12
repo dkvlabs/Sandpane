@@ -28,9 +28,11 @@ import {
   FEATURE_CONVERSATION_SEND_MODE,
   FEATURE_GIT_APPLY,
   FEATURE_VERIFICATION,
+  FEATURE_MAINTENANCE,
   KNOWN_FEATURES,
   METHODS,
   VERIFICATION_METHODS,
+  MAINTENANCE_METHODS,
   coreAdvertisesFeature,
   coreAdvertisesMethod,
   type Method,
@@ -116,28 +118,31 @@ describeLive("real Core answers the way the mirror claims", () => {
       ...CONVERSATION_LIFECYCLE_METHODS,
       // A5: git.diff.
       "git.diff",
-      // A7: the five verification methods and project.context (34 in all).
+      // A7: the five verification methods and project.context; A9 appended
+      // the two maintenance methods (36 in all).
       ...VERIFICATION_METHODS,
+      ...MAINTENANCE_METHODS,
     ];
     for (const method of additive) {
       expect(coreAdvertisesMethod(outcome.capabilities, method)).toBe(true);
     }
     // Every advertised name must be one this client is allowed to call, and an
-    // A7 Core advertises exactly this client's 34, in Method::ALL order.
+    // A9 Core advertises exactly this client's 36, in Method::ALL order.
     const allowlist: readonly string[] = METHODS;
     for (const advertised of outcome.capabilities.methods ?? []) {
       expect(allowlist).toContain(advertised);
     }
     expect(outcome.capabilities.methods).toEqual([...METHODS]);
-    expect(METHODS).toHaveLength(34);
+    expect(METHODS).toHaveLength(36);
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SANDBOX_ID)).toBe(true);
-    // A4: conversation-send-mode; A6: git-apply; A7: verification. An A7
-    // Core advertises exactly this client's 6 known features (A4 and A6 added
-    // no method; A5 added git.diff; A7 added six methods: 34).
+    // A4: conversation-send-mode; A6: git-apply; A7: verification; A9:
+    // maintenance. An A9 Core advertises exactly this client's 7 known
+    // features (A5 added git.diff; A7 six methods; A9 two more: 36).
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_CONVERSATION_SEND_MODE)).toBe(true);
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_GIT_APPLY)).toBe(true);
     expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_VERIFICATION)).toBe(true);
-    expect(KNOWN_FEATURES).toHaveLength(6);
+    expect(coreAdvertisesFeature(outcome.capabilities, FEATURE_MAINTENANCE)).toBe(true);
+    expect(KNOWN_FEATURES).toHaveLength(7);
     expect(outcome.capabilities.features).toEqual([...KNOWN_FEATURES]);
   });
 
@@ -178,6 +183,23 @@ describeLive("real Core answers the way the mirror claims", () => {
     ).rejects.toMatchObject({ source: "core", code: "VALIDATION_FAILED" });
     // Nothing was stored.
     expect(await client.request("verification.list", { projectId: created.id })).toEqual({ commands: [] });
+  });
+
+  it("A9: the inventory answers {items, truncated} and an unknown cleanup id is refused", async () => {
+    // Read-only scan: an empty items list on a fresh Core is fine.
+    const inventory = (await client.maintenanceInventory()) as {
+      items: unknown[];
+      truncated: boolean;
+    };
+    expect(Array.isArray(inventory.items)).toBe(true);
+    expect(typeof inventory.truncated).toBe("boolean");
+    // Step 1 with an id Core's own fresh inventory cannot know: refused before
+    // any token is issued (the live check never removes anything).
+    await expect(
+      client.request("maintenance.cleanup", {
+        items: ["temp:00000000-0000-4000-8000-000000000000"],
+      }),
+    ).rejects.toMatchObject({ source: "core", code: "VALIDATION_FAILED" });
   });
 
   it("refuses a blank scoping id with VALIDATION_FAILED — the guard mirrors the verdict", async () => {

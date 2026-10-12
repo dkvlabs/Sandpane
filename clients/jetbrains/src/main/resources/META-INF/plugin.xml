@@ -127,6 +127,13 @@
                     text="Sandpane: Refresh Projects and Sandboxes"
                     description="Re-probe project and sandbox state from Core (read-only; state is never assumed)"/>
 
+            <!-- A9 maintenance (design 2026-10-09 \u00A73.9): gated on the maintenance feature plus
+                 both methods; step 2 only ever runs from the modal confirmation. -->
+            <action id="labs.dkv.sandpane.Maintenance"
+                    class="labs.dkv.sandpane.actions.MaintenanceAction"
+                    text="Sandpane: Clean Up Core State…"
+                    description="Scan what Core itself created and confirm a cleanup (worktrees are report-only)"/>
+
             <action id="labs.dkv.sandpane.StopSandbox"
                     class="labs.dkv.sandpane.actions.StopSandboxAction"
                     text="Sandpane: Stop Sandbox…"

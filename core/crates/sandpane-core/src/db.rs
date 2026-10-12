@@ -28,7 +28,7 @@ pub struct Database {
 }
 
 /// Newest schema version this build understands.
-pub const LATEST_SCHEMA_VERSION: i64 = 8;
+pub const LATEST_SCHEMA_VERSION: i64 = 9;
 
 /// Schema v1: the entity set from specs/02 §3.
 const MIGRATION_V1: &str = r#"
@@ -312,6 +312,16 @@ CREATE INDEX idx_verification_runs_task ON verification_runs(task_id);
 CREATE INDEX idx_verification_runs_status ON verification_runs(status);
 "#;
 
+/// Schema v9 (A9, design 2026-10-09 §3.9 item 2 `verificationOutput`):
+/// `output_pruned` marks a run whose stored stdout/stderr were removed by
+/// `maintenance.cleanup` (`verification.result` then answers
+/// `outputPruned: true`). Rows created before v9 stay 0 — never back-filled.
+/// Only 0 or 1, like the other flag columns' meaning.
+const MIGRATION_V9: &str = r#"
+ALTER TABLE verification_runs ADD COLUMN output_pruned INTEGER NOT NULL DEFAULT 0
+    CHECK (output_pruned IN (0, 1));
+"#;
+
 impl Database {
     /// Open (or create) the database at `path` and migrate to the latest
     /// schema. Refuses databases from a newer schema version.
@@ -335,6 +345,12 @@ impl Database {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// The database file (`None` in memory). A9 maintenance lists the
+    /// migration backups beside it (§3.9 item 2 `dbBackup`).
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Current user_version pragma.
@@ -391,6 +407,9 @@ impl Database {
         }
         if current < 8 {
             self.apply_migration(8, MIGRATION_V8)?;
+        }
+        if current < 9 {
+            self.apply_migration(9, MIGRATION_V9)?;
         }
         Ok(())
     }
@@ -1020,8 +1039,7 @@ mod tests {
             .unwrap();
         }
         let db = Database::open(&path).unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 8);
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let c = db.conn();
         let one = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(
@@ -1095,7 +1113,9 @@ mod tests {
                 "started_at",
                 "finished_at",
                 "elapsed_ms",
-                "output_incomplete"
+                "output_incomplete",
+                // v9 (A9) appends `output_pruned`.
+                "output_pruned"
             ]
         );
         c.execute_batch(
@@ -1144,27 +1164,114 @@ mod tests {
             .is_err());
         drop(db);
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         assert!(!dir.path().join("core.sqlite3.pre-v8.bak.1").exists());
     }
 
-    /// A database written by a NEWER Core (v9) is refused untouched — no
-    /// pragma, no backup, no migration (no silent downgrade).
+    /// A9 migration (design 2026-10-09 §3.9 item 2 `verificationOutput`): a
+    /// REAL v8 file with a finished run upgrades forward to v9: the run keeps
+    /// its output, `output_pruned` is 0 for it (never back-filled as
+    /// pruned), a consistent `.pre-v9.bak` of the v8 file is taken, and the
+    /// column only holds 0 or 1.
     #[test]
-    fn v9_database_is_refused_by_a_v8_core() {
+    fn v8_database_migrates_forward_to_v9_with_output_pruned_and_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("core.sqlite3");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 9).unwrap();
+            for sql in [
+                MIGRATION_V1,
+                MIGRATION_V2,
+                MIGRATION_V3,
+                MIGRATION_V4,
+                MIGRATION_V5,
+                MIGRATION_V6,
+                MIGRATION_V7,
+                MIGRATION_V8,
+            ] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 8).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id,name,created_at) VALUES ('p1','Atlas Demo','t');
+                 INSERT INTO conversations (id,project_id,title,agent_id,created_at)
+                     VALUES ('c1','p1','Chat','codex','t');
+                 INSERT INTO tasks (id,conversation_id,status,created_at,updated_at,mode)
+                     VALUES ('t1','c1','completed','t','t','task');
+                 INSERT INTO verification_commands (id,project_id,label,argv_json,approved_at)
+                     VALUES ('vc1','p1','tests','[\"make\",\"test\"]','t');
+                 INSERT INTO verification_runs (id,task_id,command_id,sandbox_name,
+                     workspace_mode,argv_json,label,status,outcome,stdout,stderr,
+                     started_sequence,started_at,finished_at)
+                     VALUES ('r1','t1','vc1','atlas-auth','mountless','[]','tests',
+                     'finished','exited','out','err',1,'t','2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(LATEST_SCHEMA_VERSION, 9);
+        assert_eq!(db.schema_version().unwrap(), 9);
+        let c = db.conn();
+        let row: (String, String, i64) = c
+            .query_row(
+                "SELECT stdout, stderr, output_pruned FROM verification_runs WHERE id='r1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("out".into(), "err".into(), 0), "never back-filled");
+        let backup = dir.path().join("core.sqlite3.pre-v9.bak");
+        assert!(backup.exists());
+        let b = Connection::open(&backup).unwrap();
+        let v: i64 = b
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 8);
+        let pruned_cols: i64 = b
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('verification_runs')
+                 WHERE name = 'output_pruned'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pruned_cols, 0, "the backup is the untouched v8 schema");
+        // Only 0 or 1.
+        assert!(c
+            .execute(
+                "UPDATE verification_runs SET output_pruned = 2 WHERE id='r1'",
+                []
+            )
+            .is_err());
+        c.execute(
+            "UPDATE verification_runs SET stdout='', stderr='', output_pruned = 1 WHERE id='r1'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 9);
+        assert!(!dir.path().join("core.sqlite3.pre-v9.bak.1").exists());
+        assert_eq!(db.path(), Some(path.as_path()));
+    }
+
+    /// A database written by a NEWER Core (v10) is refused untouched — no
+    /// pragma, no backup, no migration (no silent downgrade).
+    #[test]
+    fn v10_database_is_refused_by_a_v9_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 10).unwrap();
         }
         let err = Database::open(&path).unwrap_err();
         assert!(
             matches!(
                 err,
                 DbError::TooNew {
-                    found: 9,
-                    supported: 8
+                    found: 10,
+                    supported: 9
                 }
             ),
             "{err}"
@@ -1181,7 +1288,7 @@ mod tests {
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 9, "left untouched");
+        assert_eq!(v, 10, "left untouched");
     }
 
     #[test]

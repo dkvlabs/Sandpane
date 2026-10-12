@@ -23,6 +23,22 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+/// Every process spawn ATTEMPT made by this crate's runners
+/// ([`run_bounded`], [`run_partial`]) — the only production spawn paths of
+/// Core (git and sbx both go through them). Counted before `spawn()` so a
+/// failed spawn counts too. A9 (§3.9 item 8) uses it to prove inventory and
+/// cleanup spawn nothing.
+static SPAWN_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn count_spawn() {
+    SPAWN_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Process-wide count of spawn attempts so far (see [`SPAWN_ATTEMPTS`]).
+pub fn spawn_attempts() -> u64 {
+    SPAWN_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Wall-clock and output limits for one invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunLimits {
@@ -137,6 +153,7 @@ fn run_bounded_in(
     let deadline = Instant::now() + limits.timeout;
     let mut child = {
         let mut st = slot.lock();
+        count_spawn();
         let child = cmd.spawn().map_err(ProcessError::Spawn)?;
         st.pgid = Some(child.id());
         child
@@ -231,6 +248,7 @@ pub fn run_bounded(mut cmd: Command, limits: &RunLimits) -> Result<BoundedOutput
         cmd.process_group(0);
     }
     let deadline = Instant::now() + limits.timeout;
+    count_spawn();
     let mut child = cmd.spawn().map_err(ProcessError::Spawn)?;
     let pid = child.id();
 
@@ -749,6 +767,7 @@ pub fn run_partial(
                 group_signalled: false,
             });
         }
+        count_spawn();
         let child = cmd.spawn()?;
         st.pgid = Some(child.id());
         child
@@ -1110,6 +1129,27 @@ perl -e 'use POSIX; POSIX::setsid(); $SIG{PIPE}=\"IGNORE\"; \
             (c.bytes.as_slice(), c.truncated, c.done),
             (&b"hel"[..], true, true)
         );
+    }
+
+    /// A9 (§3.9 item 8): every spawn ATTEMPT — even one that fails — is
+    /// counted, so a test can prove a code path spawned nothing. Other
+    /// tests run in parallel, so only a lower bound is asserted here.
+    #[test]
+    fn spawn_attempts_are_counted_even_when_the_spawn_fails() {
+        let before = spawn_attempts();
+        let _ = run_bounded(Command::new("true"), &limits(5000, 1024)).unwrap();
+        let _ = run_bounded(
+            Command::new("/nonexistent/definitely-not-a-binary"),
+            &limits(5000, 1024),
+        );
+        let _ = run_partial(
+            Command::new("true"),
+            &limits(5000, 1024),
+            Duration::from_millis(100),
+            &ChildSlot::default(),
+        )
+        .unwrap();
+        assert!(spawn_attempts() >= before + 3);
     }
 
     #[test]

@@ -48,6 +48,12 @@ import {
   type TaskSummary,
   type WorkspaceMode,
   type DetectedManifest,
+  type MaintenanceCleanupResult,
+  type MaintenanceConfirmation,
+  type MaintenanceInventoryResult,
+  type MaintenanceItem,
+  type MaintenanceSkipped,
+  type MaintenanceUnavailable,
   type OutputRedaction,
   type ProjectContextResult,
   type RepositoryContext,
@@ -949,7 +955,8 @@ function decodeOutputRedaction(value: unknown): OutputRedaction {
 /**
  * `verification.result`. `outcome` and `workspaceMode` are OPEN strings
  * (never mapped onto a known value here); `exitCode`, `elapsedMs`,
- * `finishedAt` and `outputIncomplete` are optional and stay absent.
+ * `finishedAt`, `outputIncomplete` and `outputPruned` are optional and stay
+ * absent.
  */
 export function decodeVerificationResult(value: unknown): VerificationResult {
   const w = "VerificationResult";
@@ -958,6 +965,7 @@ export function decodeVerificationResult(value: unknown): VerificationResult {
   const elapsedMs = optInt(r, "elapsedMs", w);
   const finishedAt = optStr(r, "finishedAt", w);
   const outputIncomplete = optFlag(r, "outputIncomplete", w);
+  const outputPruned = optFlag(r, "outputPruned", w);
   return {
     runId: str(r, "runId", w),
     taskId: str(r, "taskId", w),
@@ -974,6 +982,7 @@ export function decodeVerificationResult(value: unknown): VerificationResult {
     stderrTruncated: bool(r, "stderrTruncated", w),
     redactions: decodeOutputRedaction(r.redactions),
     ...(outputIncomplete === undefined ? {} : { outputIncomplete }),
+    ...(outputPruned === undefined ? {} : { outputPruned }),
     ...(elapsedMs === undefined ? {} : { elapsedMs }),
     startedAt: str(r, "startedAt", w),
     ...optField("finishedAt", finishedAt),
@@ -1017,5 +1026,108 @@ export function decodeProjectContext(value: unknown): ProjectContextResult {
   return {
     repositories: arr(r, "repositories", w).map(decodeRepositoryContext),
     approved: commandList(r, "approved", w),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// A9 — maintenance inventory and cleanup (design 2026-10-09 §3.9)
+// ---------------------------------------------------------------------------
+
+/**
+ * `maintenance.inventory` item. `kind` is an OPEN string; `detail`, `reason`,
+ * `path` and `repositoryPath` are UNTRUSTED display text kept as decoded
+ * strings (the UI renders them as text and reveals control characters).
+ */
+export function decodeMaintenanceItem(value: unknown): MaintenanceItem {
+  const w = "MaintenanceItem";
+  const r = asRecord(value, w);
+  const bytes = optInt(r, "bytes", w);
+  const sizeIncomplete = optFlag(r, "sizeIncomplete", w);
+  const createdAt = optStr(r, "createdAt", w);
+  const reason = optStr(r, "reason", w);
+  const path = optStr(r, "path", w);
+  const repositoryPath = optStr(r, "repositoryPath", w);
+  return {
+    id: str(r, "id", w),
+    kind: str(r, "kind", w),
+    removable: bool(r, "removable", w),
+    ...(bytes === undefined ? {} : { bytes }),
+    ...(sizeIncomplete === undefined ? {} : { sizeIncomplete }),
+    ...optField("createdAt", createdAt),
+    detail: str(r, "detail", w),
+    ...optField("reason", reason),
+    ...optField("path", path),
+    ...optField("repositoryPath", repositoryPath),
+  };
+}
+
+function decodeMaintenanceUnavailable(value: unknown): MaintenanceUnavailable {
+  const w = "MaintenanceUnavailable";
+  const r = asRecord(value, w);
+  return {
+    kind: str(r, "kind", w),
+    reason: str(r, "reason", w),
+  };
+}
+
+/** `maintenance.inventory` → items in Core's (kind, id) order. */
+export function decodeMaintenanceInventory(value: unknown): MaintenanceInventoryResult {
+  const w = "MaintenanceInventoryResult";
+  const r = asRecord(value, w);
+  return {
+    items: arr(r, "items", w).map(decodeMaintenanceItem),
+    truncated: bool(r, "truncated", w),
+    ...(r.unavailable === undefined
+      ? {}
+      : { unavailable: arr(r, "unavailable", w).map(decodeMaintenanceUnavailable) }),
+  };
+}
+
+function decodeMaintenanceConfirmation(value: unknown): MaintenanceConfirmation {
+  const w = "MaintenanceConfirmation";
+  const r = asRecord(value, w);
+  const target = asRecord(r.target, `${w}.target`);
+  return {
+    token: str(r, "token", w),
+    expiresAt: str(r, "expiresAt", w),
+    action: str(r, "action", w),
+    target: { items: strArray(target, "items", `${w}.target`) },
+    impact: strArray(r, "impact", w),
+    external: bool(r, "external", w),
+  };
+}
+
+function decodeMaintenanceSkipped(value: unknown): MaintenanceSkipped {
+  const w = "MaintenanceSkipped";
+  const r = asRecord(value, w);
+  return {
+    id: str(r, "id", w),
+    reason: str(r, "reason", w),
+  };
+}
+
+/**
+ * `maintenance.cleanup`. The step-1 answer must carry a `confirmation`; the
+ * step-2 answer must carry `removed` and `skipped` (both possibly empty) —
+ * anything else is a malformed frame, never a guessed outcome.
+ */
+export function decodeMaintenanceCleanup(value: unknown): MaintenanceCleanupResult {
+  const w = "MaintenanceCleanupResult";
+  const r = asRecord(value, w);
+  const freedBytes = optInt(r, "freedBytes", w);
+  if (r.confirmation !== undefined) {
+    if (r.removed !== undefined || r.skipped !== undefined) {
+      throw new MalformedFrameError(`${w} carries both a confirmation and a step-2 outcome`);
+    }
+    return { confirmation: decodeMaintenanceConfirmation(r.confirmation) };
+  }
+  if (r.removed === undefined || r.skipped === undefined) {
+    throw new MalformedFrameError(`${w} must carry a confirmation or a removed/skipped outcome`);
+  }
+  return {
+    removed: strArray(r, "removed", w),
+    skipped: arr(r, "skipped", w).map(decodeMaintenanceSkipped),
+    ...(freedBytes === undefined ? {} : { freedBytes }),
+    ...(r.notes === undefined ? {} : { notes: strArray(r, "notes", w) }),
   };
 }

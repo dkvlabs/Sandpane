@@ -23,6 +23,7 @@ import {
   Warning,
 } from "../../components/ui/primitives";
 import { IconRefresh } from "../../components/layout/icons";
+import { MaintenancePanel } from "./MaintenancePanel";
 import type { Route } from "../../app/router";
 import { useProbeRefetch, RefreshButton } from "../../components/ui/refresh";
 import { useDeps, useUiPreferences } from "../../app/context";
@@ -208,6 +209,8 @@ export function SettingsView({ route }: { route: Route }) {
           would be a Core setting and is not available in this build.
         </p>
       </Panel>
+
+      <MaintenancePanel capabilities={capabilities} />
 
       <Panel
         title="Appearance"

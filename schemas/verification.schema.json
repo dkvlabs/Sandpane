@@ -342,6 +342,10 @@
         "outputIncomplete": {
           "const": true,
           "description": "Present (true) only when `sbx exec` exited but its output pipes were still held open, by a descendant that left the process group, after the kill grace: the stored output may be missing a tail. outcome and exitCode are kept as reported; this is never rewritten to timed_out. Absent otherwise."
+        },
+        "outputPruned": {
+          "const": true,
+          "description": "A9 (design 2026-10-09 §3.9 item 2): present (true) only when maintenance.cleanup removed this run's stored stdout/stderr; the record is kept and stdout/stderr are empty. Takes precedence over stdoutTruncated / stderrTruncated / outputIncomplete in rendering (\"output removed by maintenance cleanup\"). Absent otherwise and from a pre-A9 Core."
         }
       }
     }

@@ -27,6 +27,7 @@ import labs.dkv.sandpane.model.CoreCapabilities
 import labs.dkv.sandpane.model.CoreJson
 import labs.dkv.sandpane.model.CoreErrorCodes
 import labs.dkv.sandpane.model.CoreMethods
+import labs.dkv.sandpane.model.MaintenanceGuards
 import labs.dkv.sandpane.model.Project
 import labs.dkv.sandpane.model.ProjectDeleteParams
 import labs.dkv.sandpane.model.ProjectDeleteResult
@@ -48,6 +49,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
@@ -716,6 +718,93 @@ class CoreCommands(
             labs.dkv.sandpane.model.ProjectContextParams.serializer(),
             labs.dkv.sandpane.model.ProjectContextParams(CoreGuards.requireId(projectId, "projectId")),
         )
+
+    // -----------------------------------------------------------------------
+    // A9: maintenance inventory + token-confirmed cleanup (design 2026-10-09 §3.9)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Why an A9 [method] may not be sent, or null: it must be ADVERTISED and Core must advertise
+     * the `maintenance` FEATURE (§3.9 item 7: the Maintenance UI is enabled only then). Nothing
+     * reaches the socket otherwise.
+     */
+    fun maintenanceGap(method: String): MethodNotSupportedException? {
+        advertisementGap(method)?.let { return it }
+        val caps = capabilities()
+            ?: return MethodNotSupportedException(method, "this plugin is not connected to Core, so its features are not known yet")
+        if (caps.hasFeature(labs.dkv.sandpane.model.CoreFeatures.MAINTENANCE)) return null
+        return MethodNotSupportedException(
+            method,
+            "Core ${caps.coreVersion} does not advertise the maintenance feature. Nothing was sent.",
+        )
+    }
+
+    private fun <T> maintenanceCall(
+        method: String,
+        build: () -> JsonElement,
+        decode: (JsonElement) -> T,
+    ): CompletableFuture<T> {
+        maintenanceGap(method)?.let { return CompletableFuture.failedFuture(it) }
+        val payload = try {
+            build()
+        } catch (e: CoreValidationException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return rpc.request(method, payload).thenApply { ok -> decodeOrFixed(method) { decode(ok) } }
+    }
+
+    /** `maintenance.inventory {}` (read-only; 35 s deadline, [MethodDeadlines.MAINTENANCE_MS]). */
+    fun maintenanceInventory(): CompletableFuture<labs.dkv.sandpane.model.MaintenanceInventoryResult> =
+        maintenanceCall(CoreMethods.MAINTENANCE_INVENTORY, { buildJsonObject { } }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.MaintenanceInventoryResult.serializer(), it)
+        }
+
+    /**
+     * `maintenance.cleanup` STEP 1: `{ items }` only — the `confirmToken` key is absent, so Core
+     * changes nothing and answers a confirmation bound to that exact set. The ids are Core-assigned
+     * ones the dialog read from a fresh inventory; none is ever built into a path here.
+     */
+    fun maintenanceCleanupRequest(items: List<String>): CompletableFuture<labs.dkv.sandpane.model.MaintenanceCleanupResult> =
+        maintenanceCall(CoreMethods.MAINTENANCE_CLEANUP, { buildMaintenanceCleanupPayload(items, null) }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.MaintenanceCleanupResult.serializer(), it)
+        }
+
+    /**
+     * `maintenance.cleanup` STEP 2: `{ items, confirmToken }` with the EXACT confirmed set. NOT
+     * replay-safe and never retried: a timeout is a lost answer — "some items may have been
+     * removed — scan again".
+     */
+    fun maintenanceCleanupConfirm(
+        items: List<String>,
+        token: String,
+    ): CompletableFuture<labs.dkv.sandpane.model.MaintenanceCleanupResult> =
+        maintenanceCall(CoreMethods.MAINTENANCE_CLEANUP, { buildMaintenanceCleanupPayload(items, token) }) {
+            CoreJson.decodeFromJsonElement(labs.dkv.sandpane.model.MaintenanceCleanupResult.serializer(), it)
+        }
+
+    /** Core's cleanup item-list rules, checked before anything is written. */
+    internal fun buildMaintenanceCleanupPayload(items: List<String>, token: String?): JsonElement {
+        if (items.isEmpty()) throw CoreValidationException("items", "at least one item is required; nothing was sent")
+        if (items.size > MaintenanceGuards.MAX_CLEANUP_ITEMS) {
+            throw CoreValidationException("items", "at most ${MaintenanceGuards.MAX_CLEANUP_ITEMS} items are allowed; nothing was sent")
+        }
+        val seen = HashSet<String>()
+        for (id in items) {
+            // Ids are Core-assigned (`temp:<uuid>`, `dbBackup:<file name>`, ...): a sane ceiling
+            // only; Core owns the grammar and re-validates.
+            if (id.isEmpty() || id.length > 512) {
+                throw CoreValidationException("items", "an id is not a maintenance item id; nothing was sent")
+            }
+            if (!seen.add(id)) throw CoreValidationException("items", "duplicate item ids; nothing was sent")
+        }
+        if (token != null && !CoreGuards.isConfirmTokenShape(token)) {
+            throw CoreValidationException("confirmToken", "not the shape Core issues; nothing was sent")
+        }
+        return buildJsonObject {
+            put("items", buildJsonArray { items.forEach { add(JsonPrimitive(it)) } })
+            if (token != null) put("confirmToken", JsonPrimitive(token))
+        }
+    }
 
     private fun conversationCall(method: String, build: () -> JsonElement): CompletableFuture<Conversation> {
         advertisementGap(method)?.let { return CompletableFuture.failedFuture(it) }

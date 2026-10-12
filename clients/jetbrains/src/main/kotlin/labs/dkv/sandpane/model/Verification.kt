@@ -123,6 +123,12 @@ data class VerificationResult(
     @SerialName("startedAt") val startedAt: String? = null,
     @SerialName("finishedAt") val finishedAt: String? = null,
     @SerialName("outputIncomplete") val outputIncomplete: Boolean? = null,
+    /**
+     * A9 (additive, §3.9 item 2): `maintenance.cleanup` removed this run's stored output. Takes
+     * precedence over [stdoutTruncated] / [stderrTruncated] / [outputIncomplete] in rendering —
+     * pruned output is not "truncated" output, so those flags are never shown beside it.
+     */
+    @SerialName("outputPruned") val outputPruned: Boolean? = null,
 ) {
     /** Output, argv and labels are never logged: a debug print shows sizes only. */
     override fun toString(): String =

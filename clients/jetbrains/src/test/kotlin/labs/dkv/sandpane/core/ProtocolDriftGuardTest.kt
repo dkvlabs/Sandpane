@@ -207,15 +207,16 @@ class ProtocolDriftGuardTest {
     fun kotlinMethodsMatchRustMethodAllExactlyIncludingOrder() {
         val fromAll = methodAllWireNames()
         assertEquals(CoreMethods.ALL, fromAll, "CoreMethods.ALL drifted from Method::ALL (order included)")
-        assertEquals(34, fromAll.size, "addition A7 advertises 34 methods")
+        assertEquals(36, fromAll.size, "addition A9 advertises 36 methods")
         // A5: git.diff sits immediately after git.review and before git.apply.
         assertEquals(fromAll.indexOf("git.review") + 1, fromAll.indexOf("git.diff"))
         assertEquals(fromAll.indexOf("git.diff") + 1, fromAll.indexOf("git.apply"))
-        // A7: the six verification methods follow git.apply, in this exact order, at the end.
+        // A7: the six verification methods follow git.apply, in this exact order; A9 appended
+        // the two maintenance methods at the end.
         assertEquals(
             listOf(
                 "verification.list", "verification.approve", "verification.revoke", "verification.run",
-                "verification.result", "project.context",
+                "verification.result", "project.context", "maintenance.inventory", "maintenance.cleanup",
             ),
             fromAll.subList(fromAll.indexOf("git.apply") + 1, fromAll.size),
         )
@@ -239,7 +240,7 @@ class ProtocolDriftGuardTest {
             "conversation.rename", "conversation.archive", "conversation.unarchive", "conversation.delete",
             "conversation.export", "git.diff",
             "verification.list", "verification.approve", "verification.revoke", "verification.run",
-            "verification.result", "project.context",
+            "verification.result", "project.context", "maintenance.inventory", "maintenance.cleanup",
         ).forEach { added ->
             assertTrue(fromAll.contains(added), "Rust no longer advertises $added")
             assertTrue(CoreMethods.ALL.contains(added), "the Kotlin mirror dropped $added")
@@ -256,7 +257,7 @@ class ProtocolDriftGuardTest {
     @Test
     fun methodAdvertisementIsDerivedNotHandWritten() {
         assertTrue(
-            rust.contains("pub const ALL: [Method; 34]"),
+            rust.contains("pub const ALL: [Method; 36]"),
             "Method::ALL's declared length changed — update CoreMethods.ALL and this gate",
         )
         assertTrue(
@@ -1021,7 +1022,7 @@ class ProtocolDriftGuardTest {
     fun gitApplyShapesLimitsDeadlineAndEventsMatchCore() {
         assertTrue(labs.dkv.sandpane.model.CoreFeatures.KNOWN.contains("git-apply"))
         assertEquals(labs.dkv.sandpane.model.CoreFeatures.GIT_APPLY, "git-apply")
-        assertEquals(34, CoreMethods.ALL.size, "A6 added no method (A7 added six)")
+        assertEquals(36, CoreMethods.ALL.size, "A6 added no method (A7 added six, A9 two more)")
         val max = Regex("""pub const MAX_APPLY_ENTRIES: usize = (\d+);""").find(applyRs)?.groupValues?.get(1)?.toInt()
             ?: fail("apply.rs has no MAX_APPLY_ENTRIES")
         assertEquals(max, GitApplies.MAX_ENTRIES)
@@ -1165,7 +1166,7 @@ class ProtocolDriftGuardTest {
     @Test
     fun verificationShapesOutcomesEventsAndDeadlineMatchCore() {
         assertEquals("verification", labs.dkv.sandpane.model.CoreFeatures.VERIFICATION)
-        assertEquals(6, labs.dkv.sandpane.model.CoreFeatures.KNOWN.size)
+        assertEquals(7, labs.dkv.sandpane.model.CoreFeatures.KNOWN.size)
         fun fields(struct: String) = (Regex("""pub struct $struct \{([\s\S]*?)\n\}""").find(rust)?.groupValues?.get(1)
             ?: fail("$struct not found")).let { body -> Regex("""pub ([a-z_]+):""").findAll(body).map { it.groupValues[1] }.toList() }
         assertEquals(listOf("id", "project_id", "label", "argv", "approved_at"), fields("VerificationCommand"))
@@ -1187,7 +1188,7 @@ class ProtocolDriftGuardTest {
             listOf(
                 "run_id", "task_id", "command_id", "label", "argv", "sandbox", "workspace_mode", "outcome", "exit_code",
                 "stdout", "stderr", "stdout_truncated", "stderr_truncated", "redactions", "elapsed_ms", "started_at",
-                "finished_at", "output_incomplete",
+                "finished_at", "output_incomplete", "output_pruned",
             ),
             fields("VerificationResult"),
         )

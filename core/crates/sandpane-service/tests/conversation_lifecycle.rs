@@ -1400,7 +1400,8 @@ fn probe_advertises_the_conversation_lifecycle_methods_and_feature() {
         .collect();
     // 27 after A3b; 28 since A5 added git.diff; 34 since A7 added the five
     // verification methods and project.context.
-    assert_eq!(methods.len(), 34);
+    // 36 since A9 added maintenance.inventory and maintenance.cleanup.
+    assert_eq!(methods.len(), 36);
     for m in [
         "conversation.rename",
         "conversation.archive",

@@ -70,6 +70,14 @@ object MethodDeadlines {
      */
     const val VERIFICATION_RUN_MS: Int = 45_000
 
+    /**
+     * `maintenance.inventory` / `maintenance.cleanup` (A9, \u00A73.9 item 4): the inventory runs under
+     * Core's 10 s scan budget and a cleanup step re-scans before removing, so both get 35 s (a
+     * floor at least the 20 s the client brief demands). Cleanup is NOT replay-safe: a timeout is
+     * a lost answer — "some items may have been removed — scan again" — never retried.
+     */
+    const val MAINTENANCE_MS: Int = 35_000
+
     /** The deadline for [method] given the user's [configuredMs]; never shorter than [configuredMs]. */
     fun forMethod(method: String, configuredMs: Int): Int = when (method) {
         CoreMethods.SANDBOX_STOP -> maxOf(configuredMs, SANDBOX_STOP_MS)
@@ -80,6 +88,8 @@ object MethodDeadlines {
         CoreMethods.GIT_APPLY -> maxOf(configuredMs, GIT_APPLY_MS)
         CoreMethods.PROJECT_CONTEXT -> maxOf(configuredMs, PROJECT_CONTEXT_MS)
         CoreMethods.VERIFICATION_RUN -> maxOf(configuredMs, VERIFICATION_RUN_MS)
+        CoreMethods.MAINTENANCE_INVENTORY -> maxOf(configuredMs, MAINTENANCE_MS)
+        CoreMethods.MAINTENANCE_CLEANUP -> maxOf(configuredMs, MAINTENANCE_MS)
         else -> configuredMs
     }
 }

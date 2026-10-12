@@ -104,6 +104,13 @@ fn is_spoofing_format_char(c: char) -> bool {
     )
 }
 
+/// A character Core never shows unescaped in Core-built display text (A9
+/// maintenance `detail` / `reason`, I8): every invisible format character
+/// and every bidi / line-separator spoofing character above.
+pub(crate) fn is_hidden_or_spoofing_char(c: char) -> bool {
+    is_invisible_format_char(c) || is_spoofing_format_char(c)
+}
+
 /// System trees that are never registrable as repositories (security W1).
 /// `/private/var` (macOS temp dirs) is deliberately NOT listed.
 pub const SYSTEM_TREES: &[&str] = &[

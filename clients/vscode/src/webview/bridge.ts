@@ -85,6 +85,14 @@ export interface VerificationRepositoryRow {
   unreadable: string[];
 }
 
+/** A9 Maintenance section: a button that opens the native flow. */
+export interface MaintenancePanelView {
+  /** Core advertises the two A9 methods and the feature `maintenance`. */
+  supported: boolean;
+  /** A flow is open; the button is disabled. */
+  inFlight: boolean;
+}
+
 /** A7 per-project Verification section. */
 export interface VerificationPanelView {
   /** Core advertises the six A7 methods and the feature `verification`. */
@@ -194,6 +202,8 @@ export interface SidebarState {
   applyInFlight: boolean;
   /** A7: the selected project's Verification section. */
   verification: VerificationPanelView;
+  /** A9: the Maintenance section (a click opens the native flow). */
+  maintenance: MaintenancePanelView;
   lines: ChatLine[];
   /** What the stream shows: one conversation, or every task of the project. */
   transcript: { scope: 'conversation' | 'project'; label: string };
@@ -251,7 +261,9 @@ export type WebviewToExtension =
   /** A7: open the Run dialog for this task (command picked there, from Core's list). */
   | { type: 'runVerification'; taskId: string }
   /** A7: pick one of the task's runs (named by Core's events) and open its result. */
-  | { type: 'showVerificationResults'; taskId: string };
+  | { type: 'showVerificationResults'; taskId: string }
+  /** A9: open the native Maintenance flow (scan → pick → modal); carries no ids. */
+  | { type: 'maintenanceScan' };
 
 export type ExtensionToWebview = { type: 'state'; state: SidebarState };
 
@@ -271,6 +283,7 @@ export const WEBVIEW_MESSAGE_KINDS: readonly string[] = [
   'verificationAction',
   'runVerification',
   'showVerificationResults',
+  'maintenanceScan',
 ];
 
 /** Upper bound on a conversation id from the webview (Core's scoping-id bound). */
@@ -292,6 +305,7 @@ export function parseWebviewMessage(raw: unknown): WebviewToExtension | undefine
     case 'refresh':
       return { type };
     case 'toggleArchivedConversations':
+    case 'maintenanceScan':
       return { type };
     case 'selectConversation': {
       const id = webviewId((raw as { conversationId?: unknown }).conversationId, true);
@@ -376,6 +390,7 @@ export function emptySidebarState(connection: ConnectionTone): SidebarState {
     gitApplySupported: false,
     applyInFlight: false,
     verification: { supported: false, note: null, commands: [], repositories: [] },
+    maintenance: { supported: false, inFlight: false },
     lines: [],
     transcript: { scope: 'project', label: 'Transcript of all tasks in this project (no conversation selected)' },
     tasks: [],

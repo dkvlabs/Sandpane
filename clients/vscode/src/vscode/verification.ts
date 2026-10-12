@@ -360,6 +360,7 @@ export function parseVerificationResult(raw: unknown): VerificationResult | null
     raw[key] === undefined || raw[key] === null || typeof raw[key] === type;
   if (!optional('exitCode', 'number') || !optional('elapsedMs', 'number') || !optional('finishedAt', 'string')) return null;
   if (!optional('outputIncomplete', 'boolean')) return null;
+  if (!optional('outputPruned', 'boolean')) return null;
   const s = (key: string): string => raw[key] as string;
   return {
     runId: s('runId'),
@@ -380,6 +381,7 @@ export function parseVerificationResult(raw: unknown): VerificationResult | null
     startedAt: s('startedAt'),
     ...(typeof raw['finishedAt'] === 'string' ? { finishedAt: raw['finishedAt'] } : {}),
     ...(typeof raw['outputIncomplete'] === 'boolean' ? { outputIncomplete: raw['outputIncomplete'] } : {}),
+    ...(raw['outputPruned'] === true ? { outputPruned: true } : {}),
   };
 }
 
@@ -426,11 +428,17 @@ export interface DisclosureInput {
   stdoutTruncated?: boolean | null;
   stderrTruncated?: boolean | null;
   outputIncomplete?: boolean | null;
+  /** A9: pruned output takes precedence over every truncation flag. */
+  outputPruned?: boolean | null;
   redactions?: Partial<OutputRedaction> | null;
 }
 
+/** A9 (§3.9 item 2): pruned output is not truncated output. */
+export const OUTPUT_PRUNED_DISCLOSURE = 'output removed by maintenance cleanup';
+
 /** Every flag Core set, as plain sentences (none = empty list). */
 export function resultDisclosures(input: DisclosureInput): string[] {
+  if (input.outputPruned === true) return [OUTPUT_PRUNED_DISCLOSURE];
   const out: string[] = [];
   if (input.stdoutTruncated === true) out.push('stdout was truncated at 64 KiB');
   if (input.stderrTruncated === true) out.push('stderr was truncated at 64 KiB');

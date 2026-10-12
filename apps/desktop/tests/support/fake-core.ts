@@ -85,6 +85,20 @@ export interface FakeCoreOptions {
    * the field entirely, like a pre-A2 Core.
    */
   features?: readonly string[] | null;
+  /**
+   * A9 `maintenance.*` handlers (MODELED on the design, not captured). The
+   * inventory handler answers `maintenance.inventory`; the cleanup handler
+   * receives the decoded params and answers a step-1 confirmation (no
+   * `confirmToken`) or a step-2 outcome. Without handlers the double answers
+   * the two methods `VALIDATION_FAILED` ("unknown method") when they are not
+   * advertised.
+   */
+  maintenance?: {
+    inventory?: () => Record<string, unknown>;
+    cleanup?: (params: { items: string[]; confirmToken?: string }) =>
+      | Record<string, unknown>
+      | { code: string; message: string };
+  };
 }
 
 /** What the A2 Core advertises (Rust `FEATURES`), plus a future unknown one. */
@@ -121,7 +135,7 @@ export const A6_CORE_FEATURES: readonly string[] = [
 ];
 
 /**
- * What the A7 Core advertises (Rust `FEATURES`, 6, drift-tested in
+ * What the A7 Core advertises (Rust `FEATURES`, 6 of 7 today, drift-tested in
  * `tests/verification.test.ts`), plus a future unknown one clients must ignore.
  * Feature pin only: this double does NOT model the verification methods.
  */
@@ -132,6 +146,16 @@ export const A7_CORE_FEATURES: readonly string[] = [
   "conversation-send-mode",
   "git-apply",
   "verification",
+  "some-future-feature",
+];
+
+/**
+ * What the A9 Core advertises (Rust `FEATURES`, 7, drift-tested in
+ * `tests/maintenance.test.ts`), plus a future unknown one clients must ignore.
+ */
+export const A9_CORE_FEATURES: readonly string[] = [
+  ...A7_CORE_FEATURES.slice(0, 6),
+  "maintenance",
   "some-future-feature",
 ];
 
@@ -208,10 +232,10 @@ export const A5_CORE_METHODS: readonly string[] = (() => {
 })();
 
 /**
- * Every method the A7 Core dispatches (34), in `Method::ALL` order: the five
- * `verification.*` methods and `project.context` sit right after `git.apply`.
- * Advertisement pin only: this double answers them `VALIDATION_FAILED`
- * ("unknown method"), it does NOT model them.
+ * Every method the A7 Core dispatches (34 of 36 today), in `Method::ALL`
+ * order: the five `verification.*` methods and `project.context` sit right
+ * after `git.apply`. Advertisement pin only: this double answers them
+ * `VALIDATION_FAILED` ("unknown method"), it does NOT model them.
  */
 export const A7_CORE_METHODS: readonly string[] = [
   ...A5_CORE_METHODS,
@@ -221,6 +245,18 @@ export const A7_CORE_METHODS: readonly string[] = [
   "verification.run",
   "verification.result",
   "project.context",
+];
+
+/**
+ * Every method the A9 Core dispatches (36), in `Method::ALL` order: the two
+ * `maintenance.*` methods sit at the end. Advertisement pin only: this double
+ * answers them `VALIDATION_FAILED` ("unknown method") unless a test installs a
+ * maintenance handler.
+ */
+export const A9_CORE_METHODS: readonly string[] = [
+  ...A7_CORE_METHODS,
+  "maintenance.inventory",
+  "maintenance.cleanup",
 ];
 
 /** One change-set entry the double serves (MODELED A5 git.review / git.diff). */
@@ -1183,6 +1219,28 @@ export class FakeCore {
           lossy: entry.lossy === true,
           ...(entry.baseBlob === undefined ? {} : { baseBlob: entry.baseBlob }),
         });
+      }
+      case "maintenance.inventory": {
+        const handler = this.options.maintenance?.inventory;
+        if (!handler) {
+          return err("VALIDATION_FAILED", "unknown method maintenance.inventory");
+        }
+        return ok(handler());
+      }
+      case "maintenance.cleanup": {
+        const handler = this.options.maintenance?.cleanup;
+        if (!handler) {
+          return err("VALIDATION_FAILED", "unknown method maintenance.cleanup");
+        }
+        const answer = handler({
+          items: Array.isArray(params.items) ? (params.items as string[]) : [],
+          ...(typeof params.confirmToken === "string" ? { confirmToken: params.confirmToken } : {}),
+        });
+        const maybe = answer as { code?: unknown; message?: unknown };
+        if (typeof maybe.code === "string" && typeof maybe.message === "string") {
+          return err(maybe.code, maybe.message);
+        }
+        return ok(answer);
       }
       default:
         return err("VALIDATION_FAILED", `unknown method ${request.method}`);

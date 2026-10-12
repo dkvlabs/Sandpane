@@ -2334,7 +2334,8 @@ fn the_probe_advertises_verification_and_the_six_methods_in_order() {
         .iter()
         .map(|m| m.as_str().unwrap())
         .collect();
-    assert_eq!(methods.len(), 34);
+    // 36 since A9 added maintenance.inventory and maintenance.cleanup.
+    assert_eq!(methods.len(), 36);
     let at = methods.iter().position(|m| *m == "git.apply").unwrap();
     assert_eq!(
         &methods[at + 1..at + 7],

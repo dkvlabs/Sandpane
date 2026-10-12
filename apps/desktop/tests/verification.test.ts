@@ -54,6 +54,7 @@ import {
   CORE_EVENT_KINDS,
   FEATURE_VERIFICATION,
   KNOWN_FEATURES,
+  MAINTENANCE_METHODS,
   METHODS,
   PROTOCOL_VERSION,
   VERIFICATION_METHODS,
@@ -137,7 +138,7 @@ import {
 import { ApproveConfirmDialog, RunConfirmDialog } from "../src/components/verification/VerificationDialogs";
 import { OutputBlock } from "../src/components/verification/VerificationText";
 import { StopDialog } from "../src/components/sandbox/SandboxLifecycle";
-import { A6_CORE_FEATURES, A7_CORE_FEATURES, A7_CORE_METHODS, FakeCore } from "./support/fake-core";
+import { A6_CORE_FEATURES, A7_CORE_FEATURES, A7_CORE_METHODS, A9_CORE_METHODS, FakeCore } from "./support/fake-core";
 import {
   desktopProxyRustSource,
   protocolRustSource,
@@ -261,13 +262,13 @@ const source = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.m
 // ---------------------------------------------------------------------------
 
 describe("A7 drift against the Rust sources", () => {
-  it("34 methods in Method::ALL order; the six sit right after git.apply", () => {
+  it("36 methods in Method::ALL order; the six sit right after git.apply", () => {
     const all = rustMethodAll();
-    expect(all.declaredLength).toBe(34);
+    expect(all.declaredLength).toBe(36);
     expect([...METHODS]).toEqual(all.names);
     expect(schemaMethodEnum()).toEqual(all.names);
     const at = METHODS.indexOf("git.apply");
-    expect(METHODS.slice(at + 1)).toEqual([...VERIFICATION_METHODS]);
+    expect(METHODS.slice(at + 1)).toEqual([...VERIFICATION_METHODS, ...MAINTENANCE_METHODS]);
     expect([...VERIFICATION_METHODS]).toEqual([
       "verification.list",
       "verification.approve",
@@ -276,17 +277,19 @@ describe("A7 drift against the Rust sources", () => {
       "verification.result",
       "project.context",
     ]);
-    expect([...A7_CORE_METHODS]).toEqual([...METHODS]);
+    expect([...A9_CORE_METHODS]).toEqual([...METHODS]);
   });
 
   it("verification is the 6th known feature, in Rust FEATURES order", () => {
     const rust = /pub const FEATURES: \[&str; (\d+)\] = \[([^\]]*)\];/.exec(protocolRustSource());
     const names = [...((rust?.[2] ?? "").matchAll(/"([^"]+)"/g))].map((m) => m[1]);
-    expect(Number(rust?.[1])).toBe(6);
+    expect(Number(rust?.[1])).toBe(7);
     expect([...KNOWN_FEATURES]).toEqual(names);
     expect(KNOWN_FEATURES[5]).toBe(FEATURE_VERIFICATION);
     expect(FEATURE_VERIFICATION).toBe("verification");
-    expect(A7_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names);
+    // A9 added `maintenance` as the 7th; the A7 features are unchanged.
+    expect(names.slice(0, 6)).toEqual(A7_CORE_FEATURES.filter((f) => f !== "some-future-feature"));
+    expect(names[6]).toBe("maintenance");
   });
 
   it("deadlines: project.context and verification.run get the git deadline (webview 45 000, proxy 43 000); list, approve, revoke and result the default", () => {

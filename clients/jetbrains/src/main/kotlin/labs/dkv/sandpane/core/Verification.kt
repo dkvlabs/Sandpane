@@ -275,6 +275,11 @@ object Verifications {
 
     /** Every disclosure flag Core set on [result], in a fixed order. */
     fun disclosures(result: VerificationResult): List<String> = buildList {
+        // A9 precedence (§3.9 item 2): pruned output is not truncated output.
+        if (result.outputPruned == true) {
+            add("output removed by maintenance cleanup")
+            return@buildList
+        }
         when (result.stdoutTruncated) {
             true -> add("stdout was truncated at Core's $MAX_OUTPUT_KIB KiB cap")
             null -> add("Core did not report whether stdout was truncated")
