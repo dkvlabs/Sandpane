@@ -779,7 +779,7 @@ A8 is split by evidence. Only facts proven by a capture in `core/crates/sandpane
      - `versionCaptured?: boolean` is true only when the probed version number equals a version whose fixtures are in the tree (a new `CAPTURED_VERSIONS = [v0.47.0]`, drift-tested against the `captured/` directory names). The build is not compared (`SbxVersion` drops the commit) and the captures are from one macOS arm64 host (I3). Clients show "same sbx version number as Sandpane's captured fixtures (macOS; build not compared): yes/no". It is a statement about evidence, never a support claim.
    - No new feature string: the fields are optional, and absent means "this Core does not say".
    - **Clients:** the existing sbx status display gains these lines:
-     - "daemon stopped" is now reachable (desktop and JetBrains already render `daemonRunning: false`);
+     - "daemon stopped" is now reachable (desktop and JetBrains already render `daemonRunning: false`); the daemon line is labelled "(at last check)" (item 4);
      - the exec line;
      - the captured line;
      - desktop relabels `daemonRunning === true` from "SBX ready" to "SBX daemon running", because the captured errors show a running daemon can still be unusable (not signed in, policy not initialised) (I4);
@@ -797,6 +797,15 @@ A8 is split by evidence. Only facts proven by a capture in `core/crates/sandpane
    - `CAPTURED_VERSIONS` drift against the fixture directories;
    - schema and drift updates for the two fields;
    - the service integration test's fake sbx answers the text form (I10).
+4. **Implementation and review outcome (A8a).**
+   - **Core review (PASS-WITH-WARNINGS), all fixed before the commit:**
+     - W1: `execVerified` is the gate's predicate over the probe's own reading of `sbx version`; `verification.run` re-reads the version before every exec and is authoritative. The protocol doc, schema description and code comment say so instead of "never disagree".
+     - W2: `SbxVersion` keeps the semver pre-release identifier (`pre`, `[A-Za-z0-9.-]`, at most 64 characters), so `0.47.0-rc.1` is never "captured" or exec-verified as `0.47.0`; `+build` metadata is still dropped. The wire `version` now shows the suffix.
+     - W3 (pre-existing A7): the `verification.run` version gate refuses truncated `sbx version` stdout (`UNSUPPORTED_SBX_VERSION`, the "could not read its version" message).
+   - **Client review (PASS-WITH-WARNINGS), all fixed before the commit:**
+     - W1/W2: listing sandboxes runs `sbx ls`, which sbx 0.47.0 was captured auto-starting the daemon, so a "stopped" reading can go stale while Core stays connected. The daemon strings are "SBX daemon running (at last check)" and "SBX daemon stopped (at last check)" in every client, and the desktop banner no longer claims sandboxes will not list.
+     - W3: VS Code shows "Docker SBX not installed" instead of "state unknown" when Core reports sbx as absent.
+   - **Open (recorded, not in A8a):** the status report §6.1 rule 2 ("a listing that might start the daemon is refused when `daemon status` says it is stopped") is not implemented for the existing A1 `sandbox.list`, which still runs `sbx ls` and may start the daemon. It is carried to A8c, because it changes A1 behaviour and needs the stopped-daemon capture C-14.
 
 ### 3.9 A9 decisions (maintenance inventory and cleanup), fixed before implementation
 

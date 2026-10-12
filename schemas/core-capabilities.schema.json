@@ -18,7 +18,9 @@
         "installed": { "type": "boolean" },
         "binaryPath": { "type": ["string", "null"] },
         "version": { "type": ["string", "null"] },
-        "daemonRunning": { "type": ["boolean", "null"] }
+        "daemonRunning": { "type": ["boolean", "null"], "description": "From the captured TEXT form of `sbx daemon status` (A8a): true = `Status: running`, false = `Status: stopped`, null = unknown (non-zero exit, truncated output, or anything that is not exactly a captured shape, e.g. a `Starting…` preamble)." },
+        "execVerified": { "type": "boolean", "description": "A8a (additive, optional): whether verification.run would accept the probed version — the same predicate as its version gate, over the probe's own reading; verification.run re-reads the version before every exec and is authoritative. Absent when the version is unknown or sbx is not installed." },
+        "versionCaptured": { "type": "boolean", "description": "A8a (additive, optional): whether the probed sbx version NUMBER equals one whose fixtures Sandpane has captured. Evidence, never a support claim: the build is not compared and the captures are from one macOS arm64 host. Absent when the version is unknown or sbx is not installed." }
       }
     },
     "agents": {

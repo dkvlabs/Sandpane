@@ -1587,47 +1587,116 @@ export function foldCoreLink(
   };
 }
 
+/**
+ * The sbx evidence lines a Core may add to its probe (A8a). `null` = Core did
+ * not say (field absent), so no line is rendered.
+ */
+export interface SbxEvidenceLines {
+  execLine: string | null;
+  capturedLine: string | null;
+}
+
 export type SbxViewState =
-  | { kind: "unprobed"; label: string; tone: StatusTone }
-  | { kind: "not_installed"; label: string; tone: StatusTone }
-  | {
+  | ({ kind: "unprobed"; label: string; tone: StatusTone } & SbxEvidenceLines)
+  | ({ kind: "not_installed"; label: string; tone: StatusTone } & SbxEvidenceLines)
+  | ({
       kind: "installed_daemon_unknown";
       label: string;
       tone: StatusTone;
       version: string | null;
-    }
-  | { kind: "daemon_down"; label: string; tone: StatusTone; version: string | null }
-  | { kind: "ready"; label: string; tone: StatusTone; version: string | null };
+    } & SbxEvidenceLines)
+  | ({ kind: "daemon_down"; label: string; tone: StatusTone; version: string | null } & SbxEvidenceLines)
+  | ({
+      kind: "daemon_running";
+      label: string;
+      tone: StatusTone;
+      version: string | null;
+    } & SbxEvidenceLines);
 
 /**
- * Docker SBX readiness, derived only from what Core reported. The scaffold Core
- * locates the binary but does not probe `version`/`daemonRunning`, which maps to
- * `installed_daemon_unknown` — never `ready`.
+ * Exact daemon labels (design 2026-10-09 §3.8 item 1). Never "ready"/"healthy".
+ * "(at last check)": the state is one probe's reading, and it can change
+ * without Sandpane — `sbx ls` (run by `sandbox.list`) was captured auto-starting
+ * the daemon on sbx 0.47.0.
+ */
+export const SBX_DAEMON_RUNNING_LABEL = "SBX daemon running (at last check)";
+export const SBX_DAEMON_STOPPED_LABEL = "SBX daemon stopped (at last check)";
+export const SBX_DAEMON_UNKNOWN_LABEL = "SBX daemon state unknown";
+
+export const SBX_EXEC_ENABLED_LINE = "Verification runs are enabled for this sbx version";
+export const SBX_EXEC_NOT_ENABLED_LINE = "Verification runs are not enabled for this sbx version";
+export const SBX_CAPTURED_LINE_PREFIX =
+  "Same sbx version number as Sandpane's captured fixtures (macOS; build not compared)";
+
+/** The exec line, only when Core reported `execVerified` (absent → `null`). */
+export function sbxExecLine(execVerified: boolean | undefined): string | null {
+  if (execVerified === undefined) return null;
+  return execVerified ? SBX_EXEC_ENABLED_LINE : SBX_EXEC_NOT_ENABLED_LINE;
+}
+
+/**
+ * The captured-fixtures line, only when Core reported `versionCaptured`. It is a
+ * statement about Sandpane's evidence, never a support claim, so callers render
+ * it as plain text — never a success tone or a check mark.
+ */
+export function sbxCapturedLine(versionCaptured: boolean | undefined): string | null {
+  if (versionCaptured === undefined) return null;
+  return `${SBX_CAPTURED_LINE_PREFIX}: ${versionCaptured ? "yes" : "no"}`;
+}
+
+const NO_SBX_EVIDENCE: SbxEvidenceLines = { execLine: null, capturedLine: null };
+
+/**
+ * Docker SBX daemon state, derived only from what Core reported. Core reads
+ * `daemonRunning` from the captured text form of `sbx daemon status`; `null`
+ * (or an older Core that does not say) maps to `installed_daemon_unknown`.
+ *
+ * A running daemon is labelled "SBX daemon running (at last check)" in the `info` tone, never
+ * "ready" or `success`: the captured sbx errors show a running daemon can still
+ * be unusable (not signed in, policy not initialised), so a green "ready"
+ * would claim more than Core verified.
  */
 export function foldSbxView(capabilities: CoreCapabilities | null): SbxViewState {
   if (capabilities === null || capabilities.sbx === null) {
-    return { kind: "unprobed", label: "SBX status unknown", tone: "neutral" };
+    return { kind: "unprobed", label: "SBX status unknown", tone: "neutral", ...NO_SBX_EVIDENCE };
   }
   const { sbx } = capabilities;
   if (!sbx.installed) {
-    return { kind: "not_installed", label: "Docker SBX not installed", tone: "danger" };
+    return {
+      kind: "not_installed",
+      label: "Docker SBX not installed",
+      tone: "danger",
+      ...NO_SBX_EVIDENCE,
+    };
   }
+  const evidence: SbxEvidenceLines = {
+    execLine: sbxExecLine(sbx.execVerified),
+    capturedLine: sbxCapturedLine(sbx.versionCaptured),
+  };
   if (sbx.daemonRunning === false) {
     return {
       kind: "daemon_down",
-      label: "SBX daemon is not running",
+      label: SBX_DAEMON_STOPPED_LABEL,
       tone: "danger",
       version: sbx.version,
+      ...evidence,
     };
   }
   if (sbx.daemonRunning === true) {
-    return { kind: "ready", label: "SBX ready", tone: "success", version: sbx.version };
+    return {
+      kind: "daemon_running",
+      label: SBX_DAEMON_RUNNING_LABEL,
+      tone: "info",
+      version: sbx.version,
+      ...evidence,
+    };
   }
   return {
     kind: "installed_daemon_unknown",
-    label: "SBX located, daemon not probed",
+    label: SBX_DAEMON_UNKNOWN_LABEL,
     tone: "attention",
     version: sbx.version,
+    ...evidence,
   };
 }
 

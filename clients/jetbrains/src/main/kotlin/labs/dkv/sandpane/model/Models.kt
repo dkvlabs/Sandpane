@@ -389,12 +389,33 @@ data class CoreCapabilities(
     val hasVerifiedAgent: Boolean get() = verifiedAgentIds.isNotEmpty()
 }
 
+/**
+ * `system.probe` → `capabilities.sbx` (schemas/core-capabilities.schema.json). Rendered only through
+ * [labs.dkv.sandpane.ui.SbxStatusText].
+ */
 @Serializable
 data class SbxStatus(
     val installed: Boolean,
     @SerialName("binaryPath") val binaryPath: String? = null,
     val version: String? = null,
+    /**
+     * A8a: from the captured TEXT form of `sbx daemon status`. true = `Status: running`,
+     * false = `Status: stopped`, null/absent = unknown. A running daemon is NOT "ready": it can still
+     * be unusable (not signed in, policy not initialised).
+     */
     @SerialName("daemonRunning") val daemonRunning: Boolean? = null,
+    /**
+     * A8a, additive: the same predicate as Core's `verification.run` version gate (false in
+     * production today). Absent (null) when the version is unknown, sbx is not installed, or the
+     * Core predates A8a — absent means "this Core does not say", never false.
+     */
+    @SerialName("execVerified") val execVerified: Boolean? = null,
+    /**
+     * A8a, additive: the probed version NUMBER equals one whose fixtures Sandpane captured (one
+     * macOS arm64 host; the build is not compared). Evidence, never a support claim. Absent (null)
+     * under the same conditions as [execVerified].
+     */
+    @SerialName("versionCaptured") val versionCaptured: Boolean? = null,
 )
 
 @Serializable

@@ -19,6 +19,23 @@ export function SbxBadge({ view }: { view: SbxViewState }) {
   );
 }
 
+/**
+ * The A8a evidence lines under an sbx badge, as plain text: the exec line and
+ * the captured-fixtures line, each only when Core reported its field. Neither
+ * is a badge, a success tone or a check mark — the captured line is a
+ * statement about Sandpane's evidence, not a support claim. Renders nothing
+ * when Core said neither.
+ */
+export function SbxDetails({ view }: { view: SbxViewState }) {
+  if (view.execLine === null && view.capturedLine === null) return null;
+  return (
+    <ul className="muted" aria-label="SBX version evidence">
+      {view.execLine !== null && <li>{view.execLine}</li>}
+      {view.capturedLine !== null && <li>{view.capturedLine}</li>}
+    </ul>
+  );
+}
+
 /** Compact status-bar rendering of the Core link. */
 export function ConnectionChip({
   link,
@@ -75,7 +92,10 @@ export function ConnectionBanner({
 }) {
   if (link.kind === "attached") {
     const sbx = foldSbxView(link.capabilities);
-    if (sbx.kind === "ready") return null;
+    // A running daemon raises no banner, but it is not called "ready": sbx can
+    // still refuse (signed out, policy not initialised) and operations then
+    // surface their real error.
+    if (sbx.kind === "daemon_running") return null;
     return (
       <div className={`banner banner--${sbx.tone}`} role="status">
         <div>
@@ -89,19 +109,25 @@ export function ConnectionBanner({
               </>
             )}
             {sbx.kind === "daemon_down" && (
-              <>Start the SBX daemon, then retry. Sandboxes will not list until it answers.</>
+              <>
+                Core read the SBX daemon as stopped at the last check. Sandpane has no control
+                that starts or stops it. Listing sandboxes runs <Mono>sbx ls</Mono>, which sbx
+                0.47.0 was captured starting the daemon; use Re-check to read the state again.
+              </>
             )}
             {sbx.kind === "installed_daemon_unknown" && (
               <>
-                Core located <Mono>{link.capabilities.sbx?.binaryPath ?? "sbx"}</Mono> but does
-                not probe the daemon or version in this build, so sandbox operations report
-                their real failure instead of a guessed readiness.
+                Core located <Mono>{link.capabilities.sbx?.binaryPath ?? "sbx"}</Mono> but did
+                not report a daemon state (the probe answer was not a form Sandpane recognises,
+                or this Core does not probe it), so sandbox operations report their real failure
+                instead of a guessed state.
               </>
             )}
             {sbx.kind === "unprobed" && (
               <>Core did not report an SBX status, so sandbox features stay gated.</>
             )}
           </p>
+          <SbxDetails view={sbx} />
         </div>
         <Button onClick={onRetry}>Re-check</Button>
       </div>

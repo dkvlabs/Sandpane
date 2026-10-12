@@ -76,6 +76,21 @@ export function activate(context: vscode.ExtensionContext): void {
         : `Core ${state.capabilities.coreVersion} · protocol v${state.capabilities.protocolVersion}\n` +
           `instance ${state.capabilities.instanceId}\nplatform: ${state.capabilities.platform}\n` +
           `sbx installed: ${String(state.capabilities.sbxInstalled)}\n` +
+          // A8a: the same finished lines the sidebar shows (src/vscode/sbxStatus.ts),
+          // only while online — a cached probe is not presented as current.
+          (state.connection === 'online'
+            ? [
+                state.capabilities.sbxNote,
+                state.capabilities.sbxVersion === null ? null : `sbx version: ${state.capabilities.sbxVersion}`,
+                state.capabilities.sbxDaemon,
+                state.capabilities.sbxExec,
+                state.capabilities.sbxCaptured,
+              ]
+            : [`sbx status: last probe not shown while Core is ${state.connection}`]
+          )
+            .filter((line): line is string => line !== null)
+            .map((line) => `${line}\n`)
+            .join('') +
           `agents: ${state.capabilities.agents
             .map((a) => `${a.id}${a.verified ? ' (verified)' : ' (unverified)'}`)
             .join(', ') || 'none'}\nCore socket: ${session.socketPath}`;

@@ -11,6 +11,7 @@ import {
   ConnectionBanner,
   ConnectionChip,
   SbxBadge,
+  SbxDetails,
 } from "../../components/layout/ConnectionState";
 import { ProjectSidebar } from "../../components/project/ProjectSidebar";
 import {
@@ -43,6 +44,7 @@ export function SettingsView({ route }: { route: Route }) {
   const storeStatus = useStoreStatus();
   const { preferences, set } = useUiPreferences();
   const capabilities = capabilitiesOf(link);
+  const sbxView = foldSbxView(capabilities);
 
   return (
     <AppShell
@@ -106,7 +108,14 @@ export function SettingsView({ route }: { route: Route }) {
           <div className="kv">
             <dt>SBX</dt>
             <dd>
-              <SbxBadge view={foldSbxView(capabilities)} />
+              <SbxBadge view={sbxView} />
+              {capabilities?.sbx?.version != null && (
+                <>
+                  {" "}
+                  · version <Mono>{capabilities.sbx.version}</Mono>
+                </>
+              )}
+              <SbxDetails view={sbxView} />
             </dd>
           </div>
           <div className="kv">

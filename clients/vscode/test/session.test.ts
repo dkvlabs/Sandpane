@@ -131,6 +131,8 @@ class ScriptedCore {
   /** Sandboxes `sandbox.list` reports after a successful remove. */
   removed = new Set<string>();
   agentVerified = true;
+  /** `system.probe` → `sbx` as Core sends it (A8a fields optional). */
+  sbx: Record<string, unknown> | null = { installed: true };
   /** When set, sandbox.list answers this structured error (with details). */
   sandboxListError: { code: string; message: string; details?: unknown } | null = null;
   /** Repositories Core reports for p1 (canonical paths). */
@@ -227,7 +229,7 @@ class ScriptedCore {
             coreVersion: '0.1.0-test',
             instanceId: this.instanceId,
             platform: 'darwin',
-            sbx: { installed: true },
+            sbx: this.sbx,
             agents: [{ id: 'codex', verified: this.agentVerified, supportsStreaming: false, supportsCancel: false, supportsResume: false }],
             methods: this.methods,
             ...(this.features !== undefined ? { features: this.features } : {}),
@@ -544,6 +546,93 @@ describe('loading (bugs 9, 12d)', () => {
     await attaching;
     await settle();
     expect(core.calls('system.probe')).toHaveLength(1);
+    session.dispose();
+  });
+});
+
+describe('A8a sbx status from system.probe', () => {
+  it('passes finished daemon / exec / captured lines to the sidebar, never "ready"', async () => {
+    const core = new ScriptedCore();
+    core.sbx = {
+      installed: true,
+      binaryPath: '/usr/local/bin/sbx',
+      version: '0.47.0',
+      daemonRunning: true,
+      execVerified: false,
+      versionCaptured: true,
+      someFutureKey: { nested: 1 }, // unknown extra keys are tolerated
+    };
+    const { session } = makeSession(core);
+    await session.attach();
+    await settle();
+    const caps = session.snapshot().capabilities;
+    expect(caps?.sbxInstalled).toBe(true);
+    expect(caps?.sbxVersion).toBe('0.47.0');
+    expect(caps?.sbxDaemon).toBe('SBX daemon running (at last check)');
+    expect(caps?.sbxExec).toBe('Verification runs are not enabled for this sbx version');
+    expect(caps?.sbxCaptured).toBe(
+      "Same sbx version number as Sandpane's captured fixtures (macOS; build not compared): yes",
+    );
+    expect(JSON.stringify(caps)).not.toMatch(/ready|healthy/i);
+    session.dispose();
+  });
+
+  it('Refresh re-probes: a daemon stopped after attach is shown after the next refresh', async () => {
+    const core = new ScriptedCore();
+    core.sbx = { installed: true, version: '0.47.0', daemonRunning: true };
+    const { session } = makeSession(core);
+    await session.attach();
+    await settle();
+    expect(session.snapshot().capabilities?.sbxDaemon).toBe('SBX daemon running (at last check)');
+    core.sbx = { installed: true, version: '0.47.0', daemonRunning: false };
+    await session.refresh();
+    await settle();
+    expect(core.calls('system.probe').length).toBeGreaterThanOrEqual(2);
+    expect(session.snapshot().capabilities?.sbxDaemon).toBe('SBX daemon stopped (at last check)');
+    session.dispose();
+  });
+
+  it('an older Core (no A8a fields, daemon not reported) shows unknown and no exec/captured line', async () => {
+    const core = new ScriptedCore(); // sbx: { installed: true }
+    const { session } = makeSession(core);
+    await session.attach();
+    await settle();
+    const caps = session.snapshot().capabilities;
+    expect(caps?.sbxVersion).toBeNull();
+    expect(caps?.sbxDaemon).toBe('SBX daemon state unknown');
+    expect(caps?.sbxExec).toBeNull();
+    expect(caps?.sbxCaptured).toBeNull();
+    session.dispose();
+  });
+
+  it.each([
+    ['installed: false', { installed: false, version: '0.47.0', daemonRunning: true, execVerified: true, versionCaptured: true }, 'Docker SBX not installed'],
+    ['no sbx object', null, 'SBX status not reported by this Core'],
+  ])('%s → only the note; no daemon / exec / captured line', async (_label, sbx, note) => {
+    const core = new ScriptedCore();
+    core.sbx = sbx;
+    const { session } = makeSession(core);
+    await session.attach();
+    await settle();
+    const caps = session.snapshot().capabilities;
+    expect(caps?.sbxNote).toBe(note);
+    expect(caps?.sbxVersion).toBeNull();
+    expect(caps?.sbxDaemon).toBeNull();
+    expect(caps?.sbxExec).toBeNull();
+    expect(caps?.sbxCaptured).toBeNull();
+    session.dispose();
+  });
+
+  it('a stopped daemon and non-boolean A8a values: "stopped", and the bad fields are ignored', async () => {
+    const core = new ScriptedCore();
+    core.sbx = { installed: true, version: '0.47.0', daemonRunning: false, execVerified: 'true', versionCaptured: 1 };
+    const { session } = makeSession(core);
+    await session.attach();
+    await settle();
+    const caps = session.snapshot().capabilities;
+    expect(caps?.sbxDaemon).toBe('SBX daemon stopped (at last check)');
+    expect(caps?.sbxExec).toBeNull();
+    expect(caps?.sbxCaptured).toBeNull();
     session.dispose();
   });
 });

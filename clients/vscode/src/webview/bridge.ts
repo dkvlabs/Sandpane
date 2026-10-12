@@ -105,6 +105,16 @@ export interface CapabilitySummary {
   instanceId: string;
   platform: string;
   sbxInstalled: boolean | null;
+  /** A8a: the probed sbx version, revealed and capped; `null` = unknown. */
+  sbxVersion: string | null;
+  /** A8a: "Docker SBX not installed" / "SBX status not reported by this Core"; `null` when installed. */
+  sbxNote: string | null;
+  /** A8a: "SBX daemon running|stopped (at last check)" / "SBX daemon state unknown"; `null` unless installed. */
+  sbxDaemon: string | null;
+  /** A8a: the verification-runs line, or `null` when Core did not say (no line). */
+  sbxExec: string | null;
+  /** A8a: the captured-fixtures evidence line, or `null` when Core did not say (no line). */
+  sbxCaptured: string | null;
   agents: { id: string; verified: boolean; supportsStreaming: boolean; supportsCancel: boolean }[];
 }
 

@@ -52,8 +52,9 @@ use rusqlite::params;
 use sandpane_core::idempotency::{self, Lookup};
 use sandpane_core::process::RunLimits;
 use sandpane_core::sbx::{
-    classify_failure, parse_daemon_status_json, parse_list_json, RemovalConfirmation,
-    SbxCommandBuilder, SbxListEntry, SbxLocator, SbxSandboxStatus, SbxVersion, SbxWorkspace,
+    classify_failure, exec_verified, parse_daemon_status_text, parse_list_json, version_captured,
+    RemovalConfirmation, SbxCommandBuilder, SbxListEntry, SbxLocator, SbxSandboxStatus, SbxVersion,
+    SbxWorkspace,
 };
 use sandpane_core::scheduler::{Admission, Scheduler};
 use sandpane_core::task::{TaskStateMachine, ALL_STATUSES};
@@ -1256,24 +1257,27 @@ fn validate_cursor_map(map: &HashMap<String, i64>) -> Result<(), SvcError> {
     Ok(())
 }
 
-/// Version + daemon probe for an installed sbx: `sbx version` and
-/// `sbx daemon status --json`, both under [`RunLimits::PROBE`] (3 s, 64 KiB each).
-/// Deliberately NOT `sbx ls`, which auto-starts the daemon (captured
-/// `state/ls_json_autostarts_daemon.txt`) — a probe must not change state.
-/// Any failure (timeout, non-zero exit, unparseable output) reports the field
-/// as unknown (`null`), never a guess.
-pub fn probe_sbx(program: &Path, limits: &RunLimits) -> (Option<String>, Option<bool>) {
+/// Version + daemon probe for an installed sbx: `sbx version` and the TEXT
+/// form `sbx daemon status` (A8a, design 2026-10-09 §3.8 item 1), both under
+/// [`RunLimits::PROBE`] (3 s, 64 KiB each). Deliberately NOT `sbx ls`, which
+/// auto-starts the daemon (captured `state/ls_json_autostarts_daemon.txt`) —
+/// a probe must not change state — and not `--json`, whose stopped form is not
+/// captured (C-14). Any failure (timeout, non-zero exit, truncated or
+/// unparseable output) reports the field as unknown (`None`), never a guess.
+/// stderr is ignored (the bounded runner captures it; it is never parsed,
+/// stored or logged); of stdout only the parsed state is kept (the
+/// `Socket:` / `Logs:` paths are dropped with the output).
+pub fn probe_sbx(program: &Path, limits: &RunLimits) -> (Option<SbxVersion>, Option<bool>) {
     let version = SbxCommandBuilder::version(program)
         .run(limits)
         .ok()
         .filter(|o| o.status.success() && !o.stdout_truncated)
-        .and_then(|o| SbxVersion::parse(&o.stdout_lossy()).ok())
-        .map(|v| v.to_string());
-    let daemon_running = SbxCommandBuilder::daemon_status_json(program)
+        .and_then(|o| SbxVersion::parse(&o.stdout_lossy()).ok());
+    let daemon_running = SbxCommandBuilder::daemon_status(program)
         .run(limits)
         .ok()
         .filter(|o| o.status.success() && !o.stdout_truncated)
-        .and_then(|o| parse_daemon_status_json(&o.stdout_lossy()));
+        .and_then(|o| parse_daemon_status_text(&o.stdout_lossy()));
     (version, daemon_running)
 }
 
@@ -1287,7 +1291,17 @@ fn system_probe(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
                 // The RESOLVED binary (security S8). Its source (env override
                 // vs PATH) has no v1 wire field; main.rs logs it at startup.
                 binary_path: Some(path.display().to_string()),
-                version,
+                // A8a (§3.8 I2): the SAME predicate and seam as the
+                // `verification.run` version gate, over the probe's own
+                // reading of `sbx version`; the gate re-reads the version
+                // before every exec and is authoritative (review W1).
+                // Unknown version → absent.
+                exec_verified: version
+                    .as_ref()
+                    .map(|v| exec_verified(v, &inner.test_verified_exec_versions)),
+                // A8a (§3.8 I3): evidence about the version NUMBER only.
+                version_captured: version.as_ref().map(version_captured),
+                version: version.map(|v| v.to_string()),
                 daemon_running,
             }
         }
@@ -1296,6 +1310,8 @@ fn system_probe(inner: &ServerInner) -> Result<serde_json::Value, SvcError> {
             binary_path: None,
             version: None,
             daemon_running: None,
+            exec_verified: None,
+            version_captured: None,
         },
     };
     let caps = CoreCapabilities {

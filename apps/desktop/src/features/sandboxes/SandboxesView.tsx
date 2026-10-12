@@ -22,6 +22,7 @@ import {
   ConnectionBanner,
   ConnectionChip,
   SbxBadge,
+  SbxDetails,
 } from "../../components/layout/ConnectionState";
 import { ProjectSidebar } from "../../components/project/ProjectSidebar";
 import { SandboxWizard } from "../../components/sandbox/SandboxWizard";
@@ -220,6 +221,7 @@ function CapabilityPanel() {
       <div className="badges">
         <SbxBadge view={sbx} />
       </div>
+      <SbxDetails view={sbx} />
       <table className="table">
         <thead>
           <tr>
@@ -232,7 +234,16 @@ function CapabilityPanel() {
           <tr>
             <td>List sandboxes</td>
             <td>
-              <Badge tone={sbx.kind === "not_installed" ? "danger" : "success"}>
+              {/* A stopped daemon at the last check is not shown green (review Info). */}
+              <Badge
+                tone={
+                  sbx.kind === "not_installed"
+                    ? "danger"
+                    : sbx.kind === "daemon_down"
+                      ? "info"
+                      : "success"
+                }
+              >
                 {sbx.kind === "not_installed" ? "unavailable" : "available"}
               </Badge>
             </td>

@@ -32,7 +32,7 @@ pub struct RunLimits {
 }
 
 impl RunLimits {
-    /// Short read-only probes (`sbx version`, `sbx daemon status --json`).
+    /// Short read-only probes (`sbx version`, `sbx daemon status`).
     /// `system.probe` runs two of these, so 2 × 3 s stays well inside the
     /// clients' 15 s request timeout (vscode `connection.ts`, desktop
     /// `DEFAULT_REQUEST_TIMEOUT_MS`); real `sbx version` answers in ms.

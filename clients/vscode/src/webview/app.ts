@@ -161,6 +161,12 @@ interface SidebarState {
     instanceId: string;
     platform: string;
     sbxInstalled: boolean | null;
+    // A8a — optional here so a state without them (older extension host) still paints.
+    sbxNote?: string | null;
+    sbxVersion?: string | null;
+    sbxDaemon?: string | null;
+    sbxExec?: string | null;
+    sbxCaptured?: string | null;
     agents: { id: string; verified: boolean; supportsStreaming: boolean; supportsCancel: boolean }[];
   } | null;
   contextPlan: ContextPlanView | null;
@@ -174,6 +180,7 @@ interface SidebarRefs {
   coreMeta: HTMLElement;
   meta: HTMLElement;
   select: HTMLSelectElement;
+  sbx: HTMLElement;
   notices: HTMLElement;
   conversations: HTMLElement;
   verification: HTMLElement;
@@ -194,6 +201,7 @@ interface SidebarRefs {
 interface PaintMemo {
   header: string;
   sandboxes: string;
+  sbx: string;
   notices: string;
   conversations: string;
   verification: string;
@@ -306,6 +314,13 @@ function buildSkeleton(
   refresh.addEventListener('click', () => api.postMessage({ type: 'refresh' }));
   picker.appendChild(refresh);
   root.appendChild(picker);
+
+  // --- A8a: what Core's probe says about sbx — finished text from the
+  //     extension host, neutral tone (never "ready"), no daemon controls ---
+  const sbx = el('div', 'sp-status');
+  sbx.id = 'sp-sbx';
+  sbx.setAttribute('aria-label', 'SBX status from the Sandpane Core probe');
+  root.appendChild(sbx);
 
   // --- notices: what this build cannot do, stated up front ---
   const notices = el('div', 'sp-status');
@@ -461,6 +476,7 @@ function buildSkeleton(
     coreMeta,
     meta,
     select,
+    sbx,
     notices,
     conversations,
     verification,
@@ -699,6 +715,26 @@ function paint(refs: SidebarRefs, memo: PaintMemo, state: SidebarState, api: VsC
       options.push(opt);
     }
     refs.select.replaceChildren(...options);
+  }
+
+  // --- A8a sbx status: text only, every line neutral; an absent exec /
+  //     captured line means Core did not say, so nothing is shown. Only while
+  //     Core is online: the last probe is not shown as current when Core is
+  //     unreachable (the extension host keeps its capabilities across a drop) ---
+  const caps = state.capabilities;
+  const sbxLines: string[] = [];
+  if (caps !== null && state.connection === 'online') {
+    // Not installed / not reported: the note replaces every other line.
+    if (caps.sbxNote !== undefined && caps.sbxNote !== null) sbxLines.push(caps.sbxNote);
+    if (caps.sbxDaemon !== undefined && caps.sbxDaemon !== null) sbxLines.push(caps.sbxDaemon);
+    if (caps.sbxVersion !== undefined && caps.sbxVersion !== null) sbxLines.push(`sbx version: ${caps.sbxVersion}`);
+    if (caps.sbxExec !== undefined && caps.sbxExec !== null) sbxLines.push(caps.sbxExec);
+    if (caps.sbxCaptured !== undefined && caps.sbxCaptured !== null) sbxLines.push(caps.sbxCaptured);
+  }
+  const sbxKey = JSON.stringify(sbxLines);
+  if (sbxKey !== memo.sbx) {
+    memo.sbx = sbxKey;
+    refs.sbx.replaceChildren(...sbxLines.map((line) => el('div', 'sp-empty', line)));
   }
 
   // --- notices ---
@@ -952,6 +988,7 @@ function bootSandpaneSidebar(): void {
   const memo: PaintMemo = {
     header: '',
     sandboxes: '',
+    sbx: '',
     notices: '',
     conversations: '',
     verification: '',

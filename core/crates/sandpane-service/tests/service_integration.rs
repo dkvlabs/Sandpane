@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::params;
 use sandpane_core::idempotency;
-use sandpane_core::sbx::SbxLocator;
+use sandpane_core::sbx::{SbxLocator, SbxVersion};
 use sandpane_core::{Database, EventLog};
 use sandpane_protocol::{ConversationSendParams, Method, SandboxCreateSpec};
 use sandpane_service::confirm::{ConfirmationBinding, CONFIRMATION_TTL};
@@ -142,6 +142,21 @@ impl FakeSbx {
         .unwrap();
     }
 
+    /// Replace what `daemon status` prints on stdout (a data file).
+    fn set_daemon(&self, text: &str) {
+        std::fs::write(self.dir.path().join("daemon.txt"), text).unwrap();
+    }
+
+    /// Make `daemon status` exit non-zero AFTER printing its stdout.
+    fn daemon_exits_nonzero(&self) {
+        std::fs::write(self.dir.path().join("daemon.exit"), "").unwrap();
+    }
+
+    /// Replace what `version` prints (a data file).
+    fn set_version(&self, text: &str) {
+        std::fs::write(self.dir.path().join("version.txt"), text).unwrap();
+    }
+
     /// Make `verb` fail with this stderr (exit 1), as the real CLI does.
     fn fail(&self, verb: &str, stderr: &str) {
         std::fs::write(
@@ -165,6 +180,12 @@ impl FakeSbx {
     }
 }
 
+/// Captured `state/daemon_status_running.txt` / `daemon_status_stopped.txt`
+/// (v0.47.0; the stopped capture's `exit=0` annotation line is not output).
+const DAEMON_RUNNING_TEXT: &str = "Status: running\nSocket: $HOME/.sbx/run/d/sandboxd.sock\nLogs: $HOME/Library/Application Support/com.docker.sandboxes/sandboxes/sandboxd/daemon.log\n";
+const DAEMON_STOPPED_TEXT: &str =
+    "Status: stopped\nSocket: $HOME/.sbx/run/d/sandboxd.sock (not connected)\n";
+
 /// The stand-in's program text is a FIXED literal: every variable input
 /// (list JSON, error texts) is a data file beside it, read via `$0`, so no
 /// value is ever interpolated into script source.
@@ -173,8 +194,12 @@ d=$(dirname "$0")
 for a in "$@"; do printf '%s\037' "$a" >> "$d/argv.log"; done
 printf '\n' >> "$d/argv.log"
 case "$*" in
-  'version') echo 'sbx version: v0.47.0 0411f50ee4700fe7bd37e6e7e3aced563e850ca9' ;;
-  'daemon status --json') cat "$d/daemon.json" ;;
+  'version')
+    if [ -f "$d/version.txt" ]; then cat "$d/version.txt"; exit 0; fi
+    echo 'sbx version: v0.47.0 0411f50ee4700fe7bd37e6e7e3aced563e850ca9' ;;
+  'daemon status')
+    cat "$d/daemon.txt"
+    if [ -f "$d/daemon.exit" ]; then exit 3; fi ;;
   'ls --json')
     if [ -f "$d/ls.err" ]; then cat "$d/ls.err" >&2; exit 1; fi
     cat "$d/ls.json" ;;
@@ -198,12 +223,8 @@ esac
 fn fake_sbx(list_json: &str, create_error: Option<&str>, ls_error: Option<&str>) -> FakeSbx {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("ls.json"), format!("{list_json}\n")).unwrap();
-    // Captured state/daemon_status_running_json.txt (sanitized).
-    std::fs::write(
-        dir.path().join("daemon.json"),
-        "{\n  \"status\": \"running\",\n  \"socket\": \"$HOME/.sbx/run/d/sandboxd.sock\"\n}\n",
-    )
-    .unwrap();
+    // Captured state/daemon_status_running.txt (the TEXT form, A8a).
+    std::fs::write(dir.path().join("daemon.txt"), DAEMON_RUNNING_TEXT).unwrap();
     if let Some(e) = create_error {
         std::fs::write(dir.path().join("create.err"), format!("{e}\n")).unwrap();
     }
@@ -250,6 +271,9 @@ fn probe_reports_protocol_and_honest_capabilities() {
     assert_eq!(caps["protocolVersion"], 1);
     assert!(!caps["instanceId"].as_str().unwrap().is_empty());
     assert_eq!(caps["sbx"]["installed"], false);
+    // A8a: not installed → the version-derived fields are ABSENT (unknown).
+    assert!(caps["sbx"].get("execVerified").is_none(), "{caps}");
+    assert!(caps["sbx"].get("versionCaptured").is_none(), "{caps}");
     // P0 gate not passed → nothing advertised as verified.
     assert_eq!(caps["agents"][0]["id"], "codex");
     assert_eq!(caps["agents"][0]["verified"], false);
@@ -654,8 +678,16 @@ fn sbx_failures_are_classified_with_remediation_details() {
     assert_eq!(err["code"], "PROVIDER_AUTH_REQUIRED");
 }
 
-/// Backlog 6: system.probe runs `sbx version` + `sbx daemon status --json`
-/// and NEVER `ls` (which auto-starts the daemon).
+/// The exact argv `system.probe` may run (Backlog 6, A8a): `sbx version` and
+/// the TEXT `sbx daemon status` — never `ls` (which auto-starts the daemon)
+/// and never the uncaptured-when-stopped `--json` form.
+fn probe_argv() -> Vec<Vec<String>> {
+    vec![
+        vec!["version".to_string()],
+        vec!["daemon".to_string(), "status".into()],
+    ]
+}
+
 #[test]
 fn probe_reports_version_and_daemon_without_listing() {
     let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
@@ -664,15 +696,116 @@ fn probe_reports_version_and_daemon_without_listing() {
     assert_eq!(caps["sbx"]["installed"], true);
     assert_eq!(caps["sbx"]["version"], "0.47.0");
     assert_eq!(caps["sbx"]["daemonRunning"], true);
+    // A8a: the production seam is empty → exec is not verified; the stand-in
+    // reports the captured version number.
+    assert_eq!(caps["sbx"]["execVerified"], false);
+    assert_eq!(caps["sbx"]["versionCaptured"], true);
     let bin = fake.dir.path().join("sbx").display().to_string();
     assert_eq!(caps["sbx"]["binaryPath"], bin);
-    assert_eq!(
-        fake.calls(),
-        vec![
-            vec!["version".to_string()],
-            vec!["daemon".to_string(), "status".into(), "--json".into()]
-        ]
+    // The Socket:/Logs: lines (home-directory paths) are never returned.
+    let wire = caps["sbx"].to_string();
+    assert!(!wire.contains("sandboxd"), "{wire}");
+    assert!(!wire.contains("$HOME"), "{wire}");
+    assert_eq!(fake.calls(), probe_argv());
+}
+
+/// A8a: the captured stopped text form is now reachable as `false`.
+#[test]
+fn probe_reports_a_stopped_daemon_from_the_text_form() {
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    fake.set_daemon(DAEMON_STOPPED_TEXT);
+    let mut s = start_server(fake.locator());
+    let caps = s.ok("1", "system.probe", serde_json::json!({}));
+    assert_eq!(caps["sbx"]["daemonRunning"], false);
+    assert_eq!(caps["sbx"]["version"], "0.47.0");
+    assert_eq!(fake.calls(), probe_argv());
+}
+
+/// §3.8 W8: a probe whose output is not a clean captured reading — a
+/// `Starting…` preamble (the probe changed machine state), a non-zero exit
+/// or a truncated stdout — reports the daemon as unknown (`null`).
+#[test]
+fn probe_reports_unknown_daemon_for_unclean_readings() {
+    let truncated = format!("Status: running\n{}\n", "x".repeat(70 * 1024));
+    let cases: Vec<(&str, String, bool)> = vec![
+        (
+            "starting preamble",
+            format!("Starting sandboxd daemon...\n{DAEMON_RUNNING_TEXT}"),
+            false,
+        ),
+        ("non-zero exit", DAEMON_RUNNING_TEXT.to_string(), true),
+        ("truncated past 64 KiB", truncated, false),
+        ("CRLF", "Status: running\r\n".to_string(), false),
+        (
+            "second Status line",
+            "Status: running\nStatus: stopped\n".to_string(),
+            false,
+        ),
+        ("empty", String::new(), false),
+    ];
+    for (what, stdout, nonzero) in cases {
+        let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+        fake.set_daemon(&stdout);
+        if nonzero {
+            fake.daemon_exits_nonzero();
+        }
+        let mut s = start_server(fake.locator());
+        let caps = s.ok("1", "system.probe", serde_json::json!({}));
+        assert!(caps["sbx"]["daemonRunning"].is_null(), "{what}: {caps}");
+        // The version reading is independent of the daemon reading.
+        assert_eq!(caps["sbx"]["version"], "0.47.0", "{what}");
+        assert_eq!(fake.calls(), probe_argv(), "{what}");
+    }
+}
+
+/// §3.8 I2: `execVerified` is the `verification.run` gate's own predicate —
+/// with the test seam naming the probed version it turns true.
+#[test]
+fn probe_exec_verified_follows_the_verification_gate_seam() {
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("t.sqlite3")).unwrap();
+    let inner = ServerInner::with_config(
+        db,
+        fake.locator(),
+        CoreConfig {
+            test_verified_exec_versions: Some(vec![SbxVersion {
+                major: 0,
+                minor: 47,
+                patch: 0,
+                pre: None,
+            }]),
+            ..CoreConfig::default()
+        },
     );
+    let mut s = serve_inner(inner, dir);
+    let caps = s.ok("1", "system.probe", serde_json::json!({}));
+    assert_eq!(caps["sbx"]["execVerified"], true);
+    assert_eq!(caps["sbx"]["versionCaptured"], true);
+    assert_eq!(fake.calls(), probe_argv());
+}
+
+/// §3.8 I3: another version NUMBER is not captured (and not exec-verified);
+/// an unreadable version leaves both fields absent, never guessed.
+#[test]
+fn probe_version_captured_follows_the_version_number() {
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    fake.set_version("sbx version: v0.48.0 0411f50ee4700fe7bd37e6e7e3aced563e850ca9\n");
+    let mut s = start_server(fake.locator());
+    let caps = s.ok("1", "system.probe", serde_json::json!({}));
+    assert_eq!(caps["sbx"]["version"], "0.48.0");
+    assert_eq!(caps["sbx"]["versionCaptured"], false);
+    assert_eq!(caps["sbx"]["execVerified"], false);
+
+    let fake = fake_sbx(r#"{"sandboxes":[]}"#, None, None);
+    fake.set_version("sbx version: unknown\n");
+    let mut s = start_server(fake.locator());
+    let caps = s.ok("1", "system.probe", serde_json::json!({}));
+    assert!(caps["sbx"]["version"].is_null(), "{caps}");
+    assert!(caps["sbx"].get("versionCaptured").is_none(), "{caps}");
+    assert!(caps["sbx"].get("execVerified").is_none(), "{caps}");
+    // The daemon reading is independent of the version reading.
+    assert_eq!(caps["sbx"]["daemonRunning"], true);
 }
 
 #[test]

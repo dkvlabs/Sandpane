@@ -571,6 +571,9 @@ describe('wire names match the Rust protocol crate', () => {
       ['supportsCancel', 'supports_cancel'],
       ['supportsResume', 'supports_resume'],
       ['daemonRunning', 'daemon_running'],
+      // A8a (additive, optional): both are in the strict `sbx` schema object.
+      ['execVerified', 'exec_verified'],
+      ['versionCaptured', 'version_captured'],
       ['binaryPath', 'binary_path'],
       ['baseCommit', 'base_commit'],
       ['hostDirty', 'host_dirty'],

@@ -968,6 +968,13 @@ fn version_gate(
     if !out.status.success() {
         return Err(classify_failure(&out.status.to_string(), &out.stderr_lossy()).into());
     }
+    // Truncated stdout is never parsed (process.rs contract; A8a review W3).
+    if out.stdout_truncated {
+        return Err(SvcFailure::from((
+            ErrorCode::UnsupportedSbxVersion,
+            MSG_VERSION_UNREADABLE.to_string(),
+        )));
+    }
     let version = SbxVersion::parse(&out.stdout_lossy()).map_err(|_| {
         SvcFailure::from((
             ErrorCode::UnsupportedSbxVersion,

@@ -405,7 +405,24 @@ pub struct SbxStatus {
     pub installed: bool,
     pub binary_path: Option<String>,
     pub version: Option<String>,
+    /// From the captured TEXT form of `sbx daemon status` (A8a, design
+    /// 2026-10-09 §3.8 item 1). `null` = unknown (non-zero exit, truncated or
+    /// any output that is not exactly a captured shape).
     pub daemon_running: Option<bool>,
+    /// A8a (additive): whether `verification.run` would accept the probed
+    /// version — the SAME predicate as its version gate, applied to the
+    /// probe's own reading of `sbx version`. `verification.run` re-reads the
+    /// version before every exec and is authoritative. Absent when the
+    /// version is unknown or sbx is not installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_verified: Option<bool>,
+    /// A8a (additive): whether the probed version NUMBER equals one whose
+    /// fixtures Sandpane has captured (`CAPTURED_VERSIONS`). Evidence, never
+    /// a support claim: the build is not compared and the captures are from
+    /// one macOS arm64 host. Absent when the version is unknown or sbx is not
+    /// installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_captured: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1711,6 +1728,88 @@ mod tests {
                 "verification"
             ])
         );
+    }
+
+    /// A8a (§3.8 item 1): `execVerified` / `versionCaptured` are additive and
+    /// optional — absent when unknown, camelCase when present, and a pre-A8
+    /// `sbx` object still parses. `schema-drift` compares value sets only, so
+    /// this test is the field-name pin against `core-capabilities.schema.json`.
+    #[test]
+    fn a8a_sbx_status_wire_shape() {
+        let unknown = SbxStatus {
+            installed: false,
+            binary_path: None,
+            version: None,
+            daemon_running: None,
+            exec_verified: None,
+            version_captured: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&unknown).unwrap(),
+            serde_json::json!({
+                "installed": false,
+                "binaryPath": null,
+                "version": null,
+                "daemonRunning": null
+            })
+        );
+        let known = SbxStatus {
+            installed: true,
+            binary_path: Some("/usr/local/bin/sbx".into()),
+            version: Some("0.47.0".into()),
+            daemon_running: Some(false),
+            exec_verified: Some(false),
+            version_captured: Some(true),
+        };
+        assert_eq!(
+            serde_json::to_value(&known).unwrap(),
+            serde_json::json!({
+                "installed": true,
+                "binaryPath": "/usr/local/bin/sbx",
+                "version": "0.47.0",
+                "daemonRunning": false,
+                "execVerified": false,
+                "versionCaptured": true
+            })
+        );
+        let old: SbxStatus = serde_json::from_str(
+            r#"{"installed":true,"binaryPath":"/x/sbx","version":"0.47.0","daemonRunning":true}"#,
+        )
+        .unwrap();
+        assert_eq!(old.exec_verified, None);
+        assert_eq!(old.version_captured, None);
+        let back: SbxStatus =
+            serde_json::from_value(serde_json::to_value(&known).unwrap()).unwrap();
+        assert_eq!(back.exec_verified, Some(false));
+        assert_eq!(back.version_captured, Some(true));
+
+        // The schema's `sbx` object is strict (`additionalProperties: false`):
+        // its property names must be exactly the fully-populated wire keys.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../schemas/core-capabilities.schema.json");
+        let schema: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let sbx = &schema["properties"]["sbx"];
+        assert_eq!(sbx["additionalProperties"], false);
+        let mut schema_keys: Vec<&str> = sbx["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        schema_keys.sort_unstable();
+        let wire = serde_json::to_value(&known).unwrap();
+        let mut wire_keys: Vec<&str> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        wire_keys.sort_unstable();
+        assert_eq!(schema_keys, wire_keys);
+        assert_eq!(sbx["properties"]["execVerified"]["type"], "boolean");
+        assert_eq!(sbx["properties"]["versionCaptured"]["type"], "boolean");
+        assert_eq!(sbx["required"], serde_json::json!(["installed"]));
     }
 
     /// A7 (§3.7 item 1): the wire shapes clients will build and read.

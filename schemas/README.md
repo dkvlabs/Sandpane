@@ -143,7 +143,16 @@ above `MAX_FRAME_BYTES` − 64 KiB, answer `VALIDATION_FAILED` "the response
 would exceed the frame limit (…); …; nothing was returned" (details:
 `commandIds` for the list, `repositories` / `repositoryCount` /
 `approvedBytes` for the context, `runId` for the result) instead of an
-oversized frame. Client adoption pending (A7 client step). The
+oversized frame. Client adoption pending (A7 client step). A8a (design
+2026-10-09 §3.8 item 1) adds no method and no feature string: the strict
+`sbx` object in `core-capabilities.schema.json` gains two optional booleans,
+`execVerified` (the `verification.run` version gate's own predicate) and
+`versionCaptured` (the probed version number equals a captured fixture
+version), both absent when the version is unknown, and `daemonRunning` now
+comes from the captured text form of `sbx daemon status`. `schema-drift`
+compares value sets, so these field names are pinned by the protocol test
+`a8a_sbx_status_wire_shape` instead. Client adoption pending (A8a client
+step). The
 `docs/specs/02 §2` contract blocks are the
 human-readable form. Adding a
 schema file per method is a codegen concern and belongs with the P1/P7

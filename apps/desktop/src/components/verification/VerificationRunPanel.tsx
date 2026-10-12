@@ -25,7 +25,12 @@ import {
   useVerificationResult,
 } from "../../lib/hooks";
 import { forNewAction, idempotencyKeysAdvertised } from "../../lib/idempotency";
-import { verificationRunsOf, type VerificationRunRecord } from "../../lib/reducers";
+import {
+  SBX_EXEC_ENABLED_LINE,
+  sbxExecLine,
+  verificationRunsOf,
+  type VerificationRunRecord,
+} from "../../lib/reducers";
 import {
   ARGV_ELEMENT_DISPLAY_MAX_CHARS,
   DISCLOSURE_BEST_EFFORT,
@@ -65,6 +70,8 @@ export function VerificationRunPanel({
   const supported = gate.state === "supported";
   const link = useCoreLink();
   const keysAdvertised = idempotencyKeysAdvertised(capabilitiesOf(link));
+  const execVerified = capabilitiesOf(link)?.sbx?.execVerified;
+  const execLine = sbxExecLine(execVerified);
   const commands = useVerificationCommands(projectId, supported);
   const sandboxList = useSandboxes(supported);
   const projection = useTaskProjection(taskId);
@@ -155,10 +162,19 @@ export function VerificationRunPanel({
 
   return (
     <Panel title="Verification run" description="Run one approved command inside this task's sandbox with sbx exec.">
-      <Warning tone="info" title="Running is disabled for every sbx version today">
-        {RUN_UNVERIFIED_NOTICE} No task created over the wire is bound to a sandbox yet, so Run stays disabled or is
-        refused with nothing run.
-      </Warning>
+      {/* A8a: Core's own `execVerified` (the same predicate as its run gate), shown before any click. */}
+      {execVerified === true ? (
+        <Warning tone="info" title={SBX_EXEC_ENABLED_LINE}>
+          Core reports this from the same check its run gate uses. No task created over the wire is bound to a
+          sandbox yet, so Run stays disabled or is refused with nothing run.
+        </Warning>
+      ) : (
+        <Warning tone="info" title="Running is disabled for every sbx version today">
+          {execLine !== null && <>{execLine} (reported by Core). </>}
+          {RUN_UNVERIFIED_NOTICE} No task created over the wire is bound to a sandbox yet, so Run stays disabled or is
+          refused with nothing run.
+        </Warning>
+      )}
       {commands.error !== null && <VerificationFailureNotice copy={verificationFailureCopy(commands.error, "list")} />}
       {list.length > 0 && (
         <fieldset className="stack">

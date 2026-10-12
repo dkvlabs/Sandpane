@@ -689,3 +689,105 @@ describe('A7: Verification section and per-task Verify… / Results…', () => {
     expect(h.byId('sp-verify-results-t-1').disabled).toBe(false);
   });
 });
+
+describe('A8a sbx status region', () => {
+  const caps = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    coreVersion: '0.1.0-test',
+    protocolVersion: 1,
+    instanceId: 'i-1',
+    platform: 'darwin',
+    sbxInstalled: true,
+    sbxNote: null,
+    sbxVersion: '0.47.0',
+    sbxDaemon: 'SBX daemon running (at last check)',
+    sbxExec: 'Verification runs are not enabled for this sbx version',
+    sbxCaptured: "Same sbx version number as Sandpane's captured fixtures (macOS; build not compared): yes",
+    agents: [],
+    ...overrides,
+  });
+
+  it('renders the finished lines as neutral text, with no daemon control', () => {
+    const h = boot();
+    expect(h.byId('sp-sbx').textContent).toBe(''); // no capabilities yet → nothing claimed
+    h.push(state({ capabilities: caps() }));
+    h.flushFrame();
+    const region = h.byId('sp-sbx');
+    const lines = region.findAll((node) => node.tagName === 'DIV').map((node) => node.textContent);
+    expect(lines).toEqual([
+      'SBX daemon running (at last check)',
+      'sbx version: 0.47.0',
+      'Verification runs are not enabled for this sbx version',
+      "Same sbx version number as Sandpane's captured fixtures (macOS; build not compared): yes",
+    ]);
+    for (const node of region.findAll((n) => n.tagName === 'DIV')) expect(node.className).toBe('sp-empty');
+    expect(region.findAll((n) => n.tagName === 'BUTTON')).toHaveLength(0);
+    expect(region.getAttribute('data-tone')).toBeNull();
+    expect(region.textContent).not.toMatch(/ready|healthy/i);
+  });
+
+  it('repaints when the daemon state changes, and drops absent exec / captured lines', () => {
+    const h = boot();
+    h.push(state({ capabilities: caps() }));
+    h.flushFrame();
+    h.push(state({ capabilities: caps({ sbxDaemon: 'SBX daemon stopped (at last check)', sbxExec: null, sbxCaptured: null }) }));
+    h.flushFrame();
+    const text = h.byId('sp-sbx').textContent;
+    expect(text).toContain('SBX daemon stopped (at last check)');
+    expect(text).not.toContain('SBX daemon running (at last check)');
+    expect(text).not.toContain('Verification runs');
+    expect(text).not.toContain('captured fixtures');
+  });
+
+  it('a state without the A8a fields (older extension host) claims nothing', () => {
+    const h = boot();
+    const old = caps();
+    delete old.sbxVersion;
+    delete old.sbxDaemon;
+    delete old.sbxExec;
+    delete old.sbxCaptured;
+    h.push(state({ capabilities: old }));
+    h.flushFrame();
+    expect(h.byId('sp-sbx').textContent).toBe('');
+  });
+
+  it.each(['reconnecting', 'connecting', 'offline'])(
+    'shows no cached daemon line while Core is %s, and repaints once back online',
+    (connection) => {
+      const h = boot();
+      h.push(state({ capabilities: caps() }));
+      h.flushFrame();
+      expect(h.byId('sp-sbx').textContent).toContain('SBX daemon running (at last check)');
+      h.push(state({ connection, capabilities: caps() }));
+      h.flushFrame();
+      expect(h.byId('sp-sbx').textContent).toBe('');
+      h.push(state({ capabilities: caps({ sbxDaemon: 'SBX daemon stopped (at last check)' }) }));
+      h.flushFrame();
+      expect(h.byId('sp-sbx').textContent).toContain('SBX daemon stopped (at last check)');
+    },
+  );
+
+  it.each([
+    [false, 'Docker SBX not installed'],
+    [null, 'SBX status not reported by this Core'],
+  ])('sbxInstalled %s → only the note "%s", no daemon / exec / captured line', (sbxInstalled, note) => {
+    const h = boot();
+    h.push(
+      state({
+        capabilities: caps({ sbxInstalled, sbxNote: note, sbxVersion: null, sbxDaemon: null, sbxExec: null, sbxCaptured: null }),
+      }),
+    );
+    h.flushFrame();
+    const region = h.byId('sp-sbx');
+    expect(region.findAll((n) => n.tagName === 'DIV').map((n) => n.textContent)).toEqual([note]);
+    expect(region.textContent).not.toContain('SBX daemon');
+  });
+
+  it('renders hostile text as text, never as markup', () => {
+    const h = boot();
+    h.push(state({ capabilities: caps({ sbxVersion: '<img src=x onerror=alert(1)>' }) }));
+    h.flushFrame();
+    const region = h.byId('sp-sbx');
+    expect(region.textContent).toContain('sbx version: <img src=x onerror=alert(1)>');
+    expect(region.findAll((n) => n.tagName === 'IMG')).toHaveLength(0);
+  });
+});

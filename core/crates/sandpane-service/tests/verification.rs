@@ -81,7 +81,9 @@ env > "$c/env"
 pwd -P > "$c/cwd"
 ls -A > "$c/listing"
 case "$1" in
-  version) echo 'sbx version: v0.47.0 0411f50ee4700fe7bd37e6e7e3aced563e850ca9' ;;
+  version)
+    echo 'sbx version: v0.47.0 0411f50ee4700fe7bd37e6e7e3aced563e850ca9'
+    if [ -f "$d/version.big" ]; then head -c 70000 /dev/zero | tr '\0' x; fi ;;
   ls)
     if [ -f "$d/ls.err" ]; then cat "$d/ls.err" >&2; exit 1; fi
     cat "$d/ls.json"
@@ -152,6 +154,7 @@ impl Default for Seams {
                 major: 0,
                 minor: 47,
                 patch: 0,
+                pre: None,
             }]),
             limits: Some((
                 RunLimits {
@@ -855,6 +858,31 @@ fn identity_gate_refuses_and_never_execs() {
     );
     assert_eq!(e["message"], MSG_IDENTITY);
     assert!(!env.verbs().contains(&"exec".to_string()));
+}
+
+/// A8a review W3: the gate never parses truncated `sbx version` stdout,
+/// even when its first token is a verified version.
+#[test]
+fn version_gate_refuses_truncated_version_output() {
+    let mut env = Env::with(Seams::default());
+    env.bind("t1", "atlas-demo", "direct_mount", Some(SBX_ID));
+    let repo = env.repo.clone();
+    env.set_ls(&[running_row("atlas-demo", Some(vec![repo]))]);
+    let cmd = env.approve("unit tests", &["make", "test"]);
+    env.file("version.big", "");
+    env.reset_calls();
+    let e = env.err(
+        "verification.run",
+        env.run_params("t1", &cmd, "atlas-demo", "direct_mount"),
+    );
+    assert_eq!(e["code"], "UNSUPPORTED_SBX_VERSION", "{e}");
+    assert_eq!(
+        e["message"],
+        "sbx exec argument passing has not been verified for this sbx (Core could not read its \
+         version); nothing was run"
+    );
+    assert_eq!(env.verbs(), vec!["version"], "only the version probe ran");
+    assert!(env.events("t1").is_empty());
 }
 
 #[test]

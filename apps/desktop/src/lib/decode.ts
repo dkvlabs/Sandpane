@@ -113,6 +113,17 @@ function optBool(rec: Rec, key: string, what: string): boolean | null {
   return v;
 }
 
+/**
+ * Additive optional flag (A8a `execVerified` / `versionCaptured`): a JSON
+ * boolean is kept; absent, `null` or any other type reads as absent. It never
+ * throws, so a malformed optional flag cannot fail the whole `system.probe`
+ * decode — and a non-boolean is never coerced into a claim.
+ */
+function tolerantBool(rec: Rec, key: string): boolean | undefined {
+  const v = rec[key];
+  return typeof v === "boolean" ? v : undefined;
+}
+
 function arr(rec: Rec, key: string, what: string): unknown[] {
   const v = rec[key];
   if (!Array.isArray(v)) {
@@ -203,11 +214,16 @@ export function decodeCoreCapabilities(value: unknown): CoreCapabilities {
   let sbx = null as CoreCapabilities["sbx"];
   if (sbxRaw !== undefined && sbxRaw !== null) {
     const s = asRecord(sbxRaw, "SbxStatus");
+    const execVerified = tolerantBool(s, "execVerified");
+    const versionCaptured = tolerantBool(s, "versionCaptured");
     sbx = {
       installed: bool(s, "installed", "SbxStatus"),
       binaryPath: optStr(s, "binaryPath", "SbxStatus"),
       version: optStr(s, "version", "SbxStatus"),
       daemonRunning: optBool(s, "daemonRunning", "SbxStatus"),
+      // A8a: absent stays absent (no `undefined`-valued key is added).
+      ...(execVerified === undefined ? {} : { execVerified }),
+      ...(versionCaptured === undefined ? {} : { versionCaptured }),
     };
   }
   const agents: AgentCapability[] = arr(rec, "agents", "CoreCapabilities").map(

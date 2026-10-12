@@ -319,7 +319,25 @@ export interface SbxStatus {
   installed: boolean;
   binaryPath: string | null;
   version: string | null;
+  /**
+   * `true` running, `false` stopped (now reachable: Core reads the captured
+   * text form of `sbx daemon status`), `null` unknown. A running daemon is NOT
+   * "ready": it can still be signed out or have no policy initialised.
+   */
   daemonRunning: boolean | null;
+  /**
+   * A8a (additive, optional): the same predicate as Core's `verification.run`
+   * version gate. Absent when the version is unknown, sbx is not installed, or
+   * the Core predates A8a. Only a JSON boolean is kept; anything else decodes
+   * as absent.
+   */
+  execVerified?: boolean;
+  /**
+   * A8a (additive, optional): the probed version NUMBER equals one Core has
+   * captured fixtures for (one macOS arm64 host; build not compared). A
+   * statement about evidence, never a support claim. Absent as above.
+   */
+  versionCaptured?: boolean;
 }
 
 export interface AgentCapability {

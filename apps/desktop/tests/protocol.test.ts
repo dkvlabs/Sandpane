@@ -124,6 +124,44 @@ describe("decodeCoreCapabilities", () => {
     expect(decodeCoreCapabilities(frame)).toEqual(frame);
   });
 
+  it("decodes the A8a sbx flags (execVerified / versionCaptured) when they are booleans", () => {
+    const withFlags = { ...frame, sbx: { ...frame.sbx, daemonRunning: false, execVerified: false, versionCaptured: true } };
+    expect(decodeCoreCapabilities(withFlags)).toEqual(withFlags);
+    const decoded = decodeCoreCapabilities({
+      ...frame,
+      sbx: { ...frame.sbx, execVerified: true, versionCaptured: false },
+    });
+    expect(decoded.sbx?.execVerified).toBe(true);
+    expect(decoded.sbx?.versionCaptured).toBe(false);
+  });
+
+  it("keeps the A8a sbx flags absent when Core does not send them (no undefined-valued key)", () => {
+    const decoded = decodeCoreCapabilities(frame);
+    expect(decoded.sbx).not.toHaveProperty("execVerified");
+    expect(decoded.sbx).not.toHaveProperty("versionCaptured");
+  });
+
+  it("treats a non-boolean A8a sbx flag as absent without failing the probe", () => {
+    for (const bad of ["true", "false", 1, 0, {}, [], null]) {
+      const decoded = decodeCoreCapabilities({
+        ...frame,
+        sbx: { ...frame.sbx, execVerified: bad, versionCaptured: bad },
+      });
+      expect(decoded.sbx).not.toHaveProperty("execVerified");
+      expect(decoded.sbx).not.toHaveProperty("versionCaptured");
+      expect(decoded.sbx?.installed).toBe(true);
+      expect(decoded.sbx?.binaryPath).toBe("/usr/local/bin/sbx");
+    }
+  });
+
+  it("tolerates unknown extra sbx keys", () => {
+    const decoded = decodeCoreCapabilities({
+      ...frame,
+      sbx: { ...frame.sbx, policyInitialized: true, somethingNew: { a: 1 } },
+    });
+    expect(decoded.sbx).toEqual(frame.sbx);
+  });
+
   it("treats a missing sbx as null rather than installed:false", () => {
     const { sbx, ...rest } = frame;
     expect(sbx).toBeDefined();

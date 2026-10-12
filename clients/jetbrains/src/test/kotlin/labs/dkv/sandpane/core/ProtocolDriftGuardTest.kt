@@ -875,6 +875,35 @@ class ProtocolDriftGuardTest {
         assertTrue(kotlinMirror.contains("val features: List<String> = emptyList()"))
     }
 
+    /**
+     * A8a (\u00A73.8 item 1): every `capabilities.sbx` property the schema defines is a field of the Kotlin
+     * [labs.dkv.sandpane.model.SbxStatus] (same wire names, same order), and only `installed` is
+     * required \u2014 so `execVerified` / `versionCaptured` cannot be added to the schema without the
+     * client learning them, and stay additive.
+     */
+    @Test
+    fun sbxStatusFieldsMatchSchema() {
+        val sbxAt = indexInPropertyBlock(capabilitiesSchema, "sbx")
+        val agentsAt = indexInPropertyBlock(capabilitiesSchema, "agents")
+        assertTrue(agentsAt > sbxAt, "core-capabilities: `sbx` is no longer declared before `agents`")
+        val block = capabilitiesSchema.substring(sbxAt, agentsAt)
+        val propertiesAt = block.indexOf("\"properties\"")
+        if (propertiesAt < 0) fail("core-capabilities sbx has no properties")
+        val schemaNames = Regex(""""([A-Za-z][A-Za-z0-9]*)"\s*:\s*\{""").findAll(block.substring(propertiesAt + 1))
+            .map { it.groupValues[1] }.toList()
+        val descriptor = labs.dkv.sandpane.model.SbxStatus.serializer().descriptor
+        val kotlinNames = (0 until descriptor.elementsCount).map { descriptor.getElementName(it) }
+        assertEquals(kotlinNames, schemaNames, "SbxStatus drifted from schemas/core-capabilities.schema.json sbx.properties")
+        for (i in 0 until descriptor.elementsCount) {
+            assertEquals(
+                descriptor.getElementName(i) == "installed",
+                !descriptor.isElementOptional(i),
+                "only `installed` may be required in SbxStatus (${descriptor.getElementName(i)})",
+            )
+        }
+        assertTrue(Regex(""""required"\s*:\s*\[\s*"installed"\s*\]""").containsMatchIn(block), "sbx.required changed")
+    }
+
     /** A5 (\u00A73.5): git.diff's exact refusals, bounds and wire shape are Core's. */
     @Test
     fun gitDiffMessagesAndBoundsMatchCore() {

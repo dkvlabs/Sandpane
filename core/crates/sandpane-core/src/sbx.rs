@@ -134,6 +134,10 @@ pub struct SbxVersion {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+    /// The semver pre-release identifier (`rc.1` in `v0.47.0-rc.1`), kept so
+    /// a pre-release never compares equal to its release (A8a review W2).
+    /// `+build` metadata is dropped.
+    pub pre: Option<String>,
 }
 
 impl SbxVersion {
@@ -163,10 +167,26 @@ impl SbxVersion {
         if !(rest.is_empty() || rest.starts_with('-') || rest.starts_with('+')) {
             return None;
         }
+        let pre = match rest.strip_prefix('-') {
+            None => None,
+            Some(r) => {
+                let id = r.split('+').next().unwrap_or("");
+                let ok = !id.is_empty()
+                    && id.len() <= 64
+                    && id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+                if !ok {
+                    return None;
+                }
+                Some(id.to_string())
+            }
+        };
         Some(Self {
             major: major.parse().ok()?,
             minor: minor.parse().ok()?,
             patch: patch_digits.parse().ok()?,
+            pre,
         })
     }
 
@@ -177,7 +197,11 @@ impl SbxVersion {
 
 impl std::fmt::Display for SbxVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(pre) = &self.pre {
+            write!(f, "-{pre}")?;
+        }
+        Ok(())
     }
 }
 
@@ -198,6 +222,28 @@ pub fn exec_verified(version: &SbxVersion, extra: &[SbxVersion]) -> bool {
         .iter()
         .chain(extra.iter())
         .any(|v| v == version)
+}
+
+/// sbx versions whose fixtures are in the tree
+/// (`tests/fixtures/sbx/captured/v{X.Y.Z}/`; design 2026-10-09 §3.8 item 1,
+/// I3). Drift-tested against the directory names. A statement about
+/// EVIDENCE, never a support claim: the captures come from one macOS arm64
+/// host, and only the version NUMBER is known (the build is not recorded in
+/// [`SbxVersion`]).
+pub const CAPTURED_VERSIONS: &[SbxVersion] = &[SbxVersion {
+    major: 0,
+    minor: 47,
+    patch: 0,
+    pre: None,
+}];
+
+/// Whether `version`'s NUMBER equals one in [`CAPTURED_VERSIONS`]. The build
+/// is not compared (`SbxVersion` drops the commit), and the captures are from
+/// one macOS arm64 host — so `true` means "same version number as Sandpane's
+/// captured fixtures", nothing more. A pre-release (`0.47.0-rc.1`) never
+/// matches its release (review W2): equality includes [`SbxVersion::pre`].
+pub fn version_captured(version: &SbxVersion) -> bool {
+    CAPTURED_VERSIONS.contains(version)
 }
 
 /// Environment variables passed to sbx on the A7 verification path (W4):
@@ -332,8 +378,22 @@ impl SbxCommandBuilder {
         }
     }
 
-    /// `sbx daemon status --json` — a read-only probe. NOT `ls`, which
-    /// auto-starts the daemon (captured `state/ls_json_autostarts_daemon.txt`).
+    /// `sbx daemon status` (TEXT form) — the read-only daemon probe used by
+    /// `system.probe` (design 2026-10-09 §3.8 item 1). Its output is captured
+    /// for BOTH states (`state/daemon_status_running.txt`,
+    /// `state/daemon_status_stopped.txt`); parse it with
+    /// [`parse_daemon_status_text`]. NOT `ls`, which auto-starts the daemon
+    /// (captured `state/ls_json_autostarts_daemon.txt`).
+    pub fn daemon_status(program: &Path) -> SbxCommand {
+        SbxCommand {
+            program: program.to_path_buf(),
+            args: vec!["daemon".into(), "status".into()],
+        }
+    }
+
+    /// `sbx daemon status --json`. UNUSED by the probe since A8a and kept as
+    /// a unit-tested fallback only: its output is captured for a RUNNING
+    /// daemon alone — the stopped JSON form is not captured (C-14).
     pub fn daemon_status_json(program: &Path) -> SbxCommand {
         SbxCommand {
             program: program.to_path_buf(),
@@ -548,10 +608,48 @@ pub fn parse_list_json(output: &str) -> Result<Vec<SbxListEntry>, SbxError> {
         .collect())
 }
 
+/// Parse the TEXT form of `sbx daemon status` (design 2026-10-09 §3.8
+/// item 1, rule W8). Captured shapes (v0.47.0):
+///
+/// ```text
+/// Status: running            Status: stopped
+/// Socket: …                  Socket: … (not connected)
+/// Logs: …
+/// ```
+///
+/// After stripping ONE trailing `\n` (any `\r` anywhere → `None`), line 1
+/// must be exactly `Status: running` (`Some(true)`) or `Status: stopped`
+/// (`Some(false)`), and no later line may begin with `Status:`. Anything
+/// else — including a `Starting…` preamble, which means the probe changed
+/// machine state — is `None` (unknown). The `Socket:` / `Logs:` lines carry
+/// home-directory paths and are never parsed or kept. The exit-status-0 and
+/// not-truncated checks belong to the caller.
+pub fn parse_daemon_status_text(stdout: &str) -> Option<bool> {
+    if stdout.contains('\r') {
+        return None;
+    }
+    let text = stdout.strip_suffix('\n').unwrap_or(stdout);
+    // `split('\n')`, never `.lines()`, which silently accepts `\r\n` line
+    // ends (any `\r` is already refused above; this keeps the rule local).
+    let mut lines = text.split('\n');
+    let running = match lines.next()? {
+        "Status: running" => true,
+        "Status: stopped" => false,
+        _ => return None,
+    };
+    if lines.any(|l| l.starts_with("Status:")) {
+        return None;
+    }
+    Some(running)
+}
+
 /// Parse `sbx daemon status --json` (captured
 /// `state/daemon_status_running_json.txt`): `"running"` → `Some(true)`,
 /// `"stopped"` → `Some(false)`, anything else (other values, non-JSON — the
-/// stopped capture exists only in TEXT form) → `None` (unknown).
+/// stopped capture exists only in TEXT form) → `None` (unknown). UNUSED by
+/// the probe since A8a (it reads [`parse_daemon_status_text`]); kept as a
+/// unit-tested fallback. The `"stopped"` arm is illustrative: that JSON form
+/// is not captured (C-14).
 pub fn parse_daemon_status_json(output: &str) -> Option<bool> {
     let v: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
     match v.get("status")?.as_str()? {
@@ -763,7 +861,8 @@ mod tests {
             SbxVersion {
                 major: 0,
                 minor: 47,
-                patch: 0
+                patch: 0,
+                pre: None
             }
         );
         assert_eq!(v.to_string(), "0.47.0");
@@ -778,9 +877,23 @@ mod tests {
             SbxVersion {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                pre: Some("beta".into())
             }
         );
+        assert_eq!(
+            SbxVersion::parse("1.2.3-beta").unwrap().to_string(),
+            "1.2.3-beta"
+        );
+        // `+build` metadata is dropped; a pre-release keeps its identifier.
+        assert_eq!(SbxVersion::parse("v1.2.3+abc").unwrap().pre, None);
+        assert_eq!(
+            SbxVersion::parse("v1.2.3-rc.1+abc").unwrap().pre.as_deref(),
+            Some("rc.1")
+        );
+        // A malformed pre-release identifier is refused, not guessed.
+        assert!(SbxVersion::parse("1.2.3-").is_err());
+        assert!(SbxVersion::parse("1.2.3-b@d").is_err());
         // A digit-leading commit hash is never mistaken for the version.
         assert!(SbxVersion::parse("sbx version: 0411f50ee4700fe7").is_err());
         assert!(SbxVersion::parse("no digits here").is_err());
@@ -792,6 +905,10 @@ mod tests {
     fn builders_produce_exact_vectors() {
         let p = prog();
         assert_eq!(SbxCommandBuilder::version(&p).args, vec!["version"]);
+        assert_eq!(
+            SbxCommandBuilder::daemon_status(&p).args,
+            vec!["daemon", "status"]
+        );
         assert_eq!(
             SbxCommandBuilder::daemon_status_json(&p).args,
             vec!["daemon", "status", "--json"]
@@ -855,6 +972,11 @@ mod tests {
                 "help/version.txt",
                 "sbx version",
                 SbxCommandBuilder::version(&p),
+            ),
+            (
+                "help/daemon_status.txt",
+                "sbx daemon status",
+                SbxCommandBuilder::daemon_status(&p),
             ),
             (
                 "help/daemon_status.txt",
@@ -1046,6 +1168,10 @@ mod tests {
             parse_daemon_status_json(&body(&fixture("crud/05_daemon_status_json.txt"))),
             Some(true)
         );
+        // ILLUSTRATIVE, not captured: the stopped JSON form was never
+        // recorded (design 2026-10-09 §3.8 item 1, capture C-14). This arm
+        // only pins the parser's own mapping; the probe no longer uses the
+        // JSON form at all (it reads the captured TEXT form).
         assert_eq!(
             parse_daemon_status_json(r#"{"status":"stopped"}"#),
             Some(false)
@@ -1056,6 +1182,114 @@ mod tests {
             None
         );
         assert_eq!(parse_daemon_status_json(r#"{"status":"starting"}"#), None);
+    }
+
+    /// §3.8 W8: both captured text forms read as a clean state.
+    #[test]
+    fn daemon_status_text_parses_both_captures() {
+        // The running capture is the raw output (no `$ ` / `exit=` lines),
+        // ending in a newline.
+        let running = fixture("state/daemon_status_running.txt");
+        assert!(running.ends_with('\n'));
+        assert_eq!(parse_daemon_status_text(&running), Some(true));
+        // The stopped capture carries a trailing `exit=0` ANNOTATION line
+        // (the recorder's, not sbx output); `body` drops it.
+        let stopped = fixture("state/daemon_status_stopped.txt");
+        assert_eq!(stopped.lines().last(), Some("exit=0"));
+        assert_eq!(parse_daemon_status_text(&body(&stopped)), Some(false));
+    }
+
+    /// §3.8 W8: anything that is not exactly the captured shape is unknown.
+    /// Hostile inputs are raw literals — never routed through `body`, whose
+    /// `.lines()` would silently drop a `\r`.
+    #[test]
+    fn daemon_status_text_refuses_everything_else() {
+        let hostile = [
+            "",
+            "\n",
+            "Status: starting\n",
+            "Status: running \n",
+            " Status: running\n",
+            "status: running\n",
+            "Status:running\n",
+            "Status: running\r\n",
+            "Status: running\r\nSocket: x\r\n",
+            "Status: running\nSocket: x\r\n",
+            "Status: stopped\r",
+            "Starting sandboxd daemon...\nStatus: running\n",
+            "\nStatus: running\n",
+            "extra\nStatus: running\nSocket: x\n",
+            "Status: running\nStatus: stopped\n",
+            "Status: stopped\nSocket: x\nStatus: running\n",
+            "Status: running\nStatus:\n",
+            "Status: running\n\nStatus: running\n",
+            "{\"status\":\"running\"}\n",
+        ];
+        for input in hostile {
+            assert_eq!(parse_daemon_status_text(input), None, "{input:?}");
+        }
+        // Exactly ONE trailing newline is stripped; later non-`Status:` lines
+        // (the captured Socket:/Logs:) are ignored, never kept.
+        assert_eq!(parse_daemon_status_text("Status: running"), Some(true));
+        assert_eq!(parse_daemon_status_text("Status: stopped\n"), Some(false));
+        assert_eq!(
+            parse_daemon_status_text("Status: running\nSocket: $HOME/x.sock\nLogs: $HOME/l\n"),
+            Some(true)
+        );
+    }
+
+    /// §3.8 I3: `CAPTURED_VERSIONS` is exactly the set of version
+    /// directories under `captured/` — adding or dropping a capture set
+    /// without updating the const (or vice versa) fails here.
+    #[test]
+    fn captured_versions_match_fixture_directories() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sbx/captured");
+        let mut dirs: Vec<String> = std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("{}: {e}", root.display()))
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_dir())
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        dirs.sort();
+        for d in &dirs {
+            let v = d
+                .strip_prefix('v')
+                .unwrap_or_else(|| panic!("captured dir {d:?} is not vX.Y.Z"));
+            let parts: Vec<&str> = v.split('.').collect();
+            assert!(
+                parts.len() == 3
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+                "captured dir {d:?} is not vX.Y.Z"
+            );
+        }
+        let mut consts: Vec<String> = CAPTURED_VERSIONS.iter().map(|v| format!("v{v}")).collect();
+        consts.sort();
+        assert_eq!(dirs, consts);
+        assert_eq!(consts, vec!["v0.47.0"]);
+    }
+
+    /// The version NUMBER only: the build/commit is not compared
+    /// (`SbxVersion` drops it), so a different 0.47.0 build still matches.
+    #[test]
+    fn version_captured_compares_the_number_only() {
+        let v047 = SbxVersion::parse(&fixture("state/version.txt")).unwrap();
+        assert!(version_captured(&v047));
+        let other_build = SbxVersion::parse("sbx version: v0.47.0 deadbeefcafe").unwrap();
+        assert!(version_captured(&other_build));
+        for (major, minor, patch) in [(0, 47, 1), (0, 48, 0), (1, 47, 0), (0, 46, 0)] {
+            assert!(!version_captured(&SbxVersion {
+                major,
+                minor,
+                patch,
+                pre: None
+            }));
+        }
+        // Review W2: a pre-release is never "the same version number".
+        let rc = SbxVersion::parse("sbx version: v0.47.0-rc.1 deadbeef").unwrap();
+        assert!(!version_captured(&rc));
+        assert!(!exec_verified(&rc, std::slice::from_ref(&v047)));
     }
 
     #[test]
@@ -1221,6 +1455,7 @@ mod tests {
             major: 0,
             minor: 47,
             patch: 1,
+            pre: None,
         };
         assert!(!exec_verified(&other, std::slice::from_ref(&v047)));
     }

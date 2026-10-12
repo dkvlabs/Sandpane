@@ -187,7 +187,20 @@ export interface SbxStatus {
   installed: boolean;
   binaryPath?: string | null;
   version?: string | null;
+  /** `null` = unknown (Core could not read a captured `Status:` line). */
   daemonRunning?: boolean | null;
+  /**
+   * A8a (additive): whether `verification.run` may spawn `sbx exec` for the
+   * probed version — the same predicate as Core's version gate. Absent when the
+   * version is unknown or sbx is not installed ("this Core does not say").
+   */
+  execVerified?: boolean;
+  /**
+   * A8a (additive): whether the probed version NUMBER equals one whose fixtures
+   * Sandpane captured (macOS arm64; build not compared). Evidence, never a
+   * support claim. Absent when the version is unknown or sbx is not installed.
+   */
+  versionCaptured?: boolean;
 }
 
 export interface AgentCapability {

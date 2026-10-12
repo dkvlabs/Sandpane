@@ -8,6 +8,7 @@ import labs.dkv.sandpane.core.ConnectionManager
 import labs.dkv.sandpane.services.SbxService
 import labs.dkv.sandpane.text.VisibleText
 import labs.dkv.sandpane.services.TaskMonitorService
+import labs.dkv.sandpane.ui.SbxStatusText
 
 /**
  * "Manage project / show activity" refresh (docs/specs/04 §3): re-probe project and sandbox
@@ -66,17 +67,14 @@ class RefreshSandboxesAction : AnAction() {
             val projects = snapshot.projects?.size?.toString() ?: "unknown"
             val sandboxes = snapshot.sandboxes?.size?.toString() ?: "unknown"
             val gate = connection.agentGate()
-            val sbxLine = snapshot.projects?.let { coreProjects ->
-                val caps = connection.capabilities
-                when {
-                    caps?.sbx == null -> "SBX: not reported by this Core"
-                    caps.sbx.installed -> "SBX: installed ${caps.sbx.version?.let { "(${VisibleText.reveal(it)})" } ?: "(version not probed)"}" +
-                        caps.sbx.daemonRunning?.let { if (it) ", daemon running" else ", daemon NOT running" }
-                        .orEmpty() + "; ${coreProjects.size} project(s) in Core"
-
-                    else -> "SBX: NOT INSTALLED — sandbox features cannot work until the user installs Docker " +
-                        "Sandboxes separately (Sandpane bundles no sbx binary)"
-                }
+            // A8a: every sbx line (headline, daemon, verification runs, captured fixtures) comes from
+            // SbxStatusText — exact wording, unit-tested. It is the connect-time `system.probe`
+            // reading, NOT part of this refresh (`sandbox.list` → `sbx ls` can auto-start the daemon),
+            // so the daemon line says "(at last check)" and the block ends with
+            // SbxStatusText.FROM_CONNECTION_CHECK. Read-only: nothing here starts or stops the sbx
+            // daemon.
+            val sbxLines: List<String> = snapshot.projects?.let { coreProjects ->
+                SbxStatusText.refreshLines(connection.capabilities?.sbx, coreProjects.size)
             }.orEmpty()
 
             // Task discovery needs a Core project id; without folder→project resolution the
@@ -94,7 +92,7 @@ class RefreshSandboxesAction : AnAction() {
                 "Sandpane: refreshed · ${snapshot.describeAge()}",
                 buildString {
                     appendLine("projects: $projects · sandboxes: $sandboxes")
-                    if (sbxLine.isNotEmpty()) appendLine(sbxLine)
+                    sbxLines.forEach { appendLine(it) }
                     appendLine(taskLine)
                     appendLine("agent gate: ${gate.reasonForUser()}")
                     snapshot.failure?.let { appendLine("Core problems: ${VisibleText.reveal(it)}") }

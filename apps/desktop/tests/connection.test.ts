@@ -8,6 +8,7 @@ import {
 } from "../src/lib/reducers";
 import { CoreRequestError, type ProbeOutcome } from "../src/lib/core-client";
 import type { AgentCapability, CoreCapabilities } from "../src/lib/protocol";
+import { decodeCoreCapabilities } from "../src/lib/decode";
 
 const capabilities: CoreCapabilities = {
   protocolVersion: 1,
@@ -88,37 +89,128 @@ describe("foldCoreLink", () => {
 });
 
 describe("foldSbxView", () => {
+  const installed = (sbx: Partial<NonNullable<CoreCapabilities["sbx"]>>): CoreCapabilities => ({
+    ...capabilities,
+    sbx: { installed: true, binaryPath: "/x", version: "0.47.0", daemonRunning: null, ...sbx },
+  });
+
   it("distinguishes not-installed from unprobed", () => {
     expect(foldSbxView(null).kind).toBe("unprobed");
     expect(foldSbxView({ ...capabilities, sbx: null }).kind).toBe("unprobed");
     expect(foldSbxView(capabilities).kind).toBe("not_installed");
   });
 
-  it("does not call a located-but-unprobed binary ready", () => {
+  it("daemonRunning null → 'SBX daemon state unknown', never running", () => {
     const view = foldSbxView({
       ...capabilities,
       sbx: { installed: true, binaryPath: "/usr/local/bin/sbx", version: null, daemonRunning: null },
     });
     expect(view.kind).toBe("installed_daemon_unknown");
     expect(view.tone).toBe("attention");
-    expect(view.label).toContain("daemon not probed");
+    expect(view.label).toBe("SBX daemon state unknown");
   });
 
-  it("reports daemon_down separately from not_installed", () => {
-    const view = foldSbxView({
+  it("daemonRunning absent (decoded from an older Core) → 'SBX daemon state unknown'", () => {
+    const decoded = decodeCoreCapabilities({
       ...capabilities,
-      sbx: { installed: true, binaryPath: "/x", version: "0.9", daemonRunning: false },
+      sbx: { installed: true, binaryPath: "/x", version: "0.47.0" },
     });
+    expect(decoded.sbx?.daemonRunning).toBeNull();
+    expect(foldSbxView(decoded).label).toBe("SBX daemon state unknown");
+  });
+
+  it("daemonRunning false → 'SBX daemon stopped (at last check)', separate from not_installed", () => {
+    const view = foldSbxView(installed({ daemonRunning: false }));
     expect(view.kind).toBe("daemon_down");
     expect(view.tone).toBe("danger");
+    expect(view.label).toBe("SBX daemon stopped (at last check)");
   });
 
-  it("only says ready when Core actually probed a running daemon", () => {
-    const view = foldSbxView({
+  it("daemonRunning true → 'SBX daemon running (at last check)' in a tone that does not claim readiness", () => {
+    const view = foldSbxView(installed({ daemonRunning: true }));
+    expect(view.kind).toBe("daemon_running");
+    expect(view.label).toBe("SBX daemon running (at last check)");
+    // A running daemon can still be signed out / have no policy: never green.
+    expect(view.tone).toBe("info");
+    expect(view.tone).not.toBe("success");
+  });
+
+  it("execVerified: false / true / absent", () => {
+    expect(foldSbxView(installed({ execVerified: false })).execLine).toBe(
+      "Verification runs are not enabled for this sbx version",
+    );
+    expect(foldSbxView(installed({ execVerified: true })).execLine).toBe(
+      "Verification runs are enabled for this sbx version",
+    );
+    expect(foldSbxView(installed({})).execLine).toBeNull();
+  });
+
+  it("versionCaptured: true / false / absent", () => {
+    expect(foldSbxView(installed({ versionCaptured: true })).capturedLine).toBe(
+      "Same sbx version number as Sandpane's captured fixtures (macOS; build not compared): yes",
+    );
+    expect(foldSbxView(installed({ versionCaptured: false })).capturedLine).toBe(
+      "Same sbx version number as Sandpane's captured fixtures (macOS; build not compared): no",
+    );
+    expect(foldSbxView(installed({})).capturedLine).toBeNull();
+  });
+
+  it("the evidence lines are independent of the daemon state", () => {
+    for (const daemonRunning of [true, false, null]) {
+      const view = foldSbxView(installed({ daemonRunning, execVerified: false, versionCaptured: true }));
+      expect(view.execLine).toBe("Verification runs are not enabled for this sbx version");
+      expect(view.capturedLine).toMatch(/: yes$/);
+    }
+  });
+
+  it("no evidence lines when sbx is not installed or not probed", () => {
+    const notInstalled = foldSbxView({
       ...capabilities,
-      sbx: { installed: true, binaryPath: "/x", version: "0.9", daemonRunning: true },
+      sbx: { installed: false, binaryPath: null, version: null, daemonRunning: null, execVerified: false, versionCaptured: true },
     });
-    expect(view.kind).toBe("ready");
+    expect(notInstalled.execLine).toBeNull();
+    expect(notInstalled.capturedLine).toBeNull();
+    expect(foldSbxView(null).execLine).toBeNull();
+  });
+
+  it("a non-boolean wire value for a new field is ignored end to end", () => {
+    for (const bad of ["true", 1, 0, {}, [], null]) {
+      const decoded = decodeCoreCapabilities({
+        ...capabilities,
+        sbx: { installed: true, binaryPath: "/x", version: "0.47.0", daemonRunning: true, execVerified: bad, versionCaptured: bad },
+      });
+      const view = foldSbxView(decoded);
+      expect(view.execLine).toBeNull();
+      expect(view.capturedLine).toBeNull();
+      expect(view.label).toBe("SBX daemon running (at last check)");
+    }
+  });
+
+  it("no 'ready' or 'healthy' wording in any sbx state, label or line", () => {
+    const views = [
+      foldSbxView(null),
+      foldSbxView(capabilities),
+      ...[true, false, null].flatMap((daemonRunning) =>
+        [true, false, undefined].flatMap((execVerified) =>
+          [true, false, undefined].map((versionCaptured) =>
+            foldSbxView(
+              installed({
+                daemonRunning,
+                ...(execVerified === undefined ? {} : { execVerified }),
+                ...(versionCaptured === undefined ? {} : { versionCaptured }),
+              }),
+            ),
+          ),
+        ),
+      ),
+    ];
+    for (const view of views) {
+      const text = [view.kind, view.label, view.execLine ?? "", view.capturedLine ?? ""].join(" ");
+      expect(text).not.toMatch(/ready|healthy/i);
+      // The captured line is evidence, never a success claim.
+      if (view.capturedLine !== null) expect(view.tone).not.toBe("success");
+    }
+    expect(views.some((v) => v.tone === "success")).toBe(false);
   });
 });
 

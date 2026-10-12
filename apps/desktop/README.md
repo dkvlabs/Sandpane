@@ -755,9 +755,18 @@ A hash router (no routing dependency) drives this; an unmatched hash renders an 
 Every view renders from the injected `CoreClient`, and the offline/missing path is a first
 class state (`docs/specs/05 §5`): `attaching`, `attached`, `version_mismatch`, `unreachable`
 (carried data is only ever labelled **stale**), plus `transport_unavailable` outside the
-Tauri shell. SBX readiness distinguishes `not_installed`, `daemon_down`,
-`installed_daemon_unknown` and `ready` — the scaffold Core locates the binary but does not
-probe version/daemon, so it maps to `installed_daemon_unknown`, never a green "ready".
+Tauri shell. The SBX state distinguishes `unprobed`, `not_installed`, `daemon_down`
+("SBX daemon stopped (at last check)"), `installed_daemon_unknown` ("SBX daemon state
+unknown") and `daemon_running` ("SBX daemon running (at last check)", `info` tone). The
+daemon state is one probe's reading: listing sandboxes runs `sbx ls`, which sbx 0.47.0 was
+captured auto-starting the daemon, so Sandpane never claims it stays as read. A running daemon is never called
+"ready" or shown green: the captured sbx errors show it can still be unusable (signed out, no
+policy initialised). Where Core sends them (A8a), two plain-text lines follow the badge in
+Settings, Sandboxes and the SBX banner (when one is shown): whether verification runs are enabled for this sbx
+version (`execVerified`, Core's own run-gate predicate; also shown on the Run panel), and
+whether the version number matches Sandpane's captured fixtures (`versionCaptured`; macOS,
+build not compared — evidence, never a support claim). Absent fields render no line; a
+non-boolean value decodes as absent. There is no control that starts or stops the daemon.
 
 Two disclosures are deliberate safety choices rather than cosmetics:
 

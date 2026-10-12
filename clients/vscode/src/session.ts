@@ -99,6 +99,7 @@ import {
   stopOutcomeView,
 } from './vscode/sandboxActions';
 import { plainText } from './text/visibleText';
+import { sbxStatusView } from './vscode/sbxStatus';
 import {
   APPLY_IN_FLIGHT,
   APPLY_LIST_GONE_TEXT,
@@ -222,6 +223,7 @@ import { collectEditorSnapshot } from './vscode/editor';
 import { buildChangeSetPlans, capReviewPlans, materializeUri, type UriFactory } from './vscode/diff';
 import {
   emptySidebarState,
+  type CapabilitySummary,
   type ConnectionTone,
   type ContextPlanView,
   type ConversationAction,
@@ -3739,23 +3741,33 @@ export class SandpaneSession {
       acceptedSends: this.acceptedSends,
       sending: this.sending,
       status: this.status,
-      capabilities: this.capabilities
-        ? {
-            coreVersion: this.capabilities.coreVersion,
-            protocolVersion: this.capabilities.protocolVersion,
-            instanceId: this.capabilities.instanceId,
-            platform: this.capabilities.platform,
-            sbxInstalled: this.capabilities.sbx?.installed ?? null,
-            agents: this.capabilities.agents.map((a: AgentCapability) => ({
-              id: a.id,
-              verified: a.verified,
-              supportsStreaming: a.supportsStreaming,
-              supportsCancel: a.supportsCancel,
-            })),
-          }
-        : null,
+      capabilities: this.capabilities ? this.capabilitySummary(this.capabilities) : null,
       contextPlan: this.planView(),
       notices: this.notices(base),
+    };
+  }
+
+  private capabilitySummary(capabilities: CoreCapabilities): CapabilitySummary {
+    // A8a: the webview gets finished display strings only (src/vscode/sbxStatus.ts);
+    // a `null` exec/captured line = Core did not say, so nothing is shown for it.
+    const sbx = sbxStatusView(capabilities.sbx);
+    return {
+      coreVersion: capabilities.coreVersion,
+      protocolVersion: capabilities.protocolVersion,
+      instanceId: capabilities.instanceId,
+      platform: capabilities.platform,
+      sbxInstalled: capabilities.sbx?.installed ?? null,
+      sbxNote: sbx.note,
+      sbxVersion: sbx.version,
+      sbxDaemon: sbx.daemon,
+      sbxExec: sbx.exec,
+      sbxCaptured: sbx.captured,
+      agents: capabilities.agents.map((a: AgentCapability) => ({
+        id: a.id,
+        verified: a.verified,
+        supportsStreaming: a.supportsStreaming,
+        supportsCancel: a.supportsCancel,
+      })),
     };
   }
 
