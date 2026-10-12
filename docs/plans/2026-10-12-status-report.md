@@ -106,6 +106,8 @@ Each capture is stored under `core/crates/sandpane-core/tests/fixtures/sbx/captu
 
 ## 6. A8 — sbx status, ports and read-only listings
 
+> **Superseded in part (2026-10-12).** After the design security review, the binding A8 and A9 designs are [protocol-v1-additions §3.8 and §3.9](2026-10-09-protocol-v1-additions.md). Where this section differs, §3.8/§3.9 win. In particular: `sbx.status` is folded into `system.probe`; the A9 token TTL is §2's 120 s; there is no durable counts event; Core never reads an orphan worktree's `.git` file and offers no orphan discard; tracked worktrees show the repository and worktree paths separately instead of a one-line command; and the aggregate output id is `verificationOutput:<cutoff>`.
+
 ### 6.1 Principles (bind every A8 sub-step)
 
 1. **Capture-gated advertisement.** A method or feature is advertised only for an sbx version whose real output for that exact command is captured. Today only `version` and `daemon status --json` are captured, so only `sbx.status` can ship advertised. The rest ship in Core and the clients, but stay unadvertised (clients show "not supported by this Core / sbx version") until the capture lands. This uses the same mechanism as `VERIFIED_EXEC_VERSIONS`: a per-surface `VERIFIED_<SURFACE>_VERSIONS` list.
@@ -199,6 +201,8 @@ Each capture is stored under `core/crates/sandpane-core/tests/fixtures/sbx/captu
 8. Splitting A8 into A8a/A8b/A8c commits is allowed if the diff grows past a reviewable size; each one is then logged separately.
 
 ## 7. A9 — `maintenance.cleanup`
+
+> **Superseded in part (2026-10-12).** After the design security review, the binding A8 and A9 designs are [protocol-v1-additions §3.8 and §3.9](2026-10-09-protocol-v1-additions.md). Where this section differs, §3.8/§3.9 win. In particular: `sbx.status` is folded into `system.probe`; the A9 token TTL is §2's 120 s; there is no durable counts event; Core never reads an orphan worktree's `.git` file and offers no orphan discard; tracked worktrees show the repository and worktree paths separately instead of a one-line command; and the aggregate output id is `verificationOutput:<cutoff>`.
 
 ### 7.1 Scope
 

@@ -79,10 +79,10 @@ Each row is one commit, plus its `docs(audit)` log entry. Status is tracked in t
 | A6 | `git.apply` (existing) implemented for reviewed entries | additive: `entries`, `FileChange.taskBlob`/`taskMode`, `ApplyResult.appliedFiles` | **Superseded by §3.6** (originally `--3way` / `cherry-pick`): `host_worktree` only; content bound to the reviewed blob ids; no git process reads the task worktree; exact-set snapshot from objects; host leading-path and dirty gates; `git apply --index` with post-write verification; durable start/finish events. |
 | A7 | `verification.list`, `verification.approve` (user-entered argv + label), `verification.revoke`, `verification.run` | `VerificationCommand { id, label, argv: string[], approvedAt }`, `VerificationResult { exitCode, stdout, stderr, truncated, elapsedMs }` | **Superseded by §3.7**: runs **only** inside the task's sandbox via `sbx exec -- <name> <argv>` (no shell), asynchronously, with output read through the added `verification.result`; approvals refuse secrets; spawning is version-gated on captured proof. Never runs on the host. |
 | A7 | `project.context` | `{ detected: [{ manifest, suggestedCommands: string[][] }], approved: VerificationCommand[] }` | Bounded, read-only manifest parsing. Suggestions are never auto-approved. |
-| A8 | `sbx.status` (read-only diagnostics) | `{ path, version, daemon: { running }, policyInitialized?, captured: boolean }` | From `version` and `daemon status --json`. |
-| A8 | `sandbox.ports.list`, `sandbox.ports.publish` (loopback only) / `unpublish` | — | Each is advertised only if captured `--help` proves the flags. Otherwise it is not advertised. |
-| A8 | policy / templates / MCP / secrets | **read-only listings only** (secrets: names and presence, never values) | Mutating policy, secrets or MCP changes machine-wide settings. They are not exposed in this pass and are recorded as UNVERIFIED and unsupported in the UI. |
-| A9 | `maintenance.cleanup` | `{ dryRun: boolean }` → `{ removable: […], removed: […] }` | Retention for worktrees, artifacts and pruned events. Dry-run is the default. |
+| A8 | `sbx.status` (read-only diagnostics) | `{ path, version, daemon: { running }, policyInitialized?, captured: boolean }` | **Superseded by §3.8**: folded into `system.probe` (`SbxStatus.execVerified?`, `versionCaptured?`; daemon state from the captured text form). |
+| A8 | `sandbox.ports.list`, `sandbox.ports.publish` (loopback only) / `unpublish` | — | **Deferred by §3.8** until captures C-8/C-9 prove the output. |
+| A8 | policy / templates / MCP / secrets | **read-only listings only** (secrets: names and presence, never values); **deferred by §3.8** until captures C-10 to C-13 | Mutating policy, secrets or MCP changes machine-wide settings. They are not exposed in this pass and are recorded as UNVERIFIED and unsupported in the UI. |
+| A9 | `maintenance.cleanup` | `{ dryRun: boolean }` → `{ removable: […], removed: […] }` | **Superseded by §3.9**: `maintenance.inventory` (read-only) + token-confirmed `maintenance.cleanup {items}`; Core-owned temp dirs, DB backups and old verification output; worktrees report-only until W-D. |
 
 **Not in v1 additions** (recorded as follow-ups):
 
@@ -761,6 +761,133 @@ The design-level `security-reviewer` pass on the first draft returned **BLOCK**.
         - Desktop Revoke… requires a trusted event.
         - An INTERNAL "…; nothing was run" refusal reads as definite.
         - Re-approving an existing argv says so.
+
+### 3.8 A8 decisions (sbx status, ports, read-only listings), fixed before implementation
+
+A8 is split by evidence. Only facts proven by a capture in `core/crates/sandpane-core/tests/fixtures/sbx/captured/v0.47.0/` are implemented. Everything else is recorded and waits for the user-run captures listed in [the status report §5](2026-10-12-status-report.md). The design security review of §3.8/§3.9 (recorded in the A8 and A9 audit entries) returned one Critical (A9, item 2 below) and eight Warnings. Each is folded in here and marked with its finding id.
+
+1. **A8a: `sbx.status` is folded into `system.probe` (no new method).**
+   - `system.probe` already returns `sbx: {installed, binaryPath, version, daemonRunning}`, and every client renders it. A separate `sbx.status` method would duplicate it. The A8 table row is superseded.
+   - Folding breaks no shipped client: JetBrains decodes with `ignoreUnknownKeys`, desktop `decode.ts` reads only known keys, VS Code fields are optional, and Rust `SbxStatus` has no `deny_unknown_fields`. The one strict pin, `schemas/core-capabilities.schema.json` (`additionalProperties: false`), changes in the same commit.
+   - **Daemon state from the text form.**
+     - Today the probe runs `sbx daemon status --json`. Its output is captured only for a running daemon; the stopped JSON form is not captured (C-14), so a stopped daemon is unproven today. The JSON parser's `"stopped"` arm is illustrative and is labelled so in its test.
+     - The text form `sbx daemon status` is captured for both states (`state/daemon_status_running.txt`, `state/daemon_status_stopped.txt`). Exit 0 is recorded for the stopped form; the running form's exit status is not recorded, so a non-zero exit reads as `null`. Neither capture shows an auto-start.
+     - **Parse rule (W8):** exit status 0, stdout not truncated, and stdout line 1 (after stripping one trailing `\n`; any `\r` makes it `null`) equal exactly to `Status: running` or `Status: stopped`. No later line may begin with `Status:`. Anything else, including any `Starting…` preamble (the captured `ls --json` auto-start prints one), is `null`, so a probe that changed machine state is never reported as a clean reading. stderr is ignored and never stored. The `Socket:` and `Logs:` lines, which carry home-directory paths, are never parsed, logged, stored or returned.
+     - The JSON parser stays as a unit-tested fallback that is not used by the probe.
+   - **New optional `SbxStatus` fields (additive):**
+     - `execVerified?: boolean` uses the same predicate as the `verification.run` gate (`exec_verified(version, &inner.test_verified_exec_versions)`), so the displayed value can never disagree with what `verification.run` does (I2). In production the seam is empty and `VERIFIED_EXEC_VERSIONS` is empty, so it is false today. It is absent when the version is unknown. Clients show "verification runs are not enabled for this sbx version" before any click.
+     - `versionCaptured?: boolean` is true only when the probed version number equals a version whose fixtures are in the tree (a new `CAPTURED_VERSIONS = [v0.47.0]`, drift-tested against the `captured/` directory names). The build is not compared (`SbxVersion` drops the commit) and the captures are from one macOS arm64 host (I3). Clients show "same sbx version number as Sandpane's captured fixtures (macOS; build not compared): yes/no". It is a statement about evidence, never a support claim.
+   - No new feature string: the fields are optional, and absent means "this Core does not say".
+   - **Clients:** the existing sbx status display gains these lines:
+     - "daemon stopped" is now reachable (desktop and JetBrains already render `daemonRunning: false`);
+     - the exec line;
+     - the captured line;
+     - desktop relabels `daemonRunning === true` from "SBX ready" to "SBX daemon running", because the captured errors show a running daemon can still be unusable (not signed in, policy not initialised) (I4);
+     - desktop's decoder must read the two new fields, or they are silently dropped.
+     There is still no button that starts or stops the daemon (a machine-wide setting).
+2. **A8b (ports) and A8c (policy, template, MCP and secret listings): recorded, not implemented.**
+   - None of their outputs is captured, so a decoder would be written against guessed JSON. That is a mocked integration (AGENTS.md rule 5).
+   - The plan of record (the status report, §6.3 and §6.4) stands: loopback-only ports built from the captured spec grammar, and allowlisted read-only listings with secret names and presence only.
+   - Each becomes its own A8b or A8c step once C-8/C-9, or C-10 to C-13, are captured.
+   - Until then, every client keeps showing these surfaces as "not supported by Sandpane yet; use the sbx CLI".
+3. **Tests:**
+   - the text-form parser against both captures, plus hostile inputs (extra lines, `Status: running ` with a trailing space, CR, a second `Status:` line, a `Starting sandboxd daemon...` preamble, a non-zero exit, 64 KiB truncation) → `null` for all of them;
+   - the probe never runs `ls` (argv pinned);
+   - `execVerified` follows the same predicate as the gate (seam empty → false; seam set → true);
+   - `CAPTURED_VERSIONS` drift against the fixture directories;
+   - schema and drift updates for the two fields;
+   - the service integration test's fake sbx answers the text form (I10).
+
+### 3.9 A9 decisions (maintenance inventory and cleanup), fixed before implementation
+
+A9 cleans up only state that Core itself created. It never touches the user's repositories, sandboxes, sbx settings or global Git config, and it never spawns git or sbx. It supersedes the A9 table row (`maintenance.cleanup {dryRun}`) with a read/act split, so the destructive call follows §2 exactly.
+
+1. **Wire (additive; 34 → 36 methods; new feature `maintenance`):**
+   - **`maintenance.inventory {}`:** read-only and replay-safe. It returns `{items: MaintenanceItem[], truncated}`.
+     - `MaintenanceItem` is `{id, kind, removable, bytes?, sizeIncomplete?, createdAt?, detail, reason?}`.
+     - `kind` is one of `temp | dbBackup | verificationOutput | worktree`; clients treat unknown kinds as open strings, render them unchecked and show Core's `detail`.
+     - `reason` explains why `removable` is false.
+     - `detail` and `reason` are Core-built, escaped (control characters and invalid UTF-8 replaced) and bounded (512 bytes), because foreign directory names are arbitrary bytes (I8).
+     - The item order is deterministic (kind, then id), so `truncated` is stable between scans.
+   - **`maintenance.cleanup {items: string[]}`:** the §2 two-step pattern.
+     - **Step 1 (no `confirmToken`):** Core re-inventories, refuses ids that are unknown or not removable (`VALIDATION_FAILED`, nothing issued), and returns `{confirmation: {token, expiresAt, action: "maintenance.cleanup", target: {items}, impact: string[], external: false}}`.
+     - **Step 2 (same `items` plus `confirmToken`):** Core consumes the token, re-checks every item, removes what still qualifies, and returns `{removed: string[], skipped: [{id, reason}], freedBytes?}`.
+   - **Ids (W2):** a strict grammar, `temp:<lowercase UUID v4>`, `dbBackup:<exact backup file name>`, `verificationOutput:<cutoff>` (see item 2). Entries Core did not create get Core-assigned opaque ids (`foreign:<n>`) and are never removable. No path is ever built from a client-supplied id: ids are only looked up in Core's own fresh inventory. Duplicate ids, ids outside the grammar, or more than 500 ids give `VALIDATION_FAILED`.
+   - **Token binding (W2):** `("maintenance.cleanup", digest)`, where the digest is SHA-256 over the sorted ids, each prefixed by its byte length as a big-endian u32. Step 2 must present exactly the confirmed set. The token's in-memory binding also keeps the step-1 identity `(dev, ino, size, mtime)` of every file-system item; at step 2 a changed identity is skipped with "changed since you confirmed". The TTL is §2's 120 s (the status report's 60 s draft is superseded, I6).
+   - The inventory is capped below the frame backstop (at most 2 000 items), with `truncated` disclosed.
+2. **Item kinds and rules:**
+   - **`temp`:** direct children of `<data>/tmp` named as a lowercase UUID (the A6 apply quarantines and A7 exec working directories). Each is removed on drop, but a crash leaves it behind.
+     - **Liveness is proven across processes, not only in memory (C1).** `<data>/tmp` is shared by every Core that runs as the same user: the single-instance lock is per socket, and a Core started with only `SANDPANE_SOCKET`/`SANDPANE_DB` overridden (the documented live-check workflow) uses the same data directory. So an in-memory "is it mine" check would let one Core delete another Core's in-flight apply or exec directory.
+     - Every `CoreTemp` first creates the sibling lock file `<data>/tmp/<uuid>.live` (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600) and takes an exclusive `flock` on it (`File::lock`, stable since Rust 1.89, or `libc::flock`). It then compares `fstat` of its descriptor with `stat` of the path on `(dev, ino)`; on a mismatch or `ENOENT` (a cleaner unlinked the file between create and lock) it drops the file and retries with a fresh UUID. Only then does it run `mkdir <uuid>`. It holds the lock for its whole lifetime; `Drop` removes the directory, then unlinks the lock file, then releases the lock. The lock dies with the process, so a crash leaves it free. The lock file sits beside the directory, not inside it, because the temp root is the pinned `--work-tree` of some git calls and the cwd of A7 exec; nothing new appears inside it.
+     - An in-process registry (`Arc<Mutex<HashSet<Uuid>>>`, cloned into each `CoreTemp`) is filled before `mkdir`, emptied on the create-error path, and in `Drop` only after `remove_dir_all`.
+     - An entry is removable only when all of these hold: it is not in this Core's registry; its `<uuid>.live`, opened with `O_NOFOLLOW`, takes `flock(LOCK_EX|LOCK_NB)`, or, when the lock file is absent (directories left by a pre-A9 Core), the directory mtime is at least 10 minutes old and older than this Core's start time; and its `symlink_metadata` is a real directory owned by the effective uid, never a symlink. Because the lock is taken before `mkdir`, there is no window in which a live directory exists unlocked.
+     - Both sides open the lock file with `O_CLOEXEC` and use `flock` only, never `fcntl` or `lockf` (a leaked descriptor in a long-lived child would keep the lock for good; POSIX record locks would not conflict within one process). The cleaner opens with `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` and never `O_CREAT`; `fstat` must show a regular file owned by the effective uid, otherwise the entry is `removable: false`; `ENOENT` means the lock-absent path.
+     - The cleaner, after taking `LOCK_NB`, re-`stat`s the path and proceeds only if it still matches its descriptor. At step 2 it holds that `flock` across the removal of the directory, unlinks the lock file, and releases the lock only after the unlink. A lock-only entry is removed only under the same `LOCK_NB` plus re-stat match. A lock file with no directory is part of the same `temp:<uuid>` item and is stale only when it is at least 10 minutes old, so a lock file between its owner's `flock` and `mkdir` is never removed. Inventory releases its probe locks before answering.
+     - Any other name under `tmp/` is listed as `foreign:<n>` with `removable: false` ("not created by Sandpane").
+     - Removal is `std::fs::remove_dir_all` on that child path, which is symlink-safe for the final component and the contents on Unix (Rust ≥ 1.58.1; MSRV 1.89).
+   - **`dbBackup` (W3):** files beside the database matching exactly `<db file name>.pre-v<N>.bak` or `.pre-v<N>.bak.<k>` (the migration backups from `db.rs`).
+     - They are listed as removable only when the database path's parent canonicalises to the data directory, and each file's `symlink_metadata` is a regular file owned by the effective uid. Otherwise they are `removable: false` with "the database is outside Sandpane's data directory; manage these files yourself". An overridden `SANDPANE_DB` in a shared directory such as `/tmp` is therefore never cleaned.
+     - The newest backup with `N == LATEST_SCHEMA_VERSION` is `removable: false` ("the only way back to the previous Sandpane Core version"), because older Cores refuse a newer database (`DbError::TooNew`). Migration v9 creates `.pre-v9.bak`, so this covers A9's own migration.
+     - The impact reads "a full copy of your projects, conversations and messages as they were at schema v{N−1}, before Core migrated to v{N}".
+     - Clients leave them **unchecked by default** and list them separately in the confirmation.
+     - Removal is `remove_file` after the regular-file, owner and identity re-check.
+     - Info, pre-existing: `VACUUM INTO` writes with the process umask, so a backup beside an overridden database may be group- or other-readable. The inventory reports a mode wider than 0600 in `detail`.
+   - **`verificationOutput` (W1, W4):** one aggregate item per inventory, `verificationOutput:<cutoff>`.
+     - The retention is a `CoreConfig` field like `confirmation_ttl` (default 30 days, clamped 1..=3650 days; Core reads no runtime settings table today).
+     - The cutoff is the exact `YYYY-MM-DDTHH:MM:SSZ` form Core emits; it is parsed strictly and must re-serialise byte for byte. It is accepted only if `cutoff <= now − retention`, checked at both steps. A client can never choose a later cutoff, so it cannot prune recent runs.
+     - It covers runs with `status IN ('finished','interrupted') AND finished_at IS NOT NULL AND finished_at < cutoff AND output_pruned = 0`. Rows with a NULL `finished_at` and `running` rows are never touched.
+     - Step 2 runs exactly `UPDATE verification_runs SET stdout = '', stderr = '', output_pruned = 1 WHERE <the predicate above>`, in batches of 500 rows per transaction, releasing the database lock between batches, with `PRAGMA secure_delete = ON` for those transactions (best effort, recorded as such). A partial result is reported honestly.
+     - `bytes` uses `length(CAST(stdout AS BLOB)) + length(CAST(stderr AS BLOB))`, because `length()` on TEXT counts characters.
+     - **Honesty:** `freedBytes` counts only file-system removals and never this kind. The result says "output removed from Sandpane's records; the database file does not shrink, and older migration backups may still contain it".
+     - Migration v9 adds `output_pruned`. `verification.result` then returns `outputPruned: true` (an additive field), which takes precedence over `stdoutTruncated`/`stderrTruncated`/`outputIncomplete` in client rendering; clients say "output removed by maintenance cleanup".
+     - **A7 invariants hold (I5):** the terminal write only updates `WHERE status = 'running'`, so the prune cannot create or overwrite a terminal record; a keyed replay of `verification.run` stores only `{runId, startedSequence}`; the `verification.result` frame refusal only gets smaller. The `verification.finished` event's `stdoutBytes` will now disagree with the stored output, which is why `outputPruned` is required. The prune changes task-scoped rows without an event; other clients learn of it on their next `verification.result` (I6).
+   - **`worktree`:** report-only in A9 (`removable: false`, no size).
+     - **Tracked:** task rows with `worktree_path` set and `worktree_removed_at` null, whose task status is final (`completed`, `rejected`, `failed`, `cancelled`). They show the repository path and the worktree path as separate copyable values, with the advice "stop the task's sandbox first, then run `git worktree remove` from that repository" (W6). If a one-line command is ever shown, every argument is POSIX single-quote-escaped by Core from database-known values only; it is displayed as text, never executed and never sent to a terminal.
+     - **Orphans:** directories under `<data>/worktrees` that no task row in this Core's database references, for example those left by a project or conversation delete, which hard-deletes rows but never touches host files. They show the path only, labelled "not referenced by this Core's database; another Sandpane Core using a different database may own it" (C1). Directories younger than 10 minutes are skipped, because a worktree being allocated exists on disk before its task row commits (I7). Core never reads an orphan's agent-writable `.git` file (the status report §7.1 idea is dropped, W6).
+     - The reason is "removal waits for W-D", because discarding runs git inside the worktree, the A4b precondition.
+     - **No size walk (W5).** Worktree contents are writable by the bound sandbox, so A9 reports no worktree size. If sizes are ever added, the walk is iterative, works from directory descriptors (`openat` with `O_NOFOLLOW|O_DIRECTORY`, then `fstatat` with `AT_SYMLINK_NOFOLLOW`), never opens non-directories, never crosses `st_dev`, caps depth at 256, counts `st_blocks`, and runs on a worker whose result is abandoned at the deadline. `temp` sizes use the same descriptor-based walk.
+3. **Path checks at cleanup time (W7):**
+   - Step 2 re-runs the owner / 0700 / not-a-symlink checks on the data directory and on `tmp/` immediately before removal, and compares `tmp/`'s `(dev, ino)` with the descriptor opened at the start of the call. Each child is re-checked with `fstatat(AT_SYMLINK_NOFOLLOW)` on that descriptor before `remove_dir_all`.
+   - Residual: `remove_dir_all` takes a path, so an intermediate-component swap between the check and the call is not excluded. Under the specs/06 same-user model that attacker could unlink these files anyway; this is confused-deputy hardening, recorded as an accepted residual.
+   - Directory enumeration is capped at 10 000 entries per directory, with `truncated` disclosed.
+   - If `worktrees_root` is `None` (no data directory), the `temp` and `worktree` kinds are reported as unavailable.
+4. **Bounds:**
+   - Size walks stop at 100 000 entries or 2 s per item and set `sizeIncomplete: true`.
+   - The whole inventory has a 10 s budget; past it, the remaining items are listed without sizes.
+   - Inventory and cleanup are both single-flight: a second inventory while one runs gets `CONFLICT` (I8), and so does a second cleanup.
+   - Cleanup removes items in order and never holds the database lock during file-system work.
+5. **Durability and honesty:**
+   - Not task-scoped, so there are no task events. The status report §7.2 durable "counts" event is dropped deliberately: the answer carries the outcome, and the log line records it (I6).
+   - The answer lists each removed and skipped item with a reason. A partial failure is never reported as "cleaned".
+   - Only id, kind and outcome are written to the log line, never a path from inside a worktree.
+6. **Not in A9:**
+   - `sbx prune` (machine-wide; it also deletes sandbox secrets; uncaptured, C-15);
+   - worktree and branch removal (W-D);
+   - idempotency keys (already pruned on every keyed write by `idempotency::prune`);
+   - event pruning (the conversation delete already removes its `task_events`; live task events are append-only);
+   - any automatic or scheduled cleanup.
+7. **Clients (I9):**
+   - A Maintenance view, gated on the `maintenance` feature: desktop Settings, a VS Code command plus a webview section, and a JetBrains action plus dialog.
+   - The flow:
+     1. "Scan" runs the inventory on a user gesture.
+     2. Items are grouped by kind with sizes. Report-only worktrees show their paths and the advice as copyable text.
+     3. Removable items have checkboxes; `dbBackup` is unchecked by default; unknown kinds are unchecked and show `detail`.
+     4. "Clean up N items…" calls step 1, and a gesture-only confirmation shows Core's `impact`, with `dbBackup` items listed separately.
+     5. Confirming calls step 2, and the result lists removed and skipped items. The view always re-scans after step 2.
+   - Single flight. Step 2 is never called without a fresh gesture and is never auto-retried. An expired token re-runs step 1 only on a new gesture.
+   - A lost answer at step 2, or a token refusal after one, reads "some items may have been removed — scan again", never "nothing was removed".
+8. **Tests:**
+   - each kind against real temporary directories (symlink planted in `tmp/`, a live `CoreTemp`, a non-UUID name, a backup name look-alike, a `.bak` symlink);
+   - **cross-process liveness:** a `CoreTemp` held by a second process (a helper child holding the `<uuid>.live` flock) is never removable; one whose holder exited is; a directory without a lock file younger than 10 minutes is not; the lock file never appears inside the temp root; a forced interleaving (the lock file unlinked between the owner's create and `flock`) makes the owner retry with a fresh UUID; the cleaner releases the lock only after the unlink (a hook between unlink and release); a FIFO named `<uuid>.live` does not block the scan and is not removable;
+   - the token is bound to the exact set (subset, superset, duplicate ids, reordered with the same digest, expired, replayed), and a file whose identity changed between steps is skipped;
+   - the cutoff grammar (non-canonical forms, a cutoff later than `now − retention`) is refused at both steps;
+   - re-check at step 2 (an item became live, was removed in between, or a run finished after the cutoff);
+   - `dbBackup` beside a database outside the data directory is not removable, and the newest current-version backup is not removable;
+   - `output_pruned` keeps the record, `verification.result` discloses it, and `freedBytes` excludes it;
+   - migration v9 with backup and downgrade refusal;
+   - no git or sbx process is spawned during inventory or cleanup (spawn counter at 0);
+   - bounds hit;
+   - single-flight `CONFLICT` for both methods.
 
 ## 4. Client obligations per addition
 
