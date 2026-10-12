@@ -269,3 +269,58 @@ These are retention targets Core owns, all on this machine:
 3. **The CL client backlog**, one client per entry.
 4. **The final README:** every run/install step for desktop, VS Code and JetBrains re-executed from a fresh clone in isolated directories, counts updated, GUI launches labeled UNVERIFIED unless the user launches them.
 5. **A final `make check`**, a clean tree, and the sbx daemon confirmed stopped.
+
+## 9. Progress since this report and handoff (2026-10-12)
+
+### Done on `main`
+
+| Step | Commits | Log |
+|---|---|---|
+| A8 and A9 design decisions (§3.8, §3.9 of the design of record) | `391babc` | design review in the commit message |
+| **A8a**: `system.probe` reads `sbx daemon status` in text form, plus `execVerified` and `versionCaptured` in all three clients | `20829f9`, `f756542` | [audit 0039](../audit/0039-protocol-a8a-sbx-status-review.md), CHANGELOG 0039 |
+
+A8b (ports) and A8c (policy, template, MCP and secret listings) stay deferred until captures C-8 to C-14 exist (§5). A8c also carries the open item that `sandbox.list` may auto-start a stopped daemon.
+
+### A9: Core on branch `wip/a9-maintenance-core`, not on `main`
+
+Commit `47afc5d` holds the Core and schemas for `maintenance.inventory` and `maintenance.cleanup`:
+
+- 36 methods and the `maintenance` feature (7 features);
+- migration v9 `output_pruned`;
+- `CoreConfig.verification_output_retention`;
+- the `CoreTemp` sibling lock-file protocol;
+- `verification.result.outputPruned`.
+
+At that commit, `cargo fmt --check` and `clippy --all-targets -D warnings` are clean, and `cargo test` gives 655 passed, 0 failed. The work is kept off `main` because `apps/desktop/src-tauri/src/ipc_client.rs` does not compile against it: `is_read_only` is an exhaustive match and pins `Method::ALL` at 34.
+
+### Remaining A9 steps, in order
+
+1. **Re-review the Core review fixes.** The security review returned PASS-WITH-WARNINGS:
+   - W1: protect the union of the newest backup at `LATEST_SCHEMA_VERSION` and the overall newest backup, newest by mtime within one N;
+   - W2: step 2 must never report a temp item as untouched after `remove_dir_all` has started;
+   - I1: a failed data-dir check makes `dbBackup` items non-removable;
+   - I2: `wal_checkpoint(TRUNCATE)` after the prune, with a wider note;
+   - I3: the "in use" reason wording;
+   - I4: `CoreTemp::lock_file` unlinks its own lock file when `metadata()` fails;
+   - I5 and I6 are accepted with no change.
+
+   The fix pass was stopped mid-way, with its tests passing, before its mutation checks finished. Before freezing the wire, check each fix in `core/crates/sandpane-service/src/maintenance.rs` and `git_apply.rs`, then have `security-reviewer` re-check W1 and W2.
+2. **Clients, in parallel:** desktop (including `src-tauri` `ipc_client.rs`: inventory is read-only, cleanup is a write, pin 36, deadlines of at least 20 s), VS Code and JetBrains. Work from the client brief: plain-text rendering; the dbBackup checkbox unchecked by default; worktrees report-only; on a lost step-2 answer, "Some items may have been removed — scan again"; on `CONFLICT`, "Another maintenance scan or cleanup is running; try again shortly"; always re-scan after step 2; render `outputPruned`. Then run a client `security-reviewer` pass.
+3. **Gates:**
+   - `make check`;
+   - JetBrains run alone: `./gradlew test --rerun buildPlugin verifyPluginStructure --offline --no-build-cache`, then `verifyPlugin`;
+   - the live Core checks in isolated directories (`env -i`, `SANDPANE_SBX_PATH=/nonexistent/sbx`);
+   - the invisible-character scan and the secret gate.
+4. **Docs:** add an "implementation and review outcome" item to design §3.9, recording the deviations:
+   - the wire additions `path`, `repositoryPath`, `unavailable` and `notes`;
+   - the `MaintenanceConfirmation` shape;
+   - `worktree:` and `foreign:` ids;
+   - no worktree size walk;
+   - the batched prune;
+   - step 1 runs under single-flight;
+   - non-Unix Core answers `INTERNAL`.
+
+   Also add an A9 row to `docs/compatibility.md` and update the README status line and counts.
+5. **Commits:** squash or rebase the branch onto `main` together with the client changes as `feat(protocol): maintenance inventory and cleanup (A9)`. Then write `docs/audit/0040-protocol-a9-maintenance-review.md` and CHANGELOG 0040, and commit them as `docs(audit): log implementation 0040 — …`.
+
+After A9, the order in §8 applies unchanged. No sbx daemon was started in this work: sbx was never run, and every check used a nonexistent sbx path.
