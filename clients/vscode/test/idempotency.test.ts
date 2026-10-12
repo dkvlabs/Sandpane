@@ -115,6 +115,7 @@ describe('features', () => {
       'conversation-send-mode',
       'git-apply',
       'verification',
+      'maintenance',
     ]);
     expect(coreAdvertisesFeature({}, 'idempotency-keys')).toBe(false);
     expect(coreAdvertisesFeature(null, 'idempotency-keys')).toBe(false);

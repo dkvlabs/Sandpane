@@ -75,6 +75,9 @@ export const MAX_SCOPING_ID_LEN = 200;
  * A7 (design §3.7) added the six verification methods right after
  * `git.apply` (34 in total). None takes a command string: `verification.run`
  * names an APPROVED command by id, never argv.
+ *
+ * A9 (design §3.9) added `maintenance.inventory` and the two-step
+ * `maintenance.cleanup` at the end (36 in total).
  */
 export const CORE_METHODS = [
   'system.probe',
@@ -114,6 +117,10 @@ export const CORE_METHODS = [
   'verification.run',
   'verification.result',
   'project.context',
+  // A9 (§3.9): the read-only inventory and the token-confirmed cleanup of
+  // Core-created state. Step 2 only ever runs from a confirmed gesture.
+  'maintenance.inventory',
+  'maintenance.cleanup',
 ] as const;
 
 export type CoreMethodName = (typeof CORE_METHODS)[number];
@@ -261,6 +268,11 @@ export const KNOWN_FEATURES = [
   // result and project.context). The UI is enabled ONLY when advertised.
   // Running is additionally gated by Core on a PROVEN sbx version.
   'verification',
+  // A9 (§3.9): `maintenance.inventory` and the token-confirmed
+  // `maintenance.cleanup` of Core-created state (temp directories, migration
+  // backups, old verification output; worktrees report-only). The Maintenance
+  // view is enabled ONLY when advertised.
+  'maintenance',
 ] as const;
 
 export type CoreFeature = (typeof KNOWN_FEATURES)[number];
@@ -927,6 +939,13 @@ export interface VerificationResult {
   startedAt: string;
   finishedAt?: string;
   outputIncomplete?: boolean;
+  /**
+   * A9 (additive): `maintenance.cleanup` removed this run's stored output.
+   * Takes precedence over `stdoutTruncated` / `stderrTruncated` /
+   * `outputIncomplete` in rendering — the copy says "output removed by
+   * maintenance cleanup", never "truncated".
+   */
+  outputPruned?: boolean;
 }
 
 /** One detected root manifest. Suggestions and notes are UNTRUSTED display strings. */
@@ -947,4 +966,83 @@ export interface RepositoryContext {
 export interface ProjectContextResult {
   repositories: RepositoryContext[];
   approved: VerificationCommand[];
+}
+
+// ---------------------------------------------------------------------------
+// A9 — maintenance inventory and cleanup (design 2026-10-09 §3.9)
+// ---------------------------------------------------------------------------
+
+/** `MaintenanceItem.kind` values Core sends today; `kind` stays an OPEN string. */
+export const MAINTENANCE_KINDS = ['temp', 'dbBackup', 'verificationOutput', 'worktree'] as const;
+export type MaintenanceKind = (typeof MAINTENANCE_KINDS)[number];
+
+/**
+ * One inventory entry. `detail`, `reason`, `path` and `repositoryPath` are
+ * Core-built, escaped, capped UNTRUSTED display text (rendered as text,
+ * never HTML). `bytes` is absent when Core did not measure a size (temp and
+ * worktree items). Worktree items are report-only: the paths are copyable
+ * display values, never executed.
+ */
+export interface MaintenanceItem {
+  id: string;
+  kind: string;
+  removable: boolean;
+  bytes?: number;
+  sizeIncomplete?: boolean;
+  createdAt?: string;
+  detail: string;
+  reason?: string;
+  path?: string;
+  repositoryPath?: string;
+}
+
+/** A kind Core could not inventory (e.g. no data directory). Open string kind. */
+export interface MaintenanceUnavailable {
+  kind: string;
+  reason: string;
+}
+
+/** `maintenance.inventory` result. Items are ordered by (kind, id). */
+export interface MaintenanceInventoryResult {
+  items: MaintenanceItem[];
+  truncated: boolean;
+  unavailable?: MaintenanceUnavailable[];
+}
+
+/** The confirmed item set of a `maintenance.cleanup` confirmation. */
+export interface MaintenanceTarget {
+  items: string[];
+}
+
+/** Step-1 answer of `maintenance.cleanup` (the §2 confirmation shape). */
+export interface MaintenanceConfirmation {
+  token: string;
+  /** RFC 3339 UTC. */
+  expiresAt: string;
+  action: string;
+  target: MaintenanceTarget;
+  /** UNTRUSTED display lines from Core; rendered as text. */
+  impact: string[];
+  /** Always false for A9 (Core-created state only). */
+  external: boolean;
+}
+
+/** An item step 2 did not remove, with Core's reason. */
+export interface MaintenanceSkipped {
+  id: string;
+  reason: string;
+}
+
+/**
+ * `maintenance.cleanup` result: `confirmation` at step 1; `removed` +
+ * `skipped` (+ `freedBytes`) at step 2. `freedBytes` counts file-system
+ * removals only (never verificationOutput) and is absent when a removed
+ * item's size was not measured. `notes` are Core's honesty statements.
+ */
+export interface MaintenanceCleanupResult {
+  confirmation?: MaintenanceConfirmation;
+  removed?: string[];
+  skipped?: MaintenanceSkipped[];
+  freedBytes?: number;
+  notes?: string[];
 }

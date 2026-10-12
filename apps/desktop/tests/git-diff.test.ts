@@ -52,7 +52,7 @@ import {
 } from "../src/lib/git-messages";
 import { METHODS, type GitDiffResult } from "../src/lib/protocol";
 import { describeCoreError } from "../src/lib/reducers";
-import { A5_CORE_METHODS, A7_CORE_METHODS, FakeCore, type FakeGitTask } from "./support/fake-core";
+import { A5_CORE_METHODS, A7_CORE_METHODS, A9_CORE_METHODS, FakeCore, type FakeGitTask } from "./support/fake-core";
 import {
   SERVICE_RUST,
   desktopProxyRustSource,
@@ -120,17 +120,17 @@ async function failure(p: Promise<unknown>): Promise<CoreRequestError> {
 // ---------------------------------------------------------------------------
 
 describe("A5 drift against the Rust sources", () => {
-  it("34 methods (since A7), git.diff right after git.review and before git.apply", () => {
+  it("36 methods (since A9), git.diff right after git.review and before git.apply", () => {
     const rust = rustMethodAll();
-    expect(rust.declaredLength).toBe(34);
+    expect(rust.declaredLength).toBe(36);
     expect([...METHODS]).toEqual(rust.names);
-    expect(METHODS).toHaveLength(34);
+    expect(METHODS).toHaveLength(36);
     const at = METHODS.indexOf("git.diff");
     expect(METHODS[at - 1]).toBe("git.review");
     expect(METHODS[at + 1]).toBe("git.apply");
     // The A5 Core's 28 are today's up to git.apply; A7 added six after it.
     expect([...A5_CORE_METHODS]).toEqual(METHODS.slice(0, METHODS.indexOf("git.apply") + 1));
-    expect([...A7_CORE_METHODS]).toEqual([...METHODS]);
+    expect([...A9_CORE_METHODS]).toEqual([...METHODS]);
   });
 
   it("git.diff is not replay-safe on either side", () => {

@@ -43,6 +43,9 @@ import {
   type TaskSubscribeParams,
   type TaskSummary,
   type ProjectContextResult,
+  type MaintenanceCleanupResult,
+  type MaintenanceConfirmation,
+  type MaintenanceInventoryResult,
   type VerificationApproveParams,
   type VerificationCommand,
   type VerificationResult,
@@ -71,6 +74,8 @@ import {
   decodeTaskSummaries,
   decodeTaskSummary,
   decodeProjectContext,
+  decodeMaintenanceCleanup,
+  decodeMaintenanceInventory,
   decodeVerificationApprove,
   decodeVerificationList,
   decodeVerificationResult,
@@ -100,6 +105,8 @@ import {
   buildTaskSubscribeParams,
   buildGitApplyParams,
   buildGitDiffParams,
+  buildMaintenanceCleanupConfirmParams,
+  buildMaintenanceCleanupRequestParams,
   buildVerificationApproveParams,
   buildVerificationProjectParams,
   buildVerificationResultParams,
@@ -252,6 +259,12 @@ export const METHOD_TIMEOUT_MS: Readonly<Partial<Record<Method, number>>> = {
   // have started" while Core is still gating. list / approve / revoke /
   // result keep the default.
   "verification.run": 45_000,
+  // A9 (design 2026-10-09 §3.9 item 4): the inventory runs under Core's 10 s
+  // scan budget and a cleanup step re-scans before removing, so both get 35 s
+  // (the native proxy gives up at 30 s, drift-tested). Step 2 is a write: a
+  // lost answer keeps the may-have-been-applied copy.
+  "maintenance.inventory": 35_000,
+  "maintenance.cleanup": 35_000,
 };
 
 /** The webview deadline for one method with the default options. */
@@ -900,6 +913,71 @@ export class CoreClient {
   async getProjectContext(projectId: string): Promise<ProjectContextResult> {
     const params = preflight(() => buildVerificationProjectParams(projectId));
     return decodeProjectContext(await this.request("project.context", params));
+  }
+
+  // -- A9 maintenance (design 2026-10-09 §3.9) ------------------------------
+
+  /**
+   * `maintenance.inventory` `{}`: Core's fresh inventory, decoded. A read; a
+   * lost answer is surfaced and the user scans again — never re-sent.
+   */
+  async maintenanceInventory(): Promise<MaintenanceInventoryResult> {
+    return decodeMaintenanceInventory(await this.request("maintenance.inventory", {}));
+  }
+
+  /**
+   * `maintenance.cleanup` STEP 1: sends exactly `{ items }`. Core changes
+   * nothing and answers a confirmation bound to that exact set. The
+   * confirmation must repeat the requested items as a set; anything else is
+   * refused so a token can never be confirmed against a different set.
+   */
+  async requestMaintenanceCleanup(items: readonly string[]): Promise<MaintenanceConfirmation> {
+    const params = preflight(() => buildMaintenanceCleanupRequestParams(items));
+    const result = decodeMaintenanceCleanup(
+      await this.request("maintenance.cleanup", params),
+    );
+    if (!result.confirmation) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "maintenance.cleanup step 1 answered a removal outcome without a confirmation token; nothing was removed",
+      );
+    }
+    const want = [...params.items].sort();
+    const got = [...result.confirmation.target.items].sort();
+    if (want.length !== got.length || want.some((id, i) => id !== got[i])) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "maintenance.cleanup confirmation names a different item set than the one requested; nothing was confirmed",
+      );
+    }
+    return result.confirmation;
+  }
+
+  /**
+   * `maintenance.cleanup` STEP 2: `{ items, confirmToken }` with the exact
+   * confirmed set. Only a decoded `removed`/`skipped` outcome is a success —
+   * Core answers a bad, expired or reused token with `VALIDATION_FAILED`.
+   * Never retried; a lost answer means items MAY HAVE BEEN REMOVED.
+   */
+  async confirmMaintenanceCleanup(
+    items: readonly string[],
+    confirmToken: string,
+  ): Promise<Omit<MaintenanceCleanupResult, "confirmation">> {
+    const params = preflight(() => buildMaintenanceCleanupConfirmParams(items, confirmToken));
+    const result = decodeMaintenanceCleanup(
+      await this.request("maintenance.cleanup", params),
+    );
+    if (result.confirmation || result.removed === undefined || result.skipped === undefined) {
+      throw new CoreRequestError(
+        "client",
+        "MALFORMED_FRAME",
+        "maintenance.cleanup step 2 answered with a new confirmation instead of a removal outcome; scan again",
+        { mayHaveBeenApplied: true },
+      );
+    }
+    return result;
   }
 
   /**

@@ -216,6 +216,12 @@ function registrations(
     vscode.commands.registerCommand('sandpane.runVerification', verificationHandlers['sandpane.runVerification']),
     vscode.commands.registerCommand('sandpane.showVerificationResult', verificationHandlers['sandpane.showVerificationResult']),
 
+    // A9: the Maintenance flow (scan → pick → modal → step 2 → re-scan). The
+    // handler IGNORES its arguments; everything is read fresh from Core.
+    vscode.commands.registerCommand('sandpane.maintenance', (..._ignored: unknown[]) =>
+      guard('Sandpane: clean up Core state', () => session.runMaintenanceCleanup()).then(() => undefined),
+    ),
+
     vscode.commands.registerCommand('sandpane.newProject', () =>
       guard('Sandpane: new project', async () => {
         const name = await vscode.window.showInputBox({

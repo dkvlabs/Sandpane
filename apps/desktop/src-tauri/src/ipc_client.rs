@@ -79,6 +79,13 @@ pub fn proxy_deadline_ms(method: Method) -> u64 {
         // too. A write: a lost answer keeps MAY_HAVE_BEEN_APPLIED_SUFFIX.
         // list / approve / revoke / result are Core DB work: the default.
         Method::VerificationRun => 43_000,
+        // A9 (design 2026-10-09 §3.9 item 4): the inventory runs under Core's
+        // 10 s scan budget, and a cleanup step re-scans before it removes, so
+        // both get at least the 20 s the client brief demands (30 s here; the
+        // webview waits 35 s). Step 2 is a write: a lost answer keeps
+        // MAY_HAVE_BEEN_APPLIED_SUFFIX.
+        Method::MaintenanceInventory => 30_000,
+        Method::MaintenanceCleanup => 30_000,
         _ => PROXY_DEADLINE_MS,
     }
 }
@@ -163,6 +170,11 @@ fn replay_safe(method: Method) -> bool {
 /// write Core's database, and `verification.run` starts an `sbx exec` inside
 /// the sandbox, so a lost answer to any of those three may have applied.
 ///
+/// A9 (design 2026-10-09 §3.9): `maintenance.inventory` is a read. Both
+/// `maintenance.cleanup` steps are writes — step 1 mints a single-use
+/// confirmation token, step 2 removes files or prunes rows — so a lost
+/// answer to either may have applied.
+///
 /// An exhaustive `match` with no wildcard: a new `Method` variant does not
 /// compile until someone decides whether it can change state.
 fn is_read_only(method: Method) -> bool {
@@ -179,7 +191,8 @@ fn is_read_only(method: Method) -> bool {
         | Method::GitDiff
         | Method::VerificationList
         | Method::VerificationResult
-        | Method::ProjectContext => true,
+        | Method::ProjectContext
+        | Method::MaintenanceInventory => true,
         Method::ProjectCreate
         | Method::ProjectUpdate
         | Method::ProjectArchive
@@ -200,7 +213,8 @@ fn is_read_only(method: Method) -> bool {
         | Method::VerificationApprove
         | Method::VerificationRevoke
         | Method::VerificationRun
-        | Method::GitApply => false,
+        | Method::GitApply
+        | Method::MaintenanceCleanup => false,
     }
 }
 
@@ -803,13 +817,15 @@ mod tests {
             "verification.run",
             "verification.result",
             "project.context",
+            "maintenance.inventory",
+            "maintenance.cleanup",
         ] {
             assert!(
                 validate_frame(&frame(method)).is_ok(),
                 "{method} must be allowlisted because Core's crate parses it"
             );
         }
-        assert_eq!(Method::ALL.len(), 34);
+        assert_eq!(Method::ALL.len(), 36);
         // Wire names are lowercase snake_case segments; camelCase is not a method.
         assert_eq!(
             validate_frame(&frame("project.addRepository"))
@@ -929,6 +945,10 @@ mod tests {
             Method::VerificationRun,
             Method::VerificationResult,
             Method::ProjectContext,
+            // A9: inventory is a read but stays out for the A-series
+            // uniformity; both cleanup steps mint or spend a token.
+            Method::MaintenanceInventory,
+            Method::MaintenanceCleanup,
         ] {
             assert!(!replay_safe(m), "{m:?} must never be re-sent");
         }
@@ -1024,6 +1044,10 @@ mod tests {
         // A7: verification.run gates on sbx synchronously before its durable
         // start (webview waits 45 s).
         assert_eq!(proxy_deadline_ms(Method::VerificationRun), 43_000);
+        // A9: the inventory runs Core's 10 s scan budget, and a cleanup step
+        // re-scans before removing; both get 30 s (webview waits 35 s).
+        assert_eq!(proxy_deadline_ms(Method::MaintenanceInventory), 30_000);
+        assert_eq!(proxy_deadline_ms(Method::MaintenanceCleanup), 30_000);
     }
 
     /// A7 review: before `verification.run` records its durable start, Core
@@ -1095,6 +1119,45 @@ mod tests {
                 assert!(!lost.may_have_been_applied, "{m:?} {code}");
                 assert_eq!(lost.message, "Core went quiet", "{m:?} {code}");
             }
+        }
+    }
+
+    /// A9 (design 2026-10-09 §3.9): `maintenance.cleanup` — both steps —
+    /// changes state (step 1 mints a single-use token, step 2 removes files
+    /// or prunes rows), so a lost answer keeps the "may have been applied"
+    /// suffix; `maintenance.inventory` is a read and never gets it. Neither
+    /// is replay-safe.
+    #[test]
+    fn a9_cleanup_keeps_the_suffix_and_inventory_never_gets_it() {
+        let codes = [
+            "TIMEOUT",
+            "CONNECTION_CLOSED",
+            "MALFORMED_FRAME",
+            "FRAME_TOO_LARGE",
+        ];
+        assert!(!is_read_only(Method::MaintenanceCleanup));
+        assert!(!replay_safe(Method::MaintenanceCleanup));
+        for code in codes {
+            let lost = after_write(
+                Method::MaintenanceCleanup,
+                ProxyError::new(code, "Core went quiet"),
+            );
+            assert!(lost.may_have_been_applied, "{code}");
+            assert_eq!(
+                lost.message,
+                format!("Core went quiet{MAY_HAVE_BEEN_APPLIED_SUFFIX}"),
+                "{code}"
+            );
+        }
+        assert!(is_read_only(Method::MaintenanceInventory));
+        assert!(!replay_safe(Method::MaintenanceInventory));
+        for code in codes {
+            let lost = after_write(
+                Method::MaintenanceInventory,
+                ProxyError::new(code, "Core went quiet"),
+            );
+            assert!(!lost.may_have_been_applied, "{code}");
+            assert_eq!(lost.message, "Core went quiet", "{code}");
         }
     }
 

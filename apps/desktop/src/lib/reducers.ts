@@ -1089,6 +1089,12 @@ export function outcomeView(outcome: string, exitCode: number | undefined): Outc
 export const DISCLOSURE_OUTPUT_INCOMPLETE =
   "output may be incomplete: a process kept the output open after the command exited";
 export const DISCLOSURE_OUTPUT_WITHHELD = "output was not stored because the secret check was unavailable";
+/**
+ * A9 (§3.9 item 2): `maintenance.cleanup` pruned this run's stored output.
+ * Takes precedence over the truncation/incomplete disclosures — pruned output
+ * is not "truncated" output, so those flags are never shown beside it.
+ */
+export const DISCLOSURE_OUTPUT_PRUNED = "output removed by maintenance cleanup";
 export const DISCLOSURE_BEST_EFFORT =
   "Output is redacted before Core stores it, on a best-effort basis; it was decoded lossily, and a secret cut at the 64 KiB cap can survive as a partial token.";
 

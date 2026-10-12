@@ -420,6 +420,73 @@ export function buildSandboxRemoveConfirmParams(
 }
 
 // ---------------------------------------------------------------------------
+// A9 maintenance cleanup params
+// ---------------------------------------------------------------------------
+
+/** Core's `MAX_CLEANUP_ITEMS` (design 2026-10-09 §3.9 item 1). */
+export const MAX_CLEANUP_ITEMS = 500;
+
+/**
+ * Longest item id sent (Core assigns `temp:<uuid>`, `dbBackup:<file name>`,
+ * `verificationOutput:<cutoff>`, `worktree:<task id>`, `foreign:<n>`; a backup
+ * file name is bounded by the file system, so only a sane ceiling is enforced
+ * here). Core re-validates the grammar; this is the faster local refusal.
+ */
+const MAX_ITEM_ID_CHARS = 512;
+
+function requireCleanupItems(items: readonly string[]): string[] {
+  const list = [...items];
+  if (list.length === 0) {
+    throw new CoreValidationError("items", "at least one item is required");
+  }
+  if (list.length > MAX_CLEANUP_ITEMS) {
+    throw new CoreValidationError("items", `at most ${MAX_CLEANUP_ITEMS} items are allowed`);
+  }
+  const seen = new Set<string>();
+  for (const id of list) {
+    if (typeof id !== "string" || id.length === 0 || id.length > MAX_ITEM_ID_CHARS) {
+      throw new CoreValidationError("items", "contains an id that is not a maintenance item id");
+    }
+    if (seen.has(id)) {
+      throw new CoreValidationError("items", "contains duplicate item ids");
+    }
+    seen.add(id);
+  }
+  return list;
+}
+
+/**
+ * `maintenance.cleanup` STEP 1 params: exactly `{ items }` — the `confirmToken`
+ * key is absent, so Core issues a confirmation and changes nothing. The ids are
+ * Core-assigned ones the UI read from a fresh inventory; none is built into a
+ * path by this client.
+ */
+export function buildMaintenanceCleanupRequestParams(items: readonly string[]): {
+  items: string[];
+} {
+  return { items: requireCleanupItems(items) };
+}
+
+/**
+ * `maintenance.cleanup` STEP 2 params: `{ items, confirmToken }` with the exact
+ * confirmed set. The token must have the shape Core issues (64 lowercase hex);
+ * it never appears in the refusal text.
+ */
+export function buildMaintenanceCleanupConfirmParams(
+  items: readonly string[],
+  confirmToken: string,
+): { items: string[]; confirmToken: string } {
+  const base = buildMaintenanceCleanupRequestParams(items);
+  if (typeof confirmToken !== "string" || !CONFIRM_TOKEN_PATTERN.test(confirmToken)) {
+    throw new CoreValidationError(
+      "confirmToken",
+      "must be the 64-character lowercase hex token Core issued in step 1",
+    );
+  }
+  return { ...base, confirmToken };
+}
+
+// ---------------------------------------------------------------------------
 // A2 idempotency key
 // ---------------------------------------------------------------------------
 

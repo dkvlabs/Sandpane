@@ -191,9 +191,9 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("A3b drift against the Rust sources", () => {
-  it("the five methods sit right after conversation.history, in Method::ALL order (34 total since A7)", () => {
+  it("the five methods sit right after conversation.history, in Method::ALL order (36 total since A9)", () => {
     const all = rustMethodAll().names;
-    expect(all).toHaveLength(34);
+    expect(all).toHaveLength(36);
     expect(METHODS).toEqual(all);
     expect(schemaMethodEnum()).toEqual(all);
     const at = METHODS.indexOf("conversation.history");
@@ -225,7 +225,7 @@ describe("A3b drift against the Rust sources", () => {
       expect(replayBody).not.toContain(`Method::${variant}`);
       expect(deadlineBody).not.toContain(`Method::${variant}`);
     }
-    expect(proxy).toContain("assert_eq!(Method::ALL.len(), 34);");
+    expect(proxy).toContain("assert_eq!(Method::ALL.len(), 36);");
   });
 
   it("every exact message equals the Rust const of the same name", () => {

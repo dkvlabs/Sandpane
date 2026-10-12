@@ -345,11 +345,11 @@ describe('A7 validators: never stricter than Core, never echo a value', () => {
 });
 
 describe('A7 drift: Rust sources', () => {
-  it('the six methods sit after git.apply in Method::ALL order (34 in total)', () => {
-    expect(CORE_METHODS).toHaveLength(34);
-    expect(CORE_METHODS.slice(28)).toEqual(A7_METHODS);
+  it('the six methods sit after git.apply in Method::ALL order (36 since A9)', () => {
+    expect(CORE_METHODS).toHaveLength(36);
+    expect(CORE_METHODS.slice(28, 34)).toEqual(A7_METHODS);
     expect(CORE_METHODS[27]).toBe('git.apply');
-    const all = rustProtocol.slice(rustProtocol.indexOf('pub const ALL: [Method; 34]'));
+    const all = rustProtocol.slice(rustProtocol.indexOf('pub const ALL: [Method; 36]'));
     const order = ['VerificationList', 'VerificationApprove', 'VerificationRevoke', 'VerificationRun', 'VerificationResult', 'ProjectContext'];
     let at = all.indexOf('Self::GitApply,');
     for (const variant of order) {
@@ -359,11 +359,12 @@ describe('A7 drift: Rust sources', () => {
     }
   });
 
-  it('"verification" is a known feature, last of Rust FEATURES (6)', () => {
+  it('"verification" is a known feature; A9 appended "maintenance" as the 7th', () => {
     expect(VERIFICATION_FEATURE).toBe('verification');
-    expect(KNOWN_FEATURES).toHaveLength(6);
+    expect(KNOWN_FEATURES).toHaveLength(7);
     expect(KNOWN_FEATURES[5]).toBe('verification');
-    expect(rustProtocol).toMatch(/pub const FEATURES: \[&str; 6\] = \[[\s\S]*"git-apply",\s*"verification",\s*\];/);
+    expect(KNOWN_FEATURES[6]).toBe('maintenance');
+    expect(rustProtocol).toMatch(/pub const FEATURES: \[&str; 7\] = \[[\s\S]*"git-apply",\s*"verification",\s*"maintenance",\s*\];/);
   });
 
   it('argv / label bounds equal sandpane-core validation.rs', () => {

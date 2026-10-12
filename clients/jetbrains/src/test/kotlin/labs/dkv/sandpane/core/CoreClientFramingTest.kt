@@ -61,7 +61,7 @@ import kotlin.test.assertTrue
  *     core/crates/sandpane-protocol/src/lib.rs;
  *   - the protocol-v1 additive fields: an OLD frame parses, and an absent value stays absent on
  *     the way out instead of becoming `null`, `{}`, or a benign workspace mode;
- *   - the 34-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
+ *   - the 36-method allowlist in `Method::ALL` order (the Rust source itself is re-read and
  *     compared by [ProtocolDriftGuardTest]).
  *
  * NOT covered here, on purpose: a live socket round trip. `SocketChannel` against
@@ -214,7 +214,7 @@ class CoreClientFramingTest {
             "verification.list", "verification.approve", "verification.revoke", "verification.run",
             "verification.result", "project.context",
         ).forEach { assertTrue(CoreMethods.isAllowlisted(it), it) }
-        assertEquals(34, CoreMethods.ALL.size)
+        assertEquals(36, CoreMethods.ALL.size)
     }
 
     @Test
@@ -233,7 +233,7 @@ class CoreClientFramingTest {
                 "conversation.export",
                 "task.cancel", "task.list", "task.subscribe", "git.review", "git.diff", "git.apply",
                 "verification.list", "verification.approve", "verification.revoke", "verification.run",
-                "verification.result", "project.context",
+                "verification.result", "project.context", "maintenance.inventory", "maintenance.cleanup",
             ),
             CoreMethods.ALL,
         )
@@ -262,12 +262,13 @@ class CoreClientFramingTest {
             ),
             CoreMethods.ADDITIVE_A7,
         )
+        assertEquals(setOf("maintenance.inventory", "maintenance.cleanup"), CoreMethods.ADDITIVE_A9)
         assertEquals(
             CoreMethods.ADDITIVE_IN_V1 + CoreMethods.ADDITIVE_A1 + CoreMethods.ADDITIVE_A3A + CoreMethods.ADDITIVE_A3B +
-                CoreMethods.ADDITIVE_A5 + CoreMethods.ADDITIVE_A7,
+                CoreMethods.ADDITIVE_A5 + CoreMethods.ADDITIVE_A7 + CoreMethods.ADDITIVE_A9,
             CoreMethods.REQUIRES_ADVERTISEMENT,
         )
-        assertEquals(23, CoreMethods.REQUIRES_ADVERTISEMENT.size, "every method beyond the 11-method baseline is gated")
+        assertEquals(25, CoreMethods.REQUIRES_ADVERTISEMENT.size, "every method beyond the 11-method baseline is gated")
     }
 
     // -----------------------------------------------------------------------

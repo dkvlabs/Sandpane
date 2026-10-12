@@ -180,7 +180,12 @@ object CoreMethods {
     const val VERIFICATION_RESULT: String = "verification.result"
     const val PROJECT_CONTEXT: String = "project.context"
 
-    /** Wire order of `Method::ALL` — 34 methods as of protocol-v1 addition A7 (A6 added none). */
+    // A9 maintenance (design 2026-10-09 \u00A73.9). inventory is read-only; cleanup is the
+    // two-step server-side confirmation (step 1 mints the token, step 2 removes).
+    const val MAINTENANCE_INVENTORY: String = "maintenance.inventory"
+    const val MAINTENANCE_CLEANUP: String = "maintenance.cleanup"
+
+    /** Wire order of `Method::ALL` — 36 methods as of protocol-v1 addition A9. */
     val ALL: List<String> = listOf(
         SYSTEM_PROBE, PROJECT_CREATE, PROJECT_LIST,
         PROJECT_UPDATE, PROJECT_ARCHIVE, PROJECT_UNARCHIVE, PROJECT_DELETE,
@@ -193,6 +198,7 @@ object CoreMethods {
         TASK_CANCEL, TASK_LIST, TASK_SUBSCRIBE, GIT_REVIEW, GIT_DIFF, GIT_APPLY,
         VERIFICATION_LIST, VERIFICATION_APPROVE, VERIFICATION_REVOKE, VERIFICATION_RUN,
         VERIFICATION_RESULT, PROJECT_CONTEXT,
+        MAINTENANCE_INVENTORY, MAINTENANCE_CLEANUP,
     )
 
     /**
@@ -233,11 +239,17 @@ object CoreMethods {
         VERIFICATION_RESULT, PROJECT_CONTEXT,
     )
 
+    /**
+     * The methods addition A9 ADDED (design \u00A73.9); a pre-A9 Core does NOT dispatch them. Calling
+     * them additionally needs the `maintenance` FEATURE ([CoreFeatures.MAINTENANCE]).
+     */
+    val ADDITIVE_A9: Set<String> = setOf(MAINTENANCE_INVENTORY, MAINTENANCE_CLEANUP)
+
     /** A7: the three read-only methods (no state changes in Core). The other three are writes. */
     val VERIFICATION_READ_ONLY: Set<String> = setOf(VERIFICATION_LIST, VERIFICATION_RESULT, PROJECT_CONTEXT)
 
     val REQUIRES_ADVERTISEMENT: Set<String> =
-        ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A + ADDITIVE_A3B + ADDITIVE_A5 + ADDITIVE_A7
+        ADDITIVE_IN_V1 + ADDITIVE_A1 + ADDITIVE_A3A + ADDITIVE_A3B + ADDITIVE_A5 + ADDITIVE_A7 + ADDITIVE_A9
 
     /**
      * The honest unsupported state for starting a sandbox (design 2026-10-09 §3 row A1). Shown to the
@@ -649,9 +661,16 @@ object CoreFeatures {
      */
     const val VERIFICATION: String = "verification"
 
+    /**
+     * A9 (design 2026-10-09 \u00A73.9): the maintenance surface (`maintenance.inventory` and the
+     * token-confirmed `maintenance.cleanup` of Core-created state). The Maintenance action is
+     * enabled ONLY when this is advertised AND both methods are.
+     */
+    const val MAINTENANCE: String = "maintenance"
+
     val KNOWN: List<String> = listOf(
         IDEMPOTENCY_KEYS, SANDBOX_CREATE_AGENT, CONVERSATION_SANDBOX_ID, CONVERSATION_SEND_MODE, GIT_APPLY,
-        VERIFICATION,
+        VERIFICATION, MAINTENANCE,
     )
 }
 

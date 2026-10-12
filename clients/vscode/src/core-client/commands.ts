@@ -643,6 +643,17 @@ export const PROJECT_CONTEXT_TIMEOUT_MS = GIT_QUERY_TIMEOUT_MS;
  */
 export const VERIFICATION_RUN_TIMEOUT_MS = 45_000;
 
+/**
+ * A9: `maintenance.inventory` runs Core's 10 s scan budget and a cleanup step
+ * re-scans before removing, so both get 35 s (the desktop proxy gives up at
+ * 30 s). Step 2 is never retried; a lost answer is surfaced as "some items
+ * may have been removed — scan again".
+ */
+export const MAINTENANCE_TIMEOUT_MS = 35_000;
+
+/** A9: Core's `MAX_CLEANUP_ITEMS` (design 2026-10-09 §3.9 item 1). */
+export const MAX_CLEANUP_ITEMS = 500;
+
 /** A6: Core's `MAX_APPLY_ENTRIES` — at most this many entries per call. */
 export const MAX_APPLY_ENTRIES = 1000;
 
@@ -1291,6 +1302,67 @@ export class CoreCommands {
       ),
     );
   }
+
+  // --- A9 (§3.9): maintenance inventory + token-confirmed cleanup ----------
+  // Every answer is UNTRUSTED and returned as `unknown`; callers shape-check
+  // it (src/vscode/maintenance.ts). Ids are Core-assigned ones read from a
+  // fresh inventory — none is ever built into a path by this client.
+
+  /** A9: `{}` → `MaintenanceInventoryResult`. Read-only; 35 s deadline. */
+  maintenanceInventory(): Promise<unknown> {
+    return guarded(() =>
+      this.connection.request<unknown>('maintenance.inventory', {}, { timeoutMs: MAINTENANCE_TIMEOUT_MS }),
+    );
+  }
+
+  /**
+   * A9 STEP 1: `{ items }` only — the `confirmToken` key is absent, so Core
+   * changes nothing and answers a confirmation bound to that exact set.
+   * Never retried; never sent automatically.
+   */
+  maintenanceCleanupRequest(items: readonly string[]): Promise<unknown> {
+    return guarded(() =>
+      this.connection.request<unknown>('maintenance.cleanup', { items: validateCleanupItems(items) }, { timeoutMs: MAINTENANCE_TIMEOUT_MS }),
+    );
+  }
+
+  /**
+   * A9 STEP 2: `{ items, confirmToken }` with the exact confirmed set. The
+   * token must have the shape Core issues (64 lowercase hex); it never appears
+   * in a refusal text. Never retried: a lost answer means items MAY HAVE BEEN
+   * REMOVED.
+   */
+  maintenanceCleanupConfirm(items: readonly string[], confirmToken: string): Promise<unknown> {
+    return guarded(() => {
+      if (typeof confirmToken !== 'string' || !CONFIRM_TOKEN_PATTERN.test(confirmToken)) {
+        throw new CoreValidationError('confirmToken', 'must be the 64-character lowercase hex token Core issued in step 1');
+      }
+      const payload: Record<string, unknown> = { items: validateCleanupItems(items), confirmToken };
+      return this.connection.request<unknown>('maintenance.cleanup', payload, { timeoutMs: MAINTENANCE_TIMEOUT_MS });
+    });
+  }
+}
+
+/** Core's cleanup item-list rules, checked before any frame is written. */
+function validateCleanupItems(items: readonly string[]): string[] {
+  const list = [...items];
+  if (list.length === 0) {
+    throw new CoreValidationError('items', 'at least one item is required');
+  }
+  if (list.length > MAX_CLEANUP_ITEMS) {
+    throw new CoreValidationError('items', `at most ${MAX_CLEANUP_ITEMS} items are allowed`);
+  }
+  const seen = new Set<string>();
+  for (const id of list) {
+    // Ids are Core-assigned (`temp:<uuid>`, `dbBackup:<file name>`, …): a sane
+    // ceiling only; Core owns the grammar and re-validates.
+    if (typeof id !== 'string' || id.length === 0 || id.length > 512) {
+      throw new CoreValidationError('items', 'contains an id that is not a maintenance item id');
+    }
+    if (seen.has(id)) throw new CoreValidationError('items', 'contains duplicate item ids');
+    seen.add(id);
+  }
+  return list;
 }
 
 /** Convenience: the adapters Core reports as actually verified (P0 gate passed). */

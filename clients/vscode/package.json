@@ -129,6 +129,10 @@
         "title": "Sandpane: Show Verification Result…"
       },
       {
+        "command": "sandpane.maintenance",
+        "title": "Sandpane: Clean Up Core State…"
+      },
+      {
         "command": "sandpane.stopSandbox",
         "title": "Sandpane: Stop Sandbox"
       },

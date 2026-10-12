@@ -194,20 +194,20 @@ const trusted = { nativeEvent: { isTrusted: true } };
 // ---------------------------------------------------------------------------
 
 describe("A6 drift against the Rust sources", () => {
-  it("git-apply is the 5th known feature, in Rust FEATURES order (6 since A7); methods are 34 since A7", () => {
+  it("git-apply is the 5th known feature, in Rust FEATURES order (7 since A9); methods are 36 since A9", () => {
     const rust = /pub const FEATURES: \[&str; (\d+)\] = \[([^\]]*)\];/.exec(protocolRustSource());
     const names = [...((rust?.[2] ?? "").matchAll(/"([^"]+)"/g))].map((m) => m[1]);
-    expect(Number(rust?.[1])).toBe(6);
+    expect(Number(rust?.[1])).toBe(7);
     expect([...KNOWN_FEATURES]).toEqual(names);
-    expect(KNOWN_FEATURES).toHaveLength(6);
+    expect(KNOWN_FEATURES).toHaveLength(7);
     expect(KNOWN_FEATURES[4]).toBe(FEATURE_GIT_APPLY);
     expect(FEATURE_GIT_APPLY).toBe("git-apply");
     // The A6 double advertises the A6 prefix (A7 appended verification).
     expect(A6_CORE_FEATURES.filter((f) => names.includes(f))).toEqual(names.slice(0, 5));
     const all = rustMethodAll();
-    expect(all.declaredLength).toBe(34);
+    expect(all.declaredLength).toBe(36);
     expect([...METHODS]).toEqual(all.names);
-    expect(METHODS).toHaveLength(34);
+    expect(METHODS).toHaveLength(36);
   });
 
   it("git.apply gets the git deadline: webview 45 000 (Core's CLIENT_APPLY_DEADLINE), proxy 43 000", () => {
@@ -226,7 +226,11 @@ describe("A6 drift against the Rust sources", () => {
     const readOnly = /fn is_read_only\(method: Method\) -> bool \{([\s\S]*?)\n\}/.exec(proxy)?.[1] ?? "";
     const trueArm = readOnly.slice(0, readOnly.indexOf("=> true"));
     expect(trueArm).not.toContain("GitApply");
-    expect(readOnly.slice(readOnly.indexOf("=> true"))).toContain("Method::GitApply => false");
+    const falseArm = readOnly.slice(readOnly.indexOf("=> true"));
+    expect(falseArm).toContain("Method::GitApply");
+    expect(falseArm).not.toContain("Method::GitApply => true");
+    // A9 appended MaintenanceCleanup to the false arm.
+    expect(falseArm).toContain("Method::MaintenanceCleanup => false");
     // The webview's own lost-answer copy for git.apply says "may have been applied".
     const lost = timeoutError("git.apply", 45_000);
     expect(lost.mayHaveBeenApplied).toBe(true);

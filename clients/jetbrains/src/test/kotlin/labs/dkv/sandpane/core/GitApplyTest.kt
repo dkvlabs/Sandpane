@@ -142,7 +142,7 @@ class GitApplyTest {
     fun theApplyDeadlineIsTheGitDeadline() {
         assertEquals(45_000, MethodDeadlines.GIT_APPLY_MS)
         assertEquals(45_000, MethodDeadlines.forMethod(CoreMethods.GIT_APPLY, 15_000))
-        assertEquals(34, CoreMethods.ALL.size, "A6 added no method (A7 added six)")
+        assertEquals(36, CoreMethods.ALL.size, "A6 added no method (A7 added six, A9 two more)")
         assertFalse(CoreMethods.REQUIRES_ADVERTISEMENT.contains(CoreMethods.GIT_APPLY), "git.apply is baseline; gated on the feature")
     }
 

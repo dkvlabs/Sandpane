@@ -213,9 +213,9 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
     );
   });
 
-  it('exposes exactly the 34 allowlisted methods and nothing else', () => {
-    expect(CORE_METHODS).toHaveLength(34);
-    expect(new Set(CORE_METHODS).size).toBe(34);
+  it('exposes exactly the 36 allowlisted methods and nothing else', () => {
+    expect(CORE_METHODS).toHaveLength(36);
+    expect(new Set(CORE_METHODS).size).toBe(36);
     expect(CORE_METHODS).not.toContain('shell.exec');
     expect(CORE_METHODS).not.toContain('sbx.raw');
     expect(CORE_METHODS).not.toContain('sandbox.start');
@@ -264,6 +264,11 @@ describe('the typed wrapper emits exactly the documented wire shape', () => {
       verificationRun: 'verification.run',
       verificationResult: 'verification.result',
       projectContext: 'project.context',
+      // A9 (§3.9): inventory plus the two cleanup steps (step 1 never carries
+      // a token, step 2 always does).
+      maintenanceInventory: 'maintenance.inventory',
+      maintenanceCleanupRequest: 'maintenance.cleanup',
+      maintenanceCleanupConfirm: 'maintenance.cleanup',
     };
     // No extra callable method on the prototype (AGENTS.md: no free-form RPC).
     expect(names.sort()).toEqual(Object.keys(wrapperToMethod).sort());
