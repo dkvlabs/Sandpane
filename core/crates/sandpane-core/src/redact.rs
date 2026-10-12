@@ -412,7 +412,7 @@ mod tests {
             "AKIAIOSFODNN7EXAMPLE",
             "AIzaSyA-abcdefghijklmnopqrstuvwxyz01234",
             "npm_abcdefghijklmnopqrstuvwxyz0123456789",
-            "hf_abcdefghijklmnopqrstuvwxyzABCDEFGH",
+            "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             "dckr_pat_abcdefghijklmnopqrstuvwx",
         ];
         for tok in cases {
